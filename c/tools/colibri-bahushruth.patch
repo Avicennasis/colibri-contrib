@@ -1,0 +1,108 @@
+diff --git i/c/tools/convert_fp8_to_int4.py w/c/tools/convert_fp8_to_int4.py
+index 9521a22..63c4954 100644
+--- i/c/tools/convert_fp8_to_int4.py
++++ w/c/tools/convert_fp8_to_int4.py
+@@ -27,6 +27,16 @@ USO:
+ """
+ import os, sys, glob, json, shutil, argparse
+ import numpy as np
++from safetensors import safe_open
++
++# Cross-shard scale resolution (patch 2): FP8 weights and their _scale_inv live in
++# different shard files.  These globals are set by --indir / --mtp --indir paths so
++# that dequant() can fetch a scale tensor from whatever shard actually contains it.
++# EN: FP8 weights and _scale_inv are split across shards. Globals set by --indir so
++# EN: dequant() can fetch scale tensors from whichever shard actually contains them.
++_SHARD_DIR = None          # root directory containing local safetensors shards
++_WEIGHT_MAP = None         # {"tensor.name": "shard_file.safetensors", ...}
++_SAFE_OPEN_CACHE = {}      # {shard_basename: safe_open handle} — lazy, never closed
+ 
+ # ---------- quantizzazione: identica al C (glm.c) ----------
+ def quant_int8(w, bits):                       # w: [O,I] f32 -> (qbytes U8 [O*I], scale f32 [O])
+@@ -163,7 +173,21 @@ def dequant(f, name, keys):
+         return dequant_nvfp4(f, name)
+     if dt in ("F8_E4M3", "float8_e4m3fn"):
+         w = f.get_tensor(name).to(torch.float32)
+-        sc = f.get_tensor(name + "_scale_inv").to(torch.float32)   # [ceil(O/128),ceil(I/128)]
++        scale_name = name + "_scale_inv"
++        # Cross-shard scale resolution (patch 2): if the scale tensor is not in
++        # the current shard, look it up in _WEIGHT_MAP and open the real shard.
++        # EN: scale may live in a different shard; resolve via _WEIGHT_MAP.
++        if scale_name in keys:
++            sc = f.get_tensor(scale_name).to(torch.float32)
++        elif _WEIGHT_MAP is not None and scale_name in _WEIGHT_MAP:
++            real_shard = _WEIGHT_MAP[scale_name]
++            if real_shard not in _SAFE_OPEN_CACHE:
++                real_path = os.path.join(_SHARD_DIR, real_shard)
++                _SAFE_OPEN_CACHE[real_shard] = safe_open(real_path, framework="pt")
++            sc = _SAFE_OPEN_CACHE[real_shard].get_tensor(scale_name).to(torch.float32)
++        else:
++            raise KeyError(f"{name}: FP8 weight without _scale_inv in current or any shard")
++        sc = sc.to(torch.float32)   # [ceil(O/128),ceil(I/128)]
+         O, I = w.shape
+         sc = sc.repeat_interleave(128, 0).repeat_interleave(128, 1)[:O, :I]
+         return (w * sc).numpy()
+@@ -294,7 +318,62 @@ def main():
+         return
+ 
+     os.makedirs(a.outdir, exist_ok=True)
+-    if a.indir:    # conversione locale (test)
++    global _SHARD_DIR, _WEIGHT_MAP
++    # --mtp --indir: convert MTP head from local shards (no download)
++    # EN: convert MTP head from local FP8 shards, using cross-shard scale resolution
++    if a.mtp and a.indir:
++        _SHARD_DIR = a.indir
++        idx_path = os.path.join(a.indir, "model.safetensors.index.json")
++        idx = json.loads(open(idx_path).read())["weight_map"]
++        _WEIGHT_MAP = idx
++        pref = f"model.layers.{a.n_layers}."
++        mtp_shards = sorted(set(v for k, v in idx.items() if k.startswith(pref)))
++        print(f"[MTP] head at layer {a.n_layers}: {len(mtp_shards)} local shards to process: {mtp_shards}")
++        from safetensors.numpy import save_file
++        for i, sh in enumerate(mtp_shards):
++            outp = os.path.join(a.outdir, f"out-mtp-{i:05d}.safetensors")
++            if os.path.exists(outp):
++                print(f"[MTP] {outp} already done"); continue
++            p = os.path.join(a.indir, sh)
++            print(f"[MTP {i+1}/{len(mtp_shards)}] reading local {sh}...", flush=True)
++            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_mtp=True)
++            save_file(out, outp)
++            print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB, {len(out)} tensors)", flush=True)
++        print("[MTP] DONE.")
++        return
++    # --indexer --indir: convert DSA lightning-indexer weights from local shards (no download)
++    # EN: convert DSA indexer weights from local FP8 shards, using cross-shard scale resolution
++    if a.indexer and a.indir:
++        _SHARD_DIR = a.indir
++        idx_path = os.path.join(a.indir, "model.safetensors.index.json")
++        idx = json.loads(open(idx_path).read())["weight_map"]
++        _WEIGHT_MAP = idx
++        idx_shards = sorted(set(v for k, v in idx.items()
++                                if "indexer" in k and 0 <= layer_idx(k) < a.n_layers))
++        print(f"[IDX] indexer weights across {len(idx_shards)} local shards in {a.indir}")
++        from safetensors.numpy import save_file
++        for i, sh in enumerate(idx_shards):
++            outp = os.path.join(a.outdir, f"out-idx-{i:05d}.safetensors")
++            if os.path.exists(outp):
++                print(f"[IDX {i+1}/{len(idx_shards)}] {outp} already done"); continue
++            p = os.path.join(a.indir, sh)
++            print(f"[IDX {i+1}/{len(idx_shards)}] reading local {sh}...", flush=True)
++            out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True)
++            if out: save_file(out, outp)
++            sz = os.path.getsize(outp) if os.path.exists(outp) else 0
++            print(f"    -> {os.path.basename(outp)} ({sz/1e9:.2f} GB, {len(out)} tensors)", flush=True)
++        print("[IDX] DONE.")
++        return
++    if a.mtp and not a.indir:
++        # --mtp without --indir: falls through to download path below (needs --repo)
++        pass
++    elif a.indir and not a.mtp:
++        # conversione locale (test): convert all shards from indir
++        # EN: local conversion: convert all shards from indir
++        _SHARD_DIR = a.indir
++        idx_path = os.path.join(a.indir, "model.safetensors.index.json")
++        if os.path.exists(idx_path):
++            _WEIGHT_MAP = json.loads(open(idx_path).read())["weight_map"]
+         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
+         from safetensors.numpy import save_file
+         for i, sp in enumerate(shards):

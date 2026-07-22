@@ -1,0 +1,65 @@
+diff --git a/c/tools/convert_fp8_to_int4.py b/c/tools/convert_fp8_to_int4.py
+--- a/c/tools/convert_fp8_to_int4.py
++++ b/c/tools/convert_fp8_to_int4.py
+@@ -26,6 +26,20 @@ USO:
+   python3 tools/convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 --outdir /home/vincenzo/glm52_i4
+ """
+ import os, sys, glob, json, shutil, argparse
++
++def _hf_headers(extra=None):
++    """Headers for huggingface.co resolve requests. Attaches HF_TOKEN so gated
++    repos (e.g. Bahushruth/GLM-5.2-FP8-abliterated) download through the raw
++    urllib path used by download_retry / --mtp / --indexer, not only via
++    huggingface_hub. Token: HF_TOKEN or HUGGING_FACE_HUB_TOKEN."""
++    h = {"User-Agent": "colibri-convert"}
++    t = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
++    if t:
++        h["Authorization"] = f"Bearer {t}"
++    if extra:
++        h.update(extra)
++    return h
++
+ import numpy as np
+ 
+ # ---------- quantizzazione: identica al C (glm.c) ----------
+@@ -399,8 +413,7 @@ def main():
+             s0, s1 = segs[t]
+             while done[t] < s1 - s0 and not stopfail:
+                 pos = s0 + done[t]
+-                req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert",
+-                                                           "Range": f"bytes={pos}-{s1-1}"})
++                req = urllib.request.Request(url, headers=_hf_headers({"Range": f"bytes={pos}-{s1-1}"}))
+                 try:
+                     with urllib.request.urlopen(req, timeout=8) as r:
+                         if r.status != 206:               # Range ignorato: multi-stream impossibile
+@@ -461,7 +474,7 @@ def main():
+             have = os.path.getsize(part) if os.path.exists(part) else 0
+             if expected is not None and have >= expected: break
+             have0 = have
+-            req = urllib.request.Request(url, headers={"User-Agent": "colibri-convert"})
++            req = urllib.request.Request(url, headers=_hf_headers())
+             if have: req.add_header("Range", f"bytes={have}-")
+             try:
+                 with urllib.request.urlopen(req, timeout=8) as r:
+@@ -531,8 +544,9 @@ def main():
+     tmp = os.path.join(a.outdir, "_inflight"); os.makedirs(tmp, exist_ok=True)
+     if a.mtp:
+         import urllib.request
++        _idx_url = f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json"
+         idx = json.loads(urllib.request.urlopen(
+-            f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
++            urllib.request.Request(_idx_url, headers=_hf_headers()), timeout=30).read())["weight_map"]
+         pref = f"model.layers.{a.n_layers}."
+         mtp_shards = sorted(set(v for k, v in idx.items() if k.startswith(pref)))
+         print(f"[MTP] head at layer {a.n_layers}: {len(mtp_shards)} shards to process: {mtp_shards}")
+@@ -550,8 +564,9 @@ def main():
+         shutil.rmtree(tmp, ignore_errors=True); print("[MTP] DONE."); return
+     if a.indexer:
+         import urllib.request
++        _idx_url = f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json"
+         idx = json.loads(urllib.request.urlopen(
+-            f"https://huggingface.co/{a.repo}/resolve/main/model.safetensors.index.json", timeout=30).read())["weight_map"]
++            urllib.request.Request(_idx_url, headers=_hf_headers()), timeout=30).read())["weight_map"]
+         idx_shards = sorted(set(v for k, v in idx.items()
+                                 if "indexer" in k and 0 <= layer_idx(k) < a.n_layers))
+         tot_gb = len(idx_shards) * 5.4
