@@ -1,0 +1,9 @@
+# /git-standards per-repo policy
+#
+# release_artifacts opt-OUT rationale (Finding Y checklist): the repo's tags
+# (v1.0.0, v1.1.0, ...) are upstream's (JustVugg/colibri) and belong to
+# upstream's release process; this is a pinned private deployment fork that
+# publishes no artifacts of its own, and no release-{lang} template fits a
+# pure-C engine + Python tools tree.
+release_artifacts: false
+lang_override: generic

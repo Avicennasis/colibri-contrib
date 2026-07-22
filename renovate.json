@@ -1,0 +1,9 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "enabled": false,
+  "description": [
+    "Pinned deployment fork of JustVugg/colibri (avic-deploy = upstream bad64d1 + converter patches).",
+    "Dependency updates are deliberately disabled: upstream sync happens via manual rebase with",
+    "patch re-verification — see wiki operations/colibri-install.md (Maintenance)."
+  ]
+}
