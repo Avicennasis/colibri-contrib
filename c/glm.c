@@ -2848,7 +2848,7 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
                     la_predict(m,li+1,x,2);
                 }
                 g_pre_idx=lidx; g_pre_w=lw; g_pre_keff=lkeff; g_pre_sh=lsh;
-                moe(m,l,li,lnrm,S,tmp);
+                moe(m,l,li,lnrm,S,tmp,1);   /* with_shared=1: FASE E adds the GPU-computed shared expert g_pre_sh(=lsh); the Metal CB computes it but does NOT sum it (unlike the CUDA path, where the device sums shared and moe is called with 0) */
                 g_pre_idx=NULL; g_pre_w=NULL; g_pre_keff=NULL; g_pre_sh=NULL;
                 for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
                 return;
