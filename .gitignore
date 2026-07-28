@@ -137,3 +137,6 @@ c/*.obj
 
 # compiled objects
 *.o
+
+# local agent context (Avicennasis fork)
+.stargazer-*
