@@ -681,7 +681,7 @@ $(file >.build-config,$(BUILD_CONFIG))
 endif
 .build-config: ;
 
-colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+colibri$(EXE): colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h quant.h sample.h kv_persist.h telemetry.h route_trace.h omp_tune.h abl.h backend_cuda.h backend_metal.h backend_vulkan.h decode_batch.h kv_anchor.h schema_gbnf.h tier.h $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
 	$(CC) $(CFLAGS) colibri.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o colibri$(EXE) $(LDFLAGS)
 
 # Vulkan backend object (plain C + vulkan headers) and its SPIR-V shaders.
@@ -941,7 +941,7 @@ fp8-bench: fp8_bench$(EXE)
 # the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
 # MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
 # asserts this shape.
-olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h fused_simd.h
 	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
@@ -974,7 +974,7 @@ qwen36$(EXE): qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(C
 tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
-inkling$(EXE): inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
+inkling$(EXE): inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda_ink.h backend_metal.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
 
 # ENGINES WITHOUT A CUDA BACKEND (#783).
@@ -989,7 +989,7 @@ NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
 NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
 
-kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
+kimi_k3$(EXE): kimi_k3.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h backend_cuda.h backend_metal.h backend_vulkan.h $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) $(METAL_OBJ)
 	$(CC) $(CFLAGS) kimi_k3.c $(CUDA_OBJ) $(VK_OBJ) $(METAL_OBJ) -o kimi_k3$(EXE) $(LDFLAGS)
 
 # Use a baseline that matches the compiler target. macOS already targets a
@@ -1017,8 +1017,8 @@ iobench$(EXE): iobench.c compat.h
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h serve_codec.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_cluster_protocol$(EXE): tests/test_cluster_protocol.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_cluster_protocol$(EXE): tests/test_cluster_protocol.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_ue8m0$(EXE): tests/test_ue8m0.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1029,11 +1029,11 @@ tests/test_json$(EXE): tests/test_json.c json.h
 tests/test_tok_o200k$(EXE): tests/test_tok_o200k.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_k3_ram_budget$(EXE): tests/test_k3_ram_budget.c kimi_k3.c st.h tok.h quant.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_k3_ram_budget$(EXE): tests/test_k3_ram_budget.c kimi_k3.c st.h tok.h quant.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_k3_mmap$(EXE): tests/test_k3_mmap.c kimi_k3.c st.h tok.h quant.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h
-	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+tests/test_k3_mmap$(EXE): tests/test_k3_mmap.c kimi_k3.c st.h tok.h quant.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(METAL_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) $(METAL_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_tok_kimi_tiny$(EXE): tests/test_tok_kimi_tiny.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1071,13 +1071,13 @@ tests/test_grammar$(EXE): tests/test_grammar.c grammar.h
 # equivalence under the shipping flags is covered by the differential dump
 # (old vs new rope_interleave are byte-identical); this test guards the
 # source-level formula equivalence and must not depend on contraction luck.
-tests/test_rope_invfreq$(EXE): tests/test_rope_invfreq.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) -ffp-contract=off $< -o $@ $(LDFLAGS)
+tests/test_rope_invfreq$(EXE): tests/test_rope_invfreq.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) -ffp-contract=off $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 # schema->GBNF compile cache (#7): grammar_reset must equal a fresh setup, and
 # the GrDraft.src ownership must not leak/double-free. Includes colibri.c.
-tests/test_grammar_cache$(EXE): tests/test_grammar_cache.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_grammar_cache$(EXE): tests/test_grammar_cache.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 # Standalone: drives a faithful miniature of moe()'s routing+accumulate and links
 # the SAME abl.h the engine links -- no model/weights needed (the ablation-logic gate).
@@ -1087,8 +1087,8 @@ tests/test_ablate$(EXE): tests/test_ablate.c abl.h
 tests/test_schema_gbnf$(EXE): tests/test_schema_gbnf.c schema_gbnf.h grammar.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_spec_decode_state$(EXE): tests/test_spec_decode_state.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_spec_decode_state$(EXE): tests/test_spec_decode_state.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1099,8 +1099,8 @@ tests/test_serve_codec$(EXE): tests/test_serve_codec.c serve_codec.h compat.h
 tests/test_inkling_serve_framing$(EXE): tests/test_inkling_serve_framing.c inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_kimi_serve_framing$(EXE): tests/test_kimi_serve_framing.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
-	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+tests/test_kimi_serve_framing$(EXE): tests/test_kimi_serve_framing.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h $(METAL_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) $(METAL_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 # olmoe's matmul_q, not colibri's: compares the IDOT path against FP32
 # ACTIVATIONS rather than an integer reference. NOCUDA_* for the same reason
@@ -1111,34 +1111,34 @@ tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c st.h json.h
 tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
-tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_stops$(EXE): tests/test_stops.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_stops$(EXE): tests/test_stops.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_cfg_topk$(EXE): tests/test_cfg_topk.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_cfg_topk$(EXE): tests/test_cfg_topk.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_topp$(EXE): tests/test_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_topp$(EXE): tests/test_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 # bench_topp is a microbenchmark (old qsort vs new heap partial-select, #335), NOT a test
 # gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_topp
-tests/bench_topp$(EXE): tests/bench_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_topp$(EXE): tests/bench_topp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_sample_nan$(EXE): tests/test_sample_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_temp_env$(EXE): tests/test_temp_env.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_temp_env$(EXE): tests/test_temp_env.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_kv_alloc$(EXE): tests/test_kv_alloc.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 # fmt=6 kernel oracle: needs the generated grid table, and its fixture comes from
 # the reference codec (tools/make_e8_fixture.py) — regenerate if the layout moves.
@@ -1160,26 +1160,26 @@ fuzz-rans: tests/fuzz_rans.c rans.h
 	  tests/fuzz_rans.c -o tests/fuzz_rans -lm
 	./tests/fuzz_rans
 
-tests/test_int3$(EXE): tests/test_int3.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_int3$(EXE): tests/test_int3.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_int3_load$(EXE): tests/test_int3_load.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_int3_load$(EXE): tests/test_int3_load.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_fp8_passthrough$(EXE): tests/test_fp8_passthrough.c quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_fp8_load$(EXE): tests/test_fp8_load.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_fp8_load$(EXE): tests/test_fp8_load.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_qt_addrow$(EXE): tests/test_qt_addrow.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_qt_addrow$(EXE): tests/test_qt_addrow.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_logit_nan$(EXE): tests/test_logit_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_logit_nan$(EXE): tests/test_logit_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_router_nan$(EXE): tests/test_router_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_router_nan$(EXE): tests/test_router_nan.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
@@ -1266,64 +1266,64 @@ tests/test_route_trace$(EXE): tests/test_route_trace.c route_trace.h
 tests/test_798_guards$(EXE): tests/test_798_guards.c st.h json.h compat.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_dsa_select$(EXE): tests/test_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_corpus_draft$(EXE): tests/test_corpus_draft.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_corpus_draft$(EXE): tests/test_corpus_draft.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_cap_precedence$(EXE): tests/test_cap_precedence.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_cap_precedence$(EXE): tests/test_cap_precedence.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_cap_mixed_width$(EXE): tests/test_cap_mixed_width.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_cap_mixed_width$(EXE): tests/test_cap_mixed_width.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_eslot_inflight$(EXE): tests/test_eslot_inflight.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_eslot_inflight$(EXE): tests/test_eslot_inflight.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_ram_rebalance$(EXE): tests/test_ram_rebalance.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_ram_rebalance$(EXE): tests/test_ram_rebalance.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_ssd_probe$(EXE): tests/test_ssd_probe.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_ssd_probe$(EXE): tests/test_ssd_probe.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 # bench_dsa_select is a microbenchmark (old qsort vs new quickselect partial-select, #356),
 # NOT a test gate -- intentionally absent from TEST_BINS. Build on demand: make tests/bench_dsa_select
-tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 # bench_idot: microbenchmark (single-acc vs independent-acc AVX-VNNI idot), NOT a test gate.
 # Build on demand on an AVX-VNNI CPU: make tests/bench_idot ARCH=native
-tests/bench_idot$(EXE): tests/bench_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_idot$(EXE): tests/bench_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 # bench_gemv_stream: microbenchmark (decode-regime GEMV bandwidth vs the read ceiling;
 # frozen-baseline + deinterleaved-x candidate A/B), NOT a test gate.
 # Build on demand: make tests/bench_gemv_stream ARCH=native
-tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_gemv_stream$(EXE): tests/bench_gemv_stream.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 # bench_mla_simd: microbenchmark (scalar vs AVX2/NEON MLA-absorb reductions, #442),
 # NOT a test gate. Build on demand: make tests/bench_mla_simd
-tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_uring$(EXE): tests/test_uring.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_uring$(EXE): tests/test_uring.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_pipe_block$(EXE): tests/test_pipe_block.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_pipe_block$(EXE): tests/test_pipe_block.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_pilot_ring$(EXE): tests/test_pilot_ring.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-tests/test_moe_gs_guard$(EXE): tests/test_moe_gs_guard.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_pilot_ring$(EXE): tests/test_pilot_ring.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
+tests/test_moe_gs_guard$(EXE): tests/test_moe_gs_guard.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_omp_tune$(EXE): tests/test_omp_tune.c omp_tune.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_kvb_notice$(EXE): tests/test_kvb_notice.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_kvb_notice$(EXE): tests/test_kvb_notice.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 test-c: $(TEST_BINS)
 	$(PYTHON) tools/run_tests.py $(TEST_BINS)
@@ -1461,8 +1461,8 @@ tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 tests/test_kv_anchor$(EXE): tests/test_kv_anchor.c kv_anchor.h
 	$(CC) $(CFLAGS) tests/test_kv_anchor.c -o tests/test_kv_anchor$(EXE) $(LDFLAGS)
 
-tests/test_kv_anchor_serve$(EXE): tests/test_kv_anchor_serve.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h kv_anchor.h telemetry.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_kv_anchor_serve$(EXE): tests/test_kv_anchor_serve.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h kv_anchor.h telemetry.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
-	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)
+tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h $(METAL_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) $(METAL_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)
