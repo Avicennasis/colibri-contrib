@@ -7784,7 +7784,35 @@ static void repin_pass_limit(Model *m,int limit){
 typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
 static void ram_rebalance_boundary(Model *m,int maxctx);   /* #50402: def accanto a mem_available_gb */
+static int  idle_shrink_poll(Model *m,int maxctx);         /* #50405: def accanto a ram_rebalance_boundary */
+static int  idle_poll_wanted(void);
+static void idle_mark(int active);
 static int g_mux_boundary=0;   /* #50402: un request e' appena finito nel path MUX */
+/* #50405: stato dell'idle shrink. Vive qui e non accanto alle sue funzioni
+ * perche' run_serve_mux (piu' sotto ma prima di quelle) legge g_idle_poll_s per
+ * decidere il timeout del select. Il commento che spiega il meccanismo sta con
+ * le funzioni, vicino a ram_rebalance_boundary. */
+static int g_idle_shrink =
+#ifdef __APPLE__
+    0;                          /* memoria unificata: liberare sotto pressione e' swap-death */
+#else
+    1;
+#endif
+static double g_idle_after_s = 600.0;   /* IDLE_SHRINK_MIN (minuti), default 10 */
+static double g_idle_poll_s  = 15.0;    /* IDLE_SHRINK_POLL_S: granularita' del risveglio */
+static int    g_idle_unpin   = 0;       /* IDLE_SHRINK_UNPIN=1: molla anche il tier AUTOPIN */
+static double g_idle_since   = 0;       /* quando la coda si e' svuotata (0 = non idle) */
+static int    g_idle_shrunk  = 0;       /* latch: uno shrink per periodo di idle */
+/* Il cronometro parte solo DOPO la prima richiesta servita. Un engine appena
+ * avviato e mai usato non e' "abbandonato", e' "in attesa": la sua LRU e' ancora
+ * VUOTA, quindi stringere li' non libera praticamente niente (la densa e i pin
+ * sono il pavimento, non si toccano) e in cambio lo lascia con ecap al minimo
+ * PER SEMPRE — il gateway riavviato alle 3 di notte servirebbe tutto il giorno
+ * dopo con la cache castrata. Costo reale, beneficio nullo: si aspetta traffico.
+ * EN: the idle clock only starts after the first served request -- a
+ * EN: never-used engine has an empty LRU, so shrinking frees nothing and
+ * EN: permanently caps the cache it has not had a chance to fill yet. */
+static int    g_idle_served  = 0;
 
 static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, int maxctx){
     s->kv.kv_start=calloc(m->c.n_layers+1,sizeof(int));
@@ -7917,6 +7945,8 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     r->active=0;
     g_mux_boundary=1;                    /* #50402: run_serve_mux reads this at the top of its
                                           * loop, where no forward is in flight (see there). */
+    g_idle_served=1;                     /* #50405: da adesso il silenzio conta come abbandono
+                                          * (prima della prima richiesta e' solo attesa). */
 }
 
 /* Read and prefill one request. Returns -1 on EOF, 0 for a rejected frame and
@@ -8166,6 +8196,15 @@ static void run_serve_mux(Model *m, const char *snap){
          * request: mux_done raises the flag, we consume it exactly once. */
         if(g_mux_boundary){ g_mux_boundary=0; ram_rebalance_boundary(m,maxctx); }
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
+        /* #50405: la coda e' vuota o no. Da qui parte il cronometro dell'idle;
+         * riempirsi riarma il latch ma non rialza mai il budget. */
+        idle_mark(active);
+        /* #50405: e qui si CONSUMA il risveglio che ci siamo procurati sotto —
+         * scaduto il select idle si guarda l'orologio, e se il silenzio dura da
+         * abbastanza il budget scende al pavimento. Stesso safe point del
+         * rebalance qui sopra (nessun forward in volo), e per definizione
+         * nessuna richiesta attiva. */
+        if(!active) idle_shrink_poll(m,maxctx);
         /* Poll stdin for available input without blocking. On POSIX this is
          * select(); on Windows, select() on a pipe handle routes to winsock
          * and always returns -1 (SOCKET_ERROR), so the batch loop could never
@@ -8175,7 +8214,18 @@ static void run_serve_mux(Model *m, const char *snap){
         if(!eof){
 #if defined(__APPLE__) || defined(__linux__) ||	defined(__FreeBSD__)
             fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
-            struct timeval tv={0,0}, *ptv=active?&tv:NULL;
+            /* #50405: QUESTA riga e' il feature. A coda vuota il timeout era
+             * NULL — il loop dormiva finche' non arrivava una richiesta, quindi
+             * un engine abbandonato non poteva accorgersi di essere abbandonato
+             * (l'engine non ha thread timer). Finche' resta uno shrink da fare
+             * il select idle prende un timeout FINITO e ogni scadenza e' il
+             * risveglio che serve; fatto lo shrink si torna a NULL e il loop
+             * ridorme a costo zero. Il SIGTERM di #810 continua a svegliarci
+             * per EINTR come prima, solo prima del timeout. */
+            struct timeval tv={0,0}, idle_tv={(time_t)g_idle_poll_s,0}, *ptv;
+            if(active)                   ptv=&tv;         /* batch attivo: non bloccare */
+            else if(idle_poll_wanted())  ptv=&idle_tv;    /* idle con shrink pendente: sveglia */
+            else                         ptv=NULL;        /* idle e niente da fare: dormi */
             ready=select(STDIN_FILENO+1,&rfds,NULL,NULL,ptv);
             if(ready>0 && FD_ISSET(STDIN_FILENO,&rfds))
 #elif defined(_WIN32)
@@ -9290,6 +9340,147 @@ static void ram_rebalance_boundary(Model *m,int maxctx){    /* adapter: sensori 
     ram_rebalance_core(m,maxctx,mem_available_gb(),self_footprint_gb());
 }
 
+/* ---- IDLE SHRINK-TO-FLOOR (#50405) ----------------------------------------
+ * #50402 stringe il budget quando il MONDO prende RAM. Questo stringe quando
+ * NOI non la usiamo: a coda vuota da N minuti il budget scende al PAVIMENTO
+ * (densa residente + KV + pinnati) e rss_guard libera tutta la LRU. Un engine
+ * abbandonato passa da ~25 GB a densa+KV senza morire: resta caldo-caricabile.
+ *
+ * IL SEGNALE DI IDLE. L'engine non ha un thread timer, e a coda vuota
+ * run_serve_mux si ferma dentro select() con timeout NULL: DORME PER SEMPRE.
+ * Nessuno lo sveglia per accorgersi di essere idle. Quindi il feature non e'
+ * "misura l'idle", e' "PROCURATI un risveglio": finche' c'e' uno shrink da
+ * fare (idle_poll_wanted) il select idle prende un timeout FINITO, e ogni
+ * scadenza e' l'occasione per controllare l'orologio. Fatto lo shrink il
+ * timeout torna NULL e il loop ridorme a costo zero. Senza quella riga il
+ * resto di questo blocco e' codice morto — la stessa trappola che ha fatto
+ * fallire il primo giro di #50402, e per questo il test la asserisce.
+ *
+ * run_serve (interattivo) NON e' agganciato, ED E' VOLUTO: quel loop blocca in
+ * getline() e non ha un punto di poll; l'unico momento in cui potrebbe
+ * accorgersi dell'idle e' quando una richiesta e' GIA' arrivata, cioe' l'istante
+ * peggiore per svuotare la cache. Meglio niente che una chiamata che spara nel
+ * momento sbagliato. La produzione gira comunque run_serve_mux (SERVE_BATCH=1).
+ *
+ * SOLO RESTRINGIMENTO, e niente ripresa: budget e ecap non risalgono mai da
+ * soli (li rialza solo cap_for_ram all'avvio). Il traffico che torna trova un
+ * engine lento che ristreamma da NVMe — e' il PREZZO dichiarato del ticket, non
+ * un bug. Vedi il report: e' anche la ragione per cui il reaper non va ritirato.
+ *
+ * EN: idle shrink-to-floor. The engine has no timer thread and an idle
+ * EN: run_serve_mux blocks in select(NULL) forever, so this feature has to
+ * EN: MANUFACTURE its own wakeup (finite select timeout while a shrink is
+ * EN: still pending). Shrink-only, no recovery path: ecap and the budget only
+ * EN: ever go down. Off by default on __APPLE__ (unified memory), IDLE_SHRINK=1
+ * EN: opts in / =0 forces off; an explicit RSS_GUARD_GB stays authoritative. */
+/* (i globali stanno piu' su, accanto a g_mux_boundary: run_serve_mux li usa
+ *  prima di questo punto del file.) */
+
+/* C'e' ancora uno shrink da fare? Se no, il loop idle puo' tornare a bloccare
+ * per sempre: nessun risveglio da procurare, nessun syscall sprecato. */
+static int idle_poll_wanted(void){
+    return g_idle_shrink && g_idle_served && !g_idle_shrunk
+           && !getenv("RSS_GUARD_GB") && g_ram_budget_gb>0;
+}
+
+/* Molla il tier AUTOPIN. I pin NON si liberano come gli slot LRU:
+ *  - sotto pin_arena_bind (#419) slab/fslab sono FETTE di un'arena per layer e
+ *    non vanno MAI free()d — si restituiscono le PAGINE con MADV_DONTNEED, che
+ *    e' esattamente quello che fa expert_host_release sul path CUDA;
+ *  - sotto COLI_MMAP gli slab sono NULL e i pesi sono viste mmap inchiodate da
+ *    pin_wire: li' l'unica cosa da fare e' qt_unwire_mmap (le pagine tornano
+ *    page-cache PULITA, recuperabile — l'RSS non scende subito, ma escono dal
+ *    footprint non recuperabile, che e' il termine che conta per il floor);
+ *  - altrimenti sono allocazioni individuali e si liberano davvero.
+ * ORDINE OBBLIGATORIO: npin[l]=0 PRIMA di toccare gli slab, tutto sotto
+ * g_pilot_mx. Le ~14 lookup dei pin sono tutte `for(z<npin[layer])`, quindi
+ * azzerare npin le fa cadere tutte sulla LRU/disco in un colpo solo; se invece
+ * liberassimo prima, un lettore potrebbe trovare un pin con slab gia' morto
+ * (use-after-free) o — peggio, perche' silenzioso — leggere pagine azzerate da
+ * DONTNEED e produrre output sbagliato senza crashare. Stesso identico
+ * contratto slab-valido/slot-riusabile che rss_guard tiene per la LRU.
+ * NB: eid resta com'e' e gli slot non si riusano: npin=0 li rende irraggiungibili
+ * (mettere eid=-1 sarebbe un OOB, repin_pick indicizza m->eheat[l][s->eid]). */
+static int64_t idle_pin_release(Model *m){
+    if(!m->pin || !m->npin) return 0;
+    int NR=m->c.n_layers+1, nslot=0;
+    int64_t freed=0;
+    pthread_mutex_lock(&g_pilot_mx);
+    for(int l=0;l<NR;l++){
+        int np = m->npin[l];
+        if(np<1 || !m->pin[l]) continue;
+        m->npin[l]=0;                       /* PRIMA: nessuna lookup puo' piu' trovarli */
+        for(int z=0;z<np;z++){
+            ESlot *s=&m->pin[l][z];
+            int64_t b=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+            if(g_mmap){                     /* viste mmap: si sganciano solo le mlock */
+                qt_unwire_mmap(&s->g); qt_unwire_mmap(&s->u); qt_unwire_mmap(&s->d);
+            }
+            if(s->slab || s->fslab){
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+                if(s->slab)  munlock(s->slab,(size_t)s->slab_cap);
+                if(s->fslab) munlock(s->fslab,(size_t)s->fslab_cap*sizeof(float));
+#elif defined(_WIN32)
+                if(s->slab)  compat_munlock(s->slab,(size_t)s->slab_cap);
+                if(s->fslab) compat_munlock(s->fslab,(size_t)s->fslab_cap*sizeof(float));
+#endif
+                if(s->aslab){               /* fetta d'arena: pagine si', indirizzo no */
+#ifdef __linux__
+                    madvise(s->slab,(size_t)s->slab_cap,MADV_DONTNEED);
+                    madvise(s->fslab,(size_t)s->fslab_cap*sizeof(float),MADV_DONTNEED);
+#endif
+                    s->slab=NULL; s->fslab=NULL;
+                } else {
+                    compat_aligned_free(s->slab); free(s->fslab);
+                    s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
+                }
+            }
+            QT *q[3]={&s->g,&s->u,&s->d};
+            for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
+            s->used=0;
+            freed+=b; nslot++;
+        }
+    }
+    pthread_mutex_unlock(&g_pilot_mx);
+    m->resident_bytes-=freed; if(m->resident_bytes<0) m->resident_bytes=0;
+    if(nslot) fprintf(stderr,"[IDLE-SHRINK] unpinned %d experts (%.1f GB) from the AUTOPIN tier "
+                             "(#50405, IDLE_SHRINK_UNPIN)\n", nslot, freed/1e9);
+    return freed;
+}
+
+/* idle_s arriva per parametro (come avail/rss in #50402) cosi' il test simula
+ * ore di silenzio senza aspettarle. Ritorna 1 se ha stretto. */
+static int idle_shrink_core(Model *m,int maxctx,double idle_s){
+    if(!g_idle_shrink || getenv("RSS_GUARD_GB")) return 0;   /* esplicito vince (#379) */
+    if(g_idle_shrunk || g_ram_budget_gb<=0) return 0;
+    if(idle_s < g_idle_after_s) return 0;                    /* non ancora abbastanza fermo */
+    g_idle_shrunk=1;                                         /* un solo tentativo per idle */
+    if(g_idle_unpin) idle_pin_release(m);                    /* abbassa anche il PAVIMENTO */
+    double floor_gb=((double)m->resident_bytes+kv_pool_bytes(m,maxctx))/1e9;
+    if(floor_gb>=g_ram_budget_gb) return 0;                  /* gia' al pavimento: niente da fare */
+    fprintf(stderr,"[IDLE-SHRINK] queue empty for %.0f s: budget %.1f -> %.1f GB "
+                   "(dense+KV%s floor, #50405, shrink-only)\n",
+            idle_s,g_ram_budget_gb,floor_gb,g_idle_unpin?"":"+pinned");
+    g_ram_budget_gb=floor_gb;
+    g_rssg_last = m->n_emit>=16 ? m->n_emit-16 : 0;           /* fora il throttle a 16 token */
+    rss_guard(m);                                            /* il guard esistente libera la LRU */
+    return 1;
+}
+
+/* Adattatore col vero orologio, chiamato dal loop di run_serve_mux. */
+static int idle_shrink_poll(Model *m,int maxctx){
+    if(g_idle_since<=0) return 0;
+    return idle_shrink_core(m,maxctx,now_s()-g_idle_since);
+}
+
+/* La coda si e' svuotata / si e' riempita. Riempirsi RIARMA il latch (il
+ * prossimo silenzio merita il suo shrink) ma NON rialza il budget: l'unica
+ * direzione resta in giu'. */
+static void idle_mark(int active){
+    if(active){ g_idle_since=0; g_idle_shrunk=0; }
+    else if(g_idle_since<=0 && g_idle_served) g_idle_since=now_s();
+}
+
 static int kv_slot_count(void){
     if(!getenv("SERVE")) return 1;
     return getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
@@ -10126,6 +10317,20 @@ int main(int argc, char **argv){
     rt_trace_open();                     /* same place as before, so the log order is identical */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     if(getenv("RAM_REBALANCE")) g_ram_rebalance=atoi(getenv("RAM_REBALANCE")); /* #50402: 1 opt-in (mac unified), 0 force-off */
+    /* #50405: idle shrink-to-floor. IDLE_SHRINK=1/0 come sopra; IDLE_SHRINK_MIN
+     * e' in MINUTI (default 10, sotto i 30 del reaper cosi' si vede chi spara
+     * per primo); <=0 spegne. IDLE_SHRINK_UNPIN=1 molla anche il tier AUTOPIN:
+     * default OFF perche' non e' mai stato verificato su hardware. */
+    if(getenv("IDLE_SHRINK")) g_idle_shrink=atoi(getenv("IDLE_SHRINK"));
+    if(getenv("IDLE_SHRINK_MIN")){
+        double mn=atof(getenv("IDLE_SHRINK_MIN"));
+        if(mn>0) g_idle_after_s=mn*60.0; else g_idle_shrink=0;
+    }
+    if(getenv("IDLE_SHRINK_POLL_S")){
+        double ps=atof(getenv("IDLE_SHRINK_POLL_S"));
+        if(ps>=1.0) g_idle_poll_s=ps;            /* sotto 1 s non ha senso: e' un timer da minuti */
+    }
+    if(getenv("IDLE_SHRINK_UNPIN")) g_idle_unpin=atoi(getenv("IDLE_SHRINK_UNPIN"));
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_metal_prefill = getenv("COLI_METAL_PREFILL")?atoi(getenv("COLI_METAL_PREFILL")):0; /* default 0: S>4 attention on CPU (bit-exact); =1 opt-in GPU prefill */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;

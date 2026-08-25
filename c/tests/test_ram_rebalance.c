@@ -286,11 +286,230 @@ static void section_d_wiring(void){
     printf("D. done\n");
 }
 
+/* ===================== #50405: IDLE SHRINK-TO-FLOOR =========================
+ * A different axis from #50402: that one shrinks when the WORLD takes RAM, this
+ * one shrinks when WE stop using it. Same floor, same guard, same shrink-only
+ * rule -- so E/F/G below deliberately re-test those invariants on the new entry
+ * point rather than assuming they carry over.
+ *
+ * The one that matters is G. E and F can both pass while the feature never runs,
+ * because an idle engine has nothing to run it: run_serve_mux parks in select()
+ * with a NULL timeout and the engine owns no timer thread. The shrink is
+ * therefore reachable ONLY IF that select takes a finite timeout while a shrink
+ * is pending -- so G asserts the timeout, not just the call. Asserting the call
+ * alone is precisely the check that let #50402 ship dead code. */
+
+static void is_reset(Model *m){
+    rr_reset(m);
+    g_idle_shrink=1; g_idle_after_s=600.0; g_idle_poll_s=15.0;
+    g_idle_unpin=0; g_idle_since=0; g_idle_shrunk=0;
+    g_idle_served=1;                 /* default for E1-E10: an engine that has served */
+}
+
+static void section_e_idle_arithmetic(void){
+    Model m; is_reset(&m);
+    printf("E. idle shrink arithmetic + the poll predicate the select depends on\n");
+
+    /* Floor 8 GB, budget 24: high enough that rss_guard's lim*1.02+0.3 stays
+     * above this process's real RSS, so E stays pure arithmetic (same trick A
+     * uses). kv_pool_bytes is 0 here -- cfg widths are zero. */
+    m.resident_bytes=8e9;
+
+    /* E1. Silence shorter than the threshold does nothing. */
+    CHECK(idle_shrink_core(&m,4096,599.0)==0);
+    CHECK(g_ram_budget_gb==24.0);
+    CHECK(idle_poll_wanted()==1);          /* still armed: the loop must keep waking */
+
+    /* E2. Past the threshold: straight to the floor, one line, one step. */
+    CHECK(idle_shrink_core(&m,4096,600.0)==1);
+    CHECK(fabs(g_ram_budget_gb-8.0)<1e-9);
+
+    /* E3. THE PREDICATE. Once the shrink is done there is nothing left to wake
+     *     for, so the poll must disarm and the loop go back to blocking. An
+     *     always-armed predicate spins a syscall every poll interval forever;
+     *     a never-armed one is the dead-code bug. Both are caught here. */
+    CHECK(idle_poll_wanted()==0);
+
+    /* E4. Latch: more silence changes nothing (no re-shrink, no second log). */
+    CHECK(idle_shrink_core(&m,4096,86400.0)==0);
+    CHECK(fabs(g_ram_budget_gb-8.0)<1e-9);
+
+    /* E5. NO GROW PATH. Traffic returns, then the box goes quiet again: the
+     *     latch re-arms (a fresh silence deserves its own attempt) but the
+     *     budget must NOT climb back -- shrink-only is the ticket's hard rule. */
+    idle_mark(1);
+    CHECK(g_idle_shrunk==0 && g_idle_since==0.0);
+    CHECK(fabs(g_ram_budget_gb-8.0)<1e-9);          /* still at the floor */
+    idle_mark(0);
+    CHECK(g_idle_since>0);
+    CHECK(idle_shrink_core(&m,4096,600.0)==0);      /* already at floor: nothing to do */
+    CHECK(fabs(g_ram_budget_gb-8.0)<1e-9);
+    CHECK(idle_poll_wanted()==0);                   /* and it disarms again */
+
+    /* E6. The floor is never crossed, however long the silence. */
+    is_reset(&m); m.resident_bytes=20e9;
+    CHECK(idle_shrink_core(&m,4096,1e6)==1);
+    CHECK(fabs(g_ram_budget_gb-20.0)<1e-9);         /* clamped at dense+KV+pinned */
+
+    /* E7. A floor ABOVE the budget must not raise it (the grow path again, by
+     *     the back door: an engine whose resident set already exceeds budget). */
+    is_reset(&m); m.resident_bytes=30e9;
+    CHECK(idle_shrink_core(&m,4096,1e6)==0);
+    CHECK(g_ram_budget_gb==24.0);                   /* untouched, not raised to 30 */
+
+    /* E8. Explicit RSS_GUARD_GB stays authoritative (#379 rule, as in #50402). */
+    is_reset(&m); m.resident_bytes=8e9; setenv("RSS_GUARD_GB","4",1);
+    CHECK(idle_shrink_core(&m,4096,1e6)==0);
+    CHECK(g_ram_budget_gb==24.0);
+    CHECK(idle_poll_wanted()==0);                   /* and never even wakes to try */
+    unsetenv("RSS_GUARD_GB");
+
+    /* E9. The __APPLE__ default shape: flag off -> total no-op, no wakeups. */
+    is_reset(&m); m.resident_bytes=8e9; g_idle_shrink=0;
+    CHECK(idle_shrink_core(&m,4096,1e6)==0);
+    CHECK(g_ram_budget_gb==24.0);
+    CHECK(idle_poll_wanted()==0);
+
+    /* E10. IDLE_SHRINK_MIN is honoured as a threshold, not hardcoded at 600. */
+    is_reset(&m); m.resident_bytes=8e9; g_idle_after_s=60.0;
+    CHECK(idle_shrink_core(&m,4096,59.0)==0);
+    CHECK(idle_shrink_core(&m,4096,61.0)==1);
+    CHECK(fabs(g_ram_budget_gb-8.0)<1e-9);
+
+    /* E11. A NEVER-SERVED engine is "waiting", not "abandoned". Its LRU is still
+     *      empty, so shrinking frees essentially nothing (dense and pins are the
+     *      floor) while capping ecap for the rest of the process's life -- a
+     *      gateway restarted overnight would serve all the next day with a
+     *      crippled cache for no RAM back. The clock must not even start, and
+     *      the loop must not burn a wakeup every poll interval to find that out. */
+    is_reset(&m); m.resident_bytes=8e9; g_idle_served=0;
+    idle_mark(0);
+    CHECK(g_idle_since==0.0);                       /* clock never started */
+    CHECK(idle_poll_wanted()==0);                   /* and no wakeups armed */
+    CHECK(idle_shrink_poll(&m,4096)==0);
+    CHECK(g_ram_budget_gb==24.0);
+    /* first request completes -> from here silence really is abandonment */
+    g_idle_served=1; idle_mark(0);
+    CHECK(g_idle_since>0);
+    CHECK(idle_poll_wanted()==1);
+
+    rr_free(&m);
+    printf("E. done\n");
+}
+
+/* F. MUTATION: the idle path must reach the REAL rss_guard and actually free
+ * memory, not just move a double. Same shape as B but entered through
+ * idle_shrink_core, because "the arithmetic is right" and "the LRU got freed"
+ * are separate claims and only the second one gives dev its RAM back. */
+static void section_f_idle_evicts(void){
+    Model m; is_reset(&m);
+    double mem0=mem_available_gb();
+    printf("F. idle mutation (real slabs; MemAvailable %.1f GB)\n", mem0);
+    if(mem0<2.0){ printf("F. SKIP: MemAvailable %.1f GB < 2\n", mem0); rr_free(&m); return; }
+
+    size_t pump=450u<<20; char *p=malloc(pump);
+    if(!p){ printf("F. SKIP: pump alloc failed\n"); rr_free(&m); return; }
+    for(size_t i=0;i<pump;i+=4096) p[i]=(char)i;          /* real RSS over the floor */
+
+    for(int z=0;z<2;z++){                                 /* 2 x 120 MB fabricated LRU slabs */
+        ESlot *s=&m.ecache[0][z];
+        s->eid=z; s->used=(uint64_t)(z+1);
+        s->slab=malloc(120u<<20); s->slab_cap=120LL<<20;
+    }
+    m.resident_bytes=10e6;                                /* floor 0.01 GB: guard must fire */
+    g_ram_budget_gb=24.0;
+    int ecap0=m.ecap;
+
+    CHECK(idle_shrink_core(&m,4096,3600.0)==1);
+    CHECK(fabs(g_ram_budget_gb-0.01)<1e-6);               /* budget at the floor */
+    CHECK(m.ecache[0][0].eid==-1 && m.ecache[0][0].slab==NULL);   /* freed in place */
+    CHECK(m.ecache[0][0].used==0);
+    CHECK(m.ecache[0][1].eid==-1 && m.ecache[0][1].slab==NULL);
+    CHECK(m.ecap<ecap0 && m.ecap>=2);                     /* cap fell and stayed >= 2 */
+
+    /* and the shrink does not undo itself on the next idle poll */
+    CHECK(idle_shrink_core(&m,4096,7200.0)==0);
+    CHECK(fabs(g_ram_budget_gb-0.01)<1e-6);
+
+    free(p); rr_free(&m);
+    printf("F. done\n");
+}
+
+/* G. REACHABILITY. The section that would have caught #50402's shipped-dead-code
+ * defect, applied to this feature before it can repeat it.
+ *
+ * An idle run_serve_mux blocks in select() forever, so calling idle_shrink_poll
+ * from the top of that loop is NOT sufficient: the loop has to get there. The
+ * finite timeout is the feature; the call is just where it lands. G therefore
+ * asserts the timeout condition itself, and asserts that the old
+ * blocks-forever-when-idle line is GONE -- reinstating it would leave every
+ * check in E and F passing while the engine never shrinks in production.
+ *
+ * G also pins the asymmetry with run_serve ON PURPOSE. run_serve blocks in
+ * getline() with no poll point; the only moment it could notice the idle is
+ * after a request has already arrived, i.e. the worst possible moment to drop
+ * the cache. So it is deliberately NOT wired, and this assertion stops a future
+ * reader from "fixing" the omission with a call that fires at the wrong time. */
+static void section_g_reachability(void){
+    printf("G. reachability (the idle wakeup exists, and only where it helps)\n");
+    char *src=slurp_src("colibri.c");
+    if(!src){ printf("FAIL: cannot read colibri.c from any known prefix\n"); fails++; return; }
+
+    /* Production runs the mux loop: same SERVE_BATCH coupling D pins. */
+    CHECK(strstr(src,"if(getenv(\"SERVE_BATCH\") && atoi(getenv(\"SERVE_BATCH\"))) run_serve_mux")!=NULL);
+
+    /* The call, and the idle clock that feeds it. */
+    CHECK(fn_body_has(src,"static void run_serve_mux(","idle_shrink_poll(")==1);
+    CHECK(fn_body_has(src,"static void run_serve_mux(","idle_mark(")==1);
+
+    /* THE ONE THAT MATTERS: the idle select must consult idle_poll_wanted(), or
+     * the two checks above are decoration on an unreachable branch. */
+    CHECK(fn_body_has(src,"static void run_serve_mux(","idle_poll_wanted()")==1);
+
+    /* And the blocks-forever-when-idle shape must be gone. This is the exact
+     * line the feature replaces; if it ever comes back, so does the dead code. */
+    CHECK(fn_body_has(src,"static void run_serve_mux(",
+                          "struct timeval tv={0,0}, *ptv=active?&tv:NULL;")==0);
+
+    /* Deliberate asymmetry, asserted so it stays deliberate (see the header). */
+    CHECK(fn_body_has(src,"static void run_serve(","idle_shrink_poll(")==0);
+
+    /* The idle clock is armed by a COMPLETED request, so the flag has to be
+     * raised where requests complete -- mux_done, next to #50402's boundary
+     * flag. Without this the clock never starts and E11's gate never opens. */
+    CHECK(fn_body_has(src,"static void mux_done(","g_idle_served=1;")==1);
+
+    /* #50402's boundary must survive intact in both loops -- this ticket edits
+     * that same region and a merge slip there would silently un-ship #50402. */
+    CHECK(fn_body_has(src,"static void run_serve_mux(","ram_rebalance_boundary(")==1);
+    CHECK(fn_body_has(src,"static void run_serve(","ram_rebalance_boundary(")==1);
+
+    /* Unpinning the AUTOPIN tier is opt-in: it has never run on hardware, and a
+     * default-on release of pinned experts would be a silent-wrong-output risk
+     * (npin must be zeroed before any slab is touched). Pin the default off. */
+    CHECK(strstr(src,"static int    g_idle_unpin   = 0;")!=NULL);
+    /* ...and pin the ordering inside the release itself: npin[l]=0 has to come
+     * before the slab teardown, under g_pilot_mx, or a reader can still find a
+     * pin whose pages are being handed back. */
+    { const char *f=strstr(src,"static int64_t idle_pin_release(");
+      const char *lock = f?strstr(f,"pthread_mutex_lock(&g_pilot_mx)"):NULL;
+      const char *zero = f?strstr(f,"m->npin[l]=0;"):NULL;
+      const char *tear = f?strstr(f,"munlock("):NULL;
+      CHECK(f && lock && zero && tear);
+      if(f&&lock&&zero&&tear){ CHECK(lock<zero); CHECK(zero<tear); } }
+
+    free(src);
+    printf("G. done\n");
+}
+
 int main(void){
     section_a_arithmetic();
     section_b_mutation();
     section_c_real_sensors();
     section_d_wiring();
+    section_e_idle_arithmetic();
+    section_f_idle_evicts();
+    section_g_reachability();
     if(fails){ printf("test_ram_rebalance: %d FAIL\n", fails); return 1; }
     printf("test_ram_rebalance: all checks passed\n");
     return 0;
