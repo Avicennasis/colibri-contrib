@@ -7784,6 +7784,7 @@ static void repin_pass_limit(Model *m,int limit){
 typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
 static void ram_rebalance_boundary(Model *m,int maxctx);   /* #50402: def accanto a mem_available_gb */
+static int g_mux_boundary=0;   /* #50402: un request e' appena finito nel path MUX */
 
 static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, int maxctx){
     s->kv.kv_start=calloc(m->c.n_layers+1,sizeof(int));
@@ -7914,6 +7915,8 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     if(r->spec_logit){ free(r->spec_logit); r->spec_logit=NULL; }
     r->spec=0;
     r->active=0;
+    g_mux_boundary=1;                    /* #50402: run_serve_mux reads this at the top of its
+                                          * loop, where no forward is in flight (see there). */
 }
 
 /* Read and prefill one request. Returns -1 on EOF, 0 for a rejected frame and
@@ -8154,6 +8157,14 @@ static void run_serve_mux(Model *m, const char *snap){
          * ends. With no active request select() blocks with a NULL timeout, so the
          * EINTR from an un-restarted SIGTERM is what wakes us to reach this line. */
         if(g_shutdown) break;
+        /* #50402: THE serve request boundary for the production path. `coli serve`
+         * runs run_serve_mux (openai_server.py spawns the engine with SERVE_BATCH=1),
+         * never run_serve, so the rebalance has to live here too. Top of the loop is
+         * the safe point: step_decode_batch has returned, no expert pointer is held
+         * by this thread, and the pilot is covered by rss_guard's g_pilot_mx/eslot_busy
+         * discipline — the same contract repin_pass relies on. One step per completed
+         * request: mux_done raises the flag, we consume it exactly once. */
+        if(g_mux_boundary){ g_mux_boundary=0; ram_rebalance_boundary(m,maxctx); }
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         /* Poll stdin for available input without blocking. On POSIX this is
          * select(); on Windows, select() on a pipe handle routes to winsock
@@ -9185,11 +9196,16 @@ static double mem_available_gb(void){
  * Alla confine di richiesta del serve (la stessa sede safe di repin_pass) si
  * rilegge MemAvailable e si STRINGE g_ram_budget_gb — mai allargare — poi ci
  * pensa rss_guard a liberare l'eccesso di LRU. Un passo solo per confine.
- * Quanto e' sceso per cause ESTERNE = (boot - ora) - RSS nostro: ogni GB
+ * Quanto e' sceso per cause ESTERNE = (boot - ora) - footprint nostro: ogni GB
  * liberato da noi torna in MemAvailable ed esce dal conto, quindi la misura
  * non si morde la coda; g_ram_ceded_gb ricorda quanto gia' ceduto per non
- * contarlo due volte. Isteresi = la stessa banda 2% + 300 MB di rss_guard; e
+ * contarlo due volte. Il footprint e' self_footprint_gb() (CORRENTE e non
+ * recuperabile), non rss_gb(): vedi li' perche' ru_maxrss rompe l'invariante.
+ * Isteresi = la stessa banda 2% + 300 MB di rss_guard; e
  * siccome si stringe soltanto, non puo' oscillare per costruzione.
+ * Il confine e' AGGANCIATO A ENTRAMBI i serve loop: run_serve (interattivo) e
+ * run_serve_mux — quest'ultimo e' quello che gira in produzione, perche'
+ * openai_server.py lancia l'engine con SERVE_BATCH=1 (cioe' `coli serve`).
  * EN: shrink-only rebalance of the #403 budget at the serve request boundary,
  * EN: floor = dense-resident + KV pool (i pinnati sono gia' dentro
  * EN: resident_bytes). Off di default su __APPLE__ (memoria unificata:
@@ -9204,10 +9220,57 @@ static int g_ram_rebalance =
     1;
 #endif
 static double g_ram_ceded_gb=0;          /* GB gia' ceduti al mondo esterno (#50402) */
-static void ram_rebalance_core(Model *m,int maxctx,double avail_now,double rss_now){
+
+/* Il nostro footprint NON RECUPERABILE, ADESSO (GB) — il termine "quanto di
+ * questo calo di MemAvailable e' colpa NOSTRA" del conto qui sopra.
+ *
+ * NON e' rss_gb(): quello e' ru_maxrss, e sbaglia in due modi, entrambi nella
+ * direzione che SPEGNE il feature (footprint gonfiato -> ext piu' piccolo):
+ *   1) e' un MASSIMO STORICO, non scende mai. L'invariante su cui poggia tutto
+ *      il calcolo — "ogni GB che liberiamo torna in MemAvailable ed ESCE dal
+ *      conto esterno" — pretende un sensore di ADESSO. Con un picco, appena il
+ *      guard libera memoria avail sale ma il termine nostro resta inchiodato in
+ *      alto: ext crolla della stessa quantita' e la pressione esterna sparisce
+ *      dai conti. Basta UN prefill lungo (working set grosso, poi liberato) per
+ *      alzare il picco di GB e rendere l'engine cieco per il resto della
+ *      sessione — proprio la sessione lunga che questo ticket esiste per
+ *      proteggere.
+ *   2) include le pagine FILE-BACKED residenti (sotto COLI_MMAP gli expert sono
+ *      viste dentro mmap dei safetensors): page cache PULITA e RECUPERABILE,
+ *      che non ha mai lasciato MemAvailable. Contarla e' doppio conteggio.
+ * Il termine giusto e': anonime + shmem (senza swap non si recuperano) + le
+ * pagine mmap inchiodate da mlock, che l'engine conta gia' in g_mmap_wired
+ * (solo COLI_MMAP; le slab anonime inchiodate da mem_wire stanno gia' dentro
+ * RssAnon, quindi niente doppio conteggio).
+ * EN: current UNRECLAIMABLE self-footprint; ru_maxrss is a high-water mark that
+ * EN: also counts reclaimable file pages, and both errors bias the rebalance off. */
+static double self_footprint_gb(void){
+#ifdef __linux__
+    FILE *f=fopen("/proc/self/status","r");
+    if(f){
+        char ln[256]; double anon=-1, shm=0, v;
+        while(fgets(ln,sizeof(ln),f)){
+            if(sscanf(ln,"RssAnon: %lf",&v)==1) anon=v;
+            else if(sscanf(ln,"RssShmem: %lf",&v)==1) shm=v;
+        }
+        fclose(f);
+        if(anon>=0) return (anon+shm)/1e6 + (double)g_mmap_wired/1e9;   /* kB -> GB */
+    }
+    return rss_gb();                     /* kernel senza RssAnon (<4.5): meglio del niente */
+#elif defined(__APPLE__)
+    mach_task_basic_info_data_t ti; mach_msg_type_number_t n=MACH_TASK_BASIC_INFO_COUNT;
+    if(task_info(mach_task_self(),MACH_TASK_BASIC_INFO,(task_info_t)&ti,&n)==KERN_SUCCESS)
+        return (double)ti.resident_size/1e9;                /* corrente, non il picco */
+    return rss_gb();
+#else
+    return rss_gb();                     /* Windows: WorkingSetSize e' gia' corrente */
+#endif
+}
+
+static void ram_rebalance_core(Model *m,int maxctx,double avail_now,double own_now){
     if(!g_ram_rebalance || getenv("RSS_GUARD_GB")) return;  /* esplicito vince */
-    if(g_ram_budget_gb<=0 || g_mem_avail_boot<=0 || avail_now<=0 || rss_now<0) return;
-    double ext=(g_mem_avail_boot-avail_now)-rss_now;        /* GB presi dagli ALTRI */
+    if(g_ram_budget_gb<=0 || g_mem_avail_boot<=0 || avail_now<=0 || own_now<0) return;
+    double ext=(g_mem_avail_boot-avail_now)-own_now;        /* GB presi dagli ALTRI */
     double step=ext-g_ram_ceded_gb;                         /* solo la pressione NUOVA */
     if(step<=0) return;                                     /* il mondo ha restituito: fermissimo */
     double floor_gb=((double)m->resident_bytes+kv_pool_bytes(m,maxctx))/1e9;
@@ -9215,16 +9278,16 @@ static void ram_rebalance_core(Model *m,int maxctx,double avail_now,double rss_n
     if(target<floor_gb) target=floor_gb;                    /* mai sotto densa+KV+pinnati */
     if(target>=g_ram_budget_gb*0.98-0.3) return;            /* banda 2%+300MB: niente stillicidio */
     g_ram_ceded_gb+=g_ram_budget_gb-target;
-    fprintf(stderr,"[RAM-REBALANCE] MemAvailable %.1f GB now vs %.1f GB at boot: "
-                   "budget %.1f -> %.1f GB (#50402, shrink-only)\n",
-            avail_now,g_mem_avail_boot,g_ram_budget_gb,target);
+    fprintf(stderr,"[RAM-REBALANCE] MemAvailable %.1f GB now vs %.1f GB at boot "
+                   "(ours %.1f, others +%.1f): budget %.1f -> %.1f GB (#50402, shrink-only)\n",
+            avail_now,g_mem_avail_boot,own_now,ext,g_ram_budget_gb,target);
     g_ram_budget_gb=target;
     g_rssg_last = m->n_emit>=16 ? m->n_emit-16 : 0;         /* fora il throttle a 16 token:
                                                              * alla confine si guarda ADESSO */
     rss_guard(m);                                           /* il guard esistente fa il resto */
 }
 static void ram_rebalance_boundary(Model *m,int maxctx){    /* adapter: sensori reali */
-    ram_rebalance_core(m,maxctx,mem_available_gb(),rss_gb());
+    ram_rebalance_core(m,maxctx,mem_available_gb(),self_footprint_gb());
 }
 
 static int kv_slot_count(void){
