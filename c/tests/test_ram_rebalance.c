@@ -32,6 +32,45 @@
 static int fails = 0;
 #define CHECK(c) do{ if(!(c)){ printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } }while(0)
 
+/* Pump REAL resident memory (#50504).
+ *
+ * The obvious idiom -- `char *p=malloc(n); for(i+=4096) p[i]=(char)i;` -- is a
+ * DEAD STORE: nothing ever reads the buffer, so at -O3 clang deletes the whole
+ * loop. gcc happens to keep it, which is why this passed on Linux and failed
+ * on Apple silicon for reasons that had nothing to do with either platform.
+ *
+ * Measured 2026-08-25 on macbook1 (M1 Max, clang -O3): the loop was elided,
+ * ru_maxrss stayed at 0.006 GB across 690 MB of "touches", so rss_guard's
+ * lim*1.02+0.3 gate was never crossed and sections B and F reported 8 failed
+ * assertions -- against an engine that was behaving CORRECTLY. It declined to
+ * evict because nothing was over budget.
+ *
+ * volatile makes each store observable, so no compiler may remove it. */
+static void rr_pump(volatile char *p, size_t n){
+    for(size_t i=0;i<n;i+=4096) p[i]=(char)i;
+}
+
+/* The guard's OWN gate: rss_guard() returns early unless rss_gb() exceeds
+ * lim*1.02+0.3. Every eviction assertion in sections B and F is meaningless
+ * unless that is satisfied -- if it is not, the engine correctly does nothing
+ * and reading that as a defect is precisely the #50504 misdiagnosis.
+ *
+ * Deliberately NOT an RSS delta. Two different delta sensors were tried and
+ * both gave false alarms: rss_gb() is a PEAK, so a later section's pump raises
+ * it by zero; self_footprint_gb() is CURRENT, so it reads zero when the
+ * allocator already holds the pages resident from an earlier section. The
+ * absolute value against the gate has neither problem. */
+static int rr_gate_satisfied(const char *sec, double floor_gb){
+    double rss = rss_gb(), gate = floor_gb*1.02 + 0.3;
+    if(rss > gate) return 1;
+    printf("%s. HARNESS BROKEN: rss_gb()=%.3f GB does not exceed the guard's gate of\n"
+           "   %.3f GB, so rss_guard will correctly NOT evict. The pump did not raise\n"
+           "   real RSS -- at -O3 a non-volatile store loop is dead-code eliminated.\n"
+           "   This is a harness failure, NOT an engine failure. (#50504)\n",
+           sec, rss, gate);
+    return 0;
+}
+
 /* Deterministic harness: budget 24 GB resolved from a 40 GB-quiet boot, two
  * sparse layers + the MTP row of ecache (the guard walks l<=n_layers), and a
  * floor driven only by resident_bytes (cfg widths are zero -> kv pool 0). */
@@ -131,9 +170,9 @@ static void section_b_mutation(void){
     printf("B. mutation (real RSS pumped; MemAvailable %.1f GB)\n", mem0);
     if(mem0<2.0){ printf("B. SKIP: MemAvailable %.1f GB < 2 -- probe needs ~0.7 GB\n", mem0); rr_free(&m); return; }
 
-    size_t pump=450u<<20; char *p=malloc(pump);
+    size_t pump=450u<<20; volatile char *p=malloc(pump);
     if(!p){ printf("B. SKIP: pump alloc failed\n"); rr_free(&m); return; }
-    for(size_t i=0;i<pump;i+=4096) p[i]=(char)i;         /* touch -> real RSS */
+    rr_pump(p,pump);
 
     /* 2 x 120 MB slabs on layer 0 (untouched: virtual, guard reads slab_cap) */
     for(int z=0;z<2;z++){
@@ -145,6 +184,7 @@ static void section_b_mutation(void){
     g_mem_avail_boot=avail+rss+23.99;                    /* ext = 23.99 GB */
     m.resident_bytes=10e6;                               /* floor = 0.01 GB -> lim valid */
     int ecap0=m.ecap;
+    if(!rr_gate_satisfied("B",0.01)){ fails++; free((void*)p); rr_free(&m); return; }
     rr_pressure(&m,rss,23.99);                           /* 24 -> 0.01: guard must fire */
 
     CHECK(fabs(g_ram_budget_gb-0.01)<1e-6);              /* budget at the floor */
@@ -165,7 +205,7 @@ static void section_b_mutation(void){
     rr_pressure(&m,rss,0.0);
     CHECK(fabs(g_ram_budget_gb-0.01)<1e-6);
 
-    free(p); rr_free(&m);
+    free((void*)p); rr_free(&m);
     printf("B. done\n");
 }
 
@@ -206,9 +246,9 @@ static void section_c_real_sensors(void){
      *     leaves MemAvailable and enters the footprint, so ext must not move.
      *     A sensor blind to anonymous growth would read +2 GB of "others" here
      *     and shrink the budget for memory this very process asked for. */
-    size_t pump=(size_t)2<<30; char *p=malloc(pump);
+    size_t pump=(size_t)2<<30; volatile char *p=malloc(pump);
     if(!p){ printf("C. SKIP: 2 GB pump alloc failed\n"); rr_free(&m); return; }
-    for(size_t i=0;i<pump;i+=4096) p[i]=(char)i;
+    rr_pump(p,pump);   /* section C reports the sensor gap; no control needed (#50504) */
     ram_rebalance_boundary(&m,4096);
     CHECK(g_ram_budget_gb==8.0);
     CHECK(g_ram_ceded_gb==0.0);
@@ -216,7 +256,7 @@ static void section_c_real_sensors(void){
     /* C3. Hand the 2 GB back. A CURRENT sensor follows it down; ru_maxrss keeps
      *     the peak forever. Now claim 1.2 GB really was taken by others (past
      *     the 0.46 GB band) and require the shrink to happen. */
-    free(p);
+    free((void*)p);
     own=self_footprint_gb(); avail=mem_available_gb();
     double peak=rss_gb(), gap=peak-own;
     if(gap<1.0){ printf("C. SKIP: peak/current gap only %.2f GB -- allocator kept the pages\n", gap);
@@ -407,9 +447,9 @@ static void section_f_idle_evicts(void){
     printf("F. idle mutation (real slabs; MemAvailable %.1f GB)\n", mem0);
     if(mem0<2.0){ printf("F. SKIP: MemAvailable %.1f GB < 2\n", mem0); rr_free(&m); return; }
 
-    size_t pump=450u<<20; char *p=malloc(pump);
+    size_t pump=450u<<20; volatile char *p=malloc(pump);
     if(!p){ printf("F. SKIP: pump alloc failed\n"); rr_free(&m); return; }
-    for(size_t i=0;i<pump;i+=4096) p[i]=(char)i;          /* real RSS over the floor */
+    rr_pump(p,pump);
 
     for(int z=0;z<2;z++){                                 /* 2 x 120 MB fabricated LRU slabs */
         ESlot *s=&m.ecache[0][z];
@@ -420,6 +460,7 @@ static void section_f_idle_evicts(void){
     g_ram_budget_gb=24.0;
     int ecap0=m.ecap;
 
+    if(!rr_gate_satisfied("F",0.01)){ fails++; free((void*)p); rr_free(&m); return; }
     CHECK(idle_shrink_core(&m,4096,3600.0)==1);
     CHECK(fabs(g_ram_budget_gb-0.01)<1e-6);               /* budget at the floor */
     CHECK(m.ecache[0][0].eid==-1 && m.ecache[0][0].slab==NULL);   /* freed in place */
@@ -431,7 +472,7 @@ static void section_f_idle_evicts(void){
     CHECK(idle_shrink_core(&m,4096,7200.0)==0);
     CHECK(fabs(g_ram_budget_gb-0.01)<1e-6);
 
-    free(p); rr_free(&m);
+    free((void*)p); rr_free(&m);
     printf("F. done\n");
 }
 
