@@ -1085,21 +1085,101 @@ def cmd_run(a):
     e=env_for(a); e["PROMPT"]=f"[gMASK]<sop><|user|>{prompt}<|assistant|>{tk}"
     sys.exit(subprocess.call([GLM, str(a.cap if a.cap is not None else 0)], env=e))
 
-def server_probe(base, api_key=None, timeout=1.5):
-    """Is a coli serve alive at `base`? Returns its model_id, or None.
-    Probes /health then /v1/models — both cheap, neither touches the engine."""
-    import urllib.request, urllib.error
-    def get(path):
-        req=urllib.request.Request(base.rstrip("/")+path)
-        if api_key: req.add_header("Authorization", f"Bearer {api_key}")
+def _server_health(base, api_key=None, timeout=1.5):
+    """GET /health as a dict, or None when the server is unreachable/misbehaving.
+    Carries `engine`: "loading" | absent | "dead" (with `engine_reason`) once the
+    server reports it — the half-alive tell."""
+    import urllib.request
+    req=urllib.request.Request(base.rstrip("/")+"/health")
+    if api_key: req.add_header("Authorization", f"Bearer {api_key}")
+    try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8","replace"))
+    except Exception:
+        return None
+
+def _probe_model_id(base, api_key=None, timeout=1.5):
+    """The served model id from /v1/models, or None."""
+    import urllib.request
+    req=urllib.request.Request(base.rstrip("/")+"/v1/models")
+    if api_key: req.add_header("Authorization", f"Bearer {api_key}")
     try:
-        if get("/health").get("status")!="ok": return None
-        data=get("/v1/models").get("data") or []
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data=json.loads(r.read().decode("utf-8","replace")).get("data") or []
         return data[0]["id"] if data else None
     except Exception:
         return None
+
+def server_probe(base, api_key=None, timeout=1.5):
+    """Is a LIVE coli serve at `base`? Returns its model_id, or None.
+    Probes /health then /v1/models — both cheap, neither touches the engine.
+    A server whose ENGINE already died is refused here: it answers /health 200
+    forever but can never generate again (the half-alive case — attaching to it
+    would look like a model that hangs on every prompt)."""
+    health=_server_health(base, api_key, timeout)
+    if not health or health.get("status")!="ok": return None
+    if health.get("engine")=="dead": return None
+    return _probe_model_id(base, api_key, timeout)
+
+def _child_exit_reason(p):
+    """Why a spawn child exited — the real reason, not just "exited": a POSIX
+    signal decodes to its name (SIGKILL is the kernel's OOM-killer, the silent
+    one), a positive code stays an exit code."""
+    rc=p.poll()
+    if rc is None: return "its output closed but the process is still alive"
+    if rc<0:
+        try: return f"killed by {signal.Signals(-rc).name}"
+        except Exception: return f"killed by signal {-rc}"
+    if rc>0: return f"exit code {rc}"
+    return "exited cleanly"
+
+def wait_server_ready(p, base, api_key=None, timeout_s=1800.0, poll_s=1.0, health=None):
+    """Drain-to-ready for a spawned openai_server child (FreeToken supervisor.py
+    drain_ready pattern): block until the HTTP API is usable, surfacing WHY on
+    failure instead of a flat "exited while loading". Returns (model_id, None)
+    once ready, else (None, reason):
+
+      - the child dying during load  -> its decoded exit reason (signal name,
+        exit code); the OOM-killer stops being invisible
+      - /health reporting engine=dead -> a half-alive server: the frontend bound
+        the port, the engine died behind it; it would poll "ok" forever
+      - timeout                      -> "timed out"
+
+    `health` is injectable for tests (returns the /health dict or None)."""
+    if health is None:
+        health=lambda: _server_health(base, api_key, 1.0)
+    deadline=time.time()+timeout_s
+    while time.time()<deadline:
+        if p.poll() is not None:
+            return None,f"{_child_exit_reason(p)} while loading"
+        h=health() or {}
+        if h.get("status")=="ok":
+            if h.get("engine")=="dead":
+                # Real death reason from the server when it has one; else generic.
+                return None,f"half-alive server (engine died: {h.get('engine_reason') or 'engine exited'})"
+            mid=_probe_model_id(base, api_key, 1.0)
+            if mid: return mid,None
+        time.sleep(poll_s)
+    return None,"timed out"
+
+def _watch_server(p, base, api_key=None, poll_s=3.0):
+    """Post-ready liveness (FreeToken supervisor.py's post-ready tail): a daemon
+    that keeps watching the server AFTER chat attaches, so an engine that dies
+    mid-session is named at once. Without it the user sees a bare
+    "[server unreachable: ...]" on the next prompt and cannot tell a dead server
+    from a network blip. Returns the stop event; the caller sets it before
+    terminating the child so an orderly quit is not misreported as a death."""
+    stop=threading.Event()
+    def run():
+        while not stop.wait(poll_s):
+            if p.poll() is not None: return
+            h=_server_health(base, api_key, 1.0) or {}
+            if h.get("engine")=="dead":
+                print(f"\n  {C.yel}[server lost: {h.get('engine_reason') or 'engine exited'} — "
+                      f"this session can no longer generate; :q exits]{C.r}", flush=True)
+                return
+    threading.Thread(target=run, name="coli-server-watch", daemon=True).start()
+    return stop
 
 def chat_attached(a, base, model_id):
     """The chat REPL over HTTP against a running `coli serve`.
@@ -1272,18 +1352,21 @@ def cmd_chat(a):
         if a.cap is not None: cmd+=["--cap",str(a.cap)]
         if a.api_key: cmd+=["--api-key",a.api_key]
         p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
+        watch=None
         try:
             sp=Spinner(f"loading {model_id}…"); sp.start()
-            for _ in range(1800):
-                if p.poll() is not None:
-                    sp.stop(); sys.exit(f"{model_id} server exited while loading")
-                if server_probe("http://127.0.0.1:8000",a.api_key,timeout=1.0):
-                    sp.stop()
-                    chat_attached(a,"http://127.0.0.1:8000",model_id)
-                    return
-                time.sleep(1)
-            sp.stop(); sys.exit(f"timed out loading {model_id}")
+            mid,why=wait_server_ready(p,"http://127.0.0.1:8000",a.api_key,timeout_s=1800)
+            sp.stop()
+            if mid is None:
+                sys.exit(f"timed out loading {model_id}" if why=="timed out"
+                         else f"{model_id} server {why}")
+            # Ready. Keep watching in the background: an engine death mid-session
+            # now names itself instead of surfacing as "server unreachable".
+            watch=_watch_server(p,"http://127.0.0.1:8000",a.api_key)
+            chat_attached(a,"http://127.0.0.1:8000",model_id)
+            return
         finally:
+            if watch is not None: watch.set()
             if p.poll() is None:
                 p.terminate()
                 try: p.wait(timeout=10)

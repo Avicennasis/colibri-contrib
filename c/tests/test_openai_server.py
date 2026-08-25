@@ -807,6 +807,66 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(process.writes[-1].split(), [b"STOP", request_id])
 
 
+class EngineLivenessTest(unittest.TestCase):
+    """#50404: the engine's death gets a decoded reason (signal name / exit code)
+    recorded for /health and said on stderr -- during load and after ready. Ported
+    from FreeToken supervisor.py: the real death reason must win over the generic
+    "exited unexpectedly" (an OOM-kill must not read like a gateway bug)."""
+
+    def test_load_death_surfaces_the_reason_on_stderr(self):
+        process = FakeProcess(lambda p, f: None)
+        process.stdout.buffer.clear()              # unseed the READY sentinel:
+        process.returncode = -9                    # the engine died before READY
+        process.stdout.close()
+        with patch("openai_server.subprocess.Popen", return_value=process), \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            with self.assertRaisesRegex(RuntimeError, "exited unexpectedly"):
+                Engine("glm", "model")
+        self.assertIn("engine terminated during load: killed by SIGKILL", stderr.getvalue())
+
+    def test_post_ready_death_is_recorded_and_announced(self):
+        released = threading.Event()
+
+        def respond(process, frame):
+            if frame.split()[0] == b"SUBMIT":
+                request_id = frame.split()[1]
+                process.stdout.feed(b"DONE " + request_id + b" STAT 4 2.0 50 1.0 7 0\n")
+                process.returncode = -9             # the engine dies after its last turn
+                process.stdout.close()
+                released.set()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process), \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            engine = Engine("glm", "model")
+            engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+            self.assertTrue(released.wait(2))
+            for _ in range(100):                    # dispatcher notices EOF async
+                if engine.engine_exit:
+                    break
+                time.sleep(0.01)
+            engine.close()
+        self.assertEqual(engine.engine_exit,
+                         {"state": "dead", "reason": "killed by SIGKILL"})
+        self.assertIn("[engine terminated: killed by SIGKILL", stderr.getvalue())
+
+    def test_protocol_error_with_live_engine_is_not_an_engine_death(self):
+        # A corrupted frame with the process still alive is a protocol bug, not
+        # a dead engine: engine_exit must stay None so /health keeps "ok".
+        def respond(process, frame):
+            if frame.split()[0] == b"SUBMIT":
+                process.stdout.feed(b"GARBAGE line\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+            with self.assertRaisesRegex(RuntimeError, "invalid engine response"):
+                engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+            engine.close()
+        self.assertIsNotNone(engine.dispatcher_error)
+        self.assertIsNone(engine.engine_exit)
+
+
 class CapSentinelShimTest(unittest.TestCase):
     # #379 cap-sentinel shim, arch-keyed (#386 r2, F3): an absent cap is
     # "platform-auto" only for the glm engine (colibri.c coli_resolve_cap);
@@ -981,6 +1041,29 @@ class HTTPTest(unittest.TestCase):
                                  "authenticated caller lost access")
         finally:
             del self.engine.profile, self.engine.profile_seq
+
+    def test_health_reports_engine_lifecycle(self):
+        """engine=loading while the port is bound but the engine is still
+        draining to READY; engine=dead (+reason) after a post-ready death. Both
+        public: attach probes and monitors must not need the API key to tell a
+        serving box from a half-alive one (#50404)."""
+        server_engine = self.server.engine
+        self.server.engine = None
+        try:
+            with self.request("/health") as response:
+                self.assertEqual(json.load(response)["engine"], "loading")
+        finally:
+            self.server.engine = server_engine
+        self.engine.engine_exit = {"state": "dead", "reason": "killed by SIGKILL"}
+        try:
+            with self.request("/health") as response:
+                health = json.load(response)
+            self.assertEqual(health["engine"], "dead")
+            self.assertEqual(health["engine_reason"], "killed by SIGKILL")
+            with urlopen(self.base + "/health", timeout=2) as response:  # anonymous
+                self.assertEqual(json.load(response)["engine"], "dead")
+        finally:
+            del self.engine.engine_exit
 
     def test_browser_preflight(self):
         request = Request(self.base + "/v1/chat/completions", method="OPTIONS", headers={

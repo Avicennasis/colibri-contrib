@@ -1797,6 +1797,23 @@ def _win_kill_on_close_job(pid):
         return None   # never let process bookkeeping break starting the engine
 
 
+def _engine_exit_reason(rc):
+    """Human reason for an engine exit code: a POSIX signal decodes to its name
+    (nothing in the engine signals itself with SIGKILL -- that is the kernel's
+    OOM-killer, the silent death), a positive code stays an exit code. None means
+    the process is still alive, which for a closed stdout is its own statement."""
+    if rc is None:
+        return "stdout closed but the process is still alive"
+    if rc < 0:
+        try:
+            return f"killed by {signal.Signals(-rc).name}"
+        except ValueError:
+            return f"killed by signal {-rc}"
+    if rc > 0:
+        return f"exit code {rc}"
+    return "exited cleanly"
+
+
 class Engine:
     # cap=None = "not explicitly set": a glm-arch model's engine resolves the
     # 0 sentinel (8 historically, 1 on Metal+darwin+fast SSD -- colibri.c
@@ -1836,6 +1853,11 @@ class Engine:
         self.closed = False
         self.dispatcher_error = None
         self.kv_slots = kv_slots
+        # Why the engine died, once it has: {"state": "dead", "reason": ...}.
+        # /health reads this so a monitor can tell a serving box from a
+        # half-alive one (HTTP up, engine gone -- FreeToken issues #110/#123
+        # class); None while the engine is alive.
+        self.engine_exit = None
         self.tiers = None
         self.hwinfo = None
         self.emap = None
@@ -1843,7 +1865,16 @@ class Engine:
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
-        read_engine_turn(self.process.stdout, READY, lambda _: None)
+        # Drain-to-ready: block until the engine's READY sentinel. If it dies
+        # first, say WHY before raising -- "exited unexpectedly" hides an
+        # OOM-kill behind wording that reads like our bug (FreeToken supervisor
+        # .py: the real death reason must win over the generic message).
+        try:
+            read_engine_turn(self.process.stdout, READY, lambda _: None)
+        except RuntimeError:
+            sys.stderr.write(f"[engine terminated during load: "
+                             f"{_engine_exit_reason(self.process.poll())}]\n")
+            raise
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
         self.dispatcher.start()
@@ -1958,6 +1989,15 @@ class Engine:
                     raise RuntimeError(f"invalid engine response: {' '.join(fields)}")
         except Exception as error:
             if not self.closed:
+                # A dead process (vs a protocol error with the engine alive)
+                # is a post-ready engine death: record it for /health and say it
+                # on stderr. The server stays up to fail requests fast, but it
+                # is half-alive now -- the half it lost is the engine.
+                if self.process.poll() is not None:
+                    self.engine_exit = {"state": "dead",
+                                        "reason": _engine_exit_reason(self.process.poll())}
+                    sys.stderr.write(f"[engine terminated: {self.engine_exit['reason']}"
+                                     f" -- serving requests will now fail]\n")
                 self.dispatcher_error = error
                 self._fail_pending(error)
 
@@ -2518,6 +2558,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 # request is authed (or no key set), so a configured key isn't leaked
                 # past a bare 200 to an unauthenticated probe. (#SEC-8)
                 payload = {"status": "ok"}
+                # Engine liveness is public on purpose: coli chat's attach probe
+                # and any monitoring script must distinguish "serving" from
+                # "HTTP up, engine gone" without the API key. A bare state word
+                # and an exit reason leak nothing about what is being served.
+                if self.server.engine is None:
+                    payload["engine"] = "loading"     # port bound, engine draining to READY
+                else:
+                    exit_state = getattr(self.server.engine, "engine_exit", None)
+                    if exit_state:
+                        payload["engine"] = exit_state.get("state", "dead")
+                        payload["engine_reason"] = exit_state.get("reason")
                 if self._is_authed():
                     payload["scheduler"] = self.server.scheduler.snapshot()
                     payload["kv_slots"] = self.server.kv_slots
