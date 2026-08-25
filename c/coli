@@ -1474,7 +1474,11 @@ def cmd_serve(a):
     # pidfile: cosi' `coli stop` spegne tutto con un comando, senza pkill a mano.
     # EN: pidfile so `coli stop` can shut everything down without manual pkill.
     try:
-        with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
+        # Third field = /proc starttime: `coli stop`'s PID-reuse guard. Absent on
+        # hosts without /proc, where stop degrades to the alive-only check.
+        _st=_proc_starttime(os.getpid())
+        with open(serve_pidfile(a.port),"w") as f:
+            f.write(f"{os.getpid()} {a.model}{'' if _st is None else ' '+str(_st)}\n")
     except OSError: pass
     import openai_server
     openai_server.ARCH=arch
@@ -1531,6 +1535,96 @@ def _pid_alive(pid):
     finally:
         k32.CloseHandle(handle)
 
+# ---------- /proc identity guards (stop hardening, FreeToken osproc.py pattern) ----------
+# A bare pid is not an identity: the kernel recycles pids, and `coli stop` runs
+# long after the pidfile was written. Every helper below is best-effort -- None
+# or a safe default off-Linux / on a vanished pid -- so a degraded environment
+# degrades to the pre-hardening behavior instead of breaking the stop path.
+
+def _proc_stat_fields(pid):
+    """/proc/<pid>/stat fields from `state` onward, or None. The comm field may
+    itself contain spaces and parens, so split past its closing paren (rparen,
+    not the first one), never on raw whitespace."""
+    try:
+        with open(f"/proc/{pid}/stat","rb") as f: raw=f.read()
+    except OSError: return None
+    rparen=raw.rfind(b")")
+    if rparen==-1: return None
+    return raw[rparen+2:].split()
+
+def _proc_starttime(pid):
+    """Process start time (stat field 22, clock ticks since boot). Together with
+    the pid it is a stable identity that survives nothing -- it CHANGES on pid
+    reuse -- so it is the guard against signalling a recycled pid."""
+    fields=_proc_stat_fields(pid)
+    if fields is None or len(fields)<20: return None
+    try: return int(fields[19])   # field 22 == fields[22-3]
+    except ValueError: return None
+
+def _proc_pgid(pid):
+    """Process group id (stat field 5). Used to assert pgid == pid before any
+    killpg, so a group signal can never reach a group we did not create."""
+    fields=_proc_stat_fields(pid)
+    if fields is None or len(fields)<3: return None
+    try: return int(fields[2])    # field 5 == fields[5-3]
+    except ValueError: return None
+
+def _proc_pss_gb(pid):
+    """Proportional set size in GB from /proc/<pid>/smaps_rollup -- shared pages
+    (the 144 mmaps of an int4 container) counted fractionally, which makes the
+    sum across serve+engine the honest number for `--ram` on a busy box. 0.0
+    when unavailable (no /proc, kernel without rollup, foreign uid)."""
+    try:
+        with open(f"/proc/{pid}/smaps_rollup","rb") as f: raw=f.read()
+    except OSError: return 0.0
+    for line in raw.decode("utf-8","replace").splitlines():
+        if line.startswith("Pss:"):
+            parts=line.split()
+            if len(parts)>=2 and parts[1].isdigit(): return int(parts[1])*1024/1e9
+    return 0.0
+
+def _pidfile_pid(path):
+    """(pid, starttime) from a coli serve pidfile. Older pidfiles carry no
+    starttime: None means "cannot guard", and the caller keeps the pre-hardening
+    alive-only check rather than refusing to stop anything."""
+    try:
+        with open(path) as f: parts=f.read().split()
+        pid=int(parts[0])
+    except (OSError,ValueError,IndexError): return None,None
+    start=None
+    if len(parts)>2:
+        try: start=int(parts[2])
+        except ValueError: pass
+    return pid,start
+
+def _pid_is_same_process(pid, start):
+    """True when `pid` still names the process the pidfile was written for.
+    A live pid alone proves nothing across a recycle: the old serve dies, the
+    kernel hands its pid to an unrelated process, and a bare alive-check
+    SIGTERMs the innocent newcomer. starttime mismatch = recycled -> False.
+    A legacy pidfile or a /proc-less host returns True (degraded, old behavior)."""
+    if not _pid_alive(pid): return False
+    if start is None: return True
+    live=_proc_starttime(pid)
+    return live is None or live==start
+
+def _stop_signal(pid, sig):
+    """Signal a stop target, group-first but only when the group is provably ours
+    to signal: the target must BE its group leader (pgid == pid, the invariant of
+    a job/session spawn whose workers inherited the group) and the group must not
+    be coli's own. Any doubt -- no /proc, a re-adopted process with a foreign
+    group, win32 -- falls back to the single pid, so a misidentified target can
+    never make us nuke an innocent group. Returns True if something was signalled."""
+    if os.name=="posix":
+        pgid=_proc_pgid(pid)
+        if pgid is not None and pgid==pid and hasattr(os,"getpgrp") and pgid!=os.getpgrp():
+            try:
+                os.killpg(pgid, sig); return True
+            except OSError: pass       # raced with exit: fall through to the pid
+    try:
+        os.kill(pid, sig); return True
+    except OSError: return False       # already gone: fine
+
 def cmd_cluster_coordinator(a):
     from cluster import serve
     serve(a.host, a.port, a.stale_after, a.allowed_host)
@@ -1569,10 +1663,13 @@ def cmd_stop(a):
     banner("stop")
     targets={}  # pid -> descrizione
     pf=serve_pidfile(a.port)
-    try:
-        with open(pf) as f: pid=int(f.read().split()[0])
-        if _pid_alive(pid): targets[pid]=f"coli serve (pidfile, port {a.port})"
-    except (OSError,ValueError,IndexError): pass
+    # PID-reuse guard: a pidfile pid that survived a recycle would otherwise be
+    # signalled on liveness alone -- the starttime written by cmd_serve must
+    # still match (FreeToken osproc.py is_ft_serve_on_port, same contract).
+    pid,_start=_pidfile_pid(pf)
+    if pid is not None:
+        if _pid_is_same_process(pid,_start): targets[pid]=f"coli serve (pidfile, port {a.port})"
+        else: print(f"  {C.yel}pidfile pid {pid} was recycled (start time changed) — not stopping it{C.r}")
     try: proc_entries=os.listdir("/proc")
     except OSError: proc_entries=[]       # native Windows has no /proc; the pidfile still works
     for pd in proc_entries:
@@ -1592,22 +1689,30 @@ def cmd_stop(a):
         except (OSError,PermissionError): continue
     if not targets:
         print(f"  nothing running — no serve on port {a.port}, no SERVE engines"); return
-    for pid,desc in targets.items(): print(f"  {'would stop' if a.dry_run else 'stopping'} {pid}: {desc}")
+    # PSS, not RSS: the engine's 144-shard mmaps are shared with nothing here but
+    # counted whole in RSS, and on a container-dense box the difference is the
+    # difference between "the engine is huge" and "the engine is gone". Sum is
+    # what the machine actually gets back; per-target lines say who holds it.
+    pss_total=0.0
+    for pid,desc in targets.items():
+        pss=_proc_pss_gb(pid)
+        if pss>0: pss_total+=pss
+        note=f" · PSS {pss:.1f} GB" if pss>0 else ""
+        print(f"  {'would stop' if a.dry_run else 'stopping'} {pid}: {desc}{note}")
     if a.dry_run: return
     for pid in targets:
-        try: os.kill(pid, signal.SIGTERM)
-        except OSError: pass
+        # Group-first when the target leads its own group (catches the OMP re-exec
+        # children the /proc scan may have missed), single pid otherwise; the
+        # getattr keeps win32's missing SIGKILL from aborting mid-ladder (#1049).
+        _stop_signal(pid, signal.SIGTERM)
     time.sleep(2.0)
     for pid in targets:
-        # signal.SIGKILL does not exist on win32 and AttributeError is not OSError,
-        # so the bare `except OSError` let it escape and abort the command AFTER
-        # the SIGTERMs above (#1049). Line 752 in this file already uses the
-        # getattr form; os.kill(SIGTERM) is TerminateProcess on Windows anyway.
-        try: os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM)); print(f"  {pid}: forced")
-        except OSError: pass       # gia' morto: bene
+        if _stop_signal(pid, getattr(signal, "SIGKILL", signal.SIGTERM)):
+            print(f"  {pid}: forced")
     try: os.unlink(pf)
     except OSError: pass
-    print(f"  {C.grn}✓ stopped{C.r} — RAM released")
+    ram=f" — ~{pss_total:.1f} GB (PSS) released" if pss_total>0 else " — RAM released"
+    print(f"  {C.grn}✓ stopped{C.r}{ram}")
 
 def cmd_web(a):
     """serve + open the dashboard in the browser once the API answers."""
