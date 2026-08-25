@@ -7783,6 +7783,7 @@ static void repin_pass_limit(Model *m,int limit){
 
 typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
+static void ram_rebalance_boundary(Model *m,int maxctx);   /* #50402: def accanto a mem_available_gb */
 
 static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, int maxctx){
     s->kv.kv_start=calloc(m->c.n_layers+1,sizeof(int));
@@ -8440,6 +8441,7 @@ static void run_serve(Model *m, const char *snap){
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
         usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
         kv_disk_append(m,hist,len);      /* KV su disco: il prossimo avvio riparte da qui */
+        ram_rebalance_boundary(m,maxctx); /* #50402: stringe il budget PRIMA del guard */
         repin_pass(m);                   /* safe request boundary: adapt session-local hot tier */
     }
     free(line); free(buf);
@@ -9174,6 +9176,55 @@ static double mem_available_gb(void){
     while(fgets(ln,sizeof(ln),f)) if(sscanf(ln,"MemAvailable: %lf",&kb)==1) break;
     fclose(f); return kb/1e6;
 #endif
+}
+
+/* ---- RAM REBALANCE SHRINK-ONLY (#50402) -----------------------------------
+ * cap_for_ram() fissa il budget sulla MemAvailable MISURATA ALL'AVVIO: un engine
+ * partito a macchina tranquilla se lo tiene anche dopo che ~85 container Docker
+ * occupano la RAM — la classe di swap-pressure che ha motivato l'idle-reaper.
+ * Alla confine di richiesta del serve (la stessa sede safe di repin_pass) si
+ * rilegge MemAvailable e si STRINGE g_ram_budget_gb — mai allargare — poi ci
+ * pensa rss_guard a liberare l'eccesso di LRU. Un passo solo per confine.
+ * Quanto e' sceso per cause ESTERNE = (boot - ora) - RSS nostro: ogni GB
+ * liberato da noi torna in MemAvailable ed esce dal conto, quindi la misura
+ * non si morde la coda; g_ram_ceded_gb ricorda quanto gia' ceduto per non
+ * contarlo due volte. Isteresi = la stessa banda 2% + 300 MB di rss_guard; e
+ * siccome si stringe soltanto, non puo' oscillare per costruzione.
+ * EN: shrink-only rebalance of the #403 budget at the serve request boundary,
+ * EN: floor = dense-resident + KV pool (i pinnati sono gia' dentro
+ * EN: resident_bytes). Off di default su __APPLE__ (memoria unificata:
+ * EN: liberare sotto pressione li' e' swap-death); RAM_REBALANCE=1 opt-in,
+ * EN: =0 force-off altrove. Un RSS_GUARD_GB esplicito resta autoritario
+ * EN: (l'esplicito vince, stessa regola di CAP_RAISE #379). avail/rss
+ * EN: arrivano per parametro cosi' il test di mutazione simula la pressione. */
+static int g_ram_rebalance =
+#ifdef __APPLE__
+    0;
+#else
+    1;
+#endif
+static double g_ram_ceded_gb=0;          /* GB gia' ceduti al mondo esterno (#50402) */
+static void ram_rebalance_core(Model *m,int maxctx,double avail_now,double rss_now){
+    if(!g_ram_rebalance || getenv("RSS_GUARD_GB")) return;  /* esplicito vince */
+    if(g_ram_budget_gb<=0 || g_mem_avail_boot<=0 || avail_now<=0 || rss_now<0) return;
+    double ext=(g_mem_avail_boot-avail_now)-rss_now;        /* GB presi dagli ALTRI */
+    double step=ext-g_ram_ceded_gb;                         /* solo la pressione NUOVA */
+    if(step<=0) return;                                     /* il mondo ha restituito: fermissimo */
+    double floor_gb=((double)m->resident_bytes+kv_pool_bytes(m,maxctx))/1e9;
+    double target=g_ram_budget_gb-step;
+    if(target<floor_gb) target=floor_gb;                    /* mai sotto densa+KV+pinnati */
+    if(target>=g_ram_budget_gb*0.98-0.3) return;            /* banda 2%+300MB: niente stillicidio */
+    g_ram_ceded_gb+=g_ram_budget_gb-target;
+    fprintf(stderr,"[RAM-REBALANCE] MemAvailable %.1f GB now vs %.1f GB at boot: "
+                   "budget %.1f -> %.1f GB (#50402, shrink-only)\n",
+            avail_now,g_mem_avail_boot,g_ram_budget_gb,target);
+    g_ram_budget_gb=target;
+    g_rssg_last = m->n_emit>=16 ? m->n_emit-16 : 0;         /* fora il throttle a 16 token:
+                                                             * alla confine si guarda ADESSO */
+    rss_guard(m);                                           /* il guard esistente fa il resto */
+}
+static void ram_rebalance_boundary(Model *m,int maxctx){    /* adapter: sensori reali */
+    ram_rebalance_core(m,maxctx,mem_available_gb(),rss_gb());
 }
 
 static int kv_slot_count(void){
@@ -10011,6 +10062,7 @@ int main(int argc, char **argv){
     corpus_load();                                       /* COLI_DRAFT_CORPUS: external draft source */
     rt_trace_open();                     /* same place as before, so the log order is identical */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
+    if(getenv("RAM_REBALANCE")) g_ram_rebalance=atoi(getenv("RAM_REBALANCE")); /* #50402: 1 opt-in (mac unified), 0 force-off */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_metal_prefill = getenv("COLI_METAL_PREFILL")?atoi(getenv("COLI_METAL_PREFILL")):0; /* default 0: S>4 attention on CPU (bit-exact); =1 opt-in GPU prefill */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
