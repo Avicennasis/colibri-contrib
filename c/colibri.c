@@ -1290,6 +1290,7 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
 
 #include "sample.h"
 #include "kv_persist.h"
+#include "kv_anchor.h"                            /* #50403: multi-state prefix reuse per serve slot */
 #include "telemetry.h"
 
 /* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
@@ -7781,10 +7782,74 @@ static void repin_pass_limit(Model *m,int limit){
  * append lascia nrec vecchio = file coerente. La riga KV del layer MTP non si salva:
  * al resume kv_start=-1 e la finestra di draft riparte da sola. */
 
-typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
+typedef struct { KVState kv; int *hist, len, first;
+                 kv_anchor_ring anch;   /* #50403: states this slot still remembers */
+               } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
 static void ram_rebalance_boundary(Model *m,int maxctx);   /* #50402: def accanto a mem_available_gb */
 static int g_mux_boundary=0;   /* #50402: un request e' appena finito nel path MUX */
+
+/* #50403 anchor policy. Opt-in: an anchor is a COPY of the KV rows it covers
+ * (~217 KB per position on GLM-5.2), so arming this by default would quietly
+ * price a second KV pool into every serve. COLI_KV_ANCHOR=<slots> arms it;
+ * COLI_KV_ANCHOR_MB caps the ring's total (default 1024 MB, and one anchor
+ * larger than the whole cap is simply not taken).
+ * COLI_KV_ANCHOR_TOK=<id> overrides the tool-call opener the turn-end capture
+ * keys on; -1 disables that capture and leaves only the prompt-end one. */
+static int    g_kvanchor=-1;
+static size_t g_kvanchor_budget=0;
+static int    g_kvanchor_tok=-2;                 /* -2 = unresolved, -1 = off */
+
+static int kvanchor_slots(void){
+    if(g_kvanchor<0){
+        const char *e=getenv("COLI_KV_ANCHOR");
+        g_kvanchor = e?atoi(e):0;
+        if(g_kvanchor<0) g_kvanchor=0;
+        if(g_kvanchor>64) g_kvanchor=64;
+        const char *mb=getenv("COLI_KV_ANCHOR_MB");
+        long v = mb?atol(mb):1024;
+        if(v<0) v=0;
+        g_kvanchor_budget=(size_t)v*1024u*1024u;
+    }
+    return g_kvanchor;
+}
+
+/* The three position-addressed KV families this engine keeps, as the generic
+ * planes kv_anchor.h copies. Lc/Rc carry the extra MTP row (n_layers+1); Ic is
+ * per-attention-layer only and exists solely under DSA, with holes for the
+ * layers that reuse a neighbour's index -- kv_anchor.h skips NULL planes. */
+static int kvanchor_planes(Model *m, KVState *k, kv_anchor_plane *pl){
+    Cfg *c=&m->c; int n=0;
+    pl[n++]=(kv_anchor_plane){k->Lc,c->n_layers+1,c->kv_lora};
+    pl[n++]=(kv_anchor_plane){k->Rc,c->n_layers+1,c->qk_rope};
+    if(m->has_dsa && k->Ic) pl[n++]=(kv_anchor_plane){k->Ic,c->n_layers,c->index_hd};
+    return n;
+}
+
+/* The tool-call opener, resolved from the model's own tokenizer rather than
+ * hardcoded (GLM-5.2: <tool_call> = 154843). An agent's NEXT prompt is this
+ * reply verbatim plus the tool result, so the state at the end of a tool-call
+ * turn is the one worth remembering -- FreeToken's "semantic anchor", except
+ * keyed off a token the tokenizer actually reports. COLI_KV_ANCHOR_TOK
+ * overrides it; -1 leaves only the prompt-end capture. */
+static void kvanchor_arm_tok(Tok *T){
+    if(g_kvanchor_tok!=-2) return;
+    const char *e=getenv("COLI_KV_ANCHOR_TOK");
+    if(e){ g_kvanchor_tok=atoi(e); return; }
+    g_kvanchor_tok=tok_id_of(T,"<tool_call>");
+    if(g_kvanchor_tok<0) g_kvanchor_tok=-1;
+}
+
+/* Remember the state this slot holds right now (positions 0..len). Called at
+ * prompt end -- the boundary the client re-sends verbatim next turn -- and at
+ * turn end when the reply carried a tool-call opener. */
+static void kvanchor_capture(Model *m, ServeCtx *s, int len, const char *why){
+    if(!s->anch.n || len<=0 || len>s->kv.max_t) return;
+    kv_anchor_plane pl[3]; int npl=kvanchor_planes(m,&s->kv,pl);
+    if(kv_anchor_store(&s->anch,s->hist,len,pl,npl))
+        fprintf(stderr,"[API] KV anchor store %s=%d (ring %d/%d, %.1f MB)\n",
+                why,len,(int)s->anch.stores,s->anch.n,s->anch.bytes/1048576.0);
+}
 
 static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, int maxctx){
     s->kv.kv_start=calloc(m->c.n_layers+1,sizeof(int));
@@ -7796,6 +7861,8 @@ static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, in
     if(slot==0) snprintf(s->kv.disk_path,sizeof(s->kv.disk_path),"%s/.coli_kv",snap);
     else snprintf(s->kv.disk_path,sizeof(s->kv.disk_path),"%s/.coli_kv.%d",snap,slot);
     s->len=kv_disk_load(m,s->hist,maxctx); if(s->len>0) s->first=0;
+    int anch_n=kvanchor_slots();     /* sets g_kvanchor_budget; argument order is unspecified */
+    kv_anchor_ring_init(&s->anch,anch_n,g_kvanchor_budget);
 }
 
 static void serve_ctx_free(Model *m, ServeCtx *s){
@@ -7805,6 +7872,7 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
     if(k->Lc) for(int i=0;i<NR;i++){ free(k->Lc[i]); free(k->Rc[i]); }
     if(k->Ic) for(int i=0;i<m->c.n_layers;i++) free(k->Ic[i]);
     free(k->Lc); free(k->Rc); free(k->Ic); free(k->kv_start); free(s->hist);
+    kv_anchor_ring_free(&s->anch);
 }
 
 typedef struct {
@@ -7908,6 +7976,13 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited);
     fflush(stdout); kv_bind(m,&sc->kv); kv_disk_append(m,sc->hist,sc->len);
+    /* #50403: a reply that opened a tool call is about to be resent to us as
+     * history. Remember the state that produced it before the next prompt --
+     * possibly a different conversation on this same slot -- overwrites it. */
+    if(sc->anch.n && g_kvanchor_tok>=0 && sc->len>r->prompt_tokens){
+        for(int i=r->prompt_tokens;i<sc->len;i++)
+            if(sc->hist[i]==g_kvanchor_tok){ kvanchor_capture(m,sc,sc->len,"tool_call"); break; }
+    }
     /* PROF window = this request's lifetime; with KV_SLOTS>1 concurrent slots
      * share the batched forwards, so the shares describe the engine, not the
      * single request (same convention as the STAT hit%% above). */
@@ -8027,6 +8102,32 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     int prefix=0; while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
+    /* #50403 anchors. The slot now holds the longest prefix its OWN last state
+     * agrees with. A remembered state may agree for longer -- the conversation
+     * that was interleaved off this slot, the branch the agent abandoned and
+     * came back to, the prompt end whose reply the client re-rendered. Same
+     * strict-prefix rule as above, evaluated against the ring instead of only
+     * the live state, so an installed anchor is rows the engine would have
+     * computed from these exact ids at these exact positions: bit-exact by
+     * construction, never an approximation of an edit.
+     * Placed BEFORE the cross-slot adopt because production serve runs
+     * KV_SLOTS=1 (openai_server.py), where adoption cannot fire at all; when
+     * both are armed the adopt then extends whatever the anchor restored. */
+    if(sc->anch.n){
+        int ai=kv_anchor_match(&sc->anch,tmp,nt,sc->len);
+        if(ai>=0){
+            const int *aids=kv_anchor_ids(&sc->anch,ai);
+            kv_anchor_plane pl[3]; int npl=kvanchor_planes(m,&sc->kv,pl);
+            int from=sc->len, alen=kv_anchor_restore(&sc->anch,ai,pl,npl,from);
+            if(alen>from){
+                memcpy(sc->hist+from,aids+from,(size_t)(alen-from)*sizeof(int));
+                sc->len=alen;
+                if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;   /* MTP rows are decode state */
+                fprintf(stderr,"[API] KV anchor hit: slot %d restored rows [%d,%d)\n",
+                        sub.slot,from,alen);
+            }
+        }
+    }
     /* Cross-slot prefix adoption (COLI_KV_SHARE=1) — RadixAttention's benefit
      * at memcpy cost: if another slot's history shares a longer prefix with
      * this prompt (shared system prompt, agent loop), copy its KV rows instead
@@ -8060,7 +8161,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
                     memcpy(coli_kv_row(sc->kv.Rc[l],from,cc->qk_rope),
                            coli_kv_row(dn->kv.Rc[l],from,cc->qk_rope),
                            (size_t)n*cc->qk_rope*sizeof(float));
-                if(sc->kv.Ic&&dn->kv.Ic&&sc->kv.Ic[l]&&dn->kv.Ic[l])
+                if(l<cc->n_layers&&sc->kv.Ic&&dn->kv.Ic&&sc->kv.Ic[l]&&dn->kv.Ic[l])
                     memcpy(coli_kv_row(sc->kv.Ic[l],from,cc->index_hd),
                            coli_kv_row(dn->kv.Ic[l],from,cc->index_hd),
                            (size_t)n*cc->index_hd*sizeof(float));
@@ -8079,6 +8180,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     float *logit = add>0 ? step(m,sc->hist+sc->len,add,sc->len)
                          : step(m,sc->hist+sc->len-1,1,sc->len-1);
     sc->len+=add; sc->first=0;
+    kvanchor_capture(m,sc,sc->len,"prompt_end");   /* #50403: the boundary the client resends */
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
     r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
@@ -8115,6 +8217,14 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
+    kvanchor_arm_tok(&T);
+    /* #50403: the loop name is part of the marker on purpose. #50402 shipped a
+     * feature wired only into run_serve and nothing noticed, because a marker
+     * both loops emit cannot say which one ran -- and production is THIS one
+     * (openai_server.py spawns with SERVE_BATCH=1). */
+    if(kvanchor_slots())
+        fprintf(stderr,"[KV] anchors armed (mux): %d slot(s)/ctx, %.0f MB cap, tool_tok=%d\n",
+                kvanchor_slots(),g_kvanchor_budget/1048576.0,g_kvanchor_tok);
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
     if(nctx<1||nctx>512){fprintf(stderr,"KV_SLOTS must be between 1 and 512\n");exit(2);}
@@ -8308,6 +8418,10 @@ static void run_serve(Model *m, const char *snap){
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
+    kvanchor_arm_tok(&T);
+    if(kvanchor_slots())
+        fprintf(stderr,"[KV] anchors armed (serve): %d slot(s)/ctx, %.0f MB cap, tool_tok=%d\n",
+                kvanchor_slots(),g_kvanchor_budget/1048576.0,g_kvanchor_tok);
     grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
@@ -8395,6 +8509,21 @@ static void run_serve(Model *m, const char *snap){
                 if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
                 kv_disk_truncate(m,len);           /* il prossimo append sovrascrive solo la coda */
             }
+            if(sc->anch.n){                        /* #50403: see mux_submit */
+                int ai=kv_anchor_match(&sc->anch,tmp,prompt_tokens,len);
+                if(ai>=0){
+                    const int *aids=kv_anchor_ids(&sc->anch,ai);
+                    kv_anchor_plane pl[3]; int npl=kvanchor_planes(m,&sc->kv,pl);
+                    int from=len, alen=kv_anchor_restore(&sc->anch,ai,pl,npl,from);
+                    if(alen>from){
+                        memcpy(hist+from,aids+from,(size_t)(alen-from)*sizeof(int));
+                        len=alen;
+                        if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+                        fprintf(stderr,"[API] KV anchor hit: slot %d restored rows [%d,%d)\n",
+                                active,from,alen);
+                    }
+                }
+            }
             k=prompt_tokens-len;
             if(k>0) memcpy(hist+len,tmp+len,k*sizeof(int));
             fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",
@@ -8423,7 +8552,8 @@ static void run_serve(Model *m, const char *snap){
         double tt0=now_s();
         ProfBase pb; if(g_prof) prof_base(m,&pb);
         float *logit;
-        if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
+        if(k>0){ logit=step(m,hist+len,k,len); len+=k;
+                 kvanchor_capture(m,sc,len,"prompt_end"); }   /* #50403 */
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;

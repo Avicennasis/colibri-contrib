@@ -1455,5 +1455,14 @@ bench: iobench$(EXE)
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
 
+# #50403: the reuse rule on its own (header only), and the seam between that
+# rule and colibri.c's real Lc/Rc/Ic planes (includes the engine, like
+# test_kvb_notice, so no snapshot on disk is needed).
+tests/test_kv_anchor$(EXE): tests/test_kv_anchor.c kv_anchor.h
+	$(CC) $(CFLAGS) tests/test_kv_anchor.c -o tests/test_kv_anchor$(EXE) $(LDFLAGS)
+
+tests/test_kv_anchor_serve$(EXE): tests/test_kv_anchor_serve.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h kv_anchor.h telemetry.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
 	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)
