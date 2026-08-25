@@ -1065,6 +1065,34 @@ class HTTPTest(unittest.TestCase):
         finally:
             del self.engine.engine_exit
 
+    def test_logs_cursor_polling(self):
+        """/logs?since= lets a script tail the serve log over HTTP, no file
+        plumbing (#50404). `since` is exclusive; `next` is the next cursor."""
+        with self.request("/v1/models") as response:      # seed a request line
+            pass
+        with self.request("/logs") as response:
+            first = json.load(response)
+        self.assertGreaterEqual(first["next"], 2)
+        self.assertTrue(any(l["kind"] == "request" and "/v1/models" in l["text"]
+                            for l in first["lines"]))
+        # A /logs poll records its own line AFTER its snapshot, so the next
+        # incremental poll sees exactly that one echo and nothing else.
+        with self.request(f"/logs?since={first['next']}") as response:
+            delta = json.load(response)
+        self.assertEqual(len(delta["lines"]), 1)
+        self.assertRegex(delta["lines"][0]["text"], r"^GET /logs 200 \d+ms$")
+        self.assertEqual(delta["next"], first["next"] + 1)
+        with self.request(f"/logs?since={delta['next']}") as response:
+            echo = json.load(response)
+        self.assertEqual(len(echo["lines"]), 1)          # the previous poll's echo
+        self.assertEqual(echo["next"], delta["next"] + 1)
+
+    def test_logs_requires_auth(self):
+        # Same shape-and-gate as /profile (#SEC-8): request lines describe what
+        # the operator runs; an anonymous caller gets the empty shape.
+        with urlopen(self.base + "/logs", timeout=2) as response:
+            self.assertEqual(json.load(response), {"lines": [], "next": 0})
+
     def test_browser_preflight(self):
         request = Request(self.base + "/v1/chat/completions", method="OPTIONS", headers={
             "Origin": "http://localhost:5173",

@@ -25,7 +25,9 @@ from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id
                              family_ids, resolve_model)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
+
+import logring                      # bounded in-memory log ring for /logs (#50404)
 
 
 HERE = Path(__file__).resolve().parent
@@ -1853,6 +1855,10 @@ class Engine:
         self.closed = False
         self.dispatcher_error = None
         self.kv_slots = kv_slots
+        # Optional callback (the APIServer wires it): told the decoded reason
+        # once the engine dies, so the death lands in /logs next to the requests
+        # it took with it.
+        self.on_engine_exit = None
         # Why the engine died, once it has: {"state": "dead", "reason": ...}.
         # /health reads this so a monitor can tell a serving box from a
         # half-alive one (HTTP up, engine gone -- FreeToken issues #110/#123
@@ -1998,6 +2004,12 @@ class Engine:
                                         "reason": _engine_exit_reason(self.process.poll())}
                     sys.stderr.write(f"[engine terminated: {self.engine_exit['reason']}"
                                      f" -- serving requests will now fail]\n")
+                    callback = getattr(self, "on_engine_exit", None)
+                    if callback is not None:
+                        try:
+                            callback(self.engine_exit["reason"])
+                        except Exception:
+                            pass
                 self.dispatcher_error = error
                 self._fail_pending(error)
 
@@ -2212,6 +2224,9 @@ class APIServer(ThreadingHTTPServer):
         self.allowed_hosts = tuple(
             h.strip().lower() for h in allowed_hosts if h and h.strip())
         self.created = int(time.time())
+        # Bounded log ring behind /logs?since= (#50404): request lines and
+        # lifecycle notes in RAM, pull-only. COLI_LOG_RING bounds it; 0 disables.
+        self.logs = logring.LogRing(_positive_env("COLI_LOG_RING", 4000))
         self._conn_lock = threading.Lock()
         self._conn_live = 0
         self._conn_by_ip = {}
@@ -2327,6 +2342,7 @@ class APIHandler(BaseHTTPRequestHandler):
         instead of asking each early return to remember."""
         self._committed = False
         self._body_read = False
+        self._t0 = time.monotonic()   # request-line latency for the log ring
         # Fresh budget per request: a keep-alive connection may serve many, and
         # each is entitled to its own read window -- but none may drip forever.
         self.rfile = _DeadlineReader(self._raw_rfile, self.connection,
@@ -2406,6 +2422,19 @@ class APIHandler(BaseHTTPRequestHandler):
     def send_json(self, status, body, request_id=None, headers=None):
         data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
         self.send_response(status)
+        # One line per response, at the single choke point no responder can
+        # skip: method, path, status, latency. Recorded once the status line is
+        # committed (before the body write), so a client hanging up mid-body
+        # still leaves its request behind in /logs (#50404).
+        ring = getattr(self.server, "logs", None)
+        if ring is not None:
+            started = getattr(self, "_t0", None)
+            elapsed = f"{(time.monotonic() - started) * 1000:.0f}ms" if started else "?"
+            try:
+                ring.append(f"{self.command} {urlsplit(self.path).path} {status} {elapsed}",
+                            kind="request")
+            except Exception:      # diagnostics must never take the request down
+                pass
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         if request_id:
@@ -2600,6 +2629,23 @@ class APIHandler(BaseHTTPRequestHandler):
                 if self._is_authed() and eng:
                     payload["seq"] = getattr(eng, "profile_seq", 0)
                     payload["turns"] = list(getattr(eng, "profile", ()) or ())
+                self.send_json(200, payload, request_id)
+                return
+            if path == "/logs":
+                # Bounded ring + all-time cursor (#50404): scripts poll
+                # /logs?since=N without any file plumbing. Same pre-auth
+                # placement and _is_authed() gate as /profile — request lines
+                # say what the operator runs, an anonymous caller gets the
+                # empty shape. `since` is exclusive: pass the previous `next`.
+                payload = {"lines": [], "next": 0}
+                ring = self.server.logs
+                if self._is_authed():
+                    try:
+                        cursor = int(parse_qs(urlsplit(self.path).query)
+                                     .get("since", ["0"])[0])
+                    except ValueError:
+                        cursor = 0
+                    payload["lines"], payload["next"] = ring.since(cursor)
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):
@@ -3316,6 +3362,10 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                              f"{family.limits.max_kv_slots} KV slot(s)")
         runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
         server.engine = runtime
+        runtime.on_engine_exit = lambda reason: server.logs.append(
+            f"engine exited: {reason}", kind="engine")
+        server.logs.append(f"engine ready; listening on http://{host}:{port}/v1",
+                           kind="lifecycle")
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
         try:
