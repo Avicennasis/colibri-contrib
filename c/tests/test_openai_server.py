@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 from pathlib import Path
 
 from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
-                           DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
+                           DEFAULT_CHAT_STOP_SEQUENCES, END, EngineStats, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
@@ -401,6 +401,106 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(errors, ["scheduler_closed"])
 
 
+class EngineStatsTest(unittest.TestCase):
+    """#50404: sliding-window rates that DECAY TO ZERO when idle, plus lifetime
+    token totals — ported from FreeToken stats.py, fed from the serve protocol's
+    own ACCEPT (prompt count) / DATA (one decoded piece) / DONE (totals)."""
+
+    def test_decode_rate_is_live_and_decays_to_zero(self):
+        stats = EngineStats(window_s=5.0)
+        for i in range(10):                       # 10 pieces over 2 s = 5 tok/s
+            stats.on_data("1", now=i * 0.2)
+        self.assertAlmostEqual(stats.decode_tps(now=2.0), 5.0)
+        # measured DURING the turn: the rate does not wait for DONE
+        self.assertEqual(stats.completed, 0)
+        # partly aged out: only the 5 samples at ts >= 1.0 are still inside the
+        # window at now=6.0, and they now span the whole 5 s of it
+        self.assertAlmostEqual(stats.decode_tps(now=6.0), 1.0)
+        # every sample older than the window: zero, not the cumulative average
+        self.assertEqual(stats.decode_tps(now=8.0), 0.0)
+
+    def test_prefill_is_credited_when_prefill_ends_not_when_it_starts(self):
+        # ACCEPT states the prompt count before prefill runs; crediting it there
+        # would date the tokens ahead of the work, so it is held until the
+        # turn's first DATA — the only prefill-done edge the protocol has.
+        stats = EngineStats(window_s=5.0)
+        stats.on_accept("1", 400)
+        self.assertEqual(stats.prefill_tps(now=1.0), 0.0)   # still prefilling
+        stats.on_data("1", now=2.0)                          # prefill ended here
+        self.assertEqual(stats.prefill_tps(now=3.0), 400.0)  # 400 tok / 1 s span
+        stats.on_data("1", now=2.1)                          # later pieces do not re-credit
+        self.assertEqual(stats.prefill_tps(now=3.0), 400.0)
+        self.assertEqual(stats.prefill_tps(now=9.0), 0.0)    # decays like decode
+
+    def test_prompt_tokens_of_a_turn_that_emitted_no_data(self):
+        # Stopped on its first token: no DATA ever arrives, so DONE flushes the
+        # held sample instead of dropping it on the floor.
+        stats = EngineStats(window_s=5.0)
+        stats.on_accept("1", 90)
+        stats.observe({"prompt_tokens": 90, "completion_tokens": 0}, "1", now=1.0)
+        self.assertEqual(stats.prefill_tps(now=2.0), 90.0)
+
+    def test_failed_turn_drops_its_held_prefill_sample(self):
+        # ERROR means no DONE is coming; the held count must not survive to be
+        # credited against some later turn's request id.
+        stats = EngineStats(window_s=5.0)
+        stats.on_accept("1", 90)
+        stats.forget("1")
+        stats.on_data("1", now=1.0)
+        self.assertEqual(stats.prefill_tps(now=2.0), 0.0)
+        self.assertEqual(stats._accepted, {})
+
+    def test_totals_are_lifetime_and_survive_the_window(self):
+        stats = EngineStats(window_s=1.0)
+        stats.observe({"prompt_tokens": 7, "completion_tokens": 12}, "1", now=0.0)
+        stats.observe({"prompt_tokens": 3, "completion_tokens": 8}, "2", now=100.0)
+        self.assertEqual((stats.completed,
+                          stats.prompt_tokens_total, stats.completion_tokens_total),
+                         (2, 10, 20))
+
+    def test_last_done_snapshot_is_kept_verbatim(self):
+        stats = EngineStats()
+        stats.observe({"prompt_tokens": 7, "completion_tokens": 12,
+                       "tokens_per_second": 4.8, "cache_hit_percent": 55.0,
+                       "rss_gb": 17.2}, "1")
+        self.assertEqual(stats.last["tokens_per_second"], 4.8)
+        self.assertEqual(stats.last["completion_tokens"], 12)
+
+    def test_window_trim_bounds_memory(self):
+        # Recency is enforced on read (no timer thread): one rate read trims
+        # the deques down to the window, so a polled server cannot grow them.
+        stats = EngineStats(window_s=5.0)
+        for i in range(100):
+            stats.on_data("1", now=float(i))
+        stats.decode_tps(now=99.5)
+        self.assertLessEqual(len(stats._decode), 6)   # only ts >= 94.5 survive
+        # and maxlen still bounds the unread case
+        stats2 = EngineStats(window_s=5.0)
+        for i in range(10000):
+            stats2.on_data("1", now=float(i))
+        self.assertEqual(len(stats2._decode), 4096)
+
+    def test_reads_are_safe_while_the_engine_thread_writes(self):
+        # The reader thread appends while HTTP workers sum: an unlocked deque
+        # raises "deque mutated during iteration" under exactly this overlap.
+        stats = EngineStats(window_s=5.0)
+        done = threading.Event()
+
+        def feed():
+            for _ in range(20000):
+                stats.on_data("1")
+            done.set()
+
+        writer = threading.Thread(target=feed)
+        writer.start()
+        try:
+            while not done.is_set():
+                stats.decode_tps()
+                stats.prefill_tps()
+        finally:
+            writer.join()
+
+
 class BlockingStream:
     def __init__(self, initial=b""):
         self.buffer = bytearray(initial)
@@ -715,6 +815,34 @@ class DispatcherTest(unittest.TestCase):
             "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
         }])
 
+    def test_serve_frames_feed_the_stats_tracker(self):
+        """#50404: /v1/stats is fed off the protocol's own frames — ACCEPT holds
+        the prompt count, each DATA is one decoded piece, DONE closes the turn."""
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(
+                b"ACCEPT " + request_id + b" 7\n"
+                b"DATA " + request_id + b" 2\nhi\n"
+                b"DATA " + request_id + b" 1\n!\n"
+                b"DONE " + request_id + b" STAT 12 4.8 55 1.0 7 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+            self.assertIsNotNone(engine.ready_at)     # set once READY drained
+            engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+            engine.close()
+        self.assertEqual(engine.stats.completed, 1)
+        # totals come from DONE (12 sampled tokens), the window from the two
+        # DATA frames — DONE's numbers are the authoritative pair
+        self.assertEqual(engine.stats.prompt_tokens_total, 7)
+        self.assertEqual(engine.stats.completion_tokens_total, 12)
+        self.assertEqual(len(engine.stats._decode), 2)
+        self.assertGreater(engine.stats.decode_tps(), 0.0)
+        self.assertGreater(engine.stats.prefill_tps(), 0.0)   # credited at first DATA
+        self.assertEqual(engine.stats._accepted, {})          # nothing held after DONE
+
     def test_cancels_generation_after_consumer_disconnects(self):
         request_id = None
 
@@ -805,6 +933,66 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(output, ["x"])
         self.assertEqual(stats["completion_tokens"], 1)
         self.assertEqual(process.writes[-1].split(), [b"STOP", request_id])
+
+
+class EngineLivenessTest(unittest.TestCase):
+    """#50404: the engine's death gets a decoded reason (signal name / exit code)
+    recorded for /health and said on stderr -- during load and after ready. Ported
+    from FreeToken supervisor.py: the real death reason must win over the generic
+    "exited unexpectedly" (an OOM-kill must not read like a gateway bug)."""
+
+    def test_load_death_surfaces_the_reason_on_stderr(self):
+        process = FakeProcess(lambda p, f: None)
+        process.stdout.buffer.clear()              # unseed the READY sentinel:
+        process.returncode = -9                    # the engine died before READY
+        process.stdout.close()
+        with patch("openai_server.subprocess.Popen", return_value=process), \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            with self.assertRaisesRegex(RuntimeError, "exited unexpectedly"):
+                Engine("glm", "model")
+        self.assertIn("engine terminated during load: killed by SIGKILL", stderr.getvalue())
+
+    def test_post_ready_death_is_recorded_and_announced(self):
+        released = threading.Event()
+
+        def respond(process, frame):
+            if frame.split()[0] == b"SUBMIT":
+                request_id = frame.split()[1]
+                process.stdout.feed(b"DONE " + request_id + b" STAT 4 2.0 50 1.0 7 0\n")
+                process.returncode = -9             # the engine dies after its last turn
+                process.stdout.close()
+                released.set()
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process), \
+             patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            engine = Engine("glm", "model")
+            engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+            self.assertTrue(released.wait(2))
+            for _ in range(100):                    # dispatcher notices EOF async
+                if engine.engine_exit:
+                    break
+                time.sleep(0.01)
+            engine.close()
+        self.assertEqual(engine.engine_exit,
+                         {"state": "dead", "reason": "killed by SIGKILL"})
+        self.assertIn("[engine terminated: killed by SIGKILL", stderr.getvalue())
+
+    def test_protocol_error_with_live_engine_is_not_an_engine_death(self):
+        # A corrupted frame with the process still alive is a protocol bug, not
+        # a dead engine: engine_exit must stay None so /health keeps "ok".
+        def respond(process, frame):
+            if frame.split()[0] == b"SUBMIT":
+                process.stdout.feed(b"GARBAGE line\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+            with self.assertRaisesRegex(RuntimeError, "invalid engine response"):
+                engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+            engine.close()
+        self.assertIsNotNone(engine.dispatcher_error)
+        self.assertIsNone(engine.engine_exit)
 
 
 class CapSentinelShimTest(unittest.TestCase):
@@ -981,6 +1169,103 @@ class HTTPTest(unittest.TestCase):
                                  "authenticated caller lost access")
         finally:
             del self.engine.profile, self.engine.profile_seq
+
+    def test_health_reports_engine_lifecycle(self):
+        """engine=loading while the port is bound but the engine is still
+        draining to READY; engine=dead (+reason) after a post-ready death. Both
+        public: attach probes and monitors must not need the API key to tell a
+        serving box from a half-alive one (#50404)."""
+        server_engine = self.server.engine
+        self.server.engine = None
+        try:
+            with self.request("/health") as response:
+                self.assertEqual(json.load(response)["engine"], "loading")
+        finally:
+            self.server.engine = server_engine
+        self.engine.engine_exit = {"state": "dead", "reason": "killed by SIGKILL"}
+        try:
+            with self.request("/health") as response:
+                health = json.load(response)
+            self.assertEqual(health["engine"], "dead")
+            self.assertEqual(health["engine_reason"], "killed by SIGKILL")
+            with urlopen(self.base + "/health", timeout=2) as response:  # anonymous
+                self.assertEqual(json.load(response)["engine"], "dead")
+        finally:
+            del self.engine.engine_exit
+
+    def test_stats_endpoint_reports_rates_and_totals(self):
+        """/v1/stats over the engine's own DONE telemetry (#50404): anonymous
+        callers get the degraded zeros shape (token counts say how much the
+        operator runs — same gate as /profile); authed callers get counters."""
+        tracker = EngineStats(window_s=60.0)
+        tracker.on_accept("1", 7)
+        tracker.on_data("1")                       # prefill ends, first piece out
+        tracker.on_data("1")
+        tracker.observe({"prompt_tokens": 7, "completion_tokens": 12,
+                         "tokens_per_second": 4.8, "cache_hit_percent": 55.0,
+                         "rss_gb": 17.2}, "1")
+        self.engine.stats = tracker
+        self.engine.ready_at = time.monotonic() - 10
+        try:
+            with urlopen(self.base + "/v1/stats", timeout=2) as response:
+                anonymous = json.load(response)
+            with self.request("/v1/stats") as response:
+                authed = json.load(response)
+        finally:
+            del self.engine.stats, self.engine.ready_at
+        self.assertIsNone(anonymous["model"])
+        self.assertEqual(anonymous["tokens"], {"prompt_total": 0, "completion_total": 0})
+        self.assertEqual(authed["model"], "test-model")
+        self.assertEqual(authed["tokens"],
+                         {"prompt_total": 7, "completion_total": 12})
+        self.assertEqual(authed["requests"], {"completed": 1})
+        self.assertGreaterEqual(authed["uptime_s"], 10)
+        self.assertGreater(authed["throughput"]["decode_tps"], 0.0)
+        self.assertGreater(authed["throughput"]["prefill_tps"], 0.0)
+        self.assertEqual(authed["engine"]["cache_hit_percent"], 55.0)
+
+    def test_stats_degrades_to_zeros_without_an_engine(self):
+        # Pre-READY (or a foreign engine object): the endpoint answers honestly
+        # with zeros instead of 500-ing.
+        server_engine = self.server.engine
+        self.server.engine = None
+        try:
+            with self.request("/v1/stats") as response:
+                stats = json.load(response)
+        finally:
+            self.server.engine = server_engine
+        self.assertEqual(stats, {"model": "test-model", "uptime_s": 0,
+                                 "throughput": {"decode_tps": 0.0, "prefill_tps": 0.0},
+                                 "tokens": {"prompt_total": 0, "completion_total": 0},
+                                 "requests": {"completed": 0}})
+
+    def test_logs_cursor_polling(self):
+        """/logs?since= lets a script tail the serve log over HTTP, no file
+        plumbing (#50404). `since` is exclusive; `next` is the next cursor."""
+        with self.request("/v1/models") as response:      # seed a request line
+            pass
+        with self.request("/logs") as response:
+            first = json.load(response)
+        self.assertGreaterEqual(first["next"], 2)
+        self.assertTrue(any(l["kind"] == "request" and "/v1/models" in l["text"]
+                            for l in first["lines"]))
+        # A /logs poll records its own line AFTER its snapshot, so the next
+        # incremental poll sees exactly that one echo and nothing else.
+        with self.request(f"/logs?since={first['next']}") as response:
+            delta = json.load(response)
+        self.assertEqual(len(delta["lines"]), 1)
+        self.assertRegex(delta["lines"][0]["text"], r"^GET /logs 200 \d+ms$")
+        self.assertEqual(delta["next"], first["next"] + 1)
+        with self.request(f"/logs?since={delta['next']}") as response:
+            echo = json.load(response)
+        self.assertEqual(len(echo["lines"]), 1)          # the previous poll's echo
+        self.assertEqual(echo["next"], delta["next"] + 1)
+
+    def test_logs_requires_auth(self):
+        # Same shape-and-gate as /profile (#SEC-8): request lines describe what
+        # the operator runs; an anonymous caller gets the empty shape.
+        with urlopen(self.base + "/logs", timeout=2) as response:
+            self.assertEqual(json.load(response), {"lines": [], "next": 0})
 
     def test_browser_preflight(self):
         request = Request(self.base + "/v1/chat/completions", method="OPTIONS", headers={
