@@ -208,6 +208,103 @@ class GenerationScheduler:
             self.condition.notify_all()
 
 
+class EngineStats:
+    """Sliding-window token rates + lifetime totals for /v1/stats (#50404).
+
+    Fed from frames the serve protocol already carries — no new counters:
+    ACCEPT states the turn's prompt tokens, every DATA frame is exactly one
+    decoded piece (mux_data / coli_serve_write_data are called once per
+    sampled token in every engine), DONE carries the turn's authoritative
+    totals. Prompt tokens enter the window when prefill ENDS — the turn's
+    first DATA — the only prefill-done edge the protocol has.
+
+    Rates are a wall-clock sliding window trimmed on read, NOT a cumulative
+    average, so idle polls decay to zero (FreeToken server/stats.py's
+    StatsTracker), minus every signal colibri has no counter for: no KV page
+    counts, no VRAM gauge, no TTFT. Feeding it per DONE instead reads 0 while
+    a turn is decoding and ~250k tok/s for the millisecond after it lands —
+    the reference expects streaming deltas, so we give it streaming deltas.
+
+    Two honest gaps. kimi suppresses control pieces and synthesizes one
+    "</think>", so the decode WINDOW counts emitted pieces where the lifetime
+    totals count sampled tokens (DONE's numbers are the authoritative pair).
+    olmoe and inkling never write ACCEPT, so on those engines the prefill
+    window stays empty (prefill_tps 0.0) while prompt totals still accrue.
+    A lone sample after idle also reads high until the window refills — the
+    reference's span-from-first-sample, kept as-is.
+
+    Written from the engine reader thread, read from HTTP worker threads, so
+    one lock covers both: summing a deque is not atomic under the GIL."""
+
+    def __init__(self, window_s=5.0):
+        self.window_s = window_s
+        self.lock = threading.Lock()
+        # maxlen bounds memory when nobody polls /v1/stats: the window trim on
+        # read is what enforces recency, and a server driven only through
+        # /v1/chat/completions would otherwise grow the deques forever.
+        self._decode = collections.deque(maxlen=4096)
+        self._prefill = collections.deque(maxlen=4096)
+        self._accepted = {}                 # request id -> prompt tokens, until prefill ends
+        self.prompt_tokens_total = 0
+        self.completion_tokens_total = 0
+        self.completed = 0
+        self.last = None                    # most recent DONE snapshot verbatim
+
+    def on_accept(self, request_id, prompt_tokens):
+        """ACCEPT: submission validated, prefill starts. Held, not sampled --
+        crediting it here would date the tokens before the work."""
+        if prompt_tokens > 0:
+            with self.lock:
+                self._accepted[request_id] = prompt_tokens
+
+    def on_data(self, request_id, now=None):
+        """DATA: one decoded piece; the first one of a turn also ends prefill."""
+        t = time.monotonic() if now is None else now
+        with self.lock:
+            self._decode.append((t, 1))
+            prompt = self._accepted.pop(request_id, 0)
+            if prompt:
+                self._prefill.append((t, prompt))
+
+    def observe(self, stats, request_id=None, now=None):
+        """DONE: the turn's authoritative token counts."""
+        t = time.monotonic() if now is None else now
+        with self.lock:
+            prompt = self._accepted.pop(request_id, 0)
+            if prompt:      # a turn that emitted no DATA at all (stopped on its first token)
+                self._prefill.append((t, prompt))
+            self.completion_tokens_total += stats.get("completion_tokens") or 0
+            self.prompt_tokens_total += stats.get("prompt_tokens") or 0
+            self.completed += 1
+            self.last = dict(stats)
+
+    def forget(self, request_id):
+        """ERROR: the turn died without a DONE -- drop its held prefill sample.
+        Its sampled tokens are counted nowhere; the engine never reports them."""
+        with self.lock:
+            self._accepted.pop(request_id, None)
+
+    def _rate(self, window, now):
+        cutoff = now - self.window_s
+        while window and window[0][0] < cutoff:
+            window.popleft()
+        if not window:
+            return 0.0
+        total = sum(n for _ts, n in window)
+        span = max(now - window[0][0], 1e-9)
+        return total / span
+
+    def decode_tps(self, now=None):
+        t = time.monotonic() if now is None else now
+        with self.lock:
+            return self._rate(self._decode, t)
+
+    def prefill_tps(self, now=None):
+        t = time.monotonic() if now is None else now
+        with self.lock:
+            return self._rate(self._prefill, t)
+
+
 def content_text(content, param):
     if isinstance(content, str):
         return content
@@ -1871,12 +1968,15 @@ class Engine:
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
+        self.stats = EngineStats()      # /v1/stats: rates + lifetime token totals
+        self.ready_at = None            # set once the READY sentinel is drained
         # Drain-to-ready: block until the engine's READY sentinel. If it dies
         # first, say WHY before raising -- "exited unexpectedly" hides an
         # OOM-kill behind wording that reads like our bug (FreeToken supervisor
         # .py: the real death reason must win over the generic message).
         try:
             read_engine_turn(self.process.stdout, READY, lambda _: None)
+            self.ready_at = time.monotonic()   # /v1/stats uptime base (post-READY)
         except RuntimeError:
             sys.stderr.write(f"[engine terminated during load: "
                              f"{_engine_exit_reason(self.process.poll())}]\n")
@@ -1934,6 +2034,7 @@ class Engine:
                     data = self._read_exact(size)
                     if self._read_exact(1) != b"\n":
                         raise RuntimeError("invalid engine DATA terminator")
+                    self.stats.on_data(request_id)   # /v1/stats: one piece = one tick
                     with self.pending_lock:
                         events = self.pending.get(request_id)
                     if events is not None:
@@ -1943,6 +2044,7 @@ class Engine:
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the
                     # HTTP stream only now, so an earlier CONTEXT_EXCEEDED stays a clean 400.
                     request_id = fields[1]
+                    self.stats.on_accept(request_id, int(fields[2]))
                     with self.pending_lock:
                         events = self.pending.get(request_id)
                     if events is not None:
@@ -1950,6 +2052,7 @@ class Engine:
                 elif kind == "DONE" and len(fields) >= 7:
                     request_id = fields[1]
                     stats = self._stats(fields[2:])
+                    self.stats.observe(stats, request_id)   # /v1/stats lifetime totals
                     with self.pending_lock:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
@@ -1987,6 +2090,7 @@ class Engine:
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
+                    self.stats.forget(request_id)   # no DONE is coming for this one
                     with self.pending_lock:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
@@ -2646,6 +2750,42 @@ class APIHandler(BaseHTTPRequestHandler):
                     except ValueError:
                         cursor = 0
                     payload["lines"], payload["next"] = ring.since(cursor)
+                self.send_json(200, payload, request_id)
+                return
+            if path == "/v1/stats":
+                # Sliding-window decode/prefill rates that decay to zero when
+                # idle + lifetime token totals, over the ACCEPT/DATA/DONE frames
+                # the serve protocol already carries (#50404). Same pre-auth
+                # placement and _is_authed() gate as /profile (#SEC-8): token
+                # counts say how much the operator is running. Degraded shape (no engine yet, or an
+                # engine build without stats) is served honestly with zeros.
+                payload = {"model": None, "uptime_s": 0,
+                           "throughput": {"decode_tps": 0.0, "prefill_tps": 0.0},
+                           "tokens": {"prompt_total": 0, "completion_total": 0},
+                           "requests": {"completed": 0}}
+                eng = self.server.engine
+                if self._is_authed():
+                    payload["model"] = self.server.model_id   # /v1/models is authed too
+                if self._is_authed() and eng is not None:
+                    stats = getattr(eng, "stats", None)
+                    ready_at = getattr(eng, "ready_at", None)
+                    if ready_at is not None:
+                        payload["uptime_s"] = max(0, int(time.monotonic() - ready_at))
+                    if stats is not None:
+                        payload["throughput"] = {
+                            "decode_tps": round(stats.decode_tps(), 1),
+                            "prefill_tps": round(stats.prefill_tps(), 1)}
+                        payload["tokens"] = {
+                            "prompt_total": stats.prompt_tokens_total,
+                            "completion_total": stats.completion_tokens_total}
+                        payload["requests"] = {"completed": stats.completed}
+                        if stats.last:
+                            # last DONE verbatim: the engine's own view of the
+                            # previous turn (RSS, tok/s, cache hit).
+                            payload["engine"] = {
+                                "rss_gb": stats.last.get("rss_gb"),
+                                "tokens_per_second": stats.last.get("tokens_per_second"),
+                                "cache_hit_percent": stats.last.get("cache_hit_percent")}
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):
