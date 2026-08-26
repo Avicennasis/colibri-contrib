@@ -686,11 +686,23 @@ class DispatcherTest(unittest.TestCase):
 
     def test_dispatches_interleaved_requests_by_id(self):
         submitted = []
+        # The SUBJECT here is per-id routing of OUT-OF-ORDER responses: respond()
+        # deliberately feeds B-2 before A-1. Which thread SUBMITS first is
+        # incidental to that, but the assertions below name "a" as `first`, so
+        # leaving the start order to the scheduler made this flaky -- when "b"
+        # won the race the responses swapped and it failed 'B-2' != 'A-1A-2'
+        # (#50489, reproducible by starting the threads in reverse).
+        #
+        # So pin the submit order with a handshake. This removes the race
+        # WITHOUT touching a single assertion, which is the point: the test is
+        # exactly as discriminating about routing as it was before.
+        first_submitted = threading.Event()
 
         def respond(process, frame):
             fields = frame.split(b"\n", 1)[0].split()
             self.assertEqual(fields[0], b"SUBMIT")
             submitted.append(fields[1])
+            first_submitted.set()
             if len(submitted) == 2:
                 first, second = submitted
                 process.stdout.feed(b"DATA " + second + b" 3\nB-2\n")
@@ -711,8 +723,15 @@ class DispatcherTest(unittest.TestCase):
 
         threads = [threading.Thread(target=generate, args=("a", "alpha", 0)),
                    threading.Thread(target=generate, args=("b", "beta", 1))]
-        for thread in threads:
-            thread.start()
+        threads[0].start()
+        # Wait for "a"'s SUBMIT to actually reach the engine before starting
+        # "b". A bare sleep would only make the race rarer; this makes it
+        # impossible. The assert is real: if "a" never submits, the failure
+        # should say so rather than surfacing as a confusing routing mismatch.
+        self.assertTrue(first_submitted.wait(timeout=2),
+                        "thread 'a' never submitted; the handshake is broken, "
+                        "not the dispatcher")
+        threads[1].start()
         for thread in threads:
             thread.join(timeout=2)
             self.assertFalse(thread.is_alive())
