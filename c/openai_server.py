@@ -249,6 +249,9 @@ class EngineStats:
         self.completion_tokens_total = 0
         self.completed = 0
         self.last = None                    # most recent DONE snapshot verbatim
+        self.prefill_seconds_total = 0.0    # #50495: sum of DONE prefill_seconds, present ones only
+        self.prefill_last = None            # last turn's value; None until one arrives
+        self.prefill_seen = False           # False => the engine cannot supply the signal
 
     def on_accept(self, request_id, prompt_tokens):
         """ACCEPT: submission validated, prefill starts. Held, not sampled --
@@ -277,6 +280,11 @@ class EngineStats:
             self.prompt_tokens_total += stats.get("prompt_tokens") or 0
             self.completed += 1
             self.last = dict(stats)
+            prefill_s = stats.get("prefill_seconds")
+            if prefill_s is not None:
+                self.prefill_seconds_total += prefill_s
+                self.prefill_last = prefill_s
+                self.prefill_seen = True
 
     def forget(self, request_id):
         """ERROR: the turn died without a DONE -- drop its held prefill sample.
@@ -1996,6 +2004,10 @@ class Engine:
             "rss_gb": float(fields[4]),
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
+            # #50495: prefill wall seconds, appended by the engine. Absent for an
+            # engine build predating the field -- None, never 0.0, so /v1/stats can
+            # report the signal as missing rather than silently misreporting it.
+            "prefill_seconds": float(fields[7]) if len(fields) > 7 else None,
         }
 
     def _fail_pending(self, error):
@@ -2761,6 +2773,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 # engine build without stats) is served honestly with zeros.
                 payload = {"model": None, "uptime_s": 0,
                            "throughput": {"decode_tps": 0.0, "prefill_tps": 0.0},
+                           # #50495: prefill compute seconds. null (absent), never
+                           # 0.0, until a DONE carrying the field has arrived -- an
+                           # engine that cannot supply the signal must not read as
+                           # "prefills are free".
+                           "prefill": None,
                            "tokens": {"prompt_total": 0, "completion_total": 0},
                            "requests": {"completed": 0}}
                 eng = self.server.engine
@@ -2779,13 +2796,18 @@ class APIHandler(BaseHTTPRequestHandler):
                             "prompt_total": stats.prompt_tokens_total,
                             "completion_total": stats.completion_tokens_total}
                         payload["requests"] = {"completed": stats.completed}
+                        if stats.prefill_seen:
+                            payload["prefill"] = {
+                                "seconds_total": round(stats.prefill_seconds_total, 3),
+                                "last_turn_seconds": round(stats.prefill_last, 3)}
                         if stats.last:
                             # last DONE verbatim: the engine's own view of the
-                            # previous turn (RSS, tok/s, cache hit).
+                            # previous turn (RSS, tok/s, cache hit, prefill seconds).
                             payload["engine"] = {
                                 "rss_gb": stats.last.get("rss_gb"),
                                 "tokens_per_second": stats.last.get("tokens_per_second"),
-                                "cache_hit_percent": stats.last.get("cache_hit_percent")}
+                                "cache_hit_percent": stats.last.get("cache_hit_percent"),
+                                "prefill_seconds": stats.last.get("prefill_seconds")}
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):

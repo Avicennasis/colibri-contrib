@@ -7912,6 +7912,9 @@ typedef struct {
     unsigned long long id;
     float temp, top_p;
     double started;
+    double prefill_s;                   /* #50495: wall time of the prefill step() call --
+                                           the expert-cache work DONE now reports (0 before
+                                           first submit; memset covers every path) */
     uint64_t hits0, miss0;
     ProfBase pb;                         /* phase-time window start (same convention as hits0):
                                             feeds the PROF protocol line and the PROF=1 report */
@@ -8000,9 +8003,9 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
            edisk_s()-r->pb.edisk,m->t_ewait-r->pb.ewait,m->t_emm-r->pb.emm,
            m->t_attn-r->pb.attn,m->t_head-r->pb.head,
            (unsigned long long)(m->n_fw-r->pb.n_fw));
-    printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
+    printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d %.3f\n",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
-           r->prompt_tokens,r->length_limited);
+           r->prompt_tokens,r->length_limited,r->prefill_s);
     fflush(stdout); kv_bind(m,&sc->kv); kv_disk_append(m,sc->hist,sc->len);
     /* #50403: a reply that opened a tool call is about to be resent to us as
      * history. Remember the state that produced it before the next prompt --
@@ -8207,13 +8210,19 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);
+    /* #50495: the prefill compute -- the only forwards between ACCEPT and the
+     * first decoded token. Anchor restore / cross-slot adopt above are memcpys,
+     * not compute, so they are deliberately outside this window. */
+    double pf0=now_s();
     float *logit = add>0 ? step(m,sc->hist+sc->len,add,sc->len)
                          : step(m,sc->hist+sc->len-1,1,sc->len-1);
+    double pf_s=now_s()-pf0;
     sc->len+=add; sc->first=0;
     kvanchor_capture(m,sc,sc->len,"prompt_end");   /* #50403: the boundary the client resends */
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
-    r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
+    r->prompt_tokens=nt; r->started=now_s(); r->prefill_s=pf_s;
+    r->hits0=m->hits; r->miss0=m->miss;
     prof_base(m,&r->pb);                 /* a few loads: cheap enough to always track */
     /* Clamp to the KV room WITHOUT flagging: length_limited must mean "the
      * limit is what stopped us", not "the request asked for more than the
