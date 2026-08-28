@@ -466,6 +466,26 @@ class EngineStatsTest(unittest.TestCase):
         self.assertEqual(stats.last["tokens_per_second"], 4.8)
         self.assertEqual(stats.last["completion_tokens"], 12)
 
+    def test_prefill_seconds_accumulate_only_from_dones_that_carry_them(self):
+        # #50495: DONE gained an appended prefill-seconds field. A turn whose
+        # DONE lacks it contributes nothing and never flips the seen flag, so
+        # "engine cannot measure prefill" stays distinguishable from "prefill
+        # took 0.0 s" -- a real zero (pure KV hit) IS a value and counts.
+        stats = EngineStats(window_s=5.0)
+        self.assertFalse(stats.prefill_seen)
+        stats.observe({"prompt_tokens": 7, "completion_tokens": 12}, "1", now=0.0)
+        self.assertFalse(stats.prefill_seen)          # field absent on this DONE
+        self.assertEqual(stats.prefill_seconds_total, 0.0)
+        self.assertIsNone(stats.prefill_last)
+        stats.observe({"prompt_tokens": 3, "completion_tokens": 8,
+                       "prefill_seconds": 2.5}, "2", now=1.0)
+        stats.observe({"prompt_tokens": 5, "completion_tokens": 9,
+                       "prefill_seconds": 0.0}, "3", now=2.0)
+        stats.observe({"prompt_tokens": 2, "completion_tokens": 4}, "4", now=3.0)
+        self.assertTrue(stats.prefill_seen)
+        self.assertAlmostEqual(stats.prefill_seconds_total, 2.5)   # absent turn added 0
+        self.assertEqual(stats.prefill_last, 0.0)    # the real zero, not absence
+
     def test_window_trim_bounds_memory(self):
         # Recency is enforced on read (no timer thread): one rate read trims
         # the deques down to the window, so a polled server cannot grow them.
@@ -611,7 +631,7 @@ class DispatcherTest(unittest.TestCase):
             process.stdout.feed(
                 b"ACCEPT 1 42\n"
                 b"DATA 1 4\nA\n\xc3\xa9\n"
-                b"DONE 1 STAT 1 2.500 50.0 1.25 42 0 17\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 42 0 17.000\n"
             )
 
         process = FakeProcess(respond)
@@ -626,6 +646,7 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(chunks, ["A\né"])
         self.assertEqual(stats["completion_tokens"], 1)
         self.assertEqual(stats["prompt_tokens"], 42)
+        self.assertEqual(stats["prefill_seconds"], 17.0)   # #50495: 8th DONE field
 
     def test_kimi_request_and_response_transcript_is_byte_exact(self):
         prompt = render_chat_kimi([
@@ -659,6 +680,7 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(chunks, ["A\né"])
         self.assertEqual(stats["completion_tokens"], 1)
         self.assertEqual(stats["prompt_tokens"], 42)
+        self.assertIsNone(stats["prefill_seconds"])         # #50495: absent, not zero
 
     def test_olmoe_request_and_response_transcript_is_byte_exact(self):
         expected = b"SUBMIT 1 0 5 3 0.25 0.9\nH\xc3\xa9\nx\n"
@@ -1222,7 +1244,7 @@ class HTTPTest(unittest.TestCase):
         tracker.on_data("1")
         tracker.observe({"prompt_tokens": 7, "completion_tokens": 12,
                          "tokens_per_second": 4.8, "cache_hit_percent": 55.0,
-                         "rss_gb": 17.2}, "1")
+                         "rss_gb": 17.2, "prefill_seconds": 2.5}, "1")
         self.engine.stats = tracker
         self.engine.ready_at = time.monotonic() - 10
         try:
@@ -1233,6 +1255,7 @@ class HTTPTest(unittest.TestCase):
         finally:
             del self.engine.stats, self.engine.ready_at
         self.assertIsNone(anonymous["model"])
+        self.assertIsNone(anonymous["prefill"])    # #50495: degraded shape is absent, not zero
         self.assertEqual(anonymous["tokens"], {"prompt_total": 0, "completion_total": 0})
         self.assertEqual(authed["model"], "test-model")
         self.assertEqual(authed["tokens"],
@@ -1242,6 +1265,8 @@ class HTTPTest(unittest.TestCase):
         self.assertGreater(authed["throughput"]["decode_tps"], 0.0)
         self.assertGreater(authed["throughput"]["prefill_tps"], 0.0)
         self.assertEqual(authed["engine"]["cache_hit_percent"], 55.0)
+        self.assertEqual(authed["prefill"], {"seconds_total": 2.5, "last_turn_seconds": 2.5})
+        self.assertEqual(authed["engine"]["prefill_seconds"], 2.5)
 
     def test_stats_degrades_to_zeros_without_an_engine(self):
         # Pre-READY (or a foreign engine object): the endpoint answers honestly
@@ -1255,8 +1280,29 @@ class HTTPTest(unittest.TestCase):
             self.server.engine = server_engine
         self.assertEqual(stats, {"model": "test-model", "uptime_s": 0,
                                  "throughput": {"decode_tps": 0.0, "prefill_tps": 0.0},
+                                 "prefill": None,
                                  "tokens": {"prompt_total": 0, "completion_total": 0},
                                  "requests": {"completed": 0}})
+
+    def test_stats_prefill_seconds_absent_until_a_done_carries_the_field(self):
+        """#50495: an engine whose DONE frames carry no prefill-seconds field
+        (a build predating it) must read as ABSENT, not as zero -- /v1/stats
+        reporting prefill: null is the honest 'cannot supply', and a 0.0 there
+        would silently claim prefills are free."""
+        tracker = EngineStats(window_s=60.0)
+        tracker.observe({"prompt_tokens": 7, "completion_tokens": 12,
+                         "tokens_per_second": 4.8, "cache_hit_percent": 55.0,
+                         "rss_gb": 17.2}, "1")
+        self.assertFalse(tracker.prefill_seen)
+        self.engine.stats = tracker
+        self.engine.ready_at = time.monotonic()
+        try:
+            with self.request("/v1/stats") as response:
+                authed = json.load(response)
+        finally:
+            del self.engine.stats, self.engine.ready_at
+        self.assertIsNone(authed["prefill"])
+        self.assertIsNone(authed["engine"]["prefill_seconds"])
 
     def test_logs_cursor_polling(self):
         """/logs?since= lets a script tail the serve log over HTTP, no file
