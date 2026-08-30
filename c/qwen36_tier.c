@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include "qwen36_tier.h"
 #include "backend_cuda.h"
+#include "tier.h"
 
 #define QT_MAX_DEV 8
 #define QT_QCAP 48            /* upload queue depth (staging ~1.6 MB/entry) */
@@ -121,11 +122,19 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs){
     memset(&G,0,sizeof G);
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk;
 
-    /* devices: COLI_GPUS="0,1" (default: 0,1 when present, else 0) */
+    /* devices: COLI_GPUS="0,1" (default: first two visible devices) */
     const char *gl=getenv("COLI_GPUS");
-    char buf[128]; snprintf(buf,sizeof buf,"%s", gl?gl:"0,1");
-    for(char *t=strtok(buf,","); t && G.ndev<QT_MAX_DEV; t=strtok(NULL,","))
-        G.dev[G.ndev++]=atoi(t);
+    if (gl && *gl) {
+        char buf[128]; snprintf(buf,sizeof buf,"%s",gl);
+        for(char *t=strtok(buf,","); t && G.ndev<QT_MAX_DEV; t=strtok(NULL,","))
+            G.dev[G.ndev++]=atoi(t);
+    } else {
+        int available=coli_cuda_available_device_count();
+        int want=available<2?available:2;
+        for(int i=0;i<want && i<QT_MAX_DEV;i++) G.dev[G.ndev++]=i;
+        fprintf(stderr,"[qtier] COLI_GPUS unset: selecting %d visible device(s)\n",G.ndev);
+    }
+    if(G.ndev<1){ fprintf(stderr,"[qtier] no visible CUDA devices -> CPU path\n"); return 0; }
     if(!coli_cuda_init(G.dev,G.ndev)){ fprintf(stderr,"[qtier] coli_cuda_init failed -> CPU path\n"); return 0; }
     int have=coli_cuda_device_count();
     if(have<G.ndev){ G.ndev=have; }
@@ -322,11 +331,15 @@ void qt_fill_wait(void){
     pthread_mutex_unlock(&G.mx);
 }
 
-/* LFRU swap check (every 16 ticks = tokens): per device, coldest resident vs
- * hottest non-resident, with the tier.h hysteresis. */
+/* Adaptive swap check (every 16 ticks = tokens): per device, coldest resident
+ * vs hottest non-resident. Decay every 1024 ticks so an old workload cannot
+ * permanently own the tier; admission uses the shared tier.h contract. */
 static void qt_lfru_tick_locked(void){
-    if(++G.tick % 16) return;
     size_t n=(size_t)G.nl*G.ne;
+    G.tick++;
+    if(!(G.tick%1024))
+        for(size_t i=0;i<n;i++) G.slot[i].heat=tier_decay_value(G.slot[i].heat);
+    if(G.tick%16) return;
     for(int di=0;di<G.ndev;di++){
         int cold=-1, hot=-1; uint32_t ch=0, hh=0;
         for(size_t i=0;i<n;i++){
@@ -337,7 +350,7 @@ static void qt_lfru_tick_locked(void){
             else if(!s->resident && !s->queued && s->g4){ if(hot<0||s->heat>hh){ hot=(int)i; hh=s->heat; } }
         }
         if(cold<0||hot<0) continue;
-        if(hh<=ch+(ch>>2)+4) continue;                    /* hysteresis as in tier.h */
+        if(!tier_should_promote(hh,ch)) continue;
         QSlot *v=&G.slot[cold];
         v->resident=0;                                    /* CPU fallback from now on */
         if(enqueue_locked(hot/G.ne,hot%G.ne,cold/G.ne,cold%G.ne,0)) G.swaps++;

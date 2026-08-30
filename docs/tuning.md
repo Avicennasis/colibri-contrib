@@ -40,6 +40,12 @@ tiers, the reason for each placement, and the expected bottleneck. The default
 and router decisions unless `--topk` or `--topp` is passed; those explicit lossy
 overrides print a warning and proceed.
 
+The plan also emits a machine-readable `next_actions` list and renders it in
+the terminal. A missing storage measurement is marked `required`; subsequent
+profiling and tuning work is `recommended`. These actions produce the evidence
+needed to improve a plan on this machine—they do not silently enable an
+unmeasured optimization.
+
 Auto-tier plans size OpenMP from physical cores and bind workers across cores.
 Memory-bound quantized kernels can regress sharply when SMT siblings compete for
 limited memory channels. The GLM, Kimi K3, and OLMoE engines also apply that
@@ -71,20 +77,35 @@ coli tune --model /models/glm52_i4
 coli run --model /models/glm52_i4 --auto-tier "Explain MoE offloading"
 ```
 
-The calibration prompt is generated once. Every candidate then teacher-forces
-the same continuation, so answer length and sampling do not contaminate the
-comparison. The bounded sweep only includes execution knobs such as OpenMP
-thread count, NUMA placement, I/O overlap, direct I/O, and CUDA pipelining. It
-never changes weights, quantization, router decisions, `TOPK`, `TOPP`, or
-sampling.
+GLM generates one calibration continuation and teacher-forces it for every
+candidate. The sibling engines use their common serving protocol instead: one
+engine stays alive for all requests of a candidate, and deterministic prompts
+rotate in a fixed order. That preserves the expert cache and measures a real
+mixed chat instead of repeatedly loading one process or teaching the cache one
+exact prompt. Greedy output is compared per prompt across every candidate; any
+byte drift disqualifies the scheduling change.
+
+The bounded sweep includes execution knobs such as OpenMP thread count, NUMA
+placement, I/O overlap, direct I/O, CUDA pipelining, and DeepSeek V4 expert
+loader lanes. When cold experts remain on disk it also tests 75% and 50% of
+the planner's expert-cache allowance. Dense weights, KV/workspace reservations,
+and the OS reserve are never reduced, and no candidate may exceed the planner's
+safe baseline. GLM/Inkling/OLMoE/Qwen receive the measured slots-per-layer cap;
+V4 receives a whole-process `RAM_GB` ceiling; Kimi receives `K3_EXPERT_GB` under
+its unchanged whole-process ceiling. The sweep never changes weights,
+quantization, router decisions, `TOPK`, `TOPP`, or sampling. Add repeatable
+`--rotate-prompt` options to replace the secondary built-in workload prompt.
 
 A candidate is saved only when median throughput improves by at least 3% while
-expert hit rate remains within 0.5 percentage points and p99 latency stays
-within 20% of the baseline. The winner is then rerun before a final baseline;
-this reverse-order gate gives the baseline any remaining warm-cache advantage
-and rejects startup drift. Otherwise the baseline is recorded and no override
-is applied. Saved profiles are loaded by `--auto-tier`; explicit environment
-variables always win. Use `--no-tune-profile` to bypass a saved profile.
+expert hit rate remains within 0.5 percentage points and reported TTFT/p99
+latency stay within 20% of the baseline. The winner is then rerun before a final
+baseline; this reverse-order gate gives the baseline any remaining warm-cache
+advantage and rejects startup drift. Otherwise the baseline is recorded and no
+override is applied. Saved profiles are loaded by `--auto-tier`; `--ram`,
+`--cap`, `RAM_GB`, `K3_EXPERT_GB`, and other explicit settings always win. A
+resource winner is rechecked against the current plan at every launch, so a
+profile measured with more free RAM is ignored rather than overcommitted later.
+Use `--no-tune-profile` to bypass a saved profile.
 
 Profiles live under `$XDG_CONFIG_HOME/colibri/tuning` (normally
 `~/.config/colibri/tuning`) or `%LOCALAPPDATA%\colibri\tuning` on Windows. A

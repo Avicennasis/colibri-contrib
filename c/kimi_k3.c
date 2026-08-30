@@ -48,7 +48,11 @@
  *                        experts skip disk AND CPU at decode. CPU fallback
  *                        everywhere; output identical.
  *   K3_VK_GB=N           VRAM cap for the tier (default: driver budget)
- *   K3_VK_UP=N           routed-expert uploads per step (default 8)
+ *   K3_VK_UP=N|auto      routed-expert uploads per step (default 8). `auto`
+ *                        bounds the inline upload time to a fraction of the
+ *                        measured decode step (K3_VK_FILL_FRAC, default 0.25)
+ *                        instead of a fixed count — a slow bus stops stalling
+ *                        decode, a fast one fills the tier sooner.
  *   K3_METAL=0|1         Metal tier (build with `make METAL=1 kimi_k3`; Phase 4:
  *                        scaffolding only — dispatch hooks present, forward NOT
  *                        IMPLEMENTED; all ops fall through to CPU).
@@ -64,6 +68,20 @@
  *   K3_LOGITS=path       dump f32 logits per PREFILL position (teacher-forced
  *                        bit-width comparisons; use with --ngen 0)
  *   K3_MAXT=N            KV/context capacity (default prompt+ngen)
+ *   COLI_K3_CKPT=N       OPT-IN recurrent-state checkpoints for serve: keep N
+ *                        photos of the KDA state at turn boundaries so a
+ *                        divergent prompt (agentic edit) resumes from the
+ *                        deepest valid photo instead of re-prefilling from
+ *                        token 0. Unset/0 (default) = feature off, engine
+ *                        byte-identical to before. ~434 MB per photo on the
+ *                        full model, which is why it is opt-in.
+ *   COLI_K3_CKPT_DIR=dir park the photos in files under dir instead of RAM
+ *                        (low-RAM machines: ~0.4s of sequential I/O per
+ *                        restore against minutes of avoided re-prefill).
+ *                        Alone it implies COLI_K3_CKPT=2; an explicit
+ *                        COLI_K3_CKPT (0 included) always wins. Photos never
+ *                        outlive the process: after a restart the MLA rows
+ *                        are gone, so no restore could be valid.
  *   COLI_TEMP=F          0 = greedy (default), else softmax temperature
  */
 #define _GNU_SOURCE
@@ -94,8 +112,19 @@
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"
-#include "kv_prefix.h"                    /* KV prefix reuse (shared) */
+#include "kv_prefix.h"
+#include "hybrid_split.h"                    /* KV prefix reuse (shared) */
 #include "serve_codec.h"
+#ifdef COLI_SEGMENT_ADAPTER
+#include "segment_runtime.h"
+#include "segment_adapters.h"
+#include "segment_adapter_internal.h"
+#endif
+#ifdef COLI_EDGE_ADAPTER
+#include "edge_runtime.h"
+#include "edge_adapters.h"
+#include "edge_tok_internal.h"
+#endif
 
 /* ---------- config ---------- */
 typedef struct {
@@ -167,7 +196,11 @@ typedef struct { int eid; uint8_t *buf, *base; uint64_t used; int pinned; } Slot
  * tok/s when the pins came from a single prompt). */
                           /* base = 4K-aligned allocation (O_DIRECT target);
                            * buf = expert data view inside it (= base + off%4K) */
-typedef struct { Slot *s; int n, cap; } LCache;
+typedef struct {
+    Slot *s;
+    int *slot_by_expert;                  /* expert id -> local slot, -1 if absent */
+    int n, cap;
+} LCache;
 
 typedef struct {
     Cfg c;
@@ -207,9 +240,9 @@ static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
  * reported numbers without a 600 GB checkpoint. Returns the cap; writes the
  * bytes left for experts through `for_experts_out` when non-NULL.
  *
- * reserve = page cache + activations + KV, all in GB. `cap_requested` is what
- * K3_EXPERT_GB asked for: this only ever LOWERS it, never raises it, so an
- * explicit small cache stays small. */
+ * reserve = page cache + activations + KV + optional recurrent checkpoints,
+ * all in GB. `cap_requested` is what K3_EXPERT_GB asked for: this only ever
+ * LOWERS it, never raises it, so an explicit small cache stays small. */
 static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_gb,
                           double slot_gb, int nmoe, int cap_requested,
                           int n_experts, double *for_experts_out){
@@ -335,6 +368,10 @@ static int g_k3_vk=0;                     /* backend live (K3_VK=0 disables) */
 typedef struct { void *w1, *w2, *w3; } VkExp;   /* ColiVkTensor* triple */
 static VkExp *g_vkexp; static int64_t g_vkexp_n;
 static int g_vk_upcap=8, g_vk_up_left=0, g_vk_full=0;
+static int g_vk_up_auto=0;                /* K3_VK_UP=auto: measured budget */
+static double g_vk_fill_frac=0.25;        /* K3_VK_FILL_FRAC of step time */
+static double g_vk_step_ema, g_vk_upload_ema;  /* seconds, decode steps only */
+static int g_vk_cap_now=8;                /* last budget chosen (reporting) */
 static long g_vk_hit=0, g_vk_res=0;
 static double g_vk_gb=0;                  /* K3_VK_GB cap (0 = driver budget) */
 static const char *k3_vk_spv(char *buf, size_t n){
@@ -470,6 +507,16 @@ static int g_k3_direct=-1;               /* K3_DIRECT: O_DIRECT expert reads */
 static int g_k3_idot=1;                  /* K3_IDOT: int8-activation expert matmuls */
 static int g_k3_pipe=1;                  /* K3_PIPE: overlap loads with compute */
 static float g_k3_topp=0.f;              /* K3_TOPP: routed-expert top-p pruning */
+enum { K3_CKPT_MAX = 8 };
+static size_t k3_ckpt_blob_floats(const Model *m); /* def. with the ckpt block */
+static double k3_ckpt_reserve_gb(const Model *m, int slots);
+static int g_k3_ckpt_slots=0;            /* COLI_K3_CKPT: recurrent-state checkpoint
+                                          * slots. STRICTLY OPT-IN, 0 = off (default,
+                                          * engine behaves exactly as before). */
+static const char *g_k3_ckpt_dir=NULL;   /* COLI_K3_CKPT_DIR: park the photos in
+                                          * files instead of RAM (low-RAM machines:
+                                          * ~0.4s of sequential I/O per restore
+                                          * against minutes of avoided re-prefill). */
 
 static int k3_mmap_backend_allowed(int mmap_enabled, int vk_enabled, int cuda_enabled){
     return !mmap_enabled || (!vk_enabled && !cuda_enabled);
@@ -735,11 +782,19 @@ static void expert_table_init(Model *m){
     if(missing) fprintf(stderr,"[K3] WARNING: %d expert tensors missing (incomplete download?) — touching one aborts\n",missing);
 }
 
-static void model_init(Model *m, const char *snap, int n_layers_env){
+static void model_init_range(Model *m, const char *snap, int layer_begin,
+                             int layer_end, int truncate_model,
+                             int load_boundaries, int allocate_state,
+                             int expert_cap_override, int context_hint,
+                             int segment_mode){
     memset(m,0,sizeof(*m));
     load_cfg(&m->c,snap);
     Cfg *c=&m->c;
-    if(n_layers_env>0&&n_layers_env<c->n_layers) c->n_layers=n_layers_env;
+    if(truncate_model&&layer_end>0&&layer_end<c->n_layers) c->n_layers=layer_end;
+    if(layer_end==0) layer_end=c->n_layers;
+    if(layer_begin<0||layer_end>c->n_layers||layer_begin>=layer_end){
+        fprintf(stderr,"invalid Kimi K3 layer range [%d,%d) for %d layers\n",
+                layer_begin,layer_end,c->n_layers); exit(1); }
     st_init_multi(&m->S,snap,getenv("K3_DIRS"));   /* K3_DIRS: extra shard dirs (multi-drive split) */
     m->pfx[0]=0;   /* probe a layer-0 tensor: embed/head live in one of the LAST shards */
     if(!st_has(&m->S,"model.layers.0.input_layernorm.weight")&&
@@ -774,8 +829,26 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
 #endif
     g_k3_direct = getenv("K3_DIRECT")?atoi(getenv("K3_DIRECT")):1;
     g_k3_idot  = getenv("K3_IDOT")?atoi(getenv("K3_IDOT")):1;
-    g_k3_pipe  = getenv("K3_PIPE")?atoi(getenv("K3_PIPE")):1;
-    g_k3_topp  = getenv("K3_TOPP")?(float)atof(getenv("K3_TOPP")):0.f;
+    { /* Recurrent-state checkpoints are strictly OPT-IN: unset or 0 keeps
+       * the engine byte-identical to before the feature existed. */
+      const char *e=segment_mode?NULL:getenv("COLI_K3_CKPT");
+      g_k3_ckpt_slots=e?atoi(e):0;
+      if(g_k3_ckpt_slots<0) g_k3_ckpt_slots=0;
+      if(g_k3_ckpt_slots>K3_CKPT_MAX) g_k3_ckpt_slots=K3_CKPT_MAX;
+      g_k3_ckpt_dir=segment_mode?NULL:getenv("COLI_K3_CKPT_DIR");
+      if(g_k3_ckpt_dir&&!*g_k3_ckpt_dir) g_k3_ckpt_dir=NULL;
+      /* a directory alone is a clear enough request: default to 2 slots
+       * there, while an explicit COLI_K3_CKPT (0 included) always wins */
+      if(g_k3_ckpt_dir&&!e) g_k3_ckpt_slots=2; }
+    /* The legacy loader pool is process-global and keeps a Model pointer.
+     * Segment hosts may own several engines, so their demand loads stay
+     * synchronous until the pool becomes engine-owned. */
+    g_k3_pipe  = segment_mode ? 0
+                              : (getenv("K3_PIPE")?atoi(getenv("K3_PIPE")):1);
+    /* Segment numeric classes are exact by default: do not inherit the
+     * standalone quality lever from a donor's environment. */
+    g_k3_topp  = segment_mode ? 0.f
+                              : (getenv("K3_TOPP")?(float)atof(getenv("K3_TOPP")):0.f);
     if(g_k3_topp>0.f)
         fprintf(stderr,"[K3] TOPP=%.2f: routed experts pruned to cumulative weight (quality lever — A/B with K3_LOGITS)\n",g_k3_topp);
     int bits   = getenv("K3_BITS")?atoi(getenv("K3_BITS")):4;
@@ -789,7 +862,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     m->cwv=calloc(c->n_layers,sizeof(float*));
     char nm[512];
     #define NM(...) (snprintf(nm,sizeof(nm),__VA_ARGS__),nm)
-    for(int i=0;i<c->n_layers;i++){
+    for(int i=layer_begin;i<layer_end;i++){
         Layer *l=&m->L[i];
         l->kda=c->is_kda[i];
         l->sparse=(i>=c->first_dense);
@@ -829,10 +902,12 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
               free(al); }
             /* afcalloc: 16 KB-aligned so Metal wraps these zero-copy and GPU state/window
              * updates persist across tokens (see afcalloc note). CPU path is unaffected. */
-            m->kstate[i]=afcalloc((int64_t)c->kda_heads*c->kda_hd*c->kda_hd);
-            m->cwq[i]=afcalloc((int64_t)P*c->conv_k);
-            m->cwk[i]=afcalloc((int64_t)P*c->conv_k);
-            m->cwv[i]=afcalloc((int64_t)P*c->conv_k);
+            if(allocate_state){
+                m->kstate[i]=afcalloc((int64_t)c->kda_heads*c->kda_hd*c->kda_hd);
+                m->cwq[i]=afcalloc((int64_t)P*c->conv_k);
+                m->cwk[i]=afcalloc((int64_t)P*c->conv_k);
+                m->cwv[i]=afcalloc((int64_t)P*c->conv_k);
+            }
         } else {
             Mla *a=&l->m;
             w_load(m,&a->qa,NM("model.layers.%d.self_attn.q_a_proj.weight",i),c->q_lora,c->hidden,mbits);
@@ -871,7 +946,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         if(i%8==0) fprintf(stderr,"[K3] loaded layer %d/%d (%.1fs, RSS %.1f GB)\n",i+1,c->n_layers,now_s()-t0,rss_gb());
     }
     snprintf(nm,sizeof(nm),"%smodel.norm.weight",m->pfx);
-    m->has_head = st_has(&m->S,nm);
+    m->has_head = load_boundaries&&st_has(&m->S,nm);
     if(m->has_head){
         m->final_norm=f32_load(m,"model.norm.weight",c->hidden);
         { float *rn=f32_load(m,"model.output_attn_res_norm.weight",c->hidden);
@@ -892,7 +967,13 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
       }
       if(g_k3_vk){
         g_vk_gb=getenv("K3_VK_GB")?atof(getenv("K3_VK_GB")):0;
-        g_vk_upcap=getenv("K3_VK_UP")?atoi(getenv("K3_VK_UP")):8;
+        { const char *up=getenv("K3_VK_UP");
+          if(up&&!strcmp(up,"auto")){
+              g_vk_up_auto=1;             /* opt-in: measured budget below */
+              const char *fr=getenv("K3_VK_FILL_FRAC");
+              if(fr){ double f=atof(fr); if(f>0.0&&f<=1.0) g_vk_fill_frac=f; }
+          } else g_vk_upcap=up?atoi(up):8; }
+        g_vk_cap_now=g_vk_upcap;
         g_vkexp_n=(int64_t)c->n_layers*c->n_experts;
         g_vkexp=calloc((size_t)g_vkexp_n,sizeof(VkExp));
         if(!g_vkexp) g_k3_vk=0;
@@ -907,8 +988,9 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
             nsh+=w_vk_upload(&sm2->sh_gate)+w_vk_upload(&sm2->sh_up)+w_vk_upload(&sm2->sh_down);
         }
         double used=0,budget=0; coli_vk_mem_budget(&used,&budget);
-        fprintf(stderr,"[K3-VK] resident: %d shared-expert mats (%.1f/%.1f GB); routed MXFP4 tier fills at decode (K3_VK_UP=%d/step, cap %s)\n",
-                nsh,used,budget,g_vk_upcap,g_vk_gb>0?"K3_VK_GB":"driver budget");
+                char vk_cap_str[16]; snprintf(vk_cap_str,sizeof vk_cap_str,"%d",g_vk_upcap);
+        fprintf(stderr,"[K3-VK] resident: %d shared-expert mats (%.1f/%.1f GB); routed MXFP4 tier fills at decode (K3_VK_UP=%s/step, cap %s)\n",
+                nsh,used,budget,g_vk_up_auto?"auto":vk_cap_str,g_vk_gb>0?"K3_VK_GB":"driver budget");
       }
     }
 #endif
@@ -934,6 +1016,8 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
      * regardless of K3_EXPERT_GB. */
     if(cap<1) cap=1;
     if(cap>c->n_experts) cap=c->n_experts;
+    if(expert_cap_override>0 && cap>expert_cap_override)
+        cap=expert_cap_override;
 
     /* ---- RAM budget (#855) --------------------------------------------------
      * K3_EXPERT_GB used to be the whole story: cap = egb / slot / layers, with
@@ -972,14 +1056,18 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         /* KV is allocated later, at the first request, so it has to be projected
          * here. n_layers x max_t x (kv_lora + qk_rope) x 4, skipping KDA layers,
          * with the same K3_MAXT default the serve path uses. */
-        int max_t = getenv("K3_MAXT") ? atoi(getenv("K3_MAXT")) : 8192;
+        int max_t = context_hint > 0 ? context_hint :
+                    (getenv("K3_MAXT") ? atoi(getenv("K3_MAXT")) : 8192);
         if(max_t < 1) max_t = 8192;
         int nkv = 0; for(int i=0;i<c->n_layers;i++) if(!m->L[i].kda) nkv++;
         double kv_gb = (double)nkv*(double)max_t*(double)(c->kv_lora+c->qk_rope)*4.0/1e9;
         /* 2.5 GB page cache -- measured on Linux 2026-07-06: strangling it drops
          * buffered pread from ~800 to ~180 MB/s and the last GB of LRU costs
-         * more in lost bandwidth than it returns. 1.2 GB activations/logits. */
-        double reserve = 2.5 + 1.2 + kv_gb;
+         * more in lost bandwidth than it returns. 1.2 GB activations/logits.
+         * Checkpoints allocate lazily after this plan, so reserve all enabled
+         * slots now: RAM_GB is a whole-process ceiling even for opt-in memory. */
+        double ckpt_gb = k3_ckpt_reserve_gb(m,g_k3_ckpt_slots);
+        double reserve = 2.5 + 1.2 + kv_gb + ckpt_gb;
         double for_experts = 0.0;
 
         double slot_gb = (double)m->e_slot/1e9;
@@ -990,9 +1078,11 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
             /* Name every term. The user's number is not being ignored, it is
              * being clamped, and they cannot check the clamp without the parts. */
             fprintf(stderr,"[K3][RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB "
-                "(page cache 2.5, activations 1.2, KV %dx%d %.1f) -> %.1f GB for experts; "
+                "(page cache 2.5, activations 1.2, KV %dx%d %.1f, checkpoints %d %.1f) "
+                "-> %.1f GB for experts; "
                 "cache %d->%d/layer (%.1f MB/slot, %d layers; projected peak %.1f GB)\n",
                 budget, ram_env>0?"":" auto", resident, reserve, nkv, max_t, kv_gb,
+                g_k3_ckpt_slots,ckpt_gb,
                 for_experts>0?for_experts:0.0, cap, cap_fit>0?cap_fit:1,
                 slot_gb*1000.0, nmoe,
                 resident + reserve + (double)(cap_fit>0?cap_fit:1)*slot_gb*nmoe);
@@ -1026,10 +1116,21 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
       m->ecache=calloc((size_t)ncl,sizeof(LCache)); }
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse){
         m->ecache[i].cap=cap; m->ecache[i].s=calloc(cap,sizeof(Slot));
+        m->ecache[i].slot_by_expert=malloc((size_t)c->n_experts*sizeof(int));
+        if(!m->ecache[i].s||!m->ecache[i].slot_by_expert){
+            fprintf(stderr,"OOM expert cache/index\n"); exit(1); }
         for(int j2=0;j2<cap;j2++) m->ecache[i].s[j2].eid=-1;
+        for(int e=0;e<c->n_experts;e++) m->ecache[i].slot_by_expert[e]=-1;
     }
     fprintf(stderr,"[K3] init done in %.1fs | %d layers | expert cache %d/layer (%.1f MB/slot) | RSS %.1f GB\n",
             now_s()-t0,c->n_layers,cap,m->e_slot/1e6,rss_gb());
+    if(g_k3_ckpt_slots>0)
+        fprintf(stderr,"[K3-CKPT] enabled: %d recurrent-state slots (%.1f MB each, %s)\n",
+                g_k3_ckpt_slots,k3_ckpt_blob_floats(m)*sizeof(float)/1048576.0,
+                g_k3_ckpt_dir?g_k3_ckpt_dir:"RAM");
+    /* Validation/capture files are standalone diagnostics. A donor process
+     * must not inherit them or share their process-global FILE pointers. */
+    if(!segment_mode){
     /* Phase 9: layer validation init */
     { const char *vl=getenv("K3_VALIDATE_LAYER");
       const char *vt=getenv("K3_VALIDATE_TOKEN");
@@ -1042,7 +1143,13 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
           g_k3_val_layer=-1;
         } else {
           const char *ofn=getenv("K3_VALIDATE_OUT");
-          if(!ofn) ofn="/tmp/k3_val";
+          /* CWD-relative, not a /tmp path: same rule as test_stops.c and
+             test_pipe_block.c, since the windows job builds native .exe
+             files that resolve Windows paths and /tmp is not one. The
+             chosen path is printed on both the success and the failure
+             branch below, so a caller relying on the old default is told
+             where the dump went. */
+          if(!ofn) ofn="k3_val";
           g_k3_val_fp=fopen(ofn,"w");
           if(!g_k3_val_fp){
             fprintf(stderr,"[K3-VAL] cannot open %s (%s) — disabled\n",ofn,strerror(errno));
@@ -1068,6 +1175,7 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
           fprintf(stderr,"[K3-VAL-LOGITS] active: output %s (%d dims)\n",vl,c->vocab);
         }
       }
+    }
     }
     #undef NM
 }
@@ -1367,10 +1475,45 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
  * slots) and, when K3_DIRECT=1 (default) and st.h has an O_DIRECT twin fd,
  * bypass the page cache: measured on the box 7.1 GB/s direct vs 2.9 buffered
  * (and ~1.8 effective once the resident weights leave no cache headroom). */
-static Slot *slot_find(Model *m, int li, int eid){
+/* Cache slots are serially published by cache_promote() or pin_seed(). Expert
+ * reads land in ws[] first and never enter this index until their bytes are
+ * complete. Validate both the local range and identity before returning: a
+ * broken invariant must become a miss, never another expert's weights. */
+#ifdef COLI_CACHE_INDEX_TEST
+static uint64_t g_slot_index_probes;
+#define SLOT_INDEX_PROBE() (g_slot_index_probes++)
+#else
+#define SLOT_INDEX_PROBE() ((void)0)
+#endif
+static Slot *slot_indexed(Model *m, int li, int eid){
     LCache *lc=&m->ecache[li];
-    for(int i=0;i<lc->n;i++) if(lc->s[i].eid==eid){ m->hits++; lc->s[i].used=++m->clock; return &lc->s[i]; }
-    return NULL;
+    if(eid<0||eid>=m->c.n_experts||!lc->slot_by_expert) return NULL;
+    SLOT_INDEX_PROBE();
+    int i=lc->slot_by_expert[eid];
+    if(i<0||i>=lc->n||lc->s[i].eid!=eid) return NULL;
+    return &lc->s[i];
+}
+static Slot *slot_find(Model *m, int li, int eid){
+    Slot *s=slot_indexed(m,li,eid);
+    if(s){ m->hits++; s->used=++m->clock; }
+    return s;
+}
+static void cache_unindex(Model *m,int li,Slot *s){
+    LCache *lc=&m->ecache[li]; int i=(int)(s-lc->s);
+    if(s->eid>=0&&s->eid<m->c.n_experts&&lc->slot_by_expert[s->eid]==i)
+        lc->slot_by_expert[s->eid]=-1;
+}
+static void cache_index(Model *m,int li,Slot *s){
+    LCache *lc=&m->ecache[li]; int i=(int)(s-lc->s);
+    if(s->eid<0||s->eid>=m->c.n_experts||i<0||i>=lc->n){
+        fprintf(stderr,"layer %d: invalid expert cache publication\n",li); exit(1); }
+    lc->slot_by_expert[s->eid]=i;
+}
+static void cache_promote(Model *m,int li,Slot *dst,Slot *loaded){
+    cache_unindex(m,li,dst);
+    Slot tmp=*dst; *dst=*loaded; *loaded=tmp;
+    dst->used=++m->clock;
+    cache_index(m,li,dst);
 }
 static void expert_read(Model *m, int li, int eid, Slot *s){
     if(!s->base){
@@ -1505,6 +1648,7 @@ static void vk_expert_try_upload(Model *m, int li, int eid, Slot *s){
         return; }
     uint8_t *w1p=s->buf, *w1s=w1p+m->e_w1p, *w2p=w1s+m->e_w1s, *w2s=w2p+m->e_w2p,
             *w3p=w2s+m->e_w2s, *w3s=w3p+m->e_w1p;
+    double up_t0=now_s();                 /* whole upload incl. scale expand */
     int LT=m->c.latent, MI=m->c.moe_inter;
     int64_t n1=m->e_w1s, n2=m->e_w2s;          /* scale counts = scale bytes (u8) */
     float *sc=falloc(n1>n2?n1:n2);
@@ -1525,6 +1669,7 @@ static void vk_expert_try_upload(Model *m, int li, int eid, Slot *s){
         return;
     }
     g_vk_res++; g_vk_up_left--;
+    g_vk_upload_ema=coli_v4_hybrid_ema(g_vk_upload_ema,now_s()-up_t0);
 }
 #endif
 
@@ -1683,8 +1828,7 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                 if(lru<0) break;                    /* every slot pinned: keep the read */
                 dst=&lc->s[lru];
             }
-            Slot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp;
-            dst->used=++m->clock;
+            cache_promote(m,li,dst,&m->ws[q]);
         }
     }
     free(zq_all); free(zsc_all);
@@ -1748,15 +1892,14 @@ static void pin_seed(Model *m, int64_t hist){
             int best=-1; uint32_t bestc=0;
             for(int e=0;e<c->n_experts;e++){
                 if(u[e]<=bestc) continue;
-                int taken=0;
-                for(int i=0;i<lc->n;i++) if(lc->s[i].eid==e){ taken=1; break; }
+                int taken=slot_indexed(m,li,e)!=NULL;
                 if(!taken){ best=e; bestc=u[e]; }
             }
             if(best<0) break;                       /* history is exhausted */
             Slot *d=&lc->s[lc->n];
             expert_read(m,li,best,d);
             d->eid=best; d->used=++m->clock; d->pinned=1;
-            lc->n++; pinned_total++;
+            lc->n++; cache_index(m,li,d); pinned_total++;
         }
     }
     if(pinned_total)
@@ -1908,32 +2051,29 @@ static void dense_forward(Model *m, Layer *l, const float *x, int C, float *out)
 static float *g_x0=NULL; static int g_x0_n=0;  /* K3_X0: injected inputs (validation) */
 static FILE *g_lfp=NULL;                       /* K3_LOGITS: per-position logit dump */
 typedef int (*K3CancelPoll)(void *context);
-static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
-                            K3CancelPoll poll_cancel, void *cancel_context,
-                            int *cancelled){
+
+/* Run an arbitrary contiguous layer range on boundary activations.  Kimi's
+ * AttnRes block residuals are part of that boundary state: hidden alone is
+ * insufficient whenever a range begins after layer zero.  `bres` therefore
+ * contains nbmax hidden-width rows per token and nb_io names the live prefix. */
+static int k3_layers_forward_range(Model *m, float *hidden, float *bres,
+                                   int *nb_io, int pos0, int C,
+                                   int layer_begin, int layer_end,
+                                   K3CancelPoll poll_cancel,
+                                   void *cancel_context, int *cancelled){
     Cfg *c=&m->c; int D=c->hidden;
-    if(cancelled) *cancelled=0;
-#ifdef COLI_VULKAN
-    g_vk_up_left=g_vk_upcap;              /* routed-tier upload budget per step */
-#endif
     int nbmax=(c->n_layers+c->res_bs-1)/c->res_bs;
-    float *hidden=falloc((int64_t)C*D), *bres=falloc((int64_t)C*nbmax*D);
+    int nb=*nb_io;
     float *prefix=falloc((int64_t)C*D), *nrm=falloc((int64_t)C*D);
     float *att=falloc((int64_t)C*D), *mix=falloc(D), *mlp=falloc((int64_t)C*D);
-    int nb=0;
-    for(int t=0;t<C;t++){
-        if(g_x0){
-            if(pos0+t>=g_x0_n){ fprintf(stderr,"K3_X0: pos %d beyond %d injected rows\n",pos0+t,g_x0_n); exit(1); }
-            memcpy(hidden+(int64_t)t*D,g_x0+(int64_t)(pos0+t)*D,D*sizeof(float));
-        } else {
-            char nm[512]; snprintf(nm,sizeof(nm),"%smodel.embed_tokens.weight",m->pfx);
-            st_read_slice_f32(&m->S,nm,(int64_t)ids[t]*D,D,hidden+(int64_t)t*D,0);
-        }
-    }
-    if(pos0==0&&C<=1) fprintf(stderr,"[DBG] step_chunk pos=%d C=%d metal=%d\n", pos0, C, g_k3_metal);
-    for(int i=0;i<c->n_layers;i++){
+    if(cancelled) *cancelled=0;
+    for(int i=layer_begin;i<layer_end;i++){
         Layer *l=&m->L[i];
         int snap=(i%c->res_bs==0);                    /* block boundary: same for all t */
+        if(snap&&nb>=nbmax){
+            if(cancelled) *cancelled=1;
+            break;
+        }
         for(int t=0;t<C;t++){
             float *h=hidden+(int64_t)t*D, *p=prefix+(int64_t)t*D;
             memcpy(p,h,D*sizeof(float));              /* prefix_sum at entry */
@@ -1987,6 +2127,43 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
             break;
         }
     }
+    *nb_io=nb;
+    free(prefix);free(nrm);free(att);free(mix);free(mlp);
+    return cancelled&&*cancelled?-1:0;
+}
+
+static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
+                            K3CancelPoll poll_cancel, void *cancel_context,
+                            int *cancelled){
+    Cfg *c=&m->c; int D=c->hidden;
+    if(cancelled) *cancelled=0;
+#ifdef COLI_VULKAN
+    /* Routed-tier upload budget for this step. Fixed cap by default;
+     * K3_VK_UP=auto bounds the inline upload time to a fraction of the
+     * measured decode step instead (hybrid_split.h) — legacy cap until both
+     * rates have samples, so enabling auto never starts worse. */
+    if(g_vk_up_auto&&!g_vk_full)
+        g_vk_cap_now=coli_k3_fill_budget(g_vk_step_ema,g_vk_upload_ema,
+                                         g_vk_fill_frac,g_vk_upcap);
+    g_vk_up_left=g_vk_up_auto?g_vk_cap_now:g_vk_upcap;
+    double vk_step_t0=(g_vk_up_auto&&C==1)?now_s():0.0;
+#endif
+    int nbmax=(c->n_layers+c->res_bs-1)/c->res_bs;
+    float *hidden=falloc((int64_t)C*D), *bres=falloc((int64_t)C*nbmax*D);
+    float *mix=falloc(D);
+    int nb=0;
+    for(int t=0;t<C;t++){
+        if(g_x0){
+            if(pos0+t>=g_x0_n){ fprintf(stderr,"K3_X0: pos %d beyond %d injected rows\n",pos0+t,g_x0_n); exit(1); }
+            memcpy(hidden+(int64_t)t*D,g_x0+(int64_t)(pos0+t)*D,D*sizeof(float));
+        } else {
+            char nm[512]; snprintf(nm,sizeof(nm),"%smodel.embed_tokens.weight",m->pfx);
+            st_read_slice_f32(&m->S,nm,(int64_t)ids[t]*D,D,hidden+(int64_t)t*D,0);
+        }
+    }
+    if(pos0==0&&C<=1) fprintf(stderr,"[DBG] step_chunk pos=%d C=%d metal=%d\n", pos0, C, g_k3_metal);
+    k3_layers_forward_range(m,hidden,bres,&nb,pos0,C,0,c->n_layers,
+                            poll_cancel,cancel_context,cancelled);
     float *logits=NULL;
     if((!cancelled||!*cancelled)&&m->has_head){
         double t0=now_s();
@@ -2008,7 +2185,11 @@ static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
     }
     /* record what was just fed, at the positions it went to (kv_prefix.h) */
     if(!cancelled||!*cancelled) kv_prefix_record(&m->kvp,ids,pos0,C);
-    free(hidden);free(bres);free(prefix);free(nrm);free(att);free(mix);free(mlp);
+#ifdef COLI_VULKAN
+    if(g_vk_up_auto&&C==1&&vk_step_t0>0.0)
+        g_vk_step_ema=coli_v4_hybrid_ema(g_vk_step_ema,now_s()-vk_step_t0);
+#endif
+    free(hidden);free(bres);free(mix);
     return logits;
 }
 
@@ -2062,6 +2243,10 @@ static void kv_alloc(Model *m, int max_t){
             a->Ic = falloc((int64_t)max_t * c->index_hd);
         }
     }
+}
+
+static void model_init(Model *m, const char *snap, int n_layers_env){
+    model_init_range(m,snap,0,n_layers_env,1,1,1,0,0,0);
 }
 
 typedef struct { float p; int id; } SampleProb;
@@ -2155,6 +2340,41 @@ static void chat_assistant(ChatB *b, const char *reasoning, const char *text){
     cb_close(b,"message"); cb_special(b,b->sp_eom);
 }
 
+/* ---- tool-call XTML (#1143) -----------------------------------------------
+ * Attribute segmentation mirrors the reference renderer (encoding_k3.py):
+ * " key", "=\"", the escaped value, and "\"" are each their OWN text segment.
+ * Segment boundaries are token boundaries under K3's rank-BPE, so the split
+ * is part of the format, not a style choice. Values escape & -> &amp; and
+ * " -> &quot;, exactly the reference's _escape_attr_value. */
+static void cb_attr(ChatB *b, const char *key, const char *val){
+    char kb[80]; snprintf(kb,sizeof kb," %s",key); cb_text(b,kb);
+    cb_text(b,"=\"");
+    size_t n=strlen(val), extra=0;
+    for(size_t i=0;i<n;i++) extra += val[i]=='&'?4u : val[i]=='"'?5u : 0u;
+    char *esc=malloc(n+extra+1);
+    if(!esc){ fprintf(stderr,"OOM chat attr\n"); exit(1); }
+    char *w=esc;
+    for(size_t i=0;i<n;i++){
+        if(val[i]=='&'){ memcpy(w,"&amp;",5); w+=5; }
+        else if(val[i]=='"'){ memcpy(w,"&quot;",6); w+=6; }
+        else *w++=val[i];
+    }
+    *w=0; cb_text(b,esc); free(esc);
+    cb_text(b,"\"");
+}
+/* open tag with caller-supplied attributes: cb_open_begin, cb_attr..., cb_end */
+static void cb_open_begin(ChatB *b, const char *tag){ cb_special(b,b->sp_open); cb_text(b,tag); }
+static void cb_end(ChatB *b){ cb_special(b,b->sp_sep); }
+
+/* Is a generated XTML tag part of the tool-call structure? Open tags carry
+ * attributes ("call tool=\"x\" index=\"1\""), close tags are the bare name. */
+static int k3_tool_tag(const char *t){
+    return (!strncmp(t,"tools",5)   &&(t[5]==0||t[5]==' ')) ||
+           (!strncmp(t,"call",4)    &&(t[4]==0||t[4]==' ')) ||
+           (!strncmp(t,"argument",8)&&(t[8]==0||t[8]==' ')) ||
+           (!strncmp(t,"json",4)    &&(t[4]==0||t[4]==' '));
+}
+
 /* Internal gateway payload. Length framing keeps arbitrary UTF-8/newlines in
  * message content while preserving the segment boundaries required by K3's
  * rank-BPE chat template:
@@ -2194,6 +2414,93 @@ static int chat_build_wire(Tok *T, const char *wire, int nwire, int *thinking,
             memcpy(text,nl+1+nr,(size_t)nt); text[nt]=0;
             chat_assistant(&b,reason,text);
             free(reason); free(text); p=nl+1+nr+nt; continue;
+        }
+        if(*p=='Y'){                /* typed system message (#1143): tool-declare / tool-choice */
+            int ntp=-1, nb=-1;
+            if(sscanf(p,"Y %d %d",&ntp,&nb)!=2||ntp<1||ntp>64||nb<0||nl+1+ntp+nb>end) return -1;
+            char *typ=malloc((size_t)ntp+1), *body=malloc((size_t)nb+1);
+            if(!typ||!body){ fprintf(stderr,"OOM chat typed-system\n"); exit(1); }
+            memcpy(typ,nl+1,(size_t)ntp); typ[ntp]=0;
+            memcpy(body,nl+1+ntp,(size_t)nb); body[nb]=0;
+            cb_open_begin(&b,"message"); cb_attr(&b,"role","system"); cb_attr(&b,"type",typ); cb_end(&b);
+            cb_text(&b,body);
+            cb_close(&b,"message"); cb_special(&b,b.sp_eom);
+            free(typ); free(body); p=nl+1+ntp+nb; continue;
+        }
+        if(*p=='O'){                /* tool result (#1143): O <index> <name-len> <content-len> */
+            int idx=-1, nn=-1, nb=-1;
+            if(sscanf(p,"O %d %d %d",&idx,&nn,&nb)!=3||idx<1||nn<1||nn>256||nb<0||nl+1+nn+nb>end) return -1;
+            char *name=malloc((size_t)nn+1), *body=malloc((size_t)nb+1);
+            if(!name||!body){ fprintf(stderr,"OOM chat tool-result\n"); exit(1); }
+            memcpy(name,nl+1,(size_t)nn); name[nn]=0;
+            memcpy(body,nl+1+nn,(size_t)nb); body[nb]=0;
+            char ib[16]; snprintf(ib,sizeof ib,"%d",idx);
+            cb_open_begin(&b,"message"); cb_attr(&b,"role","tool");
+            cb_attr(&b,"tool",name); cb_attr(&b,"index",ib); cb_end(&b);
+            cb_text(&b,body);
+            cb_close(&b,"message"); cb_special(&b,b.sp_eom);
+            free(name); free(body); p=nl+1+nn+nb; continue;
+        }
+        if(*p=='B'){                /* assistant WITH tool calls (#1143):
+                                     * B <think> <nr> <nt> <ncalls>\n<reason><text>
+                                     * then ncalls of  F <name-len> <nargs>\n<name>
+                                     *                   (+ nargs of V <key-len> <type-len> <val-len>\n<key><type><val>)
+                                     * or               J <name-len> <json-len>\n<name><json> */
+            int th=-1, nr=-1, nt=-1, nc=-1;
+            if(sscanf(p,"B %d %d %d %d",&th,&nr,&nt,&nc)!=4||th<0||th>1||nr<0||nt<0||
+               nc<1||nc>64||nl+1+nr+nt>end) return -1;
+            char *reason=malloc((size_t)nr+1), *text=malloc((size_t)nt+1);
+            if(!reason||!text){ fprintf(stderr,"OOM chat assistant-tools\n"); exit(1); }
+            memcpy(reason,nl+1,(size_t)nr); reason[nr]=0;
+            memcpy(text,nl+1+nr,(size_t)nt); text[nt]=0;
+            cb_open(&b,"message","assistant");
+            if(th){ cb_open(&b,"think",NULL); cb_text(&b,reason); cb_close(&b,"think"); }
+            cb_open(&b,"response",NULL); cb_text(&b,text); cb_close(&b,"response");
+            free(reason); free(text);
+            cb_open(&b,"tools",NULL);
+            p=nl+1+nr+nt;
+            for(int ci=0;ci<nc;ci++){
+                nl=memchr(p,'\n',(size_t)(end-p)); if(!nl) return -1;
+                char ib[16]; snprintf(ib,sizeof ib,"%d",ci+1);
+                if(*p=='J'){
+                    int nn=-1, nj=-1;
+                    if(sscanf(p,"J %d %d",&nn,&nj)!=2||nn<1||nn>256||nj<0||nl+1+nn+nj>end) return -1;
+                    char *name=malloc((size_t)nn+1), *js=malloc((size_t)nj+1);
+                    if(!name||!js){ fprintf(stderr,"OOM chat tool-call\n"); exit(1); }
+                    memcpy(name,nl+1,(size_t)nn); name[nn]=0;
+                    memcpy(js,nl+1+nn,(size_t)nj); js[nj]=0;
+                    cb_open_begin(&b,"call"); cb_attr(&b,"tool",name); cb_attr(&b,"index",ib); cb_end(&b);
+                    cb_open_begin(&b,"json"); cb_attr(&b,"type","object"); cb_end(&b);
+                    cb_text(&b,js); cb_close(&b,"json"); cb_close(&b,"call");
+                    free(name); free(js); p=nl+1+nn+nj;
+                } else if(*p=='F'){
+                    int nn=-1, na=-1;
+                    if(sscanf(p,"F %d %d",&nn,&na)!=2||nn<1||nn>256||na<0||na>64||nl+1+nn>end) return -1;
+                    char *name=malloc((size_t)nn+1);
+                    if(!name){ fprintf(stderr,"OOM chat tool-call\n"); exit(1); }
+                    memcpy(name,nl+1,(size_t)nn); name[nn]=0;
+                    cb_open_begin(&b,"call"); cb_attr(&b,"tool",name); cb_attr(&b,"index",ib); cb_end(&b);
+                    free(name); p=nl+1+nn;
+                    for(int ai=0;ai<na;ai++){
+                        nl=memchr(p,'\n',(size_t)(end-p)); if(!nl) return -1;
+                        int nk=-1, ntp=-1, nv=-1;
+                        if(sscanf(p,"V %d %d %d",&nk,&ntp,&nv)!=3||nk<1||nk>256||ntp<1||ntp>16||
+                           nv<0||nl+1+nk+ntp+nv>end) return -1;
+                        char *key=malloc((size_t)nk+1), *typ=malloc((size_t)ntp+1), *val=malloc((size_t)nv+1);
+                        if(!key||!typ||!val){ fprintf(stderr,"OOM chat tool-arg\n"); exit(1); }
+                        memcpy(key,nl+1,(size_t)nk); key[nk]=0;
+                        memcpy(typ,nl+1+nk,(size_t)ntp); typ[ntp]=0;
+                        memcpy(val,nl+1+nk+ntp,(size_t)nv); val[nv]=0;
+                        cb_open_begin(&b,"argument"); cb_attr(&b,"key",key); cb_attr(&b,"type",typ); cb_end(&b);
+                        cb_text(&b,val); cb_close(&b,"argument");
+                        free(key); free(typ); free(val); p=nl+1+nk+ntp+nv;
+                    }
+                    cb_close(&b,"call");
+                } else return -1;
+            }
+            cb_close(&b,"tools");
+            cb_close(&b,"message"); cb_special(&b,b.sp_eom);
+            continue;
         }
         char role[16]; int nb=-1;
         if(sscanf(p,"M %15s %d",role,&nb)!=2||nb<0||nl+1+nb>end) return -1;
@@ -2267,6 +2574,188 @@ static void model_state_reset(Model *m){
     }
 }
 
+/* ---------- recurrent-state checkpoints (OPT-IN, COLI_K3_CKPT=N) ----------
+ *
+ * kv_prefix reuse is all-or-nothing because the 69 KDA layers carry a single
+ * RECURRENT state that exists only at "now": a prompt that diverges anywhere
+ * before the fed length cannot be resumed, so today it resets everything and
+ * re-prefills from token 0 — on a streaming engine that is minutes of disk
+ * reads for an agentic edit that changed one tool result near the end.
+ *
+ * A checkpoint is a photograph of that recurrent state (kstate + the three
+ * conv windows of every KDA layer) taken at a turn boundary, together with
+ * its OWN copy of the token ids that produced it. On a divergent prompt the
+ * deepest photo still valid for the shared prefix is restored and only the
+ * tail is re-prefilled.
+ *
+ * Validity needs BOTH checks, not one: the photo's ids must prefix-match the
+ * new prompt (KDA side), and the restore position must not exceed the live
+ * common prefix of the CURRENT record (the MLA Lc/Rc rows are per-position
+ * and only valid while the record still describes them — after a reset the
+ * record is empty and no restore can happen, which is correct because
+ * model_state_reset also freed those rows).
+ *
+ * With COLI_K3_CKPT unset or 0 (the default), none of this code runs and the
+ * engine is byte-identical to before the feature existed. */
+typedef struct {
+    int pos;            /* state covers ids[0..pos-1] */
+    int *fed;           /* own copy of those ids */
+    float *blob;        /* packed kstate + cwq/cwk/cwv of every KDA layer */
+    uint64_t used;      /* LRU stamp */
+} K3Ckpt;
+static K3Ckpt g_k3_ckpt[K3_CKPT_MAX];
+static uint64_t g_k3_ckpt_clock=0;
+
+static size_t k3_ckpt_blob_floats(const Model *m){
+    const Cfg *c=&m->c;
+    size_t per=(size_t)c->kda_heads*c->kda_hd*c->kda_hd
+              +3u*(size_t)c->kda_proj*c->conv_k, n=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kda) n+=per;
+    return n;
+}
+
+static double k3_ckpt_reserve_gb(const Model *m, int slots){
+    if(slots<1) return 0.0;
+    /* Disk-parked photos keep ONE bounce buffer in RAM regardless of slot
+     * count -- that is the whole point of COLI_K3_CKPT_DIR on a low-RAM
+     * machine. RAM slots each hold a full blob. */
+    int resident_blobs = g_k3_ckpt_dir ? 1 : slots;
+    return (double)resident_blobs*(double)k3_ckpt_blob_floats(m)*sizeof(float)/1e9;
+}
+
+static void k3_ckpt_copy(float *blob, Model *m, int to_blob){
+    Cfg *c=&m->c; size_t o=0;
+    size_t ks=(size_t)c->kda_heads*c->kda_hd*c->kda_hd;
+    size_t cw=(size_t)c->kda_proj*c->conv_k;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kda){
+        float *live[4]={m->kstate[i],m->cwq[i],m->cwk[i],m->cwv[i]};
+        size_t len[4]={ks,cw,cw,cw};
+        for(int j=0;j<4;j++){
+            if(to_blob) memcpy(blob+o,live[j],len[j]*sizeof(float));
+            else        memcpy(live[j],blob+o,len[j]*sizeof(float));
+            o+=len[j];
+        }
+    }
+}
+
+/* Disk-parked photos: same photos, same validity rules, but the blob lives
+ * in a file so the RAM cost is one bounce buffer instead of N slots. Slot
+ * metadata (pos, fed ids, LRU stamp) stays in memory: photos never survive
+ * the process, because after a restart the per-position MLA rows are gone
+ * and no restore could ever be valid. Stale files from a previous run are
+ * simply overwritten. Writes are atomic (tmp + rename); any I/O failure
+ * drops the photo, never the request. */
+static float *g_k3_ckpt_iobuf=NULL;
+#define K3_CKPT_FILE_MAGIC ((((uint64_t)0x504B4333)<<32)|1u) /* "3CKP" v1 */
+
+static void k3_ckpt_file(char *out, size_t n, int slot){
+    snprintf(out,n,"%s/k3_ckpt_%d.bin",g_k3_ckpt_dir,slot);
+}
+
+static int k3_ckpt_iobuf_ready(const Model *m){
+    if(!g_k3_ckpt_iobuf)
+        g_k3_ckpt_iobuf=malloc(k3_ckpt_blob_floats(m)*sizeof(float));
+    return g_k3_ckpt_iobuf!=NULL;
+}
+
+static int k3_ckpt_disk_write(Model *m, int slot, int pos){
+    char path[512], tmp[524];
+    k3_ckpt_file(path,sizeof path,slot);
+    snprintf(tmp,sizeof tmp,"%s.tmp",path);
+    size_t floats=k3_ckpt_blob_floats(m);
+    if(!k3_ckpt_iobuf_ready(m)) return 0;
+    k3_ckpt_copy(g_k3_ckpt_iobuf,m,1);
+    FILE *f=fopen(tmp,"wb"); if(!f) return 0;
+    uint64_t header[3]={K3_CKPT_FILE_MAGIC,(uint64_t)pos,(uint64_t)floats};
+    int ok=fwrite(header,sizeof header,1,f)==1 &&
+           fwrite(g_k3_ckpt_iobuf,sizeof(float),floats,f)==floats;
+    ok=!fclose(f)&&ok;
+    if(ok){ remove(path); ok=!rename(tmp,path); }
+    if(!ok) remove(tmp);
+    return ok;
+}
+
+static int k3_ckpt_disk_read(Model *m, int slot, int pos){
+    char path[512];
+    k3_ckpt_file(path,sizeof path,slot);
+    size_t floats=k3_ckpt_blob_floats(m);
+    if(!k3_ckpt_iobuf_ready(m)) return 0;
+    FILE *f=fopen(path,"rb"); if(!f) return 0;
+    uint64_t header[3]={0,0,0};
+    int ok=fread(header,sizeof header,1,f)==1 &&
+           header[0]==K3_CKPT_FILE_MAGIC &&
+           header[1]==(uint64_t)pos && header[2]==(uint64_t)floats &&
+           fread(g_k3_ckpt_iobuf,sizeof(float),floats,f)==floats;
+    fclose(f);
+    if(ok) k3_ckpt_copy(g_k3_ckpt_iobuf,m,0);
+    return ok;
+}
+
+/* A slot holds a photo: in RAM mode the blob pointer says so, in disk mode
+ * the committed position does (the file is only trusted through it). */
+static int k3_ckpt_slot_full(const K3Ckpt *k){
+    return g_k3_ckpt_dir ? k->pos>0 : k->blob!=NULL;
+}
+
+static void k3_ckpt_save(Model *m){
+    if(g_k3_ckpt_slots<1) return;
+    int pos=m->kvp.len;
+    if(pos<1||m->kvp.tainted||!m->kvp.fed) return;
+    for(int s=0;s<g_k3_ckpt_slots;s++){       /* identical photo: refresh LRU */
+        K3Ckpt *k=&g_k3_ckpt[s];
+        if(k3_ckpt_slot_full(k)&&k->pos==pos&&
+           !memcmp(k->fed,m->kvp.fed,(size_t)pos*sizeof(int))){
+            k->used=++g_k3_ckpt_clock; return; }
+    }
+    int victim=0;
+    for(int s=0;s<g_k3_ckpt_slots;s++){
+        if(!k3_ckpt_slot_full(&g_k3_ckpt[s])){ victim=s; break; }
+        if(g_k3_ckpt[s].used<g_k3_ckpt[victim].used) victim=s;
+    }
+    K3Ckpt *k=&g_k3_ckpt[victim];
+    if(!g_k3_ckpt_dir&&!k->blob){
+        k->blob=malloc(k3_ckpt_blob_floats(m)*sizeof(float));
+        if(!k->blob) return;                  /* optimisation, never a failure */
+    }
+    int *fed=realloc(k->fed,(size_t)pos*sizeof(int));
+    if(!fed) return;                          /* slot keeps its old photo */
+    k->fed=fed;
+    memcpy(k->fed,m->kvp.fed,(size_t)pos*sizeof(int));
+    if(g_k3_ckpt_dir){
+        if(!k3_ckpt_disk_write(m,victim,pos)){ k->pos=0; return; }
+    } else k3_ckpt_copy(k->blob,m,1);
+    k->pos=pos; k->used=++g_k3_ckpt_clock;
+    if(getenv("K3_PREFIX_LOG"))
+        fprintf(stderr,"[K3-CKPT] saved pos=%d slot=%d\n",pos,victim);
+}
+
+/* Deepest valid photo for this prompt; restores it and returns the covered
+ * positions (the caller prefills only ids[pos..np)), or 0 when none fits. */
+static int k3_ckpt_restore_best(Model *m, const int *ids, int np){
+    if(g_k3_ckpt_slots<1||m->kvp.tainted||!m->kvp.fed) return 0;
+    int live=0, lim=m->kvp.len<np?m->kvp.len:np;
+    while(live<lim&&m->kvp.fed[live]==ids[live]) live++;
+    if(live>=np) live=np-1;   /* at least one new token must be prefilled */
+    int best=-1;
+    for(int s=0;s<g_k3_ckpt_slots;s++){
+        K3Ckpt *k=&g_k3_ckpt[s];
+        if(!k3_ckpt_slot_full(k)||k->pos<1||k->pos>live) continue;
+        if(memcmp(k->fed,ids,(size_t)k->pos*sizeof(int))) continue;
+        if(best<0||k->pos>g_k3_ckpt[best].pos) best=s;
+    }
+    if(best<0) return 0;
+    K3Ckpt *k=&g_k3_ckpt[best];
+    if(g_k3_ckpt_dir){
+        if(!k3_ckpt_disk_read(m,best,k->pos)){ k->pos=0; return 0; }
+    } else k3_ckpt_copy(k->blob,m,0);
+    m->kvp.len=k->pos;        /* the record truncates with the state it describes */
+    k->used=++g_k3_ckpt_clock;
+    if(getenv("K3_PREFIX_LOG"))
+        fprintf(stderr,"[K3-CKPT] restored pos=%d of %d prompt tokens "
+                       "(recompute %d)\n",k->pos,np,np-k->pos);
+    return k->pos;
+}
+
 /* Decide reuse before changing the state it describes. A miss discards the
  * old recurrent/KV state first and allocates a fresh target; a hit grows the
  * existing target while preserving its prefix. The old order allocated first,
@@ -2274,6 +2763,9 @@ static void model_state_reset(Model *m){
  * MLA prefill immediately indexed them (#855). */
 static int prepare_request_state(Model *m, const int *ids, int np, int max_t){
     int reuse=kv_prefix_reuse(&m->kvp,ids,np);
+    /* Divergent prompt: before surrendering to a full reset, try the
+     * checkpoint pool (a no-op unless COLI_K3_CKPT enabled it). */
+    if(!reuse) reuse=k3_ckpt_restore_best(m,ids,np);
     if(!reuse) model_state_reset(m);
     kv_alloc(m,max_t);
     return reuse;
@@ -2348,6 +2840,11 @@ static void serve_data(const char *id, const char *p, int n){
     coli_serve_write_data(stdout,id,p,(size_t)n);
 }
 
+static void serve_tool(const char *id, const char *p, int n){
+    if(n<0) return;
+    coli_serve_write_tool(stdout,id,p,(size_t)n);
+}
+
 static int serve_one(Model *m, Tok *T, ServeReq *q){
     int cap=65536, *ids=malloc((size_t)cap*sizeof(int)), np=0;
     if(!ids){ coli_serve_write_error(stdout,q->id,"out of memory"); return 0; }
@@ -2380,6 +2877,10 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         coli_serve_write_error(stdout,q->id,message); free(ids); return 0;
     }
     coli_serve_write_accept(stdout,q->id,np);
+    /* Declare the structured sideband before any generated DATA. Even an
+     * empty sideband is meaningful: it tells the gateway that literal K3
+     * marker lookalikes in DATA are content, not engine-proven structure. */
+    if(chat) serve_tool(q->id,NULL,0);
     /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
      * A chat client resends the whole transcript each turn, so turn N used to
      * re-process turns 1..N-1 from scratch — the cost of a message grew with
@@ -2425,8 +2926,11 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         if(!poll.fatal) coli_serve_write_error(stdout,q->id,"CANCELLED");
         return poll.fatal?-1:0;
     }
-    int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
-    char buf[512], xtag[64];
+    /* Turn boundary: the state now covers exactly the prompt. A photo here is
+     * what an agentic edit of the NEXT request restores from. */
+    k3_ckpt_save(m);
+    int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0, xtool=0;
+    char buf[512], xtag[320];   /* tool-call open tags carry attributes: call tool="..." index="..." (#1143) */
     double tg=now_s();
     for(int s=0;s<q->max_tok&&!cancelled;s++){
         int tk=sample_tok(lo,m->c.vocab,q->temp,q->top_p);
@@ -2441,6 +2945,15 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
                     xsup=0; xtag[xtl]=0;
                     if(xopen&&!strcmp(xtag,"response")&&thinking)
                         serve_data(q->id,"</think>",8);
+                    else if(k3_tool_tag(xtag)){
+                        /* #1147: preserve engine-proven special-token structure on the
+                         * TOOL sideband. Text that only resembles these markers remains
+                         * DATA and cannot be promoted by the gateway. */
+                        char lb[352];
+                        int n=snprintf(lb,sizeof lb,"%s%s<|sep|>",xopen?"<|open|>":"<|close|>",xtag);
+                        if(n>0&&n<(int)sizeof lb) serve_tool(q->id,lb,n);
+                        if(!strcmp(xtag,"tools")) xtool=xopen;
+                    }
                 }
                 show=0;
             } else if(xsup){
@@ -2451,7 +2964,8 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         }
         if(show){
             int nb=tok_decode(T,&tk,1,buf,sizeof(buf)-1);
-            serve_data(q->id,buf,nb);
+            if(xtool) serve_tool(q->id,buf,nb);
+            else serve_data(q->id,buf,nb);
         }
         if(!eos) gen++;
         while(serve_stdin_readable()){
@@ -2470,6 +2984,9 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     }
     if(poll.fatal){ free(lo); free(ids); return -1; }
     free(lo); free(ids);
+    /* End of the reply: the next turn's transcript extends THIS state, and an
+     * edited retry of this turn restores the prompt-boundary photo above. */
+    k3_ckpt_save(m);
     double dt=now_s()-t0, decode=now_s()-tg;
     uint64_t hits=m->hits-hit0, misses=m->miss-miss0, total=hits+misses;
     ColiServeDone done={gen,decode>0?gen/decode:0.0,
@@ -2482,8 +2999,16 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
            dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,gen+1);
     fflush(stdout);
 #ifdef COLI_VULKAN
-    if(g_k3_vk) fprintf(stderr,"[K3-VK] routed tier: %ld resident, %ld GPU hits so far\n",
-                        g_vk_res,g_vk_hit);
+    if(g_k3_vk){
+        if(g_vk_up_auto)
+            fprintf(stderr,"[K3-VK] routed tier: %ld resident, %ld GPU hits | "
+                           "fill auto cap=%d (step %.2fms, upload %.2fms, frac %.2f)\n",
+                    g_vk_res,g_vk_hit,g_vk_cap_now,
+                    g_vk_step_ema*1e3,g_vk_upload_ema*1e3,g_vk_fill_frac);
+        else
+            fprintf(stderr,"[K3-VK] routed tier: %ld resident, %ld GPU hits so far\n",
+                    g_vk_res,g_vk_hit);
+    }
 #endif
     return 0;
 }
@@ -2503,6 +3028,7 @@ static void serve_loop(Model *m, Tok *T){
     }
 }
 
+#ifndef KIMI_K3_NO_MAIN
 int main(int argc, char **argv){
     coli_omp_tune_threads("kimi_k3");   /* squadra sui core fisici, niente spin-wait: vedi omp_tune.h */
     int serving=getenv("SERVE")&&getenv("SERVE")[0]=='1';
@@ -2513,6 +3039,7 @@ int main(int argc, char **argv){
      * below, so an error says what to do instead of only what went wrong. */
     if(!serving && (argc<2 || !strcmp(argv[1],"--help") || !strcmp(argv[1],"-h")
                           || !strcmp(argv[1],"help"))){
+        if(argc<2){ coli_print_launcher_help("Kimi K3"); return 1; }
         k3_usage(argv[0]);
         return argc<2 ? 1 : 0;          /* asking for help is not a failure */
     }
@@ -2702,6 +3229,11 @@ int main(int argc, char **argv){
             (unsigned long long)m.hits,(unsigned long long)(m.hits+m.miss),m.ebytes/1e9);
     fprintf(stderr,"[K3] time: attn %.1fs moe %.1fs (eload %.1fs) head %.1fs | RSS %.1f GB\n",
             m.t_attn,m.t_moe,m.t_eload,m.t_head,rss_gb());
+#ifdef COLI_VULKAN
+    if(g_k3_vk&&g_vk_up_auto)
+        fprintf(stderr,"[K3-VK] fill auto: cap=%d (step %.2fms, upload %.2fms, frac %.2f) | %ld resident\n",
+                g_vk_cap_now,g_vk_step_ema*1e3,g_vk_upload_ema*1e3,g_vk_fill_frac,g_vk_res);
+#endif
     /* One line, every engine, one format: `coli tune` sweeps scheduling knobs and
      * needs tokens-and-elapsed to compare candidates. Before this only colibri
      * emitted a parseable throughput line (REPLAY decode), so the tuner was
@@ -2721,3 +3253,742 @@ int main(int argc, char **argv){
 #endif
     return 0;
 }
+#endif /* KIMI_K3_NO_MAIN */
+
+#ifdef COLI_SEGMENT_ADAPTER
+/* ---------- engine-owned Segment adapter ------------------------------ */
+
+typedef struct {
+    Model model;
+    uint32_t layer_begin, layer_end, context_tokens, state_width, nbmax;
+    pthread_mutex_t run_lock;
+} KimiSegmentEngine;
+
+typedef struct {
+    KimiSegmentEngine *engine;
+    float **kstate, **cwq, **cwk, **cwv;
+    float **Lc, **Rc, **Ic;
+    uint32_t context_tokens, position;
+} KimiSegmentSession;
+
+static void kimi_segment_layer_destroy(Layer *layer) {
+    if (!layer) return;
+    free(layer->in_ln); free(layer->post_ln);
+    free(layer->attn_sw); free(layer->mlp_sw);
+    if (layer->kda) {
+        Kda *a = &layer->a;
+        w_release_host(&a->q); w_release_host(&a->k);
+        w_release_host(&a->v); w_release_host(&a->o);
+        w_release_host(&a->g);
+        free(a->conv_q); free(a->conv_k); free(a->conv_v);
+        free(a->fa); free(a->fb); free(a->bp);
+        free(a->dt); free(a->A); free(a->onw);
+    } else {
+        Mla *a = &layer->m;
+        w_release_host(&a->qa); w_release_host(&a->qb);
+        w_release_host(&a->kva); w_release_host(&a->kvb);
+        w_release_host(&a->o); w_release_host(&a->g);
+        w_release_host(&a->wk); w_release_host(&a->wq);
+        w_release_host(&a->wp);
+        free(a->qa_ln); free(a->kva_ln);
+        free(a->knw); free(a->knb);
+    }
+    if (layer->sparse) {
+        Moe *moe = &layer->moe;
+        free(moe->router); free(moe->rbias); free(moe->lat_norm);
+        w_release_host(&moe->lat_down); w_release_host(&moe->lat_up);
+        w_release_host(&moe->sh_gate); w_release_host(&moe->sh_up);
+        w_release_host(&moe->sh_down);
+    } else {
+        w_release_host(&layer->d_gate); w_release_host(&layer->d_up);
+        w_release_host(&layer->d_down);
+    }
+}
+
+static void kimi_segment_model_destroy(KimiSegmentEngine *engine) {
+    if (!engine) return;
+    Model *model = &engine->model;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        kimi_segment_layer_destroy(&model->L[layer]);
+        if (model->ecache) {
+            LCache *cache = &model->ecache[layer];
+            for (int slot = 0; slot < cache->cap; slot++)
+                free(cache->s[slot].base);
+            free(cache->slot_by_expert); free(cache->s);
+        }
+    }
+    for (size_t slot = 0; slot < sizeof(model->ws) / sizeof(model->ws[0]);
+         slot++)
+        free(model->ws[slot].base);
+    free(model->final_norm); free(model->out_sw);
+    w_release_host(&model->lm_head);
+    free(model->kstate); free(model->cwq); free(model->cwk); free(model->cwv);
+    if (model->Lc || model->Rc) {
+        for (int layer = 0; layer < model->c.n_layers; layer++) {
+            free(model->Lc ? model->Lc[layer] : NULL);
+            free(model->Rc ? model->Rc[layer] : NULL);
+        }
+    }
+    free(model->Lc); free(model->Rc);
+    free(model->dsa_nsel); free(model->dsa_sel);
+    free(model->eref); free(model->ecache); free(model->L);
+    kv_prefix_free(&model->kvp);
+    st_destroy(&model->S);
+}
+
+static int kimi_segment_engine_open(
+    void **engine_impl, ColiSegmentCapabilities *capabilities,
+    const ColiSegmentEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid Kimi K3 Segment open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_SEGMENT_CAP_CPU))
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi K3 Segment currently supports CPU");
+
+    Cfg config;
+    memset(&config, 0, sizeof(config));
+    load_cfg(&config, options->model_dir);
+    if (options->layer_end > (uint32_t)config.n_layers)
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi K3 Segment range exceeds model");
+    uint64_t nbmax = ((uint64_t)config.n_layers + config.res_bs - 1u) /
+                     (uint64_t)config.res_bs;
+    uint64_t state_width = (uint64_t)config.hidden * (1u + nbmax);
+    if (state_width > UINT32_MAX)
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi K3 boundary state is too wide");
+
+    int sparse_layers = 0;
+    for (uint32_t layer = options->layer_begin; layer < options->layer_end;
+         layer++)
+        if (layer >= (uint32_t)config.first_dense) sparse_layers++;
+    int expert_cap = 0;
+    if (options->memory_limit_bytes && sparse_layers) {
+        uint64_t w1p = (uint64_t)config.moe_inter *
+                       ((uint64_t)config.latent / 2u);
+        uint64_t w1s = (uint64_t)config.moe_inter *
+                       ((uint64_t)config.latent / 32u);
+        uint64_t w2p = (uint64_t)config.latent *
+                       ((uint64_t)config.moe_inter / 2u);
+        uint64_t w2s = (uint64_t)config.latent *
+                       ((uint64_t)config.moe_inter / 32u);
+        uint64_t slot_bytes = 2u * (w1p + w1s) + w2p + w2s;
+        uint64_t slots = slot_bytes
+            ? options->memory_limit_bytes / slot_bytes /
+              (uint64_t)sparse_layers : 0;
+        expert_cap = slots > (uint64_t)config.n_experts
+            ? config.n_experts : (int)slots;
+        if (expert_cap < 1) expert_cap = 1;
+    }
+
+    KimiSegmentEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory opening Kimi Segment");
+    engine->layer_begin = options->layer_begin;
+    engine->layer_end = options->layer_end;
+    engine->context_tokens = options->context_tokens;
+    engine->state_width = (uint32_t)state_width;
+    engine->nbmax = (uint32_t)nbmax;
+    if (pthread_mutex_init(&engine->run_lock, NULL)) {
+        free(engine);
+        return coli_segment_adapter_error(error, error_size,
+                                           "cannot initialize Kimi Segment lock");
+    }
+    model_init_range(&engine->model, options->model_dir,
+                     (int)options->layer_begin, (int)options->layer_end,
+                     0, 0, 0, expert_cap, (int)options->context_tokens, 1);
+    free(engine->model.kstate); free(engine->model.cwq);
+    free(engine->model.cwk); free(engine->model.cwv);
+    engine->model.kstate = NULL; engine->model.cwq = NULL;
+    engine->model.cwk = NULL; engine->model.cwv = NULL;
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_SEGMENT_ABI_VERSION;
+    capabilities->flags = COLI_SEGMENT_CAP_SNAPSHOT |
+                          COLI_SEGMENT_CAP_RANGE_NATIVE |
+                          COLI_SEGMENT_CAP_MULTI_SESSION |
+                          COLI_SEGMENT_CAP_CPU;
+    coli_segment_capability_string(capabilities->engine_id,
+                                   sizeof(capabilities->engine_id), "kimi");
+    coli_segment_capability_string(capabilities->state_schema,
+                                   sizeof(capabilities->state_schema),
+                                   "kimi-k3/attnres-kda-mla-dsa-f32-v1");
+    int bits = getenv("K3_BITS") ? atoi(getenv("K3_BITS")) : 4;
+    int mla_bits = getenv("K3_MLA_BITS") ? atoi(getenv("K3_MLA_BITS")) : 8;
+    snprintf(capabilities->numeric_class,
+             sizeof(capabilities->numeric_class),
+             "kimi-k3/q%d-mla%d-mxfp4-idot%d/f32/cpu-v1",
+             bits, mla_bits, g_k3_idot != 0);
+    capabilities->state_dtype = COLI_SEGMENT_DTYPE_F32;
+    capabilities->state_width = engine->state_width;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens = options->context_tokens;
+    capabilities->num_layers = (uint32_t)config.n_layers;
+    *engine_impl = engine;
+    return 0;
+}
+
+static void kimi_segment_engine_destroy(void *engine_impl) {
+    KimiSegmentEngine *engine = (KimiSegmentEngine *)engine_impl;
+    if (!engine) return;
+    kimi_segment_model_destroy(engine);
+    pthread_mutex_destroy(&engine->run_lock);
+    free(engine);
+}
+
+static void kimi_segment_session_free(KimiSegmentSession *session) {
+    if (!session) return;
+    if (session->engine) {
+        for (uint32_t layer = session->engine->layer_begin;
+             layer < session->engine->layer_end; layer++) {
+            free(session->kstate ? session->kstate[layer] : NULL);
+            free(session->cwq ? session->cwq[layer] : NULL);
+            free(session->cwk ? session->cwk[layer] : NULL);
+            free(session->cwv ? session->cwv[layer] : NULL);
+            free(session->Lc ? session->Lc[layer] : NULL);
+            free(session->Rc ? session->Rc[layer] : NULL);
+            free(session->Ic ? session->Ic[layer] : NULL);
+        }
+    }
+    free(session->kstate); free(session->cwq); free(session->cwk);
+    free(session->cwv); free(session->Lc); free(session->Rc);
+    free(session->Ic); free(session);
+}
+
+static int kimi_segment_session_create(
+    void *engine_impl, void **session_impl,
+    const ColiSegmentSessionOptions *options, char *error, size_t error_size) {
+    KimiSegmentEngine *engine = (KimiSegmentEngine *)engine_impl;
+    if (!engine || !session_impl || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid Kimi Segment session");
+    *session_impl = NULL;
+    KimiSegmentSession *session = calloc(1, sizeof(*session));
+    if (!session)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory creating Kimi session");
+    session->engine = engine;
+    session->context_tokens = options->context_tokens;
+    size_t layers = (size_t)engine->model.c.n_layers;
+    session->kstate = calloc(layers, sizeof(*session->kstate));
+    session->cwq = calloc(layers, sizeof(*session->cwq));
+    session->cwk = calloc(layers, sizeof(*session->cwk));
+    session->cwv = calloc(layers, sizeof(*session->cwv));
+    session->Lc = calloc(layers, sizeof(*session->Lc));
+    session->Rc = calloc(layers, sizeof(*session->Rc));
+    session->Ic = calloc(layers, sizeof(*session->Ic));
+    if (!session->kstate || !session->cwq || !session->cwk ||
+        !session->cwv || !session->Lc || !session->Rc || !session->Ic)
+        goto oom;
+
+    Cfg *config = &engine->model.c;
+    uint64_t state_bytes = 0;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++) {
+        size_t cells;
+        if (config->is_kda[layer]) {
+            if (coli_segment_size_mul((size_t)config->kda_heads,
+                                      (size_t)config->kda_hd, &cells) ||
+                coli_segment_size_mul(cells, (size_t)config->kda_hd,
+                                      &cells)) goto oom;
+            session->kstate[layer] = calloc(cells, sizeof(float));
+            if (coli_segment_size_mul((size_t)config->kda_proj,
+                                      (size_t)config->conv_k, &cells)) goto oom;
+            session->cwq[layer] = calloc(cells, sizeof(float));
+            session->cwk[layer] = calloc(cells, sizeof(float));
+            session->cwv[layer] = calloc(cells, sizeof(float));
+            state_bytes += ((uint64_t)config->kda_heads * config->kda_hd *
+                            config->kda_hd + 3u * (uint64_t)cells) *
+                           sizeof(float);
+            if (!session->kstate[layer] || !session->cwq[layer] ||
+                !session->cwk[layer] || !session->cwv[layer]) goto oom;
+        } else {
+            if (coli_segment_size_mul(options->context_tokens,
+                                      (size_t)config->kv_lora, &cells)) goto oom;
+            session->Lc[layer] = calloc(cells, sizeof(float));
+            state_bytes += (uint64_t)cells * sizeof(float);
+            if (coli_segment_size_mul(options->context_tokens,
+                                      (size_t)config->qk_rope, &cells)) goto oom;
+            session->Rc[layer] = calloc(cells, sizeof(float));
+            state_bytes += (uint64_t)cells * sizeof(float);
+            if (config->index_hd > 0 && config->idx_type[layer]) {
+                if (coli_segment_size_mul(options->context_tokens,
+                                          (size_t)config->index_hd,
+                                          &cells)) goto oom;
+                session->Ic[layer] = calloc(cells, sizeof(float));
+                state_bytes += (uint64_t)cells * sizeof(float);
+            }
+            if (!session->Lc[layer] || !session->Rc[layer] ||
+                (config->index_hd > 0 && config->idx_type[layer] &&
+                 !session->Ic[layer])) goto oom;
+        }
+    }
+    if (options->memory_limit_bytes &&
+        state_bytes > options->memory_limit_bytes) {
+        kimi_segment_session_free(session);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi session state exceeds memory limit");
+    }
+    *session_impl = session;
+    return 0;
+
+oom:
+    kimi_segment_session_free(session);
+    return coli_segment_adapter_error(error, error_size,
+                                       "out of memory allocating Kimi state");
+}
+
+static void kimi_segment_session_destroy(void *session_impl) {
+    kimi_segment_session_free((KimiSegmentSession *)session_impl);
+}
+
+static int kimi_segment_session_run(void *session_impl,
+                                    const ColiSegmentRunRequest *request,
+                                    char *error, size_t error_size) {
+    KimiSegmentSession *session = (KimiSegmentSession *)session_impl;
+    if (!session || !request || request->position != session->position)
+        return coli_segment_adapter_error(
+            error, error_size, "Kimi Segment requires contiguous positions");
+    if (request->should_cancel &&
+        request->should_cancel(request->cancel_user_data))
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi Segment run cancelled");
+    KimiSegmentEngine *engine = session->engine;
+    Cfg *config = &engine->model.c;
+    size_t hidden_cells, residual_cells;
+    if (coli_segment_size_mul(request->rows, (size_t)config->hidden,
+                              &hidden_cells) ||
+        coli_segment_size_mul(hidden_cells, (size_t)engine->nbmax,
+                              &residual_cells))
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi boundary state overflows");
+    float *hidden = calloc(hidden_cells, sizeof(float));
+    float *residuals = calloc(residual_cells, sizeof(float));
+    if (!hidden || !residuals) {
+        free(hidden); free(residuals);
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory running Kimi Segment");
+    }
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        memcpy(hidden + (size_t)row * config->hidden,
+               input + (size_t)row * engine->state_width,
+               (size_t)config->hidden * sizeof(float));
+        memcpy(residuals + (size_t)row * engine->nbmax * config->hidden,
+               input + (size_t)row * engine->state_width + config->hidden,
+               (size_t)engine->nbmax * config->hidden * sizeof(float));
+    }
+
+    pthread_mutex_lock(&engine->run_lock);
+    Model *model = &engine->model;
+    model->kstate = session->kstate;
+    model->cwq = session->cwq; model->cwk = session->cwk;
+    model->cwv = session->cwv;
+    model->Lc = session->Lc; model->Rc = session->Rc;
+    model->max_t = (int)session->context_tokens;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++)
+        if (!config->is_kda[layer]) model->L[layer].m.Ic = session->Ic[layer];
+    int nb = ((int)engine->layer_begin + config->res_bs - 1) / config->res_bs;
+    int cancelled = 0;
+    int result = k3_layers_forward_range(
+        model, hidden, residuals, &nb, (int)request->position,
+        (int)request->rows, (int)engine->layer_begin,
+        (int)engine->layer_end, NULL, NULL, &cancelled);
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++)
+        if (!config->is_kda[layer]) model->L[layer].m.Ic = NULL;
+    model->kstate = NULL; model->cwq = NULL; model->cwk = NULL;
+    model->cwv = NULL; model->Lc = NULL; model->Rc = NULL; model->max_t = 0;
+    pthread_mutex_unlock(&engine->run_lock);
+    if (result) {
+        free(hidden); free(residuals);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi Segment layer run failed");
+    }
+
+    float *output = (float *)request->output;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        memcpy(output + (size_t)row * engine->state_width,
+               hidden + (size_t)row * config->hidden,
+               (size_t)config->hidden * sizeof(float));
+        memcpy(output + (size_t)row * engine->state_width + config->hidden,
+               residuals + (size_t)row * engine->nbmax * config->hidden,
+               (size_t)engine->nbmax * config->hidden * sizeof(float));
+    }
+    free(hidden); free(residuals);
+    session->position += request->rows;
+    return 0;
+}
+
+static int kimi_segment_spans(
+    KimiSegmentSession *session, uint32_t position,
+    ColiSegmentStateSpan **spans_output, size_t *count_output,
+    char *error, size_t error_size) {
+    size_t capacity = (size_t)(session->engine->layer_end -
+                               session->engine->layer_begin) * 4u;
+    ColiSegmentStateSpan *spans = capacity
+        ? calloc(capacity, sizeof(*spans)) : NULL;
+    if (capacity && !spans)
+        return coli_segment_adapter_error(error, error_size,
+                                           "out of memory describing Kimi state");
+    Cfg *config = &session->engine->model.c;
+    size_t count = 0;
+    for (uint32_t layer = session->engine->layer_begin;
+         layer < session->engine->layer_end; layer++) {
+        if (config->is_kda[layer]) {
+            size_t rec_cells = (size_t)config->kda_heads * config->kda_hd *
+                               config->kda_hd;
+            size_t conv_cells = (size_t)config->kda_proj * config->conv_k;
+            spans[count++] = (ColiSegmentStateSpan){
+                session->kstate[layer], rec_cells * sizeof(float)};
+            spans[count++] = (ColiSegmentStateSpan){
+                session->cwq[layer], conv_cells * sizeof(float)};
+            spans[count++] = (ColiSegmentStateSpan){
+                session->cwk[layer], conv_cells * sizeof(float)};
+            spans[count++] = (ColiSegmentStateSpan){
+                session->cwv[layer], conv_cells * sizeof(float)};
+        } else {
+            spans[count++] = (ColiSegmentStateSpan){
+                session->Lc[layer],
+                (size_t)position * config->kv_lora * sizeof(float)};
+            spans[count++] = (ColiSegmentStateSpan){
+                session->Rc[layer],
+                (size_t)position * config->qk_rope * sizeof(float)};
+            if (config->index_hd > 0 && config->idx_type[layer])
+                spans[count++] = (ColiSegmentStateSpan){
+                    session->Ic[layer],
+                    (size_t)position * config->index_hd * sizeof(float)};
+        }
+    }
+    *spans_output = spans; *count_output = count;
+    return 0;
+}
+
+static int kimi_segment_session_snapshot(
+    void *session_impl, ColiSegmentWriteFn write_fn, void *write_user_data,
+    char *error, size_t error_size) {
+    KimiSegmentSession *session = (KimiSegmentSession *)session_impl;
+    ColiSegmentStateSpan *spans = NULL;
+    size_t count = 0, payload_bytes;
+    if (!session || kimi_segment_spans(session, session->position, &spans,
+                                       &count, error, error_size))
+        return -1;
+    if (coli_segment_spans_size(spans, count, &payload_bytes)) {
+        free(spans);
+        return coli_segment_adapter_error(error, error_size,
+                                           "Kimi snapshot size overflow");
+    }
+    ColiSegmentSnapshotHeader header;
+    coli_segment_snapshot_header_init(
+        &header, "kimi", session->engine->layer_begin,
+        session->engine->layer_end, session->context_tokens, session->position,
+        payload_bytes, coli_segment_spans_hash(spans, count));
+    int result = coli_segment_stream_write(
+        write_fn, write_user_data, &header, sizeof(header), error, error_size);
+    if (!result)
+        result = coli_segment_spans_write(spans, count, write_fn,
+                                          write_user_data, error, error_size);
+    free(spans);
+    return result;
+}
+
+static int kimi_segment_session_restore(
+    void *session_impl, ColiSegmentReadFn read_fn, void *read_user_data,
+    char *error, size_t error_size) {
+    KimiSegmentSession *session = (KimiSegmentSession *)session_impl;
+    ColiSegmentSnapshotHeader header;
+    if (!session || coli_segment_stream_read(read_fn, read_user_data, &header,
+                                             sizeof(header), error, error_size))
+        return -1;
+    ColiSegmentStateSpan *spans = NULL;
+    size_t count = 0, payload_bytes;
+    if (kimi_segment_spans(session, header.position, &spans, &count,
+                           error, error_size)) return -1;
+    if (coli_segment_spans_size(spans, count, &payload_bytes) ||
+        coli_segment_snapshot_header_valid(
+            &header, "kimi", session->engine->layer_begin,
+            session->engine->layer_end, session->context_tokens,
+            payload_bytes, error, error_size)) {
+        free(spans); return -1;
+    }
+    int result = coli_segment_spans_restore(
+        spans, count, header.payload_hash, read_fn, read_user_data,
+        error, error_size);
+    free(spans);
+    if (!result) session->position = header.position;
+    return result;
+}
+
+static const ColiSegmentAdapter kimi_segment_adapter = {
+    sizeof(ColiSegmentAdapter), COLI_SEGMENT_ABI_VERSION, "kimi",
+    kimi_segment_engine_open, kimi_segment_engine_destroy,
+    kimi_segment_session_create, kimi_segment_session_destroy,
+    kimi_segment_session_run, kimi_segment_session_snapshot,
+    kimi_segment_session_restore, {0}
+};
+
+int coli_kimi_segment_adapter_register(void) {
+    return coli_segment_adapter_register(&kimi_segment_adapter);
+}
+#endif /* COLI_SEGMENT_ADAPTER */
+
+#ifdef COLI_EDGE_ADAPTER
+/* ---------- engine-owned model Edge adapter --------------------------- */
+
+typedef struct {
+    Model model;
+    Tok tokenizer;
+    uint32_t state_width, nbmax;
+} KimiEdgeEngine;
+
+static uint64_t kimi_edge_w_bytes(const W *weight) {
+    uint64_t cells = (uint64_t)weight->O * weight->I;
+    if (weight->fmt == 0) return cells * sizeof(float);
+    if (weight->fmt == 1) return cells + (uint64_t)weight->O * sizeof(float);
+    if (weight->fmt == 2)
+        return (cells + 1u) / 2u + (uint64_t)weight->O * sizeof(float);
+    if (weight->fmt == 4) {
+        uint64_t groups = ((uint64_t)weight->I + weight->gs - 1u) /
+                          (uint64_t)weight->gs;
+        return (cells + 1u) / 2u +
+               (uint64_t)weight->O * groups * sizeof(float);
+    }
+    return 0;
+}
+
+static void kimi_edge_engine_destroy(void *engine_impl) {
+    KimiEdgeEngine *engine = (KimiEdgeEngine *)engine_impl;
+    if (!engine) return;
+    free(engine->model.final_norm); free(engine->model.out_sw);
+    w_release_host(&engine->model.lm_head);
+    st_destroy(&engine->model.S);
+    tok_free(&engine->tokenizer);
+    free(engine);
+}
+
+static int kimi_edge_engine_open(
+    void **engine_impl, ColiEdgeCapabilities *capabilities,
+    const ColiEdgeEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_edge_adapter_error(error, error_size,
+                                       "invalid Kimi K3 Edge open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_EDGE_CAP_CPU))
+        return coli_edge_adapter_error(error, error_size,
+                                       "Kimi K3 Edge supports CPU only");
+    KimiEdgeEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory opening Kimi K3 Edge");
+    Model *model = &engine->model;
+    load_cfg(&model->c, options->model_dir);
+    st_init_multi(&model->S, options->model_dir, getenv("K3_DIRS"));
+    model->pfx[0] = '\0';
+    if (!st_has(&model->S, "model.layers.0.input_layernorm.weight") &&
+        st_has(&model->S,
+               "language_model.model.layers.0.input_layernorm.weight"))
+        snprintf(model->pfx, sizeof(model->pfx), "language_model.");
+    Cfg *config = &model->c;
+    uint64_t nbmax = ((uint64_t)config->n_layers + config->res_bs - 1u) /
+                     (uint64_t)config->res_bs;
+    uint64_t state_width = (1u + nbmax) * (uint64_t)config->hidden;
+    if (!nbmax || state_width > UINT32_MAX) {
+        kimi_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "Kimi K3 boundary state is too wide");
+    }
+    engine->nbmax = (uint32_t)nbmax;
+    engine->state_width = (uint32_t)state_width;
+    g_bits_env = getenv("K3_BITS") != NULL;
+    g_k3_mmap = getenv("K3_MMAP") ? atoi(getenv("K3_MMAP")) : 0;
+    g_k3_idot = getenv("K3_IDOT") ? atoi(getenv("K3_IDOT")) : 1;
+    int head_bits = getenv("K3_HEAD_BITS")
+        ? atoi(getenv("K3_HEAD_BITS")) : 8;
+    char name[512];
+    snprintf(name, sizeof(name), "%smodel.norm.weight", model->pfx);
+    if (!st_has(&model->S, name)) {
+        kimi_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "Kimi K3 final head is not present");
+    }
+    model->has_head = 1;
+    model->final_norm = f32_load(model, "model.norm.weight", config->hidden);
+    float *residual_norm = f32_load(
+        model, "model.output_attn_res_norm.weight", config->hidden);
+    float *residual_projection = f32_load(
+        model, "model.output_attn_res_proj.weight", config->hidden);
+    model->out_sw = falloc(config->hidden);
+    for (int item = 0; item < config->hidden; item++)
+        model->out_sw[item] = residual_norm[item] * residual_projection[item];
+    free(residual_norm); free(residual_projection);
+    w_load(model, &model->lm_head, "lm_head.weight",
+           config->vocab, config->hidden, head_bits);
+    char tokenizer_path[4096];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
+             options->model_dir);
+    tok_load(&engine->tokenizer, tokenizer_path);
+
+    uint64_t resident = kimi_edge_w_bytes(&model->lm_head) +
+                        2u * (uint64_t)config->hidden * sizeof(float);
+    if (options->memory_limit_bytes && resident > options->memory_limit_bytes) {
+        kimi_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "Kimi K3 Edge exceeds memory limit");
+    }
+    int bits = getenv("K3_BITS") ? atoi(getenv("K3_BITS")) : 4;
+    int mla_bits = getenv("K3_MLA_BITS") ? atoi(getenv("K3_MLA_BITS")) : 8;
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_EDGE_ABI_VERSION;
+    capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
+                          COLI_EDGE_CAP_DETOKENIZE |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
+                          COLI_EDGE_CAP_CPU;
+    coli_edge_capability_string(capabilities->engine_id,
+                                sizeof(capabilities->engine_id), "kimi");
+    coli_edge_capability_string(capabilities->state_schema,
+                                sizeof(capabilities->state_schema),
+                                "kimi-k3/attnres-kda-mla-dsa-f32-v1");
+    snprintf(capabilities->numeric_class,
+             sizeof(capabilities->numeric_class),
+             "kimi-k3/q%d-mla%d-mxfp4-idot%d/f32/cpu-v1",
+             bits, mla_bits, g_k3_idot != 0);
+    coli_edge_capability_string(capabilities->tokenizer_class,
+                                sizeof(capabilities->tokenizer_class),
+                                "kimi-k3/rank-byte-bpe-v1");
+    capabilities->state_dtype = COLI_EDGE_DTYPE_F32;
+    capabilities->state_width = engine->state_width;
+    capabilities->vocab_size = (uint32_t)config->vocab;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens = UINT32_MAX;
+    capabilities->num_layers = (uint32_t)config->n_layers;
+    capabilities->bos_token_id = config->bos;
+    capabilities->eos_token_id = config->n_eos ? config->eos[0] : -1;
+    capabilities->resident_bytes = resident;
+    *engine_impl = engine;
+    return 0;
+}
+
+static int kimi_edge_tokenize(
+    void *engine_impl, const char *text, size_t text_bytes,
+    int32_t *token_ids, size_t token_capacity, size_t *token_count,
+    char *error, size_t error_size) {
+    KimiEdgeEngine *engine = (KimiEdgeEngine *)engine_impl;
+    return coli_edge_tok_tokenize(&engine->tokenizer, text, text_bytes,
+                                  token_ids, token_capacity, token_count,
+                                  error, error_size);
+}
+
+static int kimi_edge_detokenize(
+    void *engine_impl, const int32_t *token_ids, size_t token_count,
+    char *text, size_t text_capacity, size_t *text_bytes,
+    char *error, size_t error_size) {
+    KimiEdgeEngine *engine = (KimiEdgeEngine *)engine_impl;
+    return coli_edge_tok_detokenize(&engine->tokenizer, token_ids, token_count,
+                                    text, text_capacity, text_bytes,
+                                    error, error_size);
+}
+
+static int kimi_edge_embed(void *engine_impl,
+                           const ColiEdgeEmbedRequest *request,
+                           char *error, size_t error_size) {
+    KimiEdgeEngine *engine = (KimiEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *output = (float *)request->output;
+    char name[512];
+    snprintf(name, sizeof(name), "%smodel.embed_tokens.weight",
+             engine->model.pfx);
+    for (uint32_t row = 0; row < request->rows; row++) {
+        int token = request->token_ids[row];
+        if (token < 0 || token >= config->vocab)
+            return coli_edge_adapter_error(error, error_size,
+                                           "Kimi K3 token ID is out of range");
+        float *state = output + (size_t)row * engine->state_width;
+        memset(state, 0, (size_t)engine->state_width * sizeof(float));
+        st_read_slice_f32(&engine->model.S, name,
+                          (int64_t)token * config->hidden,
+                          config->hidden, state, 0);
+    }
+    return 0;
+}
+
+static int kimi_edge_select(void *engine_impl,
+                            const ColiEdgeSelectRequest *request,
+                            char *error, size_t error_size) {
+    KimiEdgeEngine *engine = (KimiEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *mixed = falloc(config->hidden);
+    float *logits = falloc(config->vocab);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(logits); free(mixed);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Kimi K3 Edge selection cancelled");
+        }
+        const float *state = input + (size_t)row * engine->state_width;
+        res_mix(mixed, state, state + config->hidden,
+                (int)engine->nbmax, config->hidden,
+                engine->model.out_sw, config->eps);
+        rmsnorm_(mixed, mixed, engine->model.final_norm,
+                 config->hidden, config->eps);
+        w_matmul(logits, mixed, &engine->model.lm_head, 1);
+        if (coli_edge_argmax(logits, (uint32_t)config->vocab,
+                            &request->token_ids[row],
+                            request->scores ? &request->scores[row] : NULL)) {
+            free(logits); free(mixed);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Kimi K3 Edge head failed");
+        }
+    }
+    free(logits); free(mixed);
+    return 0;
+}
+
+static int kimi_edge_logits(void *engine_impl,
+                            const ColiEdgeLogitsRequest *request,
+                            char *error, size_t error_size) {
+    KimiEdgeEngine *engine = (KimiEdgeEngine *)engine_impl;
+    Cfg *config = &engine->model.c;
+    float *mixed = falloc(config->hidden);
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(mixed);
+            return coli_edge_adapter_error(error, error_size,
+                                           "Kimi K3 Edge logits cancelled");
+        }
+        const float *state = input + (size_t)row * engine->state_width;
+        res_mix(mixed, state, state + config->hidden,
+                (int)engine->nbmax, config->hidden,
+                engine->model.out_sw, config->eps);
+        rmsnorm_(mixed, mixed, engine->model.final_norm,
+                 config->hidden, config->eps);
+        w_matmul(request->logits + (size_t)row * config->vocab,
+                 mixed, &engine->model.lm_head, 1);
+    }
+    free(mixed);
+    return 0;
+}
+
+static const ColiEdgeAdapter kimi_edge_adapter = {
+    sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "kimi",
+    kimi_edge_engine_open, kimi_edge_engine_destroy,
+    kimi_edge_tokenize, kimi_edge_detokenize,
+    kimi_edge_embed, kimi_edge_select, kimi_edge_logits, {0}
+};
+
+int coli_kimi_edge_adapter_register(void) {
+    return coli_edge_adapter_register(&kimi_edge_adapter);
+}
+#endif /* COLI_EDGE_ADAPTER */

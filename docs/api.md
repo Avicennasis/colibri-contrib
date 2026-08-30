@@ -54,7 +54,7 @@ exposing the server beyond the machine.
 | GLM-5.2 (`colibri`) | yes | yes | `<tool_call>` blocks |
 | DeepSeek V4 | yes | yes | native DSML tool-call blocks |
 | Inkling | no | no | active tool declarations/choices return HTTP 400 |
-| Kimi K3 | no | no | active tool declarations/choices return HTTP 400 |
+| Kimi K3 | yes | yes | native XTML `tools`/`call`/`argument` blocks (#1143) |
 | OLMoE | no | no | active tool declarations/choices return HTTP 400 |
 
 On supported engines, pass OpenAI `tools` and optionally `tool_choice` to
@@ -276,7 +276,7 @@ telemetry stack — hardware, scheduler, tier bar, per-turn time breakdown, tok/
 trend and per-GPU expert counts:
 
 <p align="center">
-  <img src="media/colibri-mobile.png" width="270" alt="the dashboard on a phone-sized viewport">
+  <img src="media/colibri-mobile.png" width="270" alt="the dashboard on a phone-sized viewport" />
   &nbsp;&nbsp;
-  <img src="media/colibri-metrics.png" width="300" alt="the telemetry sidebar">
+  <img src="media/colibri-metrics.png" width="300" alt="the telemetry sidebar" />
 </p>

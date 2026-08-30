@@ -562,10 +562,80 @@ def parse_dsv4_tool_calls(reply):
     return content.strip(), calls
 
 
-def parse_arch_tool_calls(reply, tools):
+# K3 tool-call XTML carried on the engine-authenticated TOOL sideband (#1147).
+# Older #1144 engines placed the same bytes on DATA; parse_arch_tool_calls keeps
+# that path only when a request did not declare an authoritative sideband.
+K3_TOOLS_OPEN = "<|open|>tools<|sep|>"
+_K3_TOOLS_RE = re.compile(r"<\|open\|>tools<\|sep\|>(.*?)<\|close\|>tools<\|sep\|>", re.DOTALL)
+_K3_CALL_RE = re.compile(
+    r'<\|open\|>call tool="([^"]*)" index="(\d+)"<\|sep\|>(.*?)<\|close\|>call<\|sep\|>', re.DOTALL)
+_K3_ARG_RE = re.compile(
+    r'<\|open\|>argument key="([^"]*)" type="([^"]*)"<\|sep\|>(.*?)<\|close\|>argument<\|sep\|>',
+    re.DOTALL)
+_K3_JSON_RE = re.compile(r'<\|open\|>json type="object"<\|sep\|>(.*?)<\|close\|>json<\|sep\|>',
+                         re.DOTALL)
+
+
+def _k3_unescape_attr(s):
+    return s.replace("&quot;", '"').replace("&amp;", "&")   # &amp; last, mirroring the escape
+
+
+def parse_k3_tool_calls(reply, tools=None):
+    """Return (content, tool_calls) from K3's engine-proven XTML tool block."""
+    calls = []
+    blocks = [m.group(1) for m in _K3_TOOLS_RE.finditer(reply)]
+    text = _K3_TOOLS_RE.sub("", reply)
+    # An opened-but-unclosed tools block (token budget ran out): parse the complete
+    # calls inside it, drop the fragment from the visible text — same recovery
+    # posture as the GLM path's _unclosed_tail.
+    tail_at = text.rfind(K3_TOOLS_OPEN)
+    if tail_at >= 0:
+        blocks.append(text[tail_at + len(K3_TOOLS_OPEN):])
+        text = text[:tail_at]
+    for block in blocks:
+        for m in _K3_CALL_RE.finditer(block):
+            name = _k3_unescape_attr(m.group(1))
+            inner = m.group(3)
+            jm = _K3_JSON_RE.search(inner)
+            if jm is not None:
+                arguments = jm.group(1)
+            else:
+                args = {}
+                for am in _K3_ARG_RE.finditer(inner):
+                    key = _k3_unescape_attr(am.group(1))
+                    typ, val = am.group(2), am.group(3)
+                    if typ == "string":
+                        args[key] = val
+                    else:
+                        try:
+                            args[key] = json.loads(val)
+                        except (json.JSONDecodeError, ValueError):
+                            args[key] = val
+                arguments = json.dumps(args, ensure_ascii=False)
+            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                          "function": {"name": name, "arguments": arguments}})
+    if THINK_CLOSE in text:
+        text = text.split(THINK_CLOSE, 1)[1]
+    text = text.replace(THINK_OPEN, "").replace(THINK_CLOSE, "")
+    if calls:
+        sys.stderr.write("[api] tool-calls: %d total (kimi_k3 XTML)\n" % len(calls))
+        sys.stderr.flush()
+    elif tools and K3_TOOLS_OPEN in reply:
+        sys.stderr.write("[api] K3 tool markers present but no call parsed -- "
+                         "possibly truncated or mangled output\n")
+        sys.stderr.flush()
+    return text.strip(), calls
+
+
+def parse_arch_tool_calls(reply, tools, tool_reply=None):
     """Architecture-appropriate tool-call parser. Returns (content, tool_calls)."""
     if ARCH == "deepseek_v4":
         return parse_dsv4_tool_calls(reply)
+    if ARCH == "kimi":
+        if tool_reply is not None:
+            _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
+            return reply.strip(), calls
+        return parse_k3_tool_calls(reply, tools)  # compatibility with pre-#1147 engines
     return parse_tool_calls(reply, tools)
 
 
@@ -573,6 +643,8 @@ def _tool_stream_markers():
     """Marker(s) that open a model tool-call block, in match order (arch-specific)."""
     if ARCH == "deepseek_v4":
         return ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke")
+    if ARCH == "kimi":
+        return (K3_TOOLS_OPEN,)
     return (BOX_START,)
 
 
@@ -842,6 +914,136 @@ def inkling_content_segments(content, param, audio_out):
     return segments
 
 
+# ---- Kimi K3 tool calling (#1143) ----------------------------------------------------------
+# K3's normative renderer is encoding_k3.py in the checkpoint repo: tools are pure XTML over
+# the four special tokens. The gateway ships typed K3CHAT1 records; kimi_k3.c constructs the
+# XTML (tags/attrs are ordinary text whose segment boundaries are token boundaries).
+#   Y <type-len> <body-len>       typed system message (tool-declare / tool-choice)
+#   O <index> <name-len> <n>      tool-result message
+#   B <think> <nr> <nt> <ncalls>  assistant turn with tool calls, then per call
+#     F <name-len> <nargs>          + nargs of  V <key-len> <type-len> <val-len>
+#     J <name-len> <json-len>       json fallback for an unparseable arguments string
+
+def _k3_xtml_type(value):
+    if isinstance(value, bool): return "boolean"
+    if value is None: return "null"
+    if isinstance(value, (int, float)): return "number"
+    if isinstance(value, str): return "string"
+    if isinstance(value, dict): return "object"
+    return "array"
+
+
+def _k3_parse_arguments(raw):
+    """OpenAI `arguments` -> list of (key, xtml_type, text), or None for the json fallback.
+
+    Mirrors the reference's one-level-deep parse: non-string values keep their exact JSON
+    bytes (1e2 stays 1e2), string values are the decoded string. A dict input is rendered
+    per-argument with compact re-serialization for nested values (no original bytes exist).
+    """
+    if isinstance(raw, dict):
+        return [(k, _k3_xtml_type(v),
+                 v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, separators=(",", ":")))
+                for k, v in raw.items()]
+    if raw is None or raw == "":
+        return []
+    if not isinstance(raw, str):
+        return None
+    s, idx = raw, 0
+    dec = json.JSONDecoder(strict=False)
+    def skip():
+        nonlocal idx
+        while idx < len(s) and s[idx] in " \t\n\r": idx += 1
+    skip()
+    if idx >= len(s) or s[idx] != "{": return None
+    idx += 1; skip()
+    if idx < len(s) and s[idx] == "}": return []
+    out = []
+    try:
+        while True:
+            key, idx = dec.raw_decode(s, idx)
+            if not isinstance(key, str): return None
+            skip()
+            if idx >= len(s) or s[idx] != ":": return None
+            idx += 1; skip()
+            vstart = idx
+            value, idx = dec.raw_decode(s, idx)
+            text = value if isinstance(value, str) else s[vstart:idx]
+            out.append((key, _k3_xtml_type(value), text))
+            skip()
+            if idx >= len(s): return None
+            c = s[idx]; idx += 1; skip()
+            if c == "}": return out
+            if c != ",": return None
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _k3_call_records(tool_calls, where):
+    """K3CHAT1 records for one assistant message's tool_calls (F/V or J per call)."""
+    parts = []
+    for ci, tc in enumerate(tool_calls):
+        if not isinstance(tc, dict):
+            raise APIError(400, "Each tool call must be an object.", f"{where}.{ci}")
+        fn = tc.get("function", tc)
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not isinstance(name, str) or not name or len(name.encode("utf-8")) > 256:
+            raise APIError(400, "Tool call needs a function name (<=256 bytes).",
+                           f"{where}.{ci}.function.name")
+        args = _k3_parse_arguments(fn.get("arguments") if isinstance(fn, dict) else None)
+        nb = name.encode("utf-8")
+        if args is None:
+            js = fn.get("arguments")
+            js = js if isinstance(js, str) else json.dumps(js or {}, ensure_ascii=False)
+            jb = js.encode("utf-8")
+            parts.append(f"J {len(nb)} {len(jb)}\n{name}{js}")
+        else:
+            if len(args) > 64:
+                raise APIError(400, "Too many arguments for one tool call (max 64).",
+                               f"{where}.{ci}.function.arguments")
+            parts.append(f"F {len(nb)} {len(args)}\n{name}")
+            for key, typ, text in args:
+                kb, tb, vb = key.encode("utf-8"), typ.encode("utf-8"), text.encode("utf-8")
+                if len(kb) < 1 or len(kb) > 256:
+                    raise APIError(400, "Argument keys must be 1..256 bytes.",
+                                   f"{where}.{ci}.function.arguments")
+                parts.append(f"V {len(kb)} {len(tb)} {len(vb)}\n{key}{typ}{text}")
+    return parts
+
+
+def _k3_order_tool_results(messages):
+    """Re-sort each run of tool messages into the preceding assistant's tool_calls order,
+    resolving names from tool_call_id — the reference renderer's normalization. A run with
+    any unresolvable id is left untouched (order-based name fallback still applies)."""
+    out, index_map, i = [], {}, 0
+    while i < len(messages):
+        msg = messages[i]
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            index_map = {}
+            for pos, tc in enumerate(msg.get("tool_calls") or [], start=1):
+                if isinstance(tc, dict) and tc.get("id") is not None:
+                    fn = tc.get("function", tc)
+                    nm = fn.get("name") if isinstance(fn, dict) else None
+                    index_map[str(tc["id"])] = (pos, nm)
+            out.append(msg); i += 1; continue
+        if not (isinstance(msg, dict) and msg.get("role") == "tool"):
+            out.append(msg); i += 1; continue
+        run = []
+        while i < len(messages) and isinstance(messages[i], dict) and messages[i].get("role") == "tool":
+            tm = messages[i]
+            hit = index_map.get(str(tm.get("tool_call_id"))) if tm.get("tool_call_id") is not None else None
+            run.append((hit[0] if hit else None, len(run), tm, hit[1] if hit else None))
+            i += 1
+        if any(pos is None for pos, _, _, _ in run):
+            out.extend(tm for _, _, tm, _ in run)
+        else:
+            run.sort()
+            for _, _, tm, nm in run:
+                fixed = dict(tm)
+                if nm: fixed["name"] = nm
+                out.append(fixed)
+    return out
+
+
 def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                      tool_choice=None):
     """Validated multi-turn K3 payload for the C engine.
@@ -852,28 +1054,78 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for the Kimi K3 engine yet.",
-                       "tools", "unsupported_parameter")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name") or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # the client forbade tools: do not offer them
+    messages = _k3_order_tool_results(messages)
     parts = ["K3CHAT1\n"]
+    if tools:
+        body = ("# Tools\nHere are the available tools, described in JSONSchema.\n\n"
+                "```json\n" + json.dumps(tools, ensure_ascii=False, separators=(",", ":"),
+                                         sort_keys=True) + "\n```")
+        parts.append(f"Y 12 {len(body.encode('utf-8'))}\ntool-declare{body}")
+    tool_index = 0
+    last_calls = []
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             raise APIError(400, "Each message must be an object.", f"messages.{index}")
         role = message.get("role")
-        if role not in ("system", "developer", "user", "assistant"):
+        if role not in ("system", "developer", "user", "assistant", "tool"):
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
         raw = message.get("content")
         text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role == "tool":
+            tool_index += 1
+            name = message.get("name") or message.get("tool")
+            if not name and tool_index <= len(last_calls):
+                fn = last_calls[tool_index - 1]
+                fn = fn.get("function", fn) if isinstance(fn, dict) else {}
+                name = fn.get("name")
+            if not isinstance(name, str) or not name:
+                raise APIError(400, "Kimi K3 tool messages need a resolvable tool name: "
+                               "carry `name`, or match a preceding assistant tool_call "
+                               "by id or order.", f"messages.{index}.name")
+            nb = name.encode("utf-8")
+            if len(nb) > 256:
+                raise APIError(400, "Tool name too long (max 256 bytes).", f"messages.{index}.name")
+            parts.append(f"O {tool_index} {len(nb)} {len(text.encode('utf-8'))}\n{name}{text}")
+            continue
         reasoning = message.get("reasoning_content") if role == "assistant" else None
         if reasoning is not None and not isinstance(reasoning, str):
             raise APIError(400, "`reasoning_content` must be a string.",
                            f"messages.{index}.reasoning_content")
-        if role == "assistant" and enable_thinking:
+        calls = message.get("tool_calls") if role == "assistant" else None
+        if role == "assistant":
+            last_calls = calls or []
+            tool_index = 0
+        if calls:
+            if len(calls) > 64:
+                raise APIError(400, "Too many tool calls in one message (max 64).",
+                               f"messages.{index}.tool_calls")
+            reasoning = reasoning or ""
+            parts.append(f"B {1 if enable_thinking else 0} {len(reasoning.encode('utf-8'))} "
+                         f"{len(text.encode('utf-8'))} {len(calls)}\n{reasoning}{text}")
+            parts.extend(_k3_call_records(calls, f"messages.{index}.tool_calls"))
+        elif role == "assistant" and enable_thinking:
             reasoning = reasoning or ""
             parts.append(f"A {len(reasoning.encode('utf-8'))} {len(text.encode('utf-8'))}\n"
                          f"{reasoning or ''}{text}")
         else:
-            parts.append(f"M {role} {len(text.encode('utf-8'))}\n{text}")
+            r = "system" if role == "developer" else role
+            parts.append(f"M {r} {len(text.encode('utf-8'))}\n{text}")
+    if tool_choice == "required" and tools:
+        body = ("The system is invoked with `tool_choice=required`.\n"
+                "You MUST call tools in the next message.")
+        parts.append(f"Y 11 {len(body.encode('utf-8'))}\ntool-choice{body}")
+    elif forced and tools:
+        body = (f"The system is invoked with a forced tool choice.\n"
+                f"You MUST call the tool `{forced}` in the next message.")
+        parts.append(f"Y 11 {len(body.encode('utf-8'))}\ntool-choice{body}")
     parts.append(f"G {1 if enable_thinking else 0}\n")
     return "".join(parts)
 
@@ -1224,13 +1476,245 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
+# ---- immagini per GLM-5.3 ------------------------------------------------------------
+# Il modello vede l'immagine come una sequenza di segnaposto <|image|>, uno per
+# token che la torre produrra': (griglia_h/2) x (griglia_w/2). Il numero non e'
+# negoziabile -- il motore rifiuta se non combacia con gli embedding che riceve --
+# quindi si preprocessa PRIMA di rendere il prompt e si espande il segnaposto al
+# numero giusto. Cosi' il renderer non deve sapere niente di immagini.
+GLM53_IMAGE_OPEN, GLM53_IMAGE, GLM53_IMAGE_CLOSE = (
+    "<|begin_of_image|>", "<|image|>", "<|end_of_image|>")
+
+
+def _image_bytes_from_url(url):
+    """data: URI, file:// o percorso sul disco -> i byte dell'immagine."""
+    if not isinstance(url, str) or not url:
+        raise APIError(400, "image_url.url must be a non-empty string.", "messages")
+    if url.startswith("data:"):
+        head, _, payload = url.partition(",")
+        if "base64" not in head:
+            raise APIError(400, "only base64 data: URIs are supported.", "messages")
+        import base64
+        try:
+            return base64.b64decode(payload, validate=True)
+        except Exception:
+            raise APIError(400, "image_url.url is not valid base64.", "messages")
+    if url.startswith("http://") or url.startswith("https://"):
+        # Scaricare da un URL che arriva in una richiesta vorrebbe dire far fare
+        # al server una chiamata di rete decisa da chi la manda. Non si fa.
+        raise APIError(400, "remote image URLs are not fetched; send the image "
+                            "as a base64 data: URI or a path on this machine.",
+                       "messages")
+    path = url[7:] if url.startswith("file://") else url
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError as problem:
+        raise APIError(400, f"cannot read image {path}: {problem}", "messages")
+
+
+def expand_glm53_images(messages, model_dir):
+    """Sostituisce le parti immagine coi loro segnaposto e ne estrae le patch.
+
+    Restituisce (messaggi riscritti, patch). I messaggi tornano con contenuto
+    testuale puro, quindi il renderer li tratta come qualunque altro turno."""
+    images = []
+    rewritten = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+        pieces = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text":
+                pieces.append(part.get("text", ""))
+            elif kind in ("image_url", "input_image"):
+                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
+                      else part.get("image_url") or part.get("url")
+                data = _image_bytes_from_url(url)
+                patches, grid_h, grid_w = _preprocess_image(data, model_dir)
+                tokens = (grid_h // 2) * (grid_w // 2)
+                images.append((patches, grid_h, grid_w))
+                pieces.append(GLM53_IMAGE_OPEN + GLM53_IMAGE * tokens + GLM53_IMAGE_CLOSE)
+            else:
+                raise APIError(400, f"unsupported content part {kind!r}.", "messages")
+        rewritten.append({**message, "content": "".join(pieces)})
+    return rewritten, images
+
+
+def _preprocess_image(data, model_dir):
+    """L'immagine nelle patch che la torre vuole. Il lavoro sta in
+    tools/glm53_image.py, verificato contro il processore ufficiale."""
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
+        from glm53_image import preprocess
+    except ImportError as problem:
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+                       "messages")
+    return preprocess(data, model_dir)
+
+
+GLM53_TOOL_PREAMBLE = (
+    "<|system|>\n# Tools\n\n"
+    "You may call one or more functions to assist with the user query.\n\n"
+    "You are provided with function signatures within <tools></tools> XML tags:\n"
+    "<tools>\n")
+GLM53_TOOL_EPILOGUE = (
+    "\n</tools>\n\n"
+    "For each function call, output the function name and arguments within the "
+    "following XML format:\n"
+    "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>"
+    "<arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key>"
+    "<arg_value>{arg-value-2}</arg_value>...</tool_call>")
+
+
+def _glm53_tool_json(tool):
+    """Una firma di strumento come la serializza il template di GLM-5.3.
+
+    Le chiavi restano nell'ordine in cui il client le ha mandate, perche' il
+    template itera `tool.items()` e non le riordina; `defer_loading` e `strict`
+    non entrano nel prompt."""
+    if isinstance(tool, dict) and "function" in tool:
+        tool = tool["function"]
+    if not isinstance(tool, dict):
+        raise APIError(400, "each tool must be an object.", "tools")
+    parts = [f'"{key}": {json.dumps(value, ensure_ascii=False)}'
+             for key, value in tool.items()
+             if key not in ("defer_loading", "strict")]
+    return "{" + ", ".join(parts) + "}"
+
+
+def _glm53_tool_block(tools):
+    """Il blocco di dichiarazione, spaziatura compresa.
+
+    Gli a capo non sono decorativi: sono quelli che escono da chat_template.jinja
+    e il test li confronta byte a byte contro jinja2, perche' un prompt che
+    somiglia a quello dell'addestramento non e' quello dell'addestramento."""
+    body = "".join(f"\n{_glm53_tool_json(tool)}\n\n"
+                   for tool in tools
+                   if not (isinstance(tool, dict)
+                           and (tool.get("function", tool) or {}).get("defer_loading")))
+    return GLM53_TOOL_PREAMBLE + body + GLM53_TOOL_EPILOGUE
+
+
+def _glm53_tool_calls(calls):
+    """Le chiamate di un turno assistente passato, nel formato che il modello
+    stesso produce: <tool_call>nome<arg_key>k</arg_key><arg_value>v</arg_value>.
+    Le stringhe passano cosi' come sono, il resto come JSON."""
+    out = []
+    for call in calls or []:
+        if isinstance(call, dict) and "function" in call:
+            call = call["function"]
+        name = (call or {}).get("name", "")
+        arguments = (call or {}).get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                arguments = {}
+        pieces = [f"<tool_call>{name}"]
+        for key, value in (arguments or {}).items():
+            rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            pieces.append(f"<arg_key>{key}</arg_key><arg_value>{rendered}</arg_value>")
+        pieces.append("</tool_call>")
+        out.append("".join(pieces))
+    return "\n" + "".join(out) + "\n" if out else ""
+
+
+def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    """Render the text-only subset of the official GLM-5.3-Flash chat template.
+
+    Not a variant of the GLM-5.2 renderer above, and the differences are not
+    cosmetic. GLM-5.3 emits the reasoning-effort system line ALWAYS, because its
+    template defaults the effort to Max rather than leaving it unset; it accepts
+    only low, high and max, not the six-level ladder; its generation prompt
+    OPENS the reasoning block with a bare `<think>` where 5.2 closed it
+    immediately; and it declares tools with its own preamble and spacing.
+
+    What the two share is how a call comes BACK: both models emit
+    `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`,
+    so the existing parser needs nothing added for this family.
+
+    The whole thing is pinned byte for byte against chat_template.jinja rendered
+    with jinja2 (tests/test_glm53_chat_template.py). Getting the prompt nearly
+    right is the failure mode worth guarding: the model answers either way.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # il client li ha vietati: non si offrono
+
+    # low e high passano, tutto il resto e' Max: e' la scala del template, non
+    # la nostra. `none` non arriva qui, spegne il ragionamento a monte.
+    effort = {"minimal": "Low", "low": "Low", "medium": "High",
+              "high": "High", "xhigh": "Max"}.get(reasoning_effort, "Max")
+    prompt = ["[gMASK]<sop>", f"<|system|>Reasoning Effort: {effort}"]
+    if tools:
+        prompt.append(_glm53_tool_block(tools))
+
+    for message in messages:
+        if not isinstance(message, dict):
+            raise APIError(400, "each message must be an object.", "messages")
+        role = message.get("role")
+        content = message.get("content")
+        if isinstance(content, list):                 # parti multimodali: solo il testo
+            content = "".join(part.get("text", "") for part in content
+                              if isinstance(part, dict) and part.get("type") == "text")
+        content = content or ""
+        if role == "user":
+            prompt.append(f"<|user|>{content}")
+        elif role == "system":
+            prompt.append(f"<|system|>{content}")
+        elif role == "tool":
+            prompt.append(f"<|observation|><tool_response>{content}</tool_response>")
+        elif role == "assistant":
+            reasoning = message.get("reasoning_content")
+            if not isinstance(reasoning, str) and "</think>" in content:
+                reasoning = content.split("</think>")[0].split("<think>")[-1]
+                content = content.split("</think>")[-1]
+            opened = f"<think>{reasoning}</think>" if isinstance(reasoning, str) else "<think></think>"
+            prompt.append(f"<|assistant|>{opened}{content.strip()}"
+                          f"{_glm53_tool_calls(message.get('tool_calls'))}")
+        else:
+            raise APIError(400, f"unsupported message role {role!r}.", "messages")
+
+    # Il prompt di generazione apre il blocco di ragionamento; con il
+    # ragionamento spento lo chiude subito.
+    #
+    # Il template ufficiale conosce solo la prima forma, perche' per lui il
+    # modello ragiona sempre. La seconda pero' non e' inventata: e' esattamente
+    # quello che il template scrive davanti a un turno passato che ragionamento
+    # non ne aveva (<think></think> seguito dal contenuto), quindi e' uno stato
+    # su cui il modello e' stato addestrato e non una posizione mai vista.
+    # Chi vuole il comportamento ufficiale non tocca niente: acceso e' il caso
+    # che combacia col template, ed e' quello che il test confronta.
+    prompt.append("<|assistant|><think>" if enable_thinking else "<|assistant|><think></think>")
+    return "".join(prompt)
+
+
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                          tool_choice=None, audio_out=None):
     """Render a chat request with the active engine's native prompt contract."""
     if ARCH == "inkling":
         return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
                                     tool_choice, audio_out=audio_out)
-    renderer = (render_chat_kimi if ARCH == "kimi" else
+    renderer = (render_chat_glm53 if ARCH == "glm53" else
+                render_chat_kimi if ARCH == "kimi" else
                 render_chat_qwen if ARCH == "qwen36" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
                 render_chat_olmoe if ARCH == "olmoe" else render_chat)
@@ -1244,6 +1728,17 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
 # translation and the response/SSE shapes are new. Claude Code is the reference client.
 
 ANTHROPIC_LOCAL_SIGNATURE = "colibri-local"  # opaque compatibility metadata, not a crypto proof
+
+
+def starts_in_reasoning(enable_thinking):
+    """Se l'uscita del modello comincia DENTRO al blocco di ragionamento.
+
+    Dipende da come il prompt lo ha lasciato, e ogni famiglia lo lascia come
+    dice il suo interruttore: acceso apre il blocco e il modello lo chiude da
+    solo, spento lo chiude gia' il prompt e quello che torna e' risposta pura.
+    Se le due cose non concordano il ragionamento finisce incollato davanti
+    alla risposta, che e' il difetto che questa funzione esiste per non avere."""
+    return enable_thinking
 
 
 class ThinkingStreamSplit:
@@ -1299,7 +1794,7 @@ class ThinkingStreamSplit:
 def split_thinking_reply(text, enable_thinking=True):
     """Return the marker-free (thinking, answer) portions of one GLM reply."""
     thinking, answer = [], []
-    split = ThinkingStreamSplit(thinking.append, answer.append, initial_thinking=enable_thinking)
+    split = ThinkingStreamSplit(thinking.append, answer.append, initial_thinking=starts_in_reasoning(enable_thinking))
     split.feed(text)
     split.finish()
     return "".join(thinking), "".join(answer)
@@ -1607,6 +2102,30 @@ class StopFilter:
     def stopped(self):
         return self.matched is not None
 
+
+class ToolSideband:
+    """Request-scoped K3 TOOL frames with the same stop policy as DATA."""
+    def __init__(self, enabled, sequences, ignore_leading=False):
+        self.enabled = enabled
+        self.seen = False
+        self.parts = []
+        self.filter = (StopFilter(sequences, self.parts.append, ignore_leading)
+                       if enabled else None)
+
+    def feed(self, chunk):
+        self.seen = True
+        self.filter.feed(chunk)
+
+    def stopped(self):
+        return bool(self.filter and self.filter.stopped())
+
+    def finish(self):
+        if self.filter:
+            self.filter.finish()
+
+    def reply(self):
+        return "".join(self.parts) if self.seen else None
+
 def generation_options(body, limit):
     if body.get("n", 1) != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
@@ -1764,7 +2283,7 @@ def model_arch(model):
     return resolve_model(model).descriptor.id
 
 
-def cap_for_arch(arch, cap):
+def cap_for_arch(arch, cap, env=None):
     """Cap-sentinel shim (#379): CURRENT-STATE CALIBRATION, not durable core.
 
     An absent cap (None) means different things across today's engines --
@@ -1786,6 +2305,17 @@ def cap_for_arch(arch, cap):
     -> this shim must be removed and re-derived."""
     if cap is not None:
         return cap
+    # A measured profile records the exact argv cap used during calibration.
+    # The launcher passes it privately through the server process because cap
+    # is not an engine environment knob.  It remains below an explicit --cap
+    # in the precedence chain and is removed before the engine starts.
+    if env is not None:
+        try:
+            measured = int(env.get("COLI_PROFILE_CAP", ""))
+        except (TypeError, ValueError):
+            measured = 0
+        if measured >= 1:
+            return measured
     return family_by_id(arch).limits.implicit_cap
 
 
@@ -1938,11 +2468,14 @@ class Engine:
             family = (resolve_model(model).descriptor if config.exists()
                       else family_by_id(ARCH))
         arch = family.id
+        self.model_dir = str(model)
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
+        resolved_cap = cap_for_arch(arch, cap, child_env)
+        child_env.pop("COLI_PROFILE_CAP", None)
         self.process = subprocess.Popen(
-            [str(executable), str(cap_for_arch(arch, cap))], env=child_env,
+            [str(executable), str(resolved_cap)], env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
         )
         # Keep the job handle on the instance: KILL_ON_JOB_CLOSE fires when the
@@ -2038,7 +2571,14 @@ class Engine:
                 if not fields:
                     continue
                 kind = fields[0]
-                if kind == "DATA" and len(fields) == 3:
+                if kind == "DATA" and len(fields) >= 3:
+                    # 3 fields: the legacy frame. More: the U7a per-token
+                    # numeric channel ("DATA <id> <n> <lp> <k> [tid tlp]*k"),
+                    # emitted only for requests that opted in via the SUBMIT
+                    # logprobs field. The payload framing is identical; the
+                    # numeric fields are consumed by the server feature half
+                    # (U7b) -- accepted here so the frame never kills the
+                    # dispatcher (and with it every in-flight request).
                     request_id = fields[1]
                     size = int(fields[2])
                     if not 0 <= size <= 65536:
@@ -2051,6 +2591,34 @@ class Engine:
                         events = self.pending.get(request_id)
                     if events is not None:
                         events.put(("data", data))
+                elif kind == "TOOL" and len(fields) == 3:
+                    # Opaque, request-scoped structured output. K3 emits an
+                    # initial zero-byte frame before generation so DATA marker
+                    # lookalikes can never be mistaken for engine structure.
+                    request_id = fields[1]
+                    size = int(fields[2])
+                    if not 0 <= size <= 65536:
+                        raise RuntimeError("invalid engine TOOL size")
+                    data = self._read_exact(size)
+                    if self._read_exact(1) != b"\n":
+                        raise RuntimeError("invalid engine TOOL terminator")
+                    with self.pending_lock:
+                        events = self.pending.get(request_id)
+                    if events is not None:
+                        events.put(("tool", data))
+                elif kind == "ECHO" and len(fields) >= 6:
+                    # U7a prefill read-out: "ECHO <id> <n> <pos> <lp> <k>
+                    # [tid tlp]*k" plus a DATA-framed payload (n bytes + LF).
+                    # Emitted only for opted-in requests; no current request
+                    # path opts in, so the frame is read (to keep the stream
+                    # in sync) and dropped -- U7b delivers it to the response
+                    # assembly when it wires the opt-in.
+                    size = int(fields[2])
+                    if not 0 <= size <= 65536:
+                        raise RuntimeError("invalid engine DATA size")
+                    self._read_exact(size)
+                    if self._read_exact(1) != b"\n":
+                        raise RuntimeError("invalid engine DATA terminator")
                 elif kind == "ACCEPT" and len(fields) >= 3:
                     # #597: the engine validated the submission (fits context) before prefill.
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the
@@ -2130,7 +2698,8 @@ class Engine:
                 self._fail_pending(error)
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
+                 on_tool=None, image=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -2146,11 +2715,19 @@ class Engine:
         if gpayload and apayload:
             raise APIError(400, "Grammar and audio cannot be combined.", "response_format")
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        tool_decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
         def decode(data):
             text = decoder.decode(data)
             if text:
                 on_text(text)
+
+        def decode_tool(data):
+            text = tool_decoder.decode(data)
+            if on_tool is not None:
+                # Call on zero-byte frames too: that frame declares this
+                # request's sideband authoritative even when no call follows.
+                on_tool(text)
 
         events = queue.Queue()
         with self.pending_lock:
@@ -2187,6 +2764,16 @@ class Engine:
             with self.write_lock:
                 if self.process.poll() is not None:
                     raise RuntimeError("colibri engine is not running")
+                # Le patch sono binarie e grosse: viaggiano in un frame loro,
+                # annunciato subito prima del SUBMIT a cui appartengono. Deve
+                # partire dentro lo stesso lock, o un'altra richiesta potrebbe
+                # infilarsi in mezzo e prendersi l'immagine di questa.
+                if image is not None:
+                    patches, grid_h, grid_w = image
+                    blob = patches.tobytes() if hasattr(patches, "tobytes") else patches
+                    self.process.stdin.write(
+                        f"IMAGE {request_id} {len(blob)} {grid_h} {grid_w}\n".encode()
+                        + blob + b"\n")
                 self.process.stdin.write(header + payload + xpayload + b"\n")
                 self.process.stdin.flush()
         except Exception:
@@ -2253,6 +2840,20 @@ class Engine:
                         with self.write_lock:
                             self.process.stdin.write(f"CANCEL {request_id}\n".encode())
                             self.process.stdin.flush()
+            elif kind == "tool":
+                _accept({"prompt_tokens": None})
+                if not cancel_sent and not stop_sent:
+                    decode_tool(value)
+                    if stopped and stopped():
+                        stop_sent = True
+                        with self.write_lock:
+                            self.process.stdin.write(f"STOP {request_id}\n".encode())
+                            self.process.stdin.flush()
+                    elif cancelled and cancelled():
+                        cancel_sent = True
+                        with self.write_lock:
+                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                            self.process.stdin.flush()
             elif kind == "done":
                 _accept({"prompt_tokens": None})
                 if cancel_sent:
@@ -2264,6 +2865,9 @@ class Engine:
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     on_text(tail)
+                tool_tail = tool_decoder.decode(b"", final=True)
+                if tool_tail and on_tool is not None:
+                    on_tool(tool_tail)
                 return value
             elif cancel_sent and isinstance(value, RuntimeError) and str(value) == "CANCELLED":
                 raise ClientCancelled()
@@ -2281,8 +2885,17 @@ class Engine:
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
+                # A large resident cache (e.g. 111 GB at --memory-gb 126) can
+                # take longer than the grace period to unmap and free on
+                # SIGTERM. SIGKILL cannot be caught, so the process is already
+                # on its way out; a second timeout only means the reap has not
+                # landed yet. Teardown is best-effort: never raise from here, or
+                # a completed measurement is lost to a shutdown that succeeded.
                 self.process.kill()
-                self.process.wait(timeout=5)
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         if self.dispatcher is not threading.current_thread():
             self.dispatcher.join(timeout=5)
 
@@ -2883,7 +3496,7 @@ class APIHandler(BaseHTTPRequestHandler):
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
-                   enable_thinking=False, audio=None):
+                   enable_thinking=False, audio=None, image=None):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -2937,11 +3550,20 @@ class APIHandler(BaseHTTPRequestHandler):
             if not stream:
                 output = []
                 stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop)
+                sideband = ToolSideband(ARCH == "kimi" and chat and bool(tools),
+                                        stop_sequences, ignore_leading_stop)
+
+                def generation_stopped():
+                    return stop_filter.stopped() or sideband.stopped()
+
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
-                    **({"audio": audio} if audio else {}))
+                    self.client_disconnected, grammar=grammar, stopped=generation_stopped,
+                    **({"on_tool": sideband.feed} if sideband.enabled else {}),
+                    **({"audio": audio} if audio else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
+                sideband.finish()
                 text = "".join(output)
                 reasoning = ""
                 if ARCH == "inkling":
@@ -2953,7 +3575,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning, text = split_thinking_reply(text, enable_thinking)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
-                    content, calls = parse_arch_tool_calls(text, tools)
+                    content, calls = parse_arch_tool_calls(text, tools, sideband.reply())
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if reasoning:
                         message["reasoning_content"] = reasoning
@@ -3080,8 +3702,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 sp = {"buf": "", "tool": False}
                 hold = _tool_hold()
                 raw = []
+                sideband = ToolSideband(ARCH == "kimi", stop_sequences,
+                                        ignore_leading_stop)
+
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
+                    if sideband.seen:
+                        emit(chunk)
+                        return
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
@@ -3099,23 +3727,31 @@ class APIHandler(BaseHTTPRequestHandler):
                 # #597: keep GLM reasoning out of the tool-call buffer — a think splitter sends it
                 # to reasoning_content and passes only the answer text on to feed_content/parser.
                 think = (ThinkingStreamSplit(emit_reasoning, feed_content,
-                                             initial_thinking=enable_thinking)
+                                             initial_thinking=starts_in_reasoning(enable_thinking))
                          if glm_think else None)
                 def emit_tools(chunk):
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
                     (think.feed if think else feed_content)(chunk)
                 stop_filter = StopFilter(stop_sequences, emit_tools, ignore_leading_stop)
+
+                def generation_stopped():
+                    return stop_filter.stopped() or sideband.stopped()
+
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
-                    on_accept=start_stream, **({"audio": audio} if audio else {}))
+                    self.client_disconnected, grammar=grammar, stopped=generation_stopped,
+                    **({"on_tool": sideband.feed} if sideband.enabled else {}),
+                    on_accept=start_stream, **({"audio": audio} if audio else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
+                sideband.finish()
                 if think:
                     think.finish()
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_arch_tool_calls("".join(raw), tools)
+                _content, calls = parse_arch_tool_calls("".join(raw), tools,
+                                                        sideband.reply())
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -3127,7 +3763,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     content_split = splitter
                 elif glm_think:                            # GLM <think> reasoning → reasoning_content
                     content_split = ThinkingStreamSplit(emit_reasoning, emit,
-                                                        initial_thinking=enable_thinking)
+                                                        initial_thinking=starts_in_reasoning(enable_thinking))
                 else:
                     content_split = None
                 def emit_plain(chunk):
@@ -3138,7 +3774,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
-                    on_accept=start_stream, **({"audio": audio} if audio else {}))
+                    on_accept=start_stream, **({"audio": audio} if audio else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
@@ -3207,11 +3844,24 @@ class APIHandler(BaseHTTPRequestHandler):
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         audio_clips = [] if ARCH == "inkling" else None
-        prompt = render_chat_for_arch(body.get("messages"), enable_thinking, reasoning_effort,
+        messages = body.get("messages")
+        # Le immagini diventano segnaposto PRIMA del rendering: il renderer
+        # tratta poi turni di solo testo, e il conto dei segnaposto e quello
+        # degli embedding non possono divergere.
+        image = None
+        if ARCH == "glm53":
+            messages, images = expand_glm53_images(
+                messages, getattr(self.server.engine, "model_dir", None))
+            if len(images) > 1:
+                raise APIError(400, "one image per request for now; the engine "
+                                    "holds a single pending image.", "messages")
+            image = images[0] if images else None
+        prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
                                       tools, tool_choice, audio_out=audio_clips)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking,
-                        audio=b"".join(audio_clips) if audio_clips else None)
+                        audio=b"".join(audio_clips) if audio_clips else None,
+                        image=image)
 
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
     ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
@@ -3274,7 +3924,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`stream` must be a boolean.", "stream")
         message_id = "msg_" + uuid.uuid4().hex[:24]
 
-        def blocks_and_stop(text, stats):
+        def blocks_and_stop(text, stats, tool_reply=None):
             """Split a finished reply into Anthropic content blocks + stop_reason."""
             content = []
             reasoning = ""
@@ -3287,7 +3937,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                 "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
             if tools:
-                text, calls = parse_arch_tool_calls(text, tools)
+                text, calls = parse_arch_tool_calls(text, tools, tool_reply)
             if text:
                 content.append({"type": "text", "text": text})
             for call in calls:
@@ -3307,11 +3957,20 @@ class APIHandler(BaseHTTPRequestHandler):
             if not stream:
                 output = []
                 stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop)
+                sideband = ToolSideband(ARCH == "kimi" and bool(tools), stop_sequences,
+                                        ignore_leading_stop)
+
+                def generation_stopped():
+                    return stop_filter.stopped() or sideband.stopped()
+
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped)
+                    self.client_disconnected, grammar=grammar, stopped=generation_stopped,
+                    **({"on_tool": sideband.feed} if sideband.enabled else {}))
                 stop_filter.finish()
-                content, stop_reason = blocks_and_stop("".join(output), stats)
+                sideband.finish()
+                content, stop_reason = blocks_and_stop("".join(output), stats,
+                                                       sideband.reply())
                 self.send_json(200, {
                     "id": message_id, "type": "message", "role": "assistant",
                     "model": self.server.model_id, "content": content,
@@ -3375,6 +4034,8 @@ class APIHandler(BaseHTTPRequestHandler):
             ka_thread.start()
 
             raw = []
+            sideband = ToolSideband(ARCH == "kimi" and bool(tools), stop_sequences,
+                                    ignore_leading_stop)
             state = {"buf": "", "in_tool": False}
             hold = _tool_hold()
 
@@ -3390,6 +4051,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
             def emit_answer(chunk):
                 if not tools:
+                    emit_text(chunk)
+                    return
+                if sideband.seen:
                     emit_text(chunk)
                     return
                 if state["in_tool"]:
@@ -3425,18 +4089,27 @@ class APIHandler(BaseHTTPRequestHandler):
                                            emit_thinking if enable_thinking else None,
                                            close_thinking if enable_thinking else None)
             else:
+                # Anche qui: su GLM-5.3 il blocco e' aperto dal prompt, quindi
+                # lo splitter serve pure col ragionamento "spento", o il
+                # pensiero finisce incollato davanti alla risposta.
                 split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
-                         if enable_thinking else None)
+                         if starts_in_reasoning(enable_thinking) else None)
 
             def on_text(chunk):
                 raw.append(chunk)
                 (split.feed if split else emit_answer)(chunk)
 
             stop_filter = StopFilter(stop_sequences, on_text, ignore_leading_stop)
+
+            def generation_stopped():
+                return stop_filter.stopped() or sideband.stopped()
+
             stats = self.server.engine.generate(
                 prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                lambda: not connected[0], grammar=grammar, stopped=stop_filter.stopped)
+                lambda: not connected[0], grammar=grammar, stopped=generation_stopped,
+                **({"on_tool": sideband.feed} if sideband.enabled else {}))
             stop_filter.finish()
+            sideband.finish()
             if split:
                 split.close()
                 close_thinking()               # budget exhaustion before </think>
@@ -3448,7 +4121,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 send_event("content_block_stop", {"type": "content_block_stop",
                                                   "index": text_index})
 
-            content, stop_reason = blocks_and_stop("".join(raw), stats)
+            content, stop_reason = blocks_and_stop("".join(raw), stats,
+                                                   sideband.reply())
             index = text_index + 1 if stream_state["text_started"] else 1
             for block in content:
                 if block["type"] != "tool_use":

@@ -22,12 +22,14 @@ tests/bench_omp_grain
 tests/mxfp4_ref.o
 mxfp4_cuda_test
 absorb_determinism_test
+cuda_fmt_trap_test
 tests/*.dSYM/
 tests/test_dsa_select
 tests/test_i4_grouped
 tests/test_kv_alloc
 tests/test_kv_disk
 tests/test_kv_fp8
+tests/test_kv_tq
 tests/test_logit_nan
 tests/test_sample_nan
 tests/test_stops
@@ -44,3 +46,8 @@ tests/test_inkling_serve_framing
 *.dll
 cublasLt64*.dll
 cudart64*.dll
+glm53
+qwen36
+shaders/attention_absorb.spv
+shaders/qmatmul_gate_up.spv
+shaders/rmsnorm.spv
