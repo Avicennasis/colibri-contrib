@@ -65,7 +65,11 @@ static int qwen36_max_ctx(void) {
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
+#include "qwen36_qpack.h"  /* optional MLX-affine qpack routed-expert path */
 #include "affine_quant.h"  /* MLX affine dense triples in model.safetensors */
+#ifdef COLI_METAL
+#include "backend_metal.h" /* coli_metal_init: affine pipelines for the store */
+#endif
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
 #include "segment_adapters.h"
@@ -2195,8 +2199,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     memset(out, 0, (int64_t)S*D*sizeof(float));
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
     float *sh = falloc(I), *shu = falloc(I), *shd = falloc(D);  /* shared expert scratch */
-    int use_qt = qt_ready();
-    int use_xf = !use_qt && xf_mode(m);
+    /* When a qpack container owns the routed experts, they run through
+     * the MLX-affine path (Metal on Apple, CPU reference elsewhere);
+     * neither the CUDA tier nor the expert_ffn kernel is consulted.
+     * Routing, shared expert, and the combine stay on the CPU below. */
+    int use_qq = qq_active();
+    int use_qt = !use_qq && qt_ready();
+    int use_xf = !use_qq && !use_qt && xf_mode(m);
     int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
     float *xval = use_xf ? falloc((int64_t)S * K) : NULL;
     for (int s = 0; s < S; s++) {
@@ -2249,7 +2258,20 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
         const float *xs = x + (int64_t)s*D;
-        if (use_xf) {
+        if (use_qq) {
+            /* A failed expert is fatal: once the container owns the routed
+             * experts there is no other weight source to fall back to, and a
+             * silently skipped expert would just be a wrong answer. */
+            for (int kk = 0; kk < K; kk++) {
+                if (idx[kk] < 0) continue;
+                if (!qq_expert_forward(layer, idx[kk], xs, val[kk],
+                                       out + (int64_t)s*D)) {
+                    fprintf(stderr, "qpack expert layer %d expert %d failed"
+                            " -- refusing\n", layer, idx[kk]);
+                    exit(1);
+                }
+            }
+        } else if (use_xf) {
             for (int kk = 0; kk < K; kk++) { xidx[s*K+kk] = idx[kk]; xval[s*K+kk] = val[kk]; }
         } else if (use_qt) {
             /* CUDA expert tier: run the resident experts as async groups on
@@ -3306,9 +3328,56 @@ int main(int argc, char **argv) {
                 g_qdw_n, now_s()-tq, freed/1073741824.0);
     }
 
+    /* QWEN36_QPACK=<dir> hands the routed experts to a Swiftlet qpack
+     * container through the MLX-affine path (Metal on Apple builds, CPU
+     * reference elsewhere).  A mismatched or unsupported container is a
+     * refusal, not a silent fallback to the snapshot experts. */
+    const char *qq_dir = getenv("QWEN36_QPACK");
+    if (qq_dir && *qq_dir) {
+        char qq_err[256];
+#ifdef COLI_METAL
+        /* Compile the Metal affine pipelines BEFORE the store opens.  The
+         * store dispatches through coli_metal_matmul_affine_slot, which is
+         * gated on coli_metal_affine_available() -- i.e. on pipelines that
+         * only coli_metal_init() compiles.  The parity gates call it in
+         * their own main; the ENGINE never did, so a METAL=1 build ran every
+         * real-model routed projection on the CPU affine reference while
+         * looking identical apart from qq_counts (measured: metal=0
+         * cpu=37440 on the first 35B smoke).  Not a refusal when
+         * unavailable: the CPU reference is the documented oracle arm, but
+         * it must be CHOSEN (QWEN36_QPACK_SYNC / qq_force_cpu) or loudly
+         * reported, never a silent default. */
+        if (coli_metal_init())
+            fprintf(stderr, "[qpack] Metal affine pipelines ready\n");
+        else
+            fprintf(stderr, "[qpack] Metal unavailable -- routed experts"
+                    " fall back to the CPU affine reference\n");
+#endif
+        /* QWEN36_QPACK_SLOTS=<n> bounds the refillable expert slot pool
+         * (0/unset = the default in qwen36_qpack.c, clamped to the container
+         * total either way). */
+        const char *qq_slots_env = getenv("QWEN36_QPACK_SLOTS");
+        if (qq_slots_env && *qq_slots_env)
+            qq_set_slot_count(atoi(qq_slots_env));
+        if (!qq_open(qq_dir, m.c.n_layers, m.c.n_experts, m.c.hidden,
+                     m.c.inter, qq_err, sizeof(qq_err))) {
+            fprintf(stderr, "[qpack] %s: %s\n", qq_dir, qq_err);
+            return 1;
+        }
+        atexit(qq_close);
+        {
+            int qq_slots = 0;
+            qq_slot_stats(&qq_slots, NULL, NULL);
+            fprintf(stderr, "[qpack] routed experts <- MLX affine container"
+                    " %s (%d bounded slots)\n", qq_dir, qq_slots);
+        }
+    }
+
     /* Optional CUDA VRAM expert tier (COLI_CUDA=1): hot experts live in
      * DEVICE_LOCAL memory across the configured GPUs, misses fall back to the
-     * CPU int8 path. See qwen36_tier.h. */
+     * CPU int8 path. See qwen36_tier.h. Skipped when the qpack container owns
+     * the routed experts: the tier would warmstart-load the snapshot experts
+     * moe() no longer computes. */
     /* Formato degli esperti dalla TAGLIA SU DISCO del primo, non da meta.ebits:
      * esiste un container i8 il cui meta dichiara ebits=4 (stesso motivo per cui
      * il loader piu' sopra guarda nbytes). Il tier ne ha bisogno prima di
@@ -3346,8 +3415,8 @@ int main(int argc, char **argv) {
                 qt_trunk_offer("dnproj", i, (size_t)(O_qkv + O_z) * m.c.hidden + (size_t)(O_qkv + O_z) * sizeof(float));
         }
     }
-    if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
-                m.c.expert_gs, expert_is_int4)) {
+    if (!qq_active() && qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
+                                m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
         atexit(qt_shutdown);
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The

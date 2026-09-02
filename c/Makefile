@@ -1072,8 +1072,16 @@ QWEN36_TIER_SRC =
 QWEN36_CFLAGS   = $(NOCUDA_CFLAGS)
 QWEN36_LDFLAGS  = $(NOCUDA_LDFLAGS)
 endif
-qwen36$(EXE): qwen36.c affine_quant.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h st.h json.h compat.h omp_tune.h kv_prefix.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
-	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
+# Apple METAL=1 engine builds also compile the qpack MLX-affine routed-
+# expert path (activated at runtime by QWEN36_QPACK=<container dir>); other
+# builds keep the inline stubs in qwen36_qpack.h and change nothing.
+QWEN36_QPACK_SRC =
+ifeq ($(METAL),1)
+QWEN36_QPACK_SRC = qwen36_qpack.c qpack.c
+QWEN36_CFLAGS  += -DQWEN36_QPACK
+endif
+qwen36$(EXE): qwen36.c affine_quant.h serve_poll.h cli_args.h qwen36_tier.h qwen36_qpack.h expert_ffn.h st.h json.h compat.h omp_tune.h kv_prefix.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(QWEN36_QPACK_SRC) $(CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(QWEN36_QPACK_SRC) $(CUDA_OBJ) $(METAL_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
 # stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
@@ -1141,6 +1149,13 @@ tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c expert_ffn.h qwen3
 
 tests/test_qwen36_dense_batch$(EXE): tests/test_qwen36_dense_batch.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
+# CPU gate: the qpack MLX-affine routed-expert glue (qwen36_qpack.c)
+# against the portable affine reference, on a synthesized container -- no
+# GPU, every platform. The Apple parity twin (Metal vs CPU reference on a
+# real Swiftlet-generated fixture) is the qwen36-metal-test target.
+tests/test_qwen36_qpack$(EXE): tests/test_qwen36_qpack.c qwen36.c qwen36_qpack.c qwen36_qpack.h qpack.c qpack.h affine_quant.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(METAL_OBJ)
+	$(CC) $(QWEN36_CFLAGS) -DQWEN36_QPACK $< qwen36_qpack.c qpack.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(METAL_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
 tests/test_qwen36_json_escape$(EXE): tests/test_qwen36_json_escape.c qwen36.c expert_ffn.h qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
