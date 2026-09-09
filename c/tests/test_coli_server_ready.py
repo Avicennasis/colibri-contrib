@@ -2,6 +2,7 @@
 surface the child's real exit reason when it dies during load, and refuse /
 name half-alive servers (HTTP up, engine dead — FreeToken supervisor.py pattern,
 issues #110/#123 class)."""
+import os
 from importlib.machinery import SourceFileLoader
 import importlib.util
 import time
@@ -35,6 +36,7 @@ class FakeChild:
 
 
 class ChildExitReasonTest(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "Windows has no SIGKILL; the code's 'signal 9' fallback is the correct answer there (#51279)")
     def test_signal_death_names_the_oom_killer(self):
         self.assertEqual(coli._child_exit_reason(FakeChild(-9)), "killed by SIGKILL")
 
