@@ -54,12 +54,14 @@ class WaitServerReadyTest(unittest.TestCase):
             return coli.wait_server_ready(child, "http://127.0.0.1:8000",
                                           poll_s=0.01, timeout_s=timeout_s, health=health)
 
+    @unittest.skipIf(os.name == "nt", "Windows has no SIGKILL; the signal-9 fallback is correct there (#51279)")
     def test_child_death_during_load_surfaces_the_reason(self):
         mid, why = self._ready(FakeChild(-9), lambda: None)
         self.assertIsNone(mid)
         self.assertIn("killed by SIGKILL", why)
         self.assertIn("while loading", why)
 
+    @unittest.skipIf(os.name == "nt", "Windows has no SIGKILL; the signal-9 fallback is correct there (#51279)")
     def test_half_alive_server_is_named(self):
         # The child lives, /health answers ok -- with engine=dead. This is the
         # case the old loop could only ever reach "timed out" on.
@@ -86,6 +88,7 @@ class WaitServerReadyTest(unittest.TestCase):
 
 
 class ServerProbeTest(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "Windows has no SIGKILL; the signal-9 fallback is correct there (#51279)")
     def test_refuses_half_alive_server(self):
         health = {"status": "ok", "engine": "dead", "engine_reason": "killed by SIGKILL"}
         with mock.patch.object(coli, "_server_health", return_value=health), \
@@ -103,6 +106,7 @@ class ServerProbeTest(unittest.TestCase):
 
 
 class WatchServerTest(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "Windows has no SIGKILL; the signal-9 fallback is correct there (#51279)")
     def test_names_engine_death_mid_session(self):
         child = FakeChild(None)
         health = {"status": "ok", "engine": "dead", "engine_reason": "killed by SIGKILL"}
