@@ -5,6 +5,7 @@ group signalling, PSS via smaps_rollup. Ported from FreeToken's daemon osproc.py
 The reuse tests double as mutation tests: delete the starttime comparison (or the
 pgid==pid assertion) and the corresponding test below fails, because the fixture
 presents exactly the recycled-pid / foreign-group case the guard exists for."""
+import os
 from importlib.machinery import SourceFileLoader
 import importlib.util
 import tempfile
@@ -87,6 +88,7 @@ class PidReuseGuardTest(unittest.TestCase):
             self.assertFalse(coli._pid_is_same_process(4242, 999777))
 
 
+@unittest.skipIf(os.name == "nt", "POSIX process groups: os.getpgrp/killpg do not exist on Windows")
 class GroupSignalTest(unittest.TestCase):
     def _signal(self, pgid, own_pgrp=999, killpg_error=None, kill_error=None):
         killpg = mock.Mock(side_effect=killpg_error)
