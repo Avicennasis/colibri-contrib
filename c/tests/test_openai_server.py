@@ -1,5 +1,6 @@
 import http.client
 import io
+import os
 import json
 import math
 import socket
@@ -1171,6 +1172,7 @@ class EngineLivenessTest(unittest.TestCase):
     from FreeToken supervisor.py: the real death reason must win over the generic
     "exited unexpectedly" (an OOM-kill must not read like a gateway bug)."""
 
+    @unittest.skipIf(os.name == "nt", "Windows has no SIGKILL; the signal-9 fallback is correct there (#51279)")
     def test_load_death_surfaces_the_reason_on_stderr(self):
         process = FakeProcess(lambda p, f: None)
         process.stdout.buffer.clear()              # unseed the READY sentinel:
@@ -1182,6 +1184,7 @@ class EngineLivenessTest(unittest.TestCase):
                 Engine("glm", "model")
         self.assertIn("engine terminated during load: killed by SIGKILL", stderr.getvalue())
 
+    @unittest.skipIf(os.name == "nt", "Windows has no SIGKILL; the signal-9 fallback is correct there (#51279)")
     def test_post_ready_death_is_recorded_and_announced(self):
         released = threading.Event()
 
