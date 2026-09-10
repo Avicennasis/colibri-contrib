@@ -24,8 +24,13 @@ USO:
   python3 tools/convert_fp8_to_int4.py --selftest
   # reale: scarica+converte+cancella shard per shard
   python3 tools/convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 --outdir /path/to/glm52_i4
+
+EN: a finished conversion is fingerprinted (file list + size + mtime/blob id + the resolved
+quant parameters) in the outdir, so rerunning it on unchanged sources skips instead of
+walking the container; --force redoes it. COLI_CONVERT_PROGRESS=1 adds parseable
+`COLICONVERT <phase> <done> <total>` lines for a supervising process.
 """
-import os, sys, glob, json, shutil, argparse, threading
+import os, sys, glob, hashlib, json, shutil, argparse, threading
 import numpy as np
 
 
@@ -125,6 +130,59 @@ def _positioned_write(fd, data, offset):
             if written == 0:
                 raise OSError("write returned zero bytes")
             remaining = remaining[written:]
+
+
+# ---------- machine-readable progress + source fingerprint () ----------
+# Ported from FreeToken checkpoint/convert.py (_progress, _source_fingerprint:32-56).
+
+def _progress(phase, done=0, total=0):
+    """One parseable line per step for a supervising process: `COLICONVERT <phase>
+    <done> <total>`. Gated by COLI_CONVERT_PROGRESS=1 so a plain CLI run is not
+    spammed and every human line above stays byte-identical. Phases: scan (total
+    known), shard (one per shard, converted or resumed), uptodate (fingerprint hit,
+    nothing to do), done, interrupted. The env is read per call, not cached at
+    import: a supervisor that re-execs this converter can turn it on for one run."""
+    if os.environ.get("COLI_CONVERT_PROGRESS") == "1":
+        print(f"COLICONVERT {phase} {done} {total}", flush=True)
+
+
+def _write_json_atomic(path, obj):
+    tmp = path + ".tmp"                              # a resume never sees a half-written file
+    with open(tmp, "w") as f: json.dump(obj, f, indent=1)
+    os.replace(tmp, path)
+
+
+def source_signatures(paths):
+    """size:mtime per LOCAL source shard. stat only — no read, no hash of 5 GB."""
+    return {os.path.basename(p): f"{os.stat(p).st_size}:{int(os.stat(p).st_mtime)}"
+            for p in sorted(paths)}
+
+
+def source_fingerprint(sigs, params):
+    """One short hash over (file list + per-file signature + the RESOLVED conversion
+    parameters). FreeToken hashes the GPU compute capability in too because its nvfp4
+    layout depends on it; our packing is CPU-side and ISA-independent (the bit-exactness
+    gate), so the parameters are the whole story on our side."""
+    h = hashlib.sha256()
+    h.update(json.dumps(params, sort_keys=True, default=str).encode() + b"|")
+    for name in sorted(sigs):
+        h.update(f"{name}:{sigs[name]}|".encode())
+    return h.hexdigest()[:16]
+
+
+def read_source_cache(outdir, prefix):
+    try:
+        with open(os.path.join(outdir, f".{prefix}source.json")) as f: return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_source_cache(outdir, prefix, sigs, fingerprint, complete):
+    """Cached in the OUTPUT dir, so the container carries the identity of what built it.
+    complete=False until the last shard lands: an interrupted run must never be skipped."""
+    _write_json_atomic(os.path.join(outdir, f".{prefix}source.json"),
+                       {"fingerprint": fingerprint, "complete": bool(complete),
+                        "files": sigs})
 
 
 # ---------- quantizzazione: identica al C (glm.c) ----------
@@ -553,6 +611,11 @@ def main():
              "is ~5.5s per expert matrix single-threaded; other quant modes are fast and "
              "stay serial). Works on both --indir and the --repo disk-safe path. "
              "Untested in combination with --workers>1; use one or the other.")
+    ap.add_argument("--force", action="store_true",
+        help="reconvert even when the cached source fingerprint says this outdir already "
+             "holds the conversion of these exact sources with these exact parameters. "
+             "Also clears the per-shard resume, so every shard is converted again "
+             "(on --repo that means downloading them again).")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--selftest-nvfp4", action="store_true",
         help="unit-test del dequant NVFP4 (LUT e2m1 + round-trip), nessun download / no network")
@@ -745,7 +808,8 @@ def main():
         prog_path = os.path.join(a.outdir, f".{prefix}progress.json")
         prog = {}
         if os.path.exists(prog_path):
-            try: prog = json.loads(open(prog_path).read())
+            try:
+                with open(prog_path) as f: prog = json.loads(f.read())
             except (OSError, ValueError): prog = {}
             if prog and prog.get("params") != params:
                 print(f"ERROR: {prog_path} records a conversion with {prog.get('params')};\n"
@@ -754,6 +818,31 @@ def main():
                       f"{prefix}*.safetensors shards to redo).")
                 return
         done = prog.setdefault("shards", {}); prog["params"] = params
+        # SOURCE FINGERPRINT (FreeToken checkpoint/convert.py:32-56): the file
+        # list + each file's size and mtime + the resolved parameters, hashed and cached
+        # in the outdir. Two things the per-shard manifest above cannot do. A finished
+        # conversion re-run on unchanged sources exits at once instead of walking the
+        # container. And a source shard that CHANGED under a half-finished run gets
+        # reconverted instead of being skipped as "done" -- the manifest keys on file
+        # NAME, which a re-downloaded or repaired shard reuses.
+        sigs = source_signatures(shards)
+        fingerprint = source_fingerprint(sigs, params)
+        cached = read_source_cache(a.outdir, prefix)
+        if cached.get("fingerprint") == fingerprint and cached.get("complete") and not a.force:
+            print(f"[SKIP] {a.outdir} already holds the conversion of these exact sources "
+                  f"({len(shards)} shard(s), fingerprint {fingerprint}) — pass --force to redo it.")
+            _progress("uptodate", len(shards), len(shards))
+            return
+        if a.force:
+            done.clear()                              # --force: redo every shard, not just unskip
+        stale = sorted(k for k, sig in sigs.items()
+                       if cached.get("files", {}).get(k, sig) != sig)
+        for k in stale: done.pop(k, None)
+        if stale:
+            print(f"[SOURCE] {len(stale)} source shard(s) changed since the last run "
+                  f"({', '.join(stale[:3])}{', ...' if len(stale) > 3 else ''}): reconverting them")
+        write_source_cache(a.outdir, prefix, sigs, fingerprint, False)
+        _progress("scan", 0, len(shards))
         n = 0; fresh = 0; skipped = 0
         import time as _t
         t_start = _t.time()
@@ -775,6 +864,7 @@ def main():
             if prev is not None and (prev == "" or os.path.exists(os.path.join(a.outdir, prev))):
                 if prev: n += 1
                 skipped += 1
+                _progress("shard", i + 1, len(shards))
                 continue
             # Progress + ETA: the local pass can run for days on a big model (E8 on
             # GLM-5.2 is ~50 h split across workers), and without this the loop is
@@ -784,6 +874,7 @@ def main():
                 per = (_t.time() - t_start) / fresh
                 eta = f", ETA {per * (len(shards) - i) / 3600:.1f} h"
             print(f"[{i + 1}/{len(shards)}] {key} ({free_gb(a.outdir):.0f} GB free{eta})", flush=True)
+            _progress("shard", i + 1, len(shards))
             if _result_it is not None:
                 _ri, out = next(_result_it)               # parallel: converted by a worker, in shard order
             else:
@@ -797,9 +888,7 @@ def main():
                 name = f"{prefix}{n:05d}.safetensors"
                 _save_file_atomic(save_file, out, os.path.join(a.outdir, name))
                 done[key] = name; n += 1; fresh += 1
-            tmp_prog = prog_path + ".tmp"                 # scrittura atomica: una ripresa non vede mai un manifest mezzo scritto
-            with open(tmp_prog, "w") as f: json.dump(prog, f, indent=1)   # EN: atomic write: a resume never sees a half-written manifest
-            os.replace(tmp_prog, prog_path)
+            _write_json_atomic(prog_path, prog)       # scrittura atomica: una ripresa non vede mai un manifest mezzo scritto
         if _pool is not None:
             _pool.close(); _pool.join()
         if skipped: print(f"[RESUME] {skipped} shard(s) already done in {a.outdir}, skipped")
@@ -819,8 +908,12 @@ def main():
             if missing:
                 print(f"[META] WARNING: not found in {a.indir}: {', '.join(missing)}"
                       + (" — chat/serve need tokenizer.json" if "tokenizer.json" in missing else ""))
+        # Every shard converted AND the metadata copied: only now may a later run skip on
+        # this fingerprint. An interrupt anywhere above leaves complete=False behind.
+        write_source_cache(a.outdir, prefix, sigs, fingerprint, True)
         tag = "MTP" if a.mtp else "indexer" if a.indexer else "main"
         print(f"converted {fresh} {tag} shard(s), {n} in container -> {a.outdir} ({prefix}NNNNN)")
+        _progress("done", len(shards), len(shards))
         return
 
     # reale: scarica shard per shard, converte, cancella
@@ -1112,12 +1205,45 @@ def main():
               "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
               "proj_bits": dict(PROJ_BITS)}
     if not check_or_record_params(a.outdir, "out-", params): return
+    # SOURCE FINGERPRINT), the remote twin of the --indir path's. A repo has no
+    # mtime, so a file's signature is its size plus the store's blob id -- repo_info
+    # (files_metadata=True, fetched above for the segmented downloader) already carries
+    # both, so this costs no extra request. Unlike --indir this only SKIPS or WARNS: the
+    # download path has no input->output manifest, so a shard whose remote bytes changed
+    # cannot be surgically redone here. Say which ones moved and leave the container
+    # alone; --force (re-downloads everything) or a fresh --outdir is the operator's call.
+    # The --mtp/--indexer passes are 1-3 shards and skip on output existence, so they
+    # stay as they were.
+    wanted = set(shards)
+    sigs = {s.rfilename: f"{s.size}:{getattr(s, 'blob_id', None) or ''}"
+            for s in info.siblings if s.rfilename in wanted}
+    fingerprint = source_fingerprint(sigs, params)
+    cached = read_source_cache(a.outdir, "out-")
+    if cached.get("fingerprint") == fingerprint and cached.get("complete") and not a.force:
+        print(f"[SKIP] {a.outdir} already holds the conversion of {a.repo} at these exact "
+              f"revisions ({len(shards)} shard(s), fingerprint {fingerprint}) — "
+              f"pass --force to redo it.")
+        _progress("uptodate", len(shards), len(shards))
+        return
+    moved = sorted(k for k, sig in sigs.items() if cached.get("files", {}).get(k, sig) != sig)
+    mixed = bool(moved) and not a.force
+    if moved:
+        print(f"[SOURCE] WARNING: {len(moved)} shard(s) changed in {a.repo} since this outdir "
+              f"was built ({', '.join(moved[:3])}{', ...' if len(moved) > 3 else ''}). Already "
+              f"converted output is NOT redone — rerun with --force or a fresh --outdir.")
+    write_source_cache(a.outdir, "out-", sigs, fingerprint, False)
+    _progress("scan", 0, len(shards))
+    stopped = False
     for i, sh in enumerate(shards):
         if free_gb(a.outdir) < a.min_free_gb:
-            print(f"STOP: free space is below {a.min_free_gb} GB. Free space and rerun to resume."); break
+            print(f"STOP: free space is below {a.min_free_gb} GB. Free space and rerun to resume.")
+            stopped = True; break
         outp = os.path.join(a.outdir, f"out-{i:05d}.safetensors")
-        if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
+        if os.path.exists(outp) and not a.force:
+            _progress("shard", i + 1, len(shards))
+            continue                                      # gia' fatto -> ripartibile
         print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
+        _progress("shard", i + 1, len(shards))
         p = download_retry(a.repo, sh, tmp)
         out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
         _save_file_atomic(save_file, out, outp)
@@ -1126,7 +1252,16 @@ def main():
             if os.path.isfile(blob): os.remove(blob)
         print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB)", flush=True)
     shutil.rmtree(tmp, ignore_errors=True)
-    print("DONE." if i == len(shards)-1 else "INTERRUPTED (rerun to resume).")
+    # Only a pass that actually reached the end may be skipped by the next run. Stopping
+    # ON the last shard for lack of disk left i == len(shards)-1 too, which used to print
+    # DONE for an unfinished container -- with a fingerprint behind it that would then be
+    # skipped for good. A run that left shards built from superseded remote bytes (`mixed`)
+    # does not get the marker either: the next run warns again instead of declaring a match.
+    complete = i == len(shards)-1 and not stopped
+    if complete and not mixed:
+        write_source_cache(a.outdir, "out-", sigs, fingerprint, True)
+    _progress("done" if complete else "interrupted", i + 1, len(shards))
+    print("DONE." if complete else "INTERRUPTED (rerun to resume).")
 
 if __name__ == "__main__":
     main()

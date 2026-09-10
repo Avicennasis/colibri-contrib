@@ -1375,6 +1375,7 @@ static int g_kv8_gs=0;                          /* KV8_GS=<n>: one scale per n l
                                                  * 512-dim latent). 0 = per-row (unchanged). */
 static int g_tq=0, g_tq_bits=4, g_tq_codec=1;   /* KV_TQ: codec 1=rotated int4 (default), 0=PolarQuant */
 #include "kv_persist.h"
+#include "kv_anchor.h"                            /* multi-state prefix reuse per serve slot */
 #include "telemetry.h"
 
 /* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
@@ -8466,8 +8467,102 @@ static void repin_pass_limit(Model *m,int limit){
  * append lascia nrec vecchio = file coerente. La riga KV del layer MTP non si salva:
  * al resume kv_start=-1 e la finestra di draft riparte da sola. */
 
-typedef struct { KVState kv; int *hist, len, first; } ServeCtx;
+typedef struct { KVState kv; int *hist, len, first;
+                 kv_anchor_ring anch;   /* states this slot still remembers */
+               } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
+static void ram_rebalance_boundary(Model *m,int maxctx);   /* def accanto a mem_available_gb */
+static int  idle_shrink_poll(Model *m,int maxctx);         /* def accanto a ram_rebalance_boundary */
+static int  idle_poll_wanted(void);
+static void idle_mark(int active);
+static int g_mux_boundary=0;   /* un request e' appena finito nel path MUX */
+/* stato dell'idle shrink. Vive qui e non accanto alle sue funzioni
+ * perche' run_serve_mux (piu' sotto ma prima di quelle) legge g_idle_poll_s per
+ * decidere il timeout del select. Il commento che spiega il meccanismo sta con
+ * le funzioni, vicino a ram_rebalance_boundary. */
+static int g_idle_shrink =
+#ifdef __APPLE__
+    0;                          /* memoria unificata: liberare sotto pressione e' swap-death */
+#else
+    1;
+#endif
+static double g_idle_after_s = 600.0;   /* IDLE_SHRINK_MIN (minuti), default 10 */
+static double g_idle_poll_s  = 15.0;    /* IDLE_SHRINK_POLL_S: granularita' del risveglio */
+static int    g_idle_unpin   = 0;       /* IDLE_SHRINK_UNPIN=1: molla anche il tier AUTOPIN */
+static double g_idle_since   = 0;       /* quando la coda si e' svuotata (0 = non idle) */
+static int    g_idle_shrunk  = 0;       /* latch: uno shrink per periodo di idle */
+/* Il cronometro parte solo DOPO la prima richiesta servita. Un engine appena
+ * avviato e mai usato non e' "abbandonato", e' "in attesa": la sua LRU e' ancora
+ * VUOTA, quindi stringere li' non libera praticamente niente (la densa e i pin
+ * sono il pavimento, non si toccano) e in cambio lo lascia con ecap al minimo
+ * PER SEMPRE — il gateway riavviato alle 3 di notte servirebbe tutto il giorno
+ * dopo con la cache castrata. Costo reale, beneficio nullo: si aspetta traffico.
+ * EN: the idle clock only starts after the first served request -- a
+ * EN: never-used engine has an empty LRU, so shrinking frees nothing and
+ * EN: permanently caps the cache it has not had a chance to fill yet. */
+static int    g_idle_served  = 0;
+
+/* anchor policy. Opt-in: an anchor is a COPY of the KV rows it covers
+ * (~217 KB per position on GLM-5.2), so arming this by default would quietly
+ * price a second KV pool into every serve. COLI_KV_ANCHOR=<slots> arms it;
+ * COLI_KV_ANCHOR_MB caps the ring's total (default 1024 MB, and one anchor
+ * larger than the whole cap is simply not taken).
+ * COLI_KV_ANCHOR_TOK=<id> overrides the tool-call opener the turn-end capture
+ * keys on; -1 disables that capture and leaves only the prompt-end one. */
+static int    g_kvanchor=-1;
+static size_t g_kvanchor_budget=0;
+static int    g_kvanchor_tok=-2;                 /* -2 = unresolved, -1 = off */
+
+static int kvanchor_slots(void){
+    if(g_kvanchor<0){
+        const char *e=getenv("COLI_KV_ANCHOR");
+        g_kvanchor = e?atoi(e):0;
+        if(g_kvanchor<0) g_kvanchor=0;
+        if(g_kvanchor>64) g_kvanchor=64;
+        const char *mb=getenv("COLI_KV_ANCHOR_MB");
+        long v = mb?atol(mb):1024;
+        if(v<0) v=0;
+        g_kvanchor_budget=(size_t)v*1024u*1024u;
+    }
+    return g_kvanchor;
+}
+
+/* The three position-addressed KV families this engine keeps, as the generic
+ * planes kv_anchor.h copies. Lc/Rc carry the extra MTP row (n_layers+1); Ic is
+ * per-attention-layer only and exists solely under DSA, with holes for the
+ * layers that reuse a neighbour's index -- kv_anchor.h skips NULL planes. */
+static int kvanchor_planes(Model *m, KVState *k, kv_anchor_plane *pl){
+    Cfg *c=&m->c; int n=0;
+    pl[n++]=(kv_anchor_plane){k->Lc,c->n_layers+1,c->kv_lora};
+    pl[n++]=(kv_anchor_plane){k->Rc,c->n_layers+1,c->qk_rope};
+    if(m->has_dsa && k->Ic) pl[n++]=(kv_anchor_plane){k->Ic,c->n_layers,c->index_hd};
+    return n;
+}
+
+/* The tool-call opener, resolved from the model's own tokenizer rather than
+ * hardcoded (GLM-5.2: <tool_call> = 154843). An agent's NEXT prompt is this
+ * reply verbatim plus the tool result, so the state at the end of a tool-call
+ * turn is the one worth remembering -- FreeToken's "semantic anchor", except
+ * keyed off a token the tokenizer actually reports. COLI_KV_ANCHOR_TOK
+ * overrides it; -1 leaves only the prompt-end capture. */
+static void kvanchor_arm_tok(Tok *T){
+    if(g_kvanchor_tok!=-2) return;
+    const char *e=getenv("COLI_KV_ANCHOR_TOK");
+    if(e){ g_kvanchor_tok=atoi(e); return; }
+    g_kvanchor_tok=tok_id_of(T,"<tool_call>");
+    if(g_kvanchor_tok<0) g_kvanchor_tok=-1;
+}
+
+/* Remember the state this slot holds right now (positions 0..len). Called at
+ * prompt end -- the boundary the client re-sends verbatim next turn -- and at
+ * turn end when the reply carried a tool-call opener. */
+static void kvanchor_capture(Model *m, ServeCtx *s, int len, const char *why){
+    if(!s->anch.n || len<=0 || len>s->kv.max_t) return;
+    kv_anchor_plane pl[3]; int npl=kvanchor_planes(m,&s->kv,pl);
+    if(kv_anchor_store(&s->anch,s->hist,len,pl,npl))
+        fprintf(stderr,"[API] KV anchor store %s=%d (ring %d/%d, %.1f MB)\n",
+                why,len,(int)s->anch.stores,s->anch.n,s->anch.bytes/1048576.0);
+}
 
 static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, int maxctx){
     s->kv.kv_start=calloc(m->c.n_layers+1,sizeof(int));
@@ -8479,6 +8574,8 @@ static void serve_ctx_init(Model *m, ServeCtx *s, const char *snap, int slot, in
     if(slot==0) snprintf(s->kv.disk_path,sizeof(s->kv.disk_path),"%s/.coli_kv",snap);
     else snprintf(s->kv.disk_path,sizeof(s->kv.disk_path),"%s/.coli_kv.%d",snap,slot);
     s->len=kv_disk_load(m,s->hist,maxctx); if(s->len>0) s->first=0;
+    int anch_n=kvanchor_slots();     /* sets g_kvanchor_budget; argument order is unspecified */
+    kv_anchor_ring_init(&s->anch,anch_n,g_kvanchor_budget);
 }
 
 static void serve_ctx_free(Model *m, ServeCtx *s){
@@ -8491,6 +8588,7 @@ static void serve_ctx_free(Model *m, ServeCtx *s){
     if(k->Ic) for(int i=0;i<m->c.n_layers;i++) free(k->Ic[i]);
     free(k->Lc); free(k->Rc); free(k->Lc8); free(k->Rc8); free(k->Lsc); free(k->Rsc);
     free(k->Ic); free(k->kv_start); free(s->hist);
+    kv_anchor_ring_free(&s->anch);
 }
 
 typedef struct {
@@ -8504,6 +8602,9 @@ typedef struct {
                                             top-k count from SUBMIT logprobs=k; 0 = off */
     float temp, top_p;
     double started;
+    double prefill_s;                   /* wall time of the prefill step() call --
+                                           the expert-cache work DONE now reports (0 before
+                                           first submit; memset covers every path) */
     uint64_t hits0, miss0;
     ProfBase pb;                         /* phase-time window start (same convention as hits0):
                                             feeds the PROF protocol line and the PROF=1 report */
@@ -8682,10 +8783,17 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
            edisk_s()-r->pb.edisk,m->t_ewait-r->pb.ewait,m->t_emm-r->pb.emm,
            m->t_attn-r->pb.attn,m->t_head-r->pb.head,
            (unsigned long long)(m->n_fw-r->pb.n_fw));
-    printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d\n",r->id,r->emitted,
+    printf("DONE %llu STAT %d %.2f %.1f %.2f %d %d %.3f\n",r->id,r->emitted,
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
-           r->prompt_tokens,r->length_limited);
+           r->prompt_tokens,r->length_limited,r->prefill_s);
     fflush(stdout); kv_bind(m,&sc->kv); kv_disk_append(m,sc->hist,sc->len);
+    /* a reply that opened a tool call is about to be resent to us as
+     * history. Remember the state that produced it before the next prompt --
+     * possibly a different conversation on this same slot -- overwrites it. */
+    if(sc->anch.n && g_kvanchor_tok>=0 && sc->len>r->prompt_tokens){
+        for(int i=r->prompt_tokens;i<sc->len;i++)
+            if(sc->hist[i]==g_kvanchor_tok){ kvanchor_capture(m,sc,sc->len,"tool_call"); break; }
+    }
     /* PROF window = this request's lifetime; with KV_SLOTS>1 concurrent slots
      * share the batched forwards, so the shares describe the engine, not the
      * single request (same convention as the STAT hit%% above). */
@@ -8693,6 +8801,10 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     if(r->spec_logit){ free(r->spec_logit); r->spec_logit=NULL; }
     r->spec=0;
     r->active=0;
+    g_mux_boundary=1;                    /* run_serve_mux reads this at the top of its
+                                          * loop, where no forward is in flight (see there). */
+    g_idle_served=1;                     /* da adesso il silenzio conta come abbandono
+                                          * (prima della prima richiesta e' solo attesa). */
 }
 
 /* Read and prefill one request. Returns -1 on EOF, 0 for a rejected frame and
@@ -8821,6 +8933,32 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     if(!echo) while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
+    /* anchors. The slot now holds the longest prefix its OWN last state
+     * agrees with. A remembered state may agree for longer -- the conversation
+     * that was interleaved off this slot, the branch the agent abandoned and
+     * came back to, the prompt end whose reply the client re-rendered. Same
+     * strict-prefix rule as above, evaluated against the ring instead of only
+     * the live state, so an installed anchor is rows the engine would have
+     * computed from these exact ids at these exact positions: bit-exact by
+     * construction, never an approximation of an edit.
+     * Placed BEFORE the cross-slot adopt because production serve runs
+     * KV_SLOTS=1 (openai_server.py), where adoption cannot fire at all; when
+     * both are armed the adopt then extends whatever the anchor restored. */
+    if(sc->anch.n){
+        int ai=kv_anchor_match(&sc->anch,tmp,nt,sc->len);
+        if(ai>=0){
+            const int *aids=kv_anchor_ids(&sc->anch,ai);
+            kv_anchor_plane pl[3]; int npl=kvanchor_planes(m,&sc->kv,pl);
+            int from=sc->len, alen=kv_anchor_restore(&sc->anch,ai,pl,npl,from);
+            if(alen>from){
+                memcpy(sc->hist+from,aids+from,(size_t)(alen-from)*sizeof(int));
+                sc->len=alen;
+                if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;   /* MTP rows are decode state */
+                fprintf(stderr,"[API] KV anchor hit: slot %d restored rows [%d,%d)\n",
+                        sub.slot,from,alen);
+            }
+        }
+    }
     /* Cross-slot prefix adoption (COLI_KV_SHARE=1) — RadixAttention's benefit
      * at memcpy cost: if another slot's history shares a longer prefix with
      * this prompt (shared system prompt, agent loop), copy its KV rows instead
@@ -8854,7 +8992,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
                     memcpy(coli_kv_row(sc->kv.Rc[l],from,cc->qk_rope),
                            coli_kv_row(dn->kv.Rc[l],from,cc->qk_rope),
                            (size_t)n*cc->qk_rope*sizeof(float));
-                if(sc->kv.Ic&&dn->kv.Ic&&sc->kv.Ic[l]&&dn->kv.Ic[l])
+                if(l<cc->n_layers&&sc->kv.Ic&&dn->kv.Ic&&sc->kv.Ic[l]&&dn->kv.Ic[l])
                     memcpy(coli_kv_row(sc->kv.Ic[l],from,cc->index_hd),
                            coli_kv_row(dn->kv.Ic[l],from,cc->index_hd),
                            (size_t)n*cc->index_hd*sizeof(float));
@@ -8870,14 +9008,22 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);
+    /* the prefill compute -- the only forwards between ACCEPT and the
+     * first decoded token. Anchor restore / cross-slot adopt above are memcpys,
+     * not compute, so they are deliberately outside this window. Upstream's
+     * echo path is prefill too, so it belongs inside the window. */
+    double pf0=now_s();
     float *logit = echo ? mux_prefill_echo(m,T,sub.id,sc->hist,nt,sub.logprobs)
                         : add>0 ? step(m,sc->hist+sc->len,add,sc->len)
                                 : step(m,sc->hist+sc->len-1,1,sc->len-1);
+    double pf_s=now_s()-pf0;
     sc->len+=add; sc->first=0;
+    kvanchor_capture(m,sc,sc->len,"prompt_end");   /* the boundary the client resends */
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
     r->logprobs=sub.logprobs;
-    r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
+    r->prompt_tokens=nt; r->started=now_s(); r->prefill_s=pf_s;
+    r->hits0=m->hits; r->miss0=m->miss;
     prof_base(m,&r->pb);                 /* a few loads: cheap enough to always track */
     /* Clamp to the KV room WITHOUT flagging: length_limited must mean "the
      * limit is what stopped us", not "the request asked for more than the
@@ -8912,6 +9058,14 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
+    kvanchor_arm_tok(&T);
+    /* the loop name is part of the marker on purpose. shipped a
+     * feature wired only into run_serve and nothing noticed, because a marker
+     * both loops emit cannot say which one ran -- and production is THIS one
+     * (openai_server.py spawns with SERVE_BATCH=1). */
+    if(kvanchor_slots())
+        fprintf(stderr,"[KV] anchors armed (mux): %d slot(s)/ctx, %.0f MB cap, tool_tok=%d\n",
+                kvanchor_slots(),g_kvanchor_budget/1048576.0,g_kvanchor_tok);
     int maxctx=getenv("CTX")?atoi(getenv("CTX")):4096;
     int nctx=getenv("KV_SLOTS")?atoi(getenv("KV_SLOTS")):1;
     if(nctx<1||nctx>512){fprintf(stderr,"KV_SLOTS must be between 1 and 512\n");exit(2);}
@@ -8954,7 +9108,24 @@ static void run_serve_mux(Model *m, const char *snap){
          * ends. With no active request select() blocks with a NULL timeout, so the
          * EINTR from an un-restarted SIGTERM is what wakes us to reach this line. */
         if(g_shutdown) break;
+        /* THE serve request boundary for the production path. `coli serve`
+         * runs run_serve_mux (openai_server.py spawns the engine with SERVE_BATCH=1),
+         * never run_serve, so the rebalance has to live here too. Top of the loop is
+         * the safe point: step_decode_batch has returned, no expert pointer is held
+         * by this thread, and the pilot is covered by rss_guard's g_pilot_mx/eslot_busy
+         * discipline — the same contract repin_pass relies on. One step per completed
+         * request: mux_done raises the flag, we consume it exactly once. */
+        if(g_mux_boundary){ g_mux_boundary=0; ram_rebalance_boundary(m,maxctx); }
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
+        /* la coda e' vuota o no. Da qui parte il cronometro dell'idle;
+         * riempirsi riarma il latch ma non rialza mai il budget. */
+        idle_mark(active);
+        /* e qui si CONSUMA il risveglio che ci siamo procurati sotto —
+         * scaduto il select idle si guarda l'orologio, e se il silenzio dura da
+         * abbastanza il budget scende al pavimento. Stesso safe point del
+         * rebalance qui sopra (nessun forward in volo), e per definizione
+         * nessuna richiesta attiva. */
+        if(!active) idle_shrink_poll(m,maxctx);
         /* Poll stdin for available input without blocking. On POSIX this is
          * select(); on Windows, select() on a pipe handle routes to winsock
          * and always returns -1 (SOCKET_ERROR), so the batch loop could never
@@ -8964,7 +9135,18 @@ static void run_serve_mux(Model *m, const char *snap){
         if(!eof){
 #if defined(__APPLE__) || defined(__linux__) ||	defined(__FreeBSD__)
             fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
-            struct timeval tv={0,0}, *ptv=active?&tv:NULL;
+            /* QUESTA riga e' il feature. A coda vuota il timeout era
+             * NULL — il loop dormiva finche' non arrivava una richiesta, quindi
+             * un engine abbandonato non poteva accorgersi di essere abbandonato
+             * (l'engine non ha thread timer). Finche' resta uno shrink da fare
+             * il select idle prende un timeout FINITO e ogni scadenza e' il
+             * risveglio che serve; fatto lo shrink si torna a NULL e il loop
+             * ridorme a costo zero. Il SIGTERM di #810 continua a svegliarci
+             * per EINTR come prima, solo prima del timeout. */
+            struct timeval tv={0,0}, idle_tv={(time_t)g_idle_poll_s,0}, *ptv;
+            if(active)                   ptv=&tv;         /* batch attivo: non bloccare */
+            else if(idle_poll_wanted())  ptv=&idle_tv;    /* idle con shrink pendente: sveglia */
+            else                         ptv=NULL;        /* idle e niente da fare: dormi */
             ready=select(STDIN_FILENO+1,&rfds,NULL,NULL,ptv);
             if(ready>0 && FD_ISSET(STDIN_FILENO,&rfds))
 #elif defined(_WIN32)
@@ -9097,6 +9279,10 @@ static void run_serve(Model *m, const char *snap){
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
     stops_arm_tok(&m->c, eos, &T);
+    kvanchor_arm_tok(&T);
+    if(kvanchor_slots())
+        fprintf(stderr,"[KV] anchors armed (serve): %d slot(s)/ctx, %.0f MB cap, tool_tok=%d\n",
+                kvanchor_slots(),g_kvanchor_budget/1048576.0,g_kvanchor_tok);
     grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
                                           * distribuzione int4 e' rumore di quantizzazione */
@@ -9184,6 +9370,21 @@ static void run_serve(Model *m, const char *snap){
                 if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
                 kv_disk_truncate(m,len);           /* il prossimo append sovrascrive solo la coda */
             }
+            if(sc->anch.n){                        /* see mux_submit */
+                int ai=kv_anchor_match(&sc->anch,tmp,prompt_tokens,len);
+                if(ai>=0){
+                    const int *aids=kv_anchor_ids(&sc->anch,ai);
+                    kv_anchor_plane pl[3]; int npl=kvanchor_planes(m,&sc->kv,pl);
+                    int from=len, alen=kv_anchor_restore(&sc->anch,ai,pl,npl,from);
+                    if(alen>from){
+                        memcpy(hist+from,aids+from,(size_t)(alen-from)*sizeof(int));
+                        len=alen;
+                        if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
+                        fprintf(stderr,"[API] KV anchor hit: slot %d restored rows [%d,%d)\n",
+                                active,from,alen);
+                    }
+                }
+            }
             k=prompt_tokens-len;
             if(k>0) memcpy(hist+len,tmp+len,k*sizeof(int));
             fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",
@@ -9212,7 +9413,8 @@ static void run_serve(Model *m, const char *snap){
         double tt0=now_s();
         ProfBase pb; if(g_prof) prof_base(m,&pb);
         float *logit;
-        if(k>0){ logit=step(m,hist+len,k,len); len+=k; }
+        if(k>0){ logit=step(m,hist+len,k,len); len+=k;
+                 kvanchor_capture(m,sc,len,"prompt_end"); }   /* */
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;
@@ -9241,6 +9443,7 @@ static void run_serve(Model *m, const char *snap){
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
         usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
         kv_disk_append(m,hist,len);      /* KV su disco: il prossimo avvio riparte da qui */
+        ram_rebalance_boundary(m,maxctx); /* stringe il budget PRIMA del guard */
         repin_pass(m);                   /* safe request boundary: adapt session-local hot tier */
     }
     free(line); free(buf);
@@ -9988,6 +10191,248 @@ static double mem_available_gb(void){
     while(fgets(ln,sizeof(ln),f)) if(sscanf(ln,"MemAvailable: %lf",&kb)==1) break;
     fclose(f); return kb/1e6;
 #endif
+}
+
+/* ---- RAM REBALANCE SHRINK-ONLY () -----------------------------------
+ * cap_for_ram() fissa il budget sulla MemAvailable MISURATA ALL'AVVIO: un engine
+ * partito a macchina tranquilla se lo tiene anche dopo che decine di container Docker
+ * occupano la RAM — la classe di swap-pressure che ha motivato l'idle-reaper.
+ * Alla confine di richiesta del serve (la stessa sede safe di repin_pass) si
+ * rilegge MemAvailable e si STRINGE g_ram_budget_gb — mai allargare — poi ci
+ * pensa rss_guard a liberare l'eccesso di LRU. Un passo solo per confine.
+ * Quanto e' sceso per cause ESTERNE = (boot - ora) - footprint nostro: ogni GB
+ * liberato da noi torna in MemAvailable ed esce dal conto, quindi la misura
+ * non si morde la coda; g_ram_ceded_gb ricorda quanto gia' ceduto per non
+ * contarlo due volte. Il footprint e' self_footprint_gb() (CORRENTE e non
+ * recuperabile), non rss_gb(): vedi li' perche' ru_maxrss rompe l'invariante.
+ * Isteresi = la stessa banda 2% + 300 MB di rss_guard; e
+ * siccome si stringe soltanto, non puo' oscillare per costruzione.
+ * Il confine e' AGGANCIATO A ENTRAMBI i serve loop: run_serve (interattivo) e
+ * run_serve_mux — quest'ultimo e' quello che gira in produzione, perche'
+ * openai_server.py lancia l'engine con SERVE_BATCH=1 (cioe' `coli serve`).
+ * EN: shrink-only rebalance of the #403 budget at the serve request boundary,
+ * EN: floor = dense-resident + KV pool (i pinnati sono gia' dentro
+ * EN: resident_bytes). Off di default su __APPLE__ (memoria unificata:
+ * EN: liberare sotto pressione li' e' swap-death); RAM_REBALANCE=1 opt-in,
+ * EN: =0 force-off altrove. Un RSS_GUARD_GB esplicito resta autoritario
+ * EN: (l'esplicito vince, stessa regola di CAP_RAISE #379). avail/rss
+ * EN: arrivano per parametro cosi' il test di mutazione simula la pressione. */
+static int g_ram_rebalance =
+#ifdef __APPLE__
+    0;
+#else
+    1;
+#endif
+static double g_ram_ceded_gb=0;          /* GB gia' ceduti al mondo esterno () */
+
+/* Il nostro footprint NON RECUPERABILE, ADESSO (GB) — il termine "quanto di
+ * questo calo di MemAvailable e' colpa NOSTRA" del conto qui sopra.
+ *
+ * NON e' rss_gb(): quello e' ru_maxrss, e sbaglia in due modi, entrambi nella
+ * direzione che SPEGNE il feature (footprint gonfiato -> ext piu' piccolo):
+ *   1) e' un MASSIMO STORICO, non scende mai. L'invariante su cui poggia tutto
+ *      il calcolo — "ogni GB che liberiamo torna in MemAvailable ed ESCE dal
+ *      conto esterno" — pretende un sensore di ADESSO. Con un picco, appena il
+ *      guard libera memoria avail sale ma il termine nostro resta inchiodato in
+ *      alto: ext crolla della stessa quantita' e la pressione esterna sparisce
+ *      dai conti. Basta UN prefill lungo (working set grosso, poi liberato) per
+ *      alzare il picco di GB e rendere l'engine cieco per il resto della
+ *      sessione — proprio la sessione lunga che questo ticket esiste per
+ *      proteggere.
+ *   2) include le pagine FILE-BACKED residenti (sotto COLI_MMAP gli expert sono
+ *      viste dentro mmap dei safetensors): page cache PULITA e RECUPERABILE,
+ *      che non ha mai lasciato MemAvailable. Contarla e' doppio conteggio.
+ * Il termine giusto e': anonime + shmem (senza swap non si recuperano) + le
+ * pagine mmap inchiodate da mlock, che l'engine conta gia' in g_mmap_wired
+ * (solo COLI_MMAP; le slab anonime inchiodate da mem_wire stanno gia' dentro
+ * RssAnon, quindi niente doppio conteggio).
+ * EN: current UNRECLAIMABLE self-footprint; ru_maxrss is a high-water mark that
+ * EN: also counts reclaimable file pages, and both errors bias the rebalance off. */
+static double self_footprint_gb(void){
+#ifdef __linux__
+    FILE *f=fopen("/proc/self/status","r");
+    if(f){
+        char ln[256]; double anon=-1, shm=0, v;
+        while(fgets(ln,sizeof(ln),f)){
+            if(sscanf(ln,"RssAnon: %lf",&v)==1) anon=v;
+            else if(sscanf(ln,"RssShmem: %lf",&v)==1) shm=v;
+        }
+        fclose(f);
+        if(anon>=0) return (anon+shm)/1e6 + (double)g_mmap_wired/1e9;   /* kB -> GB */
+    }
+    return rss_gb();                     /* kernel senza RssAnon (<4.5): meglio del niente */
+#elif defined(__APPLE__)
+    mach_task_basic_info_data_t ti; mach_msg_type_number_t n=MACH_TASK_BASIC_INFO_COUNT;
+    if(task_info(mach_task_self(),MACH_TASK_BASIC_INFO,(task_info_t)&ti,&n)==KERN_SUCCESS)
+        return (double)ti.resident_size/1e9;                /* corrente, non il picco */
+    return rss_gb();
+#else
+    return rss_gb();                     /* Windows: WorkingSetSize e' gia' corrente */
+#endif
+}
+
+static void ram_rebalance_core(Model *m,int maxctx,double avail_now,double own_now){
+    if(!g_ram_rebalance || getenv("RSS_GUARD_GB")) return;  /* esplicito vince */
+    if(g_ram_budget_gb<=0 || g_mem_avail_boot<=0 || avail_now<=0 || own_now<0) return;
+    double ext=(g_mem_avail_boot-avail_now)-own_now;        /* GB presi dagli ALTRI */
+    double step=ext-g_ram_ceded_gb;                         /* solo la pressione NUOVA */
+    if(step<=0) return;                                     /* il mondo ha restituito: fermissimo */
+    double floor_gb=((double)m->resident_bytes+kv_pool_bytes(m,maxctx))/1e9;
+    double target=g_ram_budget_gb-step;
+    if(target<floor_gb) target=floor_gb;                    /* mai sotto densa+KV+pinnati */
+    if(target>=g_ram_budget_gb*0.98-0.3) return;            /* banda 2%+300MB: niente stillicidio */
+    g_ram_ceded_gb+=g_ram_budget_gb-target;
+    fprintf(stderr,"[RAM-REBALANCE] MemAvailable %.1f GB now vs %.1f GB at boot "
+                   "(ours %.1f, others +%.1f): budget %.1f -> %.1f GB (shrink-only)\n",
+            avail_now,g_mem_avail_boot,own_now,ext,g_ram_budget_gb,target);
+    g_ram_budget_gb=target;
+    g_rssg_last = m->n_emit>=16 ? m->n_emit-16 : 0;         /* fora il throttle a 16 token:
+                                                             * alla confine si guarda ADESSO */
+    rss_guard(m);                                           /* il guard esistente fa il resto */
+}
+static void ram_rebalance_boundary(Model *m,int maxctx){    /* adapter: sensori reali */
+    ram_rebalance_core(m,maxctx,mem_available_gb(),self_footprint_gb());
+}
+
+/* ---- IDLE SHRINK-TO-FLOOR () ----------------------------------------
+ * stringe il budget quando il MONDO prende RAM. Questo stringe quando
+ * NOI non la usiamo: a coda vuota da N minuti il budget scende al PAVIMENTO
+ * (densa residente + KV + pinnati) e rss_guard libera tutta la LRU. Un engine
+ * abbandonato passa da ~25 GB a densa+KV senza morire: resta caldo-caricabile.
+ *
+ * IL SEGNALE DI IDLE. L'engine non ha un thread timer, e a coda vuota
+ * run_serve_mux si ferma dentro select() con timeout NULL: DORME PER SEMPRE.
+ * Nessuno lo sveglia per accorgersi di essere idle. Quindi il feature non e'
+ * "misura l'idle", e' "PROCURATI un risveglio": finche' c'e' uno shrink da
+ * fare (idle_poll_wanted) il select idle prende un timeout FINITO, e ogni
+ * scadenza e' l'occasione per controllare l'orologio. Fatto lo shrink il
+ * timeout torna NULL e il loop ridorme a costo zero. Senza quella riga il
+ * resto di questo blocco e' codice morto — la stessa trappola che ha fatto
+ * fallire il primo giro di, e per questo il test la asserisce.
+ *
+ * run_serve (interattivo) NON e' agganciato, ED E' VOLUTO: quel loop blocca in
+ * getline() e non ha un punto di poll; l'unico momento in cui potrebbe
+ * accorgersi dell'idle e' quando una richiesta e' GIA' arrivata, cioe' l'istante
+ * peggiore per svuotare la cache. Meglio niente che una chiamata che spara nel
+ * momento sbagliato. La produzione gira comunque run_serve_mux (SERVE_BATCH=1).
+ *
+ * SOLO RESTRINGIMENTO, e niente ripresa: budget e ecap non risalgono mai da
+ * soli (li rialza solo cap_for_ram all'avvio). Il traffico che torna trova un
+ * engine lento che ristreamma da NVMe — e' il PREZZO dichiarato del ticket, non
+ * un bug. Vedi il report: e' anche la ragione per cui il reaper non va ritirato.
+ *
+ * EN: idle shrink-to-floor. The engine has no timer thread and an idle
+ * EN: run_serve_mux blocks in select(NULL) forever, so this feature has to
+ * EN: MANUFACTURE its own wakeup (finite select timeout while a shrink is
+ * EN: still pending). Shrink-only, no recovery path: ecap and the budget only
+ * EN: ever go down. Off by default on __APPLE__ (unified memory), IDLE_SHRINK=1
+ * EN: opts in / =0 forces off; an explicit RSS_GUARD_GB stays authoritative. */
+/* (i globali stanno piu' su, accanto a g_mux_boundary: run_serve_mux li usa
+ *  prima di questo punto del file.) */
+
+/* C'e' ancora uno shrink da fare? Se no, il loop idle puo' tornare a bloccare
+ * per sempre: nessun risveglio da procurare, nessun syscall sprecato. */
+static int idle_poll_wanted(void){
+    return g_idle_shrink && g_idle_served && !g_idle_shrunk
+           && !getenv("RSS_GUARD_GB") && g_ram_budget_gb>0;
+}
+
+/* Molla il tier AUTOPIN. I pin NON si liberano come gli slot LRU:
+ *  - sotto pin_arena_bind (#419) slab/fslab sono FETTE di un'arena per layer e
+ *    non vanno MAI free()d — si restituiscono le PAGINE con MADV_DONTNEED, che
+ *    e' esattamente quello che fa expert_host_release sul path CUDA;
+ *  - sotto COLI_MMAP gli slab sono NULL e i pesi sono viste mmap inchiodate da
+ *    pin_wire: li' l'unica cosa da fare e' qt_unwire_mmap (le pagine tornano
+ *    page-cache PULITA, recuperabile — l'RSS non scende subito, ma escono dal
+ *    footprint non recuperabile, che e' il termine che conta per il floor);
+ *  - altrimenti sono allocazioni individuali e si liberano davvero.
+ * ORDINE OBBLIGATORIO: npin[l]=0 PRIMA di toccare gli slab, tutto sotto
+ * g_pilot_mx. Le ~14 lookup dei pin sono tutte `for(z<npin[layer])`, quindi
+ * azzerare npin le fa cadere tutte sulla LRU/disco in un colpo solo; se invece
+ * liberassimo prima, un lettore potrebbe trovare un pin con slab gia' morto
+ * (use-after-free) o — peggio, perche' silenzioso — leggere pagine azzerate da
+ * DONTNEED e produrre output sbagliato senza crashare. Stesso identico
+ * contratto slab-valido/slot-riusabile che rss_guard tiene per la LRU.
+ * NB: eid resta com'e' e gli slot non si riusano: npin=0 li rende irraggiungibili
+ * (mettere eid=-1 sarebbe un OOB, repin_pick indicizza m->eheat[l][s->eid]). */
+static int64_t idle_pin_release(Model *m){
+    if(!m->pin || !m->npin) return 0;
+    int NR=m->c.n_layers+1, nslot=0;
+    int64_t freed=0;
+    pthread_mutex_lock(&g_pilot_mx);
+    for(int l=0;l<NR;l++){
+        int np = m->npin[l];
+        if(np<1 || !m->pin[l]) continue;
+        m->npin[l]=0;                       /* PRIMA: nessuna lookup puo' piu' trovarli */
+        for(int z=0;z<np;z++){
+            ESlot *s=&m->pin[l][z];
+            int64_t b=qt_bytes(&s->g)+qt_bytes(&s->u)+qt_bytes(&s->d);
+            if(g_mmap){                     /* viste mmap: si sganciano solo le mlock */
+                qt_unwire_mmap(&s->g); qt_unwire_mmap(&s->u); qt_unwire_mmap(&s->d);
+            }
+            if(s->slab || s->fslab){
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+                if(s->slab)  munlock(s->slab,(size_t)s->slab_cap);
+                if(s->fslab) munlock(s->fslab,(size_t)s->fslab_cap*sizeof(float));
+#elif defined(_WIN32)
+                if(s->slab)  compat_munlock(s->slab,(size_t)s->slab_cap);
+                if(s->fslab) compat_munlock(s->fslab,(size_t)s->fslab_cap*sizeof(float));
+#endif
+                if(s->aslab){               /* fetta d'arena: pagine si', indirizzo no */
+#ifdef __linux__
+                    madvise(s->slab,(size_t)s->slab_cap,MADV_DONTNEED);
+                    madvise(s->fslab,(size_t)s->fslab_cap*sizeof(float),MADV_DONTNEED);
+#endif
+                    s->slab=NULL; s->fslab=NULL;
+                } else {
+                    compat_aligned_free(s->slab); free(s->fslab);
+                    s->slab=NULL; s->fslab=NULL; s->slab_cap=s->fslab_cap=0;
+                }
+            }
+            QT *q[3]={&s->g,&s->u,&s->d};
+            for(int k=0;k<3;k++){ q[k]->qf=NULL; q[k]->q8=NULL; q[k]->q4=NULL; q[k]->s=NULL; }
+            s->used=0;
+            freed+=b; nslot++;
+        }
+    }
+    pthread_mutex_unlock(&g_pilot_mx);
+    m->resident_bytes-=freed; if(m->resident_bytes<0) m->resident_bytes=0;
+    if(nslot) fprintf(stderr,"[IDLE-SHRINK] unpinned %d experts (%.1f GB) from the AUTOPIN tier "
+                             "(IDLE_SHRINK_UNPIN)\n", nslot, freed/1e9);
+    return freed;
+}
+
+/* idle_s arriva per parametro (come avail/rss in) cosi' il test simula
+ * ore di silenzio senza aspettarle. Ritorna 1 se ha stretto. */
+static int idle_shrink_core(Model *m,int maxctx,double idle_s){
+    if(!g_idle_shrink || getenv("RSS_GUARD_GB")) return 0;   /* esplicito vince (#379) */
+    if(g_idle_shrunk || g_ram_budget_gb<=0) return 0;
+    if(idle_s < g_idle_after_s) return 0;                    /* non ancora abbastanza fermo */
+    g_idle_shrunk=1;                                         /* un solo tentativo per idle */
+    if(g_idle_unpin) idle_pin_release(m);                    /* abbassa anche il PAVIMENTO */
+    double floor_gb=((double)m->resident_bytes+kv_pool_bytes(m,maxctx))/1e9;
+    if(floor_gb>=g_ram_budget_gb) return 0;                  /* gia' al pavimento: niente da fare */
+    fprintf(stderr,"[IDLE-SHRINK] queue empty for %.0f s: budget %.1f -> %.1f GB "
+                   "(dense+KV%s floor, shrink-only)\n",
+            idle_s,g_ram_budget_gb,floor_gb,g_idle_unpin?"":"+pinned");
+    g_ram_budget_gb=floor_gb;
+    g_rssg_last = m->n_emit>=16 ? m->n_emit-16 : 0;           /* fora il throttle a 16 token */
+    rss_guard(m);                                            /* il guard esistente libera la LRU */
+    return 1;
+}
+
+/* Adattatore col vero orologio, chiamato dal loop di run_serve_mux. */
+static int idle_shrink_poll(Model *m,int maxctx){
+    if(g_idle_since<=0) return 0;
+    return idle_shrink_core(m,maxctx,now_s()-g_idle_since);
+}
+
+/* La coda si e' svuotata / si e' riempita. Riempirsi RIARMA il latch (il
+ * prossimo silenzio merita il suo shrink) ma NON rialza il budget: l'unica
+ * direzione resta in giu'. */
+static void idle_mark(int active){
+    if(active){ g_idle_since=0; g_idle_shrunk=0; }
+    else if(g_idle_since<=0 && g_idle_served) g_idle_since=now_s();
 }
 
 static int kv_slot_count(void){
@@ -10872,6 +11317,21 @@ int main(int argc, char **argv){
     corpus_load();                                       /* COLI_DRAFT_CORPUS: external draft source */
     rt_trace_open();                     /* same place as before, so the log order is identical */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
+    if(getenv("RAM_REBALANCE")) g_ram_rebalance=atoi(getenv("RAM_REBALANCE")); /* 1 opt-in (mac unified), 0 force-off */
+    /* idle shrink-to-floor. IDLE_SHRINK=1/0 come sopra; IDLE_SHRINK_MIN
+     * e' in MINUTI (default 10, sotto i 30 del reaper cosi' si vede chi spara
+     * per primo); <=0 spegne. IDLE_SHRINK_UNPIN=1 molla anche il tier AUTOPIN:
+     * default OFF perche' non e' mai stato verificato su hardware. */
+    if(getenv("IDLE_SHRINK")) g_idle_shrink=atoi(getenv("IDLE_SHRINK"));
+    if(getenv("IDLE_SHRINK_MIN")){
+        double mn=atof(getenv("IDLE_SHRINK_MIN"));
+        if(mn>0) g_idle_after_s=mn*60.0; else g_idle_shrink=0;
+    }
+    if(getenv("IDLE_SHRINK_POLL_S")){
+        double ps=atof(getenv("IDLE_SHRINK_POLL_S"));
+        if(ps>=1.0) g_idle_poll_s=ps;            /* sotto 1 s non ha senso: e' un timer da minuti */
+    }
+    if(getenv("IDLE_SHRINK_UNPIN")) g_idle_unpin=atoi(getenv("IDLE_SHRINK_UNPIN"));
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_metal_prefill = getenv("COLI_METAL_PREFILL")?atoi(getenv("COLI_METAL_PREFILL")):0; /* default 0: S>4 attention on CPU (bit-exact); =1 opt-in GPU prefill */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;

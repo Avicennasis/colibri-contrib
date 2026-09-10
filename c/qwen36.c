@@ -2611,7 +2611,9 @@ static void serve_one(Model *m, ServeReq *q){
     if (m->momentum_logits)
         memset(m->momentum_logits, 0,
                (size_t)m->c.n_layers * m->c.n_experts * sizeof(float));
+    double pf0=now_s();        /* prefill forwards -- same window mux_done reports */
     float *lo = step(m, ids, np, 0);
+    double pf_s=now_s()-pf0;
     int gen=0, limited=1;
     int eos_ids[4]; int n_eos=serve_eos_ids(eos_ids,4);
     double t0=now_s();
@@ -2644,8 +2646,8 @@ static void serve_one(Model *m, ServeReq *q){
     if(sbn>0) serve_data(q->id,(char*)sbuf,sbn);   /* flush trailing partial UTF-8 */
     free(lo); free(ids);
     double dt=now_s()-t0;
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n",q->id,gen,
-           dt>0?gen/dt:0.0,0.0,rss_gb(),np,limited);
+    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d %.3f\n",q->id,gen,
+           dt>0?gen/dt:0.0,0.0,rss_gb(),np,limited,pf_s);
     fflush(stdout);
 }
 

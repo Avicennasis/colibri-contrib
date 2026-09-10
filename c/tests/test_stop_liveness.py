@@ -25,13 +25,20 @@ class StopLivenessTest(unittest.TestCase):
         self.coli = load_coli()
 
     def test_probe_exists(self):
-        """cmd_stop must not use the raw POSIX idiom for liveness."""
+        """cmd_stop must not use the raw POSIX idiom for liveness. The stop-hardening
+        PID-reuse guard moved the call one level down: stop now asks
+        _pid_is_same_process(), which starts with the same _pid_alive() probe
+        and then also refuses a pid whose start time changed. Assert the whole
+        chain, so neither half can be dropped without this failing."""
         self.assertTrue(hasattr(self.coli, "_pid_alive"))
         with open(COLI, encoding="utf-8") as f: src = f.read()
         stop = src[src.index("def cmd_stop("):]
         stop = stop[:stop.index("\ndef ")]
         self.assertNotIn("os.kill(pid,0)", stop)
-        self.assertIn("_pid_alive(pid)", stop)
+        self.assertIn("_pid_is_same_process(pid", stop)
+        same = src[src.index("def _pid_is_same_process("):]
+        same = same[:same.index("\ndef ")]
+        self.assertIn("_pid_alive(pid)", same)
 
     def test_self_is_alive(self):
         self.assertTrue(self.coli._pid_alive(os.getpid()))

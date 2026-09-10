@@ -1613,6 +1613,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
         sxoff[ns] = ns*S;
+        /* qgs=0: inkling routes fmt 1/2 (per-row scales) and shared fmt 5 (raw
+         * f32) — neither kernel reads the group size (only fmt 4 does). */
         sh_h = coli_metal_moe_block_begin(ns, D, I, 5, 0, sgp, sup, sdp,
                                           sscale, sscale, sscale,
                                           sxg, sxoff, snr, srows, srw);

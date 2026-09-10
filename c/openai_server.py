@@ -25,7 +25,9 @@ from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id
                              family_ids, resolve_model)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
+
+import logring                      # bounded in-memory log ring for /logs
 
 
 HERE = Path(__file__).resolve().parent
@@ -204,6 +206,111 @@ class GenerationScheduler:
         with self.condition:
             self.closed = True
             self.condition.notify_all()
+
+
+class EngineStats:
+    """Sliding-window token rates + lifetime totals for /v1/stats.
+
+    Fed from frames the serve protocol already carries — no new counters:
+    ACCEPT states the turn's prompt tokens, every DATA frame is exactly one
+    decoded piece (mux_data / coli_serve_write_data are called once per
+    sampled token in every engine), DONE carries the turn's authoritative
+    totals. Prompt tokens enter the window when prefill ENDS — the turn's
+    first DATA — the only prefill-done edge the protocol has.
+
+    Rates are a wall-clock sliding window trimmed on read, NOT a cumulative
+    average, so idle polls decay to zero (FreeToken server/stats.py's
+    StatsTracker), minus every signal colibri has no counter for: no KV page
+    counts, no VRAM gauge, no TTFT. Feeding it per DONE instead reads 0 while
+    a turn is decoding and ~250k tok/s for the millisecond after it lands —
+    the reference expects streaming deltas, so we give it streaming deltas.
+
+    Two honest gaps. kimi suppresses control pieces and synthesizes one
+    "</think>", so the decode WINDOW counts emitted pieces where the lifetime
+    totals count sampled tokens (DONE's numbers are the authoritative pair).
+    olmoe and inkling never write ACCEPT, so on those engines the prefill
+    window stays empty (prefill_tps 0.0) while prompt totals still accrue.
+    A lone sample after idle also reads high until the window refills — the
+    reference's span-from-first-sample, kept as-is.
+
+    Written from the engine reader thread, read from HTTP worker threads, so
+    one lock covers both: summing a deque is not atomic under the GIL."""
+
+    def __init__(self, window_s=5.0):
+        self.window_s = window_s
+        self.lock = threading.Lock()
+        # maxlen bounds memory when nobody polls /v1/stats: the window trim on
+        # read is what enforces recency, and a server driven only through
+        # /v1/chat/completions would otherwise grow the deques forever.
+        self._decode = collections.deque(maxlen=4096)
+        self._prefill = collections.deque(maxlen=4096)
+        self._accepted = {}                 # request id -> prompt tokens, until prefill ends
+        self.prompt_tokens_total = 0
+        self.completion_tokens_total = 0
+        self.completed = 0
+        self.last = None                    # most recent DONE snapshot verbatim
+        self.prefill_seconds_total = 0.0    # sum of DONE prefill_seconds, present ones only
+        self.prefill_last = None            # last turn's value; None until one arrives
+        self.prefill_seen = False           # False => the engine cannot supply the signal
+
+    def on_accept(self, request_id, prompt_tokens):
+        """ACCEPT: submission validated, prefill starts. Held, not sampled --
+        crediting it here would date the tokens before the work."""
+        if prompt_tokens > 0:
+            with self.lock:
+                self._accepted[request_id] = prompt_tokens
+
+    def on_data(self, request_id, now=None):
+        """DATA: one decoded piece; the first one of a turn also ends prefill."""
+        t = time.monotonic() if now is None else now
+        with self.lock:
+            self._decode.append((t, 1))
+            prompt = self._accepted.pop(request_id, 0)
+            if prompt:
+                self._prefill.append((t, prompt))
+
+    def observe(self, stats, request_id=None, now=None):
+        """DONE: the turn's authoritative token counts."""
+        t = time.monotonic() if now is None else now
+        with self.lock:
+            prompt = self._accepted.pop(request_id, 0)
+            if prompt:      # a turn that emitted no DATA at all (stopped on its first token)
+                self._prefill.append((t, prompt))
+            self.completion_tokens_total += stats.get("completion_tokens") or 0
+            self.prompt_tokens_total += stats.get("prompt_tokens") or 0
+            self.completed += 1
+            self.last = dict(stats)
+            prefill_s = stats.get("prefill_seconds")
+            if prefill_s is not None:
+                self.prefill_seconds_total += prefill_s
+                self.prefill_last = prefill_s
+                self.prefill_seen = True
+
+    def forget(self, request_id):
+        """ERROR: the turn died without a DONE -- drop its held prefill sample.
+        Its sampled tokens are counted nowhere; the engine never reports them."""
+        with self.lock:
+            self._accepted.pop(request_id, None)
+
+    def _rate(self, window, now):
+        cutoff = now - self.window_s
+        while window and window[0][0] < cutoff:
+            window.popleft()
+        if not window:
+            return 0.0
+        total = sum(n for _ts, n in window)
+        span = max(now - window[0][0], 1e-9)
+        return total / span
+
+    def decode_tps(self, now=None):
+        t = time.monotonic() if now is None else now
+        with self.lock:
+            return self._rate(self._decode, t)
+
+    def prefill_tps(self, now=None):
+        t = time.monotonic() if now is None else now
+        with self.lock:
+            return self._rate(self._prefill, t)
 
 
 def content_text(content, param):
@@ -2641,6 +2748,23 @@ def _win_kill_on_close_job(pid):
         return None   # never let process bookkeeping break starting the engine
 
 
+def _engine_exit_reason(rc):
+    """Human reason for an engine exit code: a POSIX signal decodes to its name
+    (nothing in the engine signals itself with SIGKILL -- that is the kernel's
+    OOM-killer, the silent death), a positive code stays an exit code. None means
+    the process is still alive, which for a closed stdout is its own statement."""
+    if rc is None:
+        return "stdout closed but the process is still alive"
+    if rc < 0:
+        try:
+            return f"killed by {signal.Signals(-rc).name}"
+        except ValueError:
+            return f"killed by signal {-rc}"
+    if rc > 0:
+        return f"exit code {rc}"
+    return "exited cleanly"
+
+
 class Engine:
     # cap=None = "not explicitly set": a glm-arch model's engine resolves the
     # 0 sentinel (8 historically, 1 on Metal+darwin+fast SSD -- colibri.c
@@ -2685,6 +2809,15 @@ class Engine:
         self.closed = False
         self.dispatcher_error = None
         self.kv_slots = kv_slots
+        # Optional callback (the APIServer wires it): told the decoded reason
+        # once the engine dies, so the death lands in /logs next to the requests
+        # it took with it.
+        self.on_engine_exit = None
+        # Why the engine died, once it has: {"state": "dead", "reason": ...}.
+        # /health reads this so a monitor can tell a serving box from a
+        # half-alive one (HTTP up, engine gone -- FreeToken issues #110/#123
+        # class); None while the engine is alive.
+        self.engine_exit = None
         self.tiers = None
         self.hwinfo = None
         self.emap = None
@@ -2692,7 +2825,19 @@ class Engine:
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
-        read_engine_turn(self.process.stdout, READY, lambda _: None)
+        self.stats = EngineStats()      # /v1/stats: rates + lifetime token totals
+        self.ready_at = None            # set once the READY sentinel is drained
+        # Drain-to-ready: block until the engine's READY sentinel. If it dies
+        # first, say WHY before raising -- "exited unexpectedly" hides an
+        # OOM-kill behind wording that reads like our bug (FreeToken supervisor
+        # .py: the real death reason must win over the generic message).
+        try:
+            read_engine_turn(self.process.stdout, READY, lambda _: None)
+            self.ready_at = time.monotonic()   # /v1/stats uptime base (post-READY)
+        except RuntimeError:
+            sys.stderr.write(f"[engine terminated during load: "
+                             f"{_engine_exit_reason(self.process.poll())}]\n")
+            raise
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
         self.dispatcher.start()
@@ -2708,6 +2853,10 @@ class Engine:
             "rss_gb": float(fields[4]),
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
+            # prefill wall seconds, appended by the engine. Absent for an
+            # engine build predating the field -- None, never 0.0, so /v1/stats can
+            # report the signal as missing rather than silently misreporting it.
+            "prefill_seconds": float(fields[7]) if len(fields) > 7 else None,
         }
 
     def _fail_pending(self, error):
@@ -2753,6 +2902,7 @@ class Engine:
                     data = self._read_exact(size)
                     if self._read_exact(1) != b"\n":
                         raise RuntimeError("invalid engine DATA terminator")
+                    self.stats.on_data(request_id)   # /v1/stats: one piece = one tick
                     with self.pending_lock:
                         events = self.pending.get(request_id)
                     if events is not None:
@@ -2790,6 +2940,7 @@ class Engine:
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the
                     # HTTP stream only now, so an earlier CONTEXT_EXCEEDED stays a clean 400.
                     request_id = fields[1]
+                    self.stats.on_accept(request_id, int(fields[2]))
                     with self.pending_lock:
                         events = self.pending.get(request_id)
                     if events is not None:
@@ -2797,6 +2948,7 @@ class Engine:
                 elif kind == "DONE" and len(fields) >= 7:
                     request_id = fields[1]
                     stats = self._stats(fields[2:])
+                    self.stats.observe(stats, request_id)   # /v1/stats lifetime totals
                     with self.pending_lock:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
@@ -2834,6 +2986,7 @@ class Engine:
                 elif kind == "ERROR" and len(fields) >= 2:
                     request_id = fields[1]
                     message = " ".join(fields[2:]) or "engine request failed"
+                    self.stats.forget(request_id)   # no DONE is coming for this one
                     with self.pending_lock:
                         events = self.pending.pop(request_id, None)
                     if events is not None:
@@ -2842,6 +2995,21 @@ class Engine:
                     raise RuntimeError(f"invalid engine response: {' '.join(fields)}")
         except Exception as error:
             if not self.closed:
+                # A dead process (vs a protocol error with the engine alive)
+                # is a post-ready engine death: record it for /health and say it
+                # on stderr. The server stays up to fail requests fast, but it
+                # is half-alive now -- the half it lost is the engine.
+                if self.process.poll() is not None:
+                    self.engine_exit = {"state": "dead",
+                                        "reason": _engine_exit_reason(self.process.poll())}
+                    sys.stderr.write(f"[engine terminated: {self.engine_exit['reason']}"
+                                     f" -- serving requests will now fail]\n")
+                    callback = getattr(self, "on_engine_exit", None)
+                    if callback is not None:
+                        try:
+                            callback(self.engine_exit["reason"])
+                        except Exception:
+                            pass
                 self.dispatcher_error = error
                 self._fail_pending(error)
 
@@ -3101,6 +3269,9 @@ class APIServer(ThreadingHTTPServer):
         self.allowed_hosts = tuple(
             h.strip().lower() for h in allowed_hosts if h and h.strip())
         self.created = int(time.time())
+        # Bounded log ring behind /logs?since=: request lines and
+        # lifecycle notes in RAM, pull-only. COLI_LOG_RING bounds it; 0 disables.
+        self.logs = logring.LogRing(_positive_env("COLI_LOG_RING", 4000))
         self._conn_lock = threading.Lock()
         self._conn_live = 0
         self._conn_by_ip = {}
@@ -3216,6 +3387,7 @@ class APIHandler(BaseHTTPRequestHandler):
         instead of asking each early return to remember."""
         self._committed = False
         self._body_read = False
+        self._t0 = time.monotonic()   # request-line latency for the log ring
         # Fresh budget per request: a keep-alive connection may serve many, and
         # each is entitled to its own read window -- but none may drip forever.
         self.rfile = _DeadlineReader(self._raw_rfile, self.connection,
@@ -3295,6 +3467,19 @@ class APIHandler(BaseHTTPRequestHandler):
     def send_json(self, status, body, request_id=None, headers=None):
         data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
         self.send_response(status)
+        # One line per response, at the single choke point no responder can
+        # skip: method, path, status, latency. Recorded once the status line is
+        # committed (before the body write), so a client hanging up mid-body
+        # still leaves its request behind in /logs.
+        ring = getattr(self.server, "logs", None)
+        if ring is not None:
+            started = getattr(self, "_t0", None)
+            elapsed = f"{(time.monotonic() - started) * 1000:.0f}ms" if started else "?"
+            try:
+                ring.append(f"{self.command} {urlsplit(self.path).path} {status} {elapsed}",
+                            kind="request")
+            except Exception:      # diagnostics must never take the request down
+                pass
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         if request_id:
@@ -3447,6 +3632,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 # request is authed (or no key set), so a configured key isn't leaked
                 # past a bare 200 to an unauthenticated probe. (#SEC-8)
                 payload = {"status": "ok"}
+                # Engine liveness is public on purpose: coli chat's attach probe
+                # and any monitoring script must distinguish "serving" from
+                # "HTTP up, engine gone" without the API key. A bare state word
+                # and an exit reason leak nothing about what is being served.
+                if self.server.engine is None:
+                    payload["engine"] = "loading"     # port bound, engine draining to READY
+                else:
+                    exit_state = getattr(self.server.engine, "engine_exit", None)
+                    if exit_state:
+                        payload["engine"] = exit_state.get("state", "dead")
+                        payload["engine_reason"] = exit_state.get("reason")
                 if self._is_authed():
                     payload["scheduler"] = self.server.scheduler.snapshot()
                     payload["kv_slots"] = self.server.kv_slots
@@ -3478,6 +3674,69 @@ class APIHandler(BaseHTTPRequestHandler):
                 if self._is_authed() and eng:
                     payload["seq"] = getattr(eng, "profile_seq", 0)
                     payload["turns"] = list(getattr(eng, "profile", ()) or ())
+                self.send_json(200, payload, request_id)
+                return
+            if path == "/logs":
+                # Bounded ring + all-time cursor: scripts poll
+                # /logs?since=N without any file plumbing. Same pre-auth
+                # placement and _is_authed() gate as /profile — request lines
+                # say what the operator runs, an anonymous caller gets the
+                # empty shape. `since` is exclusive: pass the previous `next`.
+                payload = {"lines": [], "next": 0}
+                ring = self.server.logs
+                if self._is_authed():
+                    try:
+                        cursor = int(parse_qs(urlsplit(self.path).query)
+                                     .get("since", ["0"])[0])
+                    except ValueError:
+                        cursor = 0
+                    payload["lines"], payload["next"] = ring.since(cursor)
+                self.send_json(200, payload, request_id)
+                return
+            if path == "/v1/stats":
+                # Sliding-window decode/prefill rates that decay to zero when
+                # idle + lifetime token totals, over the ACCEPT/DATA/DONE frames
+                # the serve protocol already carries. Same pre-auth
+                # placement and _is_authed() gate as /profile (#SEC-8): token
+                # counts say how much the operator is running. Degraded shape (no engine yet, or an
+                # engine build without stats) is served honestly with zeros.
+                payload = {"model": None, "uptime_s": 0,
+                           "throughput": {"decode_tps": 0.0, "prefill_tps": 0.0},
+                           # prefill compute seconds. null (absent), never
+                           # 0.0, until a DONE carrying the field has arrived -- an
+                           # engine that cannot supply the signal must not read as
+                           # "prefills are free".
+                           "prefill": None,
+                           "tokens": {"prompt_total": 0, "completion_total": 0},
+                           "requests": {"completed": 0}}
+                eng = self.server.engine
+                if self._is_authed():
+                    payload["model"] = self.server.model_id   # /v1/models is authed too
+                if self._is_authed() and eng is not None:
+                    stats = getattr(eng, "stats", None)
+                    ready_at = getattr(eng, "ready_at", None)
+                    if ready_at is not None:
+                        payload["uptime_s"] = max(0, int(time.monotonic() - ready_at))
+                    if stats is not None:
+                        payload["throughput"] = {
+                            "decode_tps": round(stats.decode_tps(), 1),
+                            "prefill_tps": round(stats.prefill_tps(), 1)}
+                        payload["tokens"] = {
+                            "prompt_total": stats.prompt_tokens_total,
+                            "completion_total": stats.completion_tokens_total}
+                        payload["requests"] = {"completed": stats.completed}
+                        if stats.prefill_seen:
+                            payload["prefill"] = {
+                                "seconds_total": round(stats.prefill_seconds_total, 3),
+                                "last_turn_seconds": round(stats.prefill_last, 3)}
+                        if stats.last:
+                            # last DONE verbatim: the engine's own view of the
+                            # previous turn (RSS, tok/s, cache hit, prefill seconds).
+                            payload["engine"] = {
+                                "rss_gb": stats.last.get("rss_gb"),
+                                "tokens_per_second": stats.last.get("tokens_per_second"),
+                                "cache_hit_percent": stats.last.get("cache_hit_percent"),
+                                "prefill_seconds": stats.last.get("prefill_seconds")}
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):
@@ -4272,6 +4531,10 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                              f"{family.limits.max_kv_slots} KV slot(s)")
         runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
         server.engine = runtime
+        runtime.on_engine_exit = lambda reason: server.logs.append(
+            f"engine exited: {reason}", kind="engine")
+        server.logs.append(f"engine ready; listening on http://{host}:{port}/v1",
+                           kind="lifecycle")
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
         try:

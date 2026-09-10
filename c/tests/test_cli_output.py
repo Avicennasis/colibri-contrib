@@ -163,11 +163,16 @@ class ChatCapForwardingTest(unittest.TestCase):
         (Path(model) / "config.json").write_text(json.dumps({"model_type": "inkling"}))
         args = types.SimpleNamespace(model=model, cap=cap, ngen=256, api_key=None,
                                      no_attach=True, attach=None)
+        # wait_server_ready is stubbed because's drain-to-ready moved the
+        # private-server wait off server_probe: unstubbed, the spawn path polls a
+        # real loopback gateway for its full 1800 s timeout (FakeProc never exits).
         with mock.patch.object(coli, "need_model"), \
              mock.patch.object(coli, "banner"), \
              mock.patch.object(coli, "engine_for", return_value="/stub/inkling"), \
              mock.patch.object(coli, "env_for_engine", return_value={}), \
              mock.patch.object(coli, "server_probe", return_value="inkling-colibri"), \
+             mock.patch.object(coli, "wait_server_ready",
+                               return_value=("inkling-colibri", None)), \
              mock.patch.object(coli, "chat_attached"), \
              mock.patch.object(coli, "Spinner", FakeSpinner), \
              mock.patch("subprocess.Popen", FakeProc):
