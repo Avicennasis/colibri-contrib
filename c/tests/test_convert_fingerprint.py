@@ -127,8 +127,8 @@ class ConvertSkipOnMatchTest(unittest.TestCase):
         self.indir.mkdir()
         for i in range(3):
             (self.indir / f"model-{i:05d}.safetensors").write_bytes(b"stand-in shard")
-        for meta in ("config.json", "tokenizer.json"):
-            (self.indir / meta).write_text("{}")
+        (self.indir / "config.json").write_text('{"model_type": "glm"}')
+        (self.indir / "tokenizer.json").write_text("{}")
         self.converted = []
 
     def run_convert(self, *extra, progress=False):
