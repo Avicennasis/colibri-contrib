@@ -3400,8 +3400,10 @@ int main(int argc, char **argv) {
     g_expert_is_int4 = expert_is_int4;
     /* Offer the dense trunk to the placer before the tier decides its budget:
      * sizes only, from the same dense-i8 entries the uploads below will use.
-     * No entry (dense-i8 off) means nothing to offer, and the CPU path stands. */
-    {
+     * No entry (dense-i8 off) means nothing to offer, and the CPU path stands.
+     * A qpack container owns routed execution outright, so it must not seed
+     * CUDA placement state for a tier that is deliberately skipped below. */
+    if (!qq_active()) {
         int O_qkv = m.c.dn_conv_dim, O_z = m.c.dn_vheads * m.c.dn_vdim;
         for (int i = 0; i < g_qdw_n; i++)
             if (g_qdw[i].w == m.lm_head)
