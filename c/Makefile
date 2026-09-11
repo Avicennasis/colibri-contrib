@@ -1089,7 +1089,7 @@ ifeq ($(METAL),1)
 QWEN36_QPACK_SRC = qwen36_qpack.c qpack.c
 QWEN36_CFLAGS  += -DQWEN36_QPACK
 endif
-qwen36$(EXE): qwen36.c affine_quant.h serve_poll.h cli_args.h qwen36_tier.h qwen36_qpack.h expert_ffn.h st.h json.h compat.h omp_tune.h kv_prefix.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(QWEN36_QPACK_SRC) $(CUDA_OBJ) $(METAL_OBJ)
+qwen36$(EXE): qwen36.c affine_quant.h backend_metal.h serve_poll.h cli_args.h qwen36_tier.h qwen36_qpack.h expert_ffn.h st.h json.h compat.h omp_tune.h kv_prefix.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h $(QWEN36_TIER_SRC) $(QWEN36_QPACK_SRC) $(CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(QWEN36_QPACK_SRC) $(CUDA_OBJ) $(METAL_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
