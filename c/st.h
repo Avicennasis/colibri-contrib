@@ -401,9 +401,8 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
         S->fmt_val[S->fmt_n]  = sv;
         S->fmt_n++;
     }
-    free(arena2);  /* always NULL (json_parse never populates it -- see j_dup); the jval
-                    * tree itself is intentionally leaked, same one-time-startup convention
-                    * as st_init_multi's own root parse a few lines below. */
+    json_free(inner);
+    free(arena2);  /* always NULL (json_parse never populates it -- see j_dup). */
 }
 
 /* Stamped format NAME for `name`, or NULL if this tensor carries no stamp
@@ -551,12 +550,20 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
                 !shp || shp->t != J_ARR || shp->len > ST_MAX_RANK) {
                 fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",
                         files[fi], name); exit(1); }
-            int64_t a0 = (int64_t)off->kids[0]->num, b0 = (int64_t)off->kids[1]->num;
+            jval *off_a = off->kids[0], *off_b = off->kids[1];
+            if (!off_a || !off_b || off_a->t != J_NUM || off_b->t != J_NUM ||
+                !isfinite(off_a->num) || !isfinite(off_b->num) ||
+                off_a->num < 0.0 || off_b->num < 0.0 ||
+                off_a->num >= ldexp(1.0, 63) || off_b->num >= ldexp(1.0, 63) ||
+                floor(off_a->num) != off_a->num || floor(off_b->num) != off_b->num) {
+                fprintf(stderr, "%s: tensor '%s' has invalid data_offsets\n",
+                        files[fi], name); exit(1); }
+            int64_t a0 = (int64_t)off_a->num, b0 = (int64_t)off_b->num;
             /* offset dichiarati dal file: non-negativi, ordinati e dentro al
              * file. Altrimenti nbytes=b0-a0 diventa negativo -> malloc((size_t))
              * gigante e la memcpy in st_read_f32 sfora il buffer del chiamante;
              * oppure off punta fuori dal file. */
-            if (a0 < 0 || b0 < a0 || data_start + b0 > fsz) {
+            if (b0 < a0 || b0 > INT64_MAX - data_start || data_start + b0 > fsz) {
                 fprintf(stderr, "%s: tensor '%s' data_offsets [%lld,%lld] out of file bounds (%lld)\n",
                         files[fi], name, (long long)a0, (long long)b0, (long long)fsz); exit(1); }
             /* SEC: lo shape viene da un file non fidato (mirror). Senza il guard
@@ -633,11 +640,13 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
              * OOB write primitive. U8/I8 (raw quant bytes) are read by byte count, so
              * their numel is unused by the read path and legitimately may differ. */
             { int esz = st_dtype_esz(t->dtype);
-              if (t->dtype != 3 && t->nbytes != numel * (int64_t)esz) {
+              if (t->dtype != 3 &&
+                  (numel > INT64_MAX / esz || t->nbytes != numel * (int64_t)esz)) {
                   fprintf(stderr, "%s: tensor '%s' numel %lld disagrees with byte span %lld (esz %d)\n",
                           files[fi], name, (long long)numel, (long long)t->nbytes, esz); exit(1); } }
         }
-        free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
+        json_free(root);
+        free(arena);
         free(hdr);
     }
     free(dup_idx);  /* duplicate detector: one-time-startup scratch, superseded by S->hidx below */
@@ -783,7 +792,7 @@ static void st_prefetch_rep(shards *S, const char *name, int rep) {
  * drop=1 -> consiglia al kernel di scartare le pagine (per gli expert in streaming). */
 static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     /* SEC: numel viene dallo shape, nbytes dagli offset — due campi indipendenti
      * del file. Se non concordano, la memcpy F32 (nbytes) o i loop BF16/F16
      * (numel elementi da un raw di soli nbytes) sforano il buffer del chiamante,
@@ -823,7 +832,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
  * self-consistent and may keep using st_read_f32. */
 static int64_t st_read_f32_cap(shards *S, const char *name, float *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     if (t->numel < 0 || t->numel > cap) {
         fprintf(stderr, "tensor %s: numel %lld exceeds destination capacity %lld\n",
                 name, (long long)t->numel, (long long)cap); exit(1); }
@@ -874,7 +883,7 @@ static inline float ue8m0_to_f32(uint8_t v) {
  * che il chiamante ha allocato, come in st_read_f32_cap. */
 static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     if (t->numel < 0 || t->numel > cap) {
         fprintf(stderr, "scale %s: numel %lld exceeds destination capacity %lld\n",
                 name, (long long)t->numel, (long long)cap); exit(1); }
@@ -911,7 +920,7 @@ static int64_t st_read_scale_f32(shards *S, const char *name, float *out, int64_
  * A new caller with none of those wants st_read_raw_cap below. */
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     st_pread_full(t->fd, out, t->nbytes, t->off, "pread raw");
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
@@ -922,11 +931,35 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
  * check -- and one that has none cannot silently do the wrong thing. */
 static void st_read_raw_cap(shards *S, const char *name, void *out, int64_t cap, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     if (t->nbytes < 0 || t->nbytes > cap) {
         fprintf(stderr, "%s: tensor declares %lld bytes, destination holds %lld — refusing "
                 "(untrusted container)\n", name, (long long)t->nbytes, (long long)cap); exit(1); }
     st_read_raw(S, name, out, drop);
+}
+
+/* Read an exact physical range from one indexed shard.  This is intentionally
+ * separate from tensor slices: callers may use it only after validating a
+ * checkpoint-specific packing invariant (for example, two adjacent tensors).
+ * The shard membership, file bounds and destination capacity remain enforced
+ * here so a malformed header cannot turn that optimization into an unchecked
+ * pread. */
+static void st_read_range_raw_cap(shards *S, int fd, int64_t off,
+                                  int64_t nbytes, void *out, int64_t cap,
+                                  int drop, const char *tag) {
+    int fidx=S?st_fidx(S,fd):-1;
+    if(fidx<0){fprintf(stderr,"physical range uses an unindexed shard fd\n");exit(1);}
+    if(off<0||nbytes<0||cap<0||nbytes>cap||
+       off>S->sizes[fidx]||nbytes>S->sizes[fidx]-off||
+       (uint64_t)nbytes>SIZE_MAX){
+        fprintf(stderr,"physical shard range [%lld,+%lld) exceeds file/destination bounds "
+                       "(file %lld, cap %lld) — refusing (untrusted container)\n",
+                (long long)off,(long long)nbytes,(long long)S->sizes[fidx],
+                (long long)cap);exit(1);
+    }
+    if(nbytes>0&&!out){fprintf(stderr,"physical range has a NULL destination\n");exit(1);}
+    if(nbytes>0)st_pread_full(fd,out,nbytes,off,tag&&*tag?tag:"pread physical range");
+    if(drop&&nbytes>0)posix_fadvise(fd,off,nbytes,POSIX_FADV_DONTNEED);
 }
 
 /* Read-only view of one tensor's exact stored bytes.  Unlike st_read_raw this
@@ -959,12 +992,95 @@ static void st_unmap_raw(st_mapped_raw *mapped) {
     mapped->nbytes = 0;
 }
 
+/* ---- per-shard mapping cache (opt-in: COLI_MAP_EXPERTS=1) --------------
+ * One mapping per FILE, kept for the process lifetime (shards stay open for
+ * the whole run, so there is nothing shorter-lived to tie the mapping to).
+ * A failed mapping is remembered per fd so it is not retried on every call;
+ * callers must treat a NULL return as "use pread", not as an error. */
+#define ST_MAX_MAPPED_FD 4096
+static uint8_t *g_st_shard_base[ST_MAX_MAPPED_FD];
+static int64_t g_st_shard_len[ST_MAX_MAPPED_FD];
+static signed char g_st_shard_tried[ST_MAX_MAPPED_FD];
+
+static int st_map_experts_enabled(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_MAP_EXPERTS"); on = (e && atoi(e)) ? 1 : 0; }
+    return on;
+}
+
+static const uint8_t *st_shard_mapped(int fd) {
+    if (fd < 0 || fd >= ST_MAX_MAPPED_FD || !st_map_experts_enabled()) return NULL;
+    if (g_st_shard_base[fd]) return g_st_shard_base[fd];
+    if (g_st_shard_tried[fd]) return NULL;
+    g_st_shard_tried[fd] = 1;
+    int64_t len = (int64_t)lseek(fd, 0, SEEK_END);
+    if (len <= 0) return NULL;
+    compat_ro_map map; const void *data;
+    if (compat_map_readonly(fd, 0, (size_t)len, &map, &data) != 0) return NULL;
+    /* The compat_ro_map itself is intentionally not tracked for unmap: shard
+     * mappings live exactly as long as the fd they wrap, i.e. the process. */
+    g_st_shard_base[fd] = (uint8_t *)data;
+    g_st_shard_len[fd] = len;
+    return g_st_shard_base[fd];
+}
+
+/* Serves [off, off+nbytes) of file `fd` directly out of its persistent
+ * mapping -- no allocation, no copy. Returns NULL if mapping is disabled,
+ * unavailable for this fd, or the range doesn't fit; the caller's existing
+ * pread path is the correct fallback in every NULL case. */
+static const void *st_map_shard_range(int fd, int64_t off, int64_t nbytes) {
+    if (off < 0 || nbytes <= 0) return NULL;
+    const uint8_t *base = st_shard_mapped(fd);
+    if (!base) return NULL;
+    if (off > g_st_shard_len[fd] - nbytes) return NULL;
+    return base + off;
+}
+
+/* Read an exact byte slice from a tensor into a caller-owned buffer.  This is
+ * the raw counterpart of st_read_slice_f32: byte_off/nbytes are relative to
+ * the tensor (not the shard), and cap is the actual byte capacity of `out`.
+ * It is deliberately usable for one-byte F8 rows and eight-byte I64 rows;
+ * there is no dtype conversion or element-size assumption here. */
+static void st_read_slice_raw_cap(shards *S, const char *name, int64_t byte_off,
+                                  int64_t nbytes, void *out, int64_t cap, int drop) {
+    st_tensor *t = st_find(S, name);
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
+    if (byte_off < 0 || nbytes < 0) {
+        fprintf(stderr, "slice %s [%lld,+%lld) has negative offset/length\n",
+                name, (long long)byte_off, (long long)nbytes); exit(1);
+    }
+    if (cap < 0 || nbytes > cap) {
+        fprintf(stderr, "slice %s requests %lld bytes, destination holds %lld — refusing\n",
+                name, (long long)nbytes, (long long)cap); exit(1);
+    }
+    if (t->nbytes < 0 || byte_off > t->nbytes || nbytes > t->nbytes - byte_off) {
+        fprintf(stderr, "slice %s [%lld,+%lld) out of tensor byte bounds (%lld)\n",
+                name, (long long)byte_off, (long long)nbytes, (long long)t->nbytes); exit(1);
+    }
+    if ((uint64_t)nbytes > SIZE_MAX) {
+        fprintf(stderr, "slice %s requests %lld bytes, exceeds host size_t\n",
+                name, (long long)nbytes); exit(1);
+    }
+    if (nbytes > 0 && !out) {
+        fprintf(stderr, "slice %s has a NULL destination for %lld bytes\n",
+                name, (long long)nbytes); exit(1);
+    }
+    if (t->off < 0 || byte_off > INT64_MAX - t->off) {
+        fprintf(stderr, "slice %s file offset overflows int64\n", name); exit(1);
+    }
+    int64_t boff = t->off + byte_off;
+    st_pread_full(t->fd, out, nbytes, boff, "pread raw slice");
+    /* A zero length to posix_fadvise means "through EOF" on POSIX, which is
+     * broader than this request.  Do not issue it for an empty slice. */
+    if (drop && nbytes > 0) posix_fadvise(t->fd, boff, nbytes, POSIX_FADV_DONTNEED);
+}
+
 /* legge una FETTA di un tensore: n_elems a partire dall'elemento elem_off.
  * Serve per gli expert fusi di GLM (un tensore = blocco [E, ...]): si legge il
  * solo expert richiesto via pread del sotto-range, niente lettura dell'intero blocco. */
 static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems, float *out, int drop) {
     st_tensor *t = st_find(S, name);
-    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (!t) st_die_missing(S, name);   /* #1317: la riga nuda esisteva gia' spiegata */
     if (t->dtype >= 3) {   /* stesso motivo di st_read_f32 sopra */
         fprintf(stderr, "slice %s: tensor is %s — not a float tensor\n",
                 name, st_dtype_name(t->dtype)); exit(1); }
@@ -972,15 +1088,21 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     if (elem_off < 0 || n_elems < 0 || elem_off > t->numel || n_elems > t->numel - elem_off) {   /* keep the slice inside the tensor; subtraction avoids overflow (#1) */
         fprintf(stderr, "slice %s [%lld,+%lld) out of tensor bounds (numel %lld)\n",
                 name, (long long)elem_off, (long long)n_elems, (long long)t->numel); exit(1); }
+    if (elem_off > INT64_MAX / esz || n_elems > INT64_MAX / esz ||
+        t->off < 0 || elem_off * esz > INT64_MAX - t->off ||
+        (uint64_t)(n_elems * esz) > SIZE_MAX || (n_elems > 0 && !out)) {
+        fprintf(stderr, "slice %s byte arithmetic/destination is invalid — refusing\n", name); exit(1); }
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
-    void *raw = malloc(nb);
-    if (!raw) { fprintf(stderr, "malloc %lld bytes for slice %s failed\n", (long long)nb, name); exit(1); }
-    st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
-    if (t->dtype == 2) memcpy(out, raw, nb);
-    else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
-    else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
+    void *raw = nb ? malloc((size_t)nb) : NULL;
+    if (nb && !raw) { fprintf(stderr, "malloc %lld bytes for slice %s failed\n", (long long)nb, name); exit(1); }
+    if (nb) st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
+    if (nb) {
+        if (t->dtype == 2) memcpy(out, raw, (size_t)nb);
+        else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
+        else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
+    }
     free(raw);
-    if (drop) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
+    if (drop && nb) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
 }
 
 #endif

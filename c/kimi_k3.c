@@ -104,6 +104,7 @@
 #include <sys/sysctl.h>
 #include <mach/mach.h>
 #endif
+#include "cli_args.h"
 #include "st.h"
 #include "tok.h"
 #include "quant.h"
@@ -227,6 +228,7 @@ typedef struct {
     /* experts */
     ERef *eref;                           /* [n_layers][n_experts] (dense rows zeroed) */
     LCache *ecache;
+    uint8_t **ehit;                       /* experts routed this turn, for HITS (dashboard Brain) */
     int64_t e_w1p, e_w1s, e_w2p, e_w2s, e_slot;
     uint64_t clock, hits, miss, ebytes;
     double t_attn, t_moe, t_eload, t_head;
@@ -309,6 +311,28 @@ static void rmsnorm_(float *out, const float *x, const float *w, int D, float ep
 }
 
 /* ---------- DSA (Dictionary Sparse Attention) CPU helpers ---------- */
+/* L'indexer DSA e' COSTRUITO ma non COLLEGATO (#1333): l'unica funzione che
+ * leggerebbe la cache Ic per scegliere le posizioni top-K, dsa_score_single qui
+ * sotto, non ha nessun chiamante -- una grep su tutto il repo trova solo la sua
+ * definizione.
+ *
+ * Finche' resta cosi' l'attenzione e' densa e il sottosistema e' lavoro pagato e
+ * mai letto: CINQUE tensori dal disco per ogni layer DSA (w_k, w_q, w_p, kn_w,
+ * kn_b -- e w_q, w_p, kn_b non sono toccati nemmeno dal codice morto), la cache
+ * Ic da [max_t * index_hd] float per layer, e per ogni token un matmul piu'
+ * rmsnorm piu' rope.
+ *
+ * Spento di default, non cancellato: quel che manca e' collegare
+ * dsa_score_single, e chi lo fara' ha bisogno di questi pesi. KIMI_DSA_INDEXER=1
+ * li ricarica. Avvertenza per chi ci mettera' mano: collegarlo CAMBIA le uscite
+ * -- l'attenzione diventa sparsa dove oggi e' densa -- quindi va fatto contro
+ * l'oracolo token-exact, non a occhio. */
+static int k3_dsa_indexer_on(void){
+    static int cached = -1;
+    if(cached < 0){ const char *e = getenv("KIMI_DSA_INDEXER"); cached = e && *e=='1'; }
+    return cached;
+}
+
 static void dsa_rope(float *v, int pos, int qk_rope, float base_theta){
     int half = qk_rope/2;
     if(qk_rope > 256){ fprintf(stderr,"qk_rope=%d exceeds rope buffer (256)\n",qk_rope); exit(1); }
@@ -919,7 +943,7 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
             a->qa_ln =f32_load(m,NM("model.layers.%d.self_attn.q_a_layernorm.weight",i),c->q_lora);
             a->kva_ln=f32_load(m,NM("model.layers.%d.self_attn.kv_a_layernorm.weight",i),c->kv_lora);
             /* DSA indexer weights – only for "full" layers (idx_type=1) */
-            if(c->index_hd > 0 && c->idx_type[i]){
+            if(c->index_hd > 0 && c->idx_type[i] && k3_dsa_indexer_on()){
                 w_load(m,&a->wk,NM("model.layers.%d.self_attn.w_k.weight",i),(int64_t)c->index_hd,c->hidden,mbits);
                 w_load(m,&a->wq,NM("model.layers.%d.self_attn.w_q.weight",i),(int64_t)c->index_hd,c->q_lora,mbits);
                 w_load(m,&a->wp,NM("model.layers.%d.self_attn.w_p.weight",i),(int64_t)c->index_hd,c->hidden,mbits);
@@ -1426,7 +1450,7 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
         memcpy(Rrow, cv + kvl, qr * sizeof(float));
     }
     /* DSA indexer: prefill — write K portion for full layers */
-    if(c->index_hd > 0 && c->idx_type[li]){
+    if(c->index_hd > 0 && c->idx_type[li] && k3_dsa_indexer_on()){
         for(int t=0;t<C;t++){
             float *ikd = a->Ic + (int64_t)(pos0+t) * c->index_hd;
             const float *xt = x + (int64_t)t * c->hidden;
@@ -1485,6 +1509,30 @@ static uint64_t g_slot_index_probes;
 #else
 #define SLOT_INDEX_PROBE() ((void)0)
 #endif
+/* One byte per expert: routed in this turn or not. The dashboard's Brain tab
+ * reads it as the HITS bitmap after every turn (serve_hits), cleared there. */
+static pthread_mutex_t g_ehit_mx = PTHREAD_MUTEX_INITIALIZER;
+static void ehit_mark(Model *m, int li, int eid){
+    Cfg *c=&m->c;
+    /* The first touch can come from a parallel region (qwen36: the tier
+     * warmstart's omp loop calls expert_get from twelve threads at once):
+     * one thread published m->ehit while it was still filling the rows and
+     * a sibling dereferenced m->ehit[layer] == NULL -- SIGSEGV in about one
+     * run in twelve on a CUDA warmstart. Build the table privately, publish
+     * it once under a lock (double-checked), and read it with acquire order. */
+    uint8_t **ehit=__atomic_load_n(&m->ehit,__ATOMIC_ACQUIRE);
+    if(!ehit){
+        pthread_mutex_lock(&g_ehit_mx);
+        ehit=m->ehit;
+        if(!ehit){
+            ehit=calloc((size_t)c->n_layers,sizeof(uint8_t*));
+            for(int i=0;i<c->n_layers;i++) ehit[i]=calloc((size_t)c->n_experts,1);
+            __atomic_store_n(&m->ehit,ehit,__ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&g_ehit_mx);
+    }
+    if(li>=0&&li<c->n_layers&&eid>=0&&eid<c->n_experts) ehit[li][eid]=1;
+}
 static Slot *slot_indexed(Model *m, int li, int eid){
     LCache *lc=&m->ecache[li];
     if(eid<0||eid>=m->c.n_experts||!lc->slot_by_expert) return NULL;
@@ -1763,6 +1811,7 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
         int nb=nu-base<LP_MAX?nu-base:LP_MAX;
         Slot *use[LP_MAX]; int missk[LP_MAX]; int qof[LP_MAX]; int nmiss=0;
         for(int j=0;j<nb;j++){
+            ehit_mark(m,li,uids[base+j]);
             use[j]=slot_find(m,li,uids[base+j]); qof[j]=-1;
             if(!use[j]){ m->miss++; use[j]=&m->ws[nmiss]; qof[j]=nmiss; missk[nmiss++]=j; }
         }
@@ -2239,7 +2288,7 @@ static void kv_alloc(Model *m, int max_t){
     /* DSA indexer cache — only for full layers (idx_type=1) */
     for(int i=0;i<c->n_layers;i++){
         Mla *a=&m->L[i].m;
-        if(c->index_hd > 0 && c->idx_type[i]){
+        if(c->index_hd > 0 && c->idx_type[i] && k3_dsa_indexer_on()){
             a->Ic = falloc((int64_t)max_t * c->index_hd);
         }
     }
@@ -2845,6 +2894,44 @@ static void serve_tool(const char *id, const char *p, int n){
     coli_serve_write_tool(stdout,id,p,(size_t)n);
 }
 
+/* ---------- dashboard protocol: EMAP / HITS ----------
+ * Same stdout lines colibri.c emits for the web dashboard's Brain tab; the
+ * gateway parses them, nothing else does. Rows are the sparse layers, columns
+ * the experts. EMAP: one byte per expert as two hex digits, tier<<6 | heat
+ * (tier 1 = resident in the layer cache, heat 0: this engine keeps no usage
+ * counter). Printed once after READY and again after every turn, because
+ * the cache fills as the turn runs. HITS: one bit per expert routed in the
+ * turn, packed 8 per hex pair, printed after DONE next to PROF. */
+static void serve_emap(Model *m){
+    Cfg *c=&m->c; int E=c->n_experts, rows=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
+    char *hex=malloc((size_t)rows*E*2+1); int w=0;
+    for(int i=0;i<c->n_layers;i++){
+        if(!m->L[i].sparse) continue;
+        for(int e=0;e<E;e++){
+            int b=(slot_indexed(m,i,e)?1:0)<<6;
+            hex[w++]="0123456789abcdef"[b>>4]; hex[w++]="0123456789abcdef"[b&15];
+        }
+    }
+    hex[w]=0;
+    printf("EMAP %d %d %s\n",rows,E,hex); fflush(stdout); free(hex);
+}
+static void serve_hits(Model *m){
+    Cfg *c=&m->c; int E=c->n_experts, rows=0;
+    if(!m->ehit) ehit_mark(m,-1,-1);   /* a turn that routed nothing still reports a bitmap: all zero */
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) rows++;
+    int nb=(rows*E+7)/8; uint8_t *bm=calloc((size_t)nb,1); int bit=0;
+    for(int i=0;i<c->n_layers;i++){
+        if(!m->L[i].sparse) continue;
+        for(int e=0;e<E;e++,bit++)
+            if(m->ehit[i][e]){ bm[bit>>3]|=(uint8_t)(1<<(bit&7)); m->ehit[i][e]=0; }
+    }
+    char *hex=malloc((size_t)nb*2+1); int w=0;
+    for(int b=0;b<nb;b++){ hex[w++]="0123456789abcdef"[bm[b]>>4]; hex[w++]="0123456789abcdef"[bm[b]&15]; }
+    hex[w]=0;
+    printf("HITS %d %d %s\n",rows,E,hex); fflush(stdout); free(hex); free(bm);
+}
+
 static int serve_one(Model *m, Tok *T, ServeReq *q){
     int cap=65536, *ids=malloc((size_t)cap*sizeof(int)), np=0;
     if(!ids){ coli_serve_write_error(stdout,q->id,"out of memory"); return 0; }
@@ -2932,6 +3019,7 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0, xtool=0;
     char buf[512], xtag[320];   /* tool-call open tags carry attributes: call tool="..." index="..." (#1143) */
     double tg=now_s();
+    int forwards=1;                       /* the prefill; decode steps are counted where they run */
     for(int s=0;s<q->max_tok&&!cancelled;s++){
         int tk=sample_tok(lo,m->c.vocab,q->temp,q->top_p);
         free(lo); lo=NULL;
@@ -2980,7 +3068,7 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         }
         if(cancelled){ limited=0; break; }
         if(eos){ limited=0; break; }
-        if(s+1<q->max_tok) lo=step_chunk(m,&tk,np+s,1);
+        if(s+1<q->max_tok){ lo=step_chunk(m,&tk,np+s,1); forwards++; }
     }
     if(poll.fatal){ free(lo); free(ids); return -1; }
     free(lo); free(ids);
@@ -2996,8 +3084,9 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     if(done_bytes>0) fwrite(done_line,1,(size_t)done_bytes,stdout);
     double moe=m->t_moe-e0, disk=m->t_eload-d0;
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n",
-           dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,gen+1);
+           dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,forwards);
     fflush(stdout);
+    serve_hits(m);
 #ifdef COLI_VULKAN
     if(g_k3_vk){
         if(g_vk_up_auto)
@@ -3020,11 +3109,12 @@ static void serve_loop(Model *m, Tok *T){
      * e' nato senza. */
     coli_serve_stdio_init();
     coli_serve_write_ready(stdout,rss_gb());
+    serve_emap(m);                        /* after READY and STAT: the boot reader discards what precedes them */
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(stdin,stdout,&q,NULL); while(r==0);
         if(r<0) return;
-        if(r==2){ int fatal=serve_one(m,T,&q); free(q.payload); if(fatal<0) return; }
+        if(r==2){ int fatal=serve_one(m,T,&q); free(q.payload); if(fatal<0) return; serve_emap(m); }
     }
 }
 
@@ -3047,7 +3137,7 @@ int main(int argc, char **argv){
     if(!snap||!*snap){ fprintf(stderr,"set SNAP=<Kimi K3 snapshot directory>\n"); return 1; }
     int ngen=32, chat=0;
     for(int i=serving?1:2;i<argc;i++){
-        if(!strcmp(argv[i],"--ngen")&&i+1<argc) ngen=atoi(argv[++i]);
+        if(!strcmp(argv[i],"--ngen")&&i+1<argc) ngen=coli_arg_int(argv[++i], "--ngen");
         else if(!strcmp(argv[i],"--ids")&&i+1<argc) idstr=argv[++i];
         else if(!strcmp(argv[i],"--chat")) chat=1;
         else if(!strcmp(argv[i],"--system")&&i+1<argc) sysmsg=argv[++i];

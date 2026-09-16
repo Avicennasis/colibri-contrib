@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 import json
+import math
 import re
 from pathlib import Path
 
@@ -72,6 +73,7 @@ class FamilyDescriptor:
     config_section: str
     limits: FamilyLimits
     capabilities: FamilyCapabilities
+    resident_inventory: object = None
     # Quanto pesano in RAM i pesi densi rispetto a come stanno su disco.
     # Vale 1.0 per chi li carica cosi' come sono; un motore che li riquantizza
     # a load time pesa meno, e senza questo il pianificatore direbbe che il
@@ -80,6 +82,41 @@ class FamilyDescriptor:
     has_gateway_adapter: bool = False
     has_cli_adapter: bool = False
     tune_prompt_template: str = "{prompt}"
+    supports_accelerator: bool = True
+    # Optional model-owned allocations that are neither dense resident
+    # tensors nor per-expert cache entries. Qwen3.8 uses this for the
+    # normalized FP8 scale bank shared by every cache slot. Keeping this
+    # separate from expert_inventory prevents a fixed allocation from
+    # being multiplied by the cache capacity.
+    fixed_resident_inventory: object = None
+    # Lo script sotto tools/ che `coli convert` puo' guidare per questa famiglia,
+    # e le opzioni di `coli convert` che quello script accetta davvero.
+    #
+    # #1368: `coli convert` lanciava convert_fp8_to_int4.py qualunque cosa gli si
+    # desse. Quel convertitore e' di GLM-5.2 e classifica i tensori per nome
+    # PIATTO, mentre GLM-5.3-Flash annida il testuale sotto il wrapper vision:
+    # `model.language_model.embed_tokens.weight` non corrisponde a nessuna regola
+    # e cade nel fallback finale, che lo quantizza. Poi glm53.c lo legge con
+    # load_f32, rifiuta l'U8, e il motore muore dentro `coli web`.
+    #
+    # Vuoto significa "coli non guida questa famiglia": non e' una lacuna, e'
+    # che il suo convertitore ha un'altra riga di comando (convert_qwen36.py usa
+    # --out e --gs, convert_inkling_int4.py non ha --repo) o non serve affatto
+    # (Qwen3.8 gira sul checkpoint ufficiale). In quel caso si lascia parlare la
+    # guardia del convertitore, che quelle indicazioni le ha gia' per famiglia e
+    # sotto test: due copie della stessa mappa sarebbero il difetto che questa
+    # correzione sta chiudendo.
+    converter: str = ""
+    converter_accepts: tuple = ()
+    converter_mtp_pass: bool = False
+    # Gli esperti per layer del checkpoint con cui display_scale e' stato
+    # scritto. display_scale e' un numero del checkpoint di riferimento, non
+    # della famiglia: un checkpoint potato (REAP) ha la stessa architettura e
+    # lo stesso model_type ma meno esperti, e annunciarlo con la taglia del
+    # riferimento e' lo stesso errore di #1367 -- con la differenza che qui
+    # la geometria lo rende visibile. 0 = nessun riferimento dichiarato, il
+    # banner stampa display_scale come sempre.
+    reference_experts: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +189,174 @@ def _qwen36_geometry(config, context, _model_dir):
     fixed = (layers - full) * (value_heads * key_dim * value_dim +
                                conv_dim * (conv_k - 1)) * 4
     return PlannerGeometry(kv, fixed, 0, _required_int(config, "num_experts", "qwen36"))
+
+
+_QWEN38_PREFILL_BATCH_ROWS = 32
+_QWEN38_PREFILL_WORKSPACE_BYTES = 64 << 20
+
+
+def _qwen38_bounded_prefill(rows, fixed_bytes, row_bytes):
+    """Mirror q38_bounded_prefill_rows() without context-sized scratch."""
+    selected = min(rows, _QWEN38_PREFILL_BATCH_ROWS)
+    while selected > 1 and fixed_bytes + selected * row_bytes > \
+            _QWEN38_PREFILL_WORKSPACE_BYTES:
+        selected -= 1
+    return selected
+
+
+def _qwen38_geometry(config, context, _model_dir):
+    """Qwen3.8-Flash-Next's hybrid state layout.
+
+    Full-attention layers retain GQA K/V plus the raw QSA index key.  Linear
+    (GDN) layers retain a recurrent matrix and a four-stream convolution ring;
+    the single PLE layer adds its own convolution history and two int64 ngram
+    history positions.  Hyper-connection streams also contribute to prefill
+    scratch, so workspace is deliberately conservative rather than zero.
+    """
+    family = "qwen38"
+    layers = _required_int(config, "num_hidden_layers", family)
+    hidden = _required_int(config, "hidden_size", family)
+    vocab = _required_int(config, "vocab_size", family)
+    max_positions = _required_int(config, "max_position_embeddings", family)
+    eos = _required_int(config, "eos_token_id", family, 0)
+    if layers > 512 or hidden > 65536 or max_positions > 262144 or eos >= vocab:
+        raise ValueError(f"{family}: model dimensions exceed the native engine limits")
+    if context > max_positions:
+        raise ValueError(f"{family}: context {context} exceeds max_position_embeddings "
+                         f"{max_positions}")
+    kinds = config.get("layer_types")
+    if not isinstance(kinds, list) or len(kinds) != layers:
+        raise ValueError(f"{family}: missing or invalid planning key 'layer_types'")
+    # Upstream calls these ``full_attention``; early Qwen4-Exp exports and the
+    # tiny oracle call the same QSA layer ``qwen_sparse_attention``.
+    allowed_kinds = {"linear_attention", "full_attention", "qwen_sparse_attention"}
+    unknown_kinds = sorted({kind for kind in kinds if kind not in allowed_kinds})
+    if unknown_kinds:
+        raise ValueError(f"{family}: unsupported layer types {unknown_kinds!r}")
+    full = sum(kind in ("full_attention", "qwen_sparse_attention") for kind in kinds)
+    linear = layers - full
+
+    n_kv = _required_int(config, "num_key_value_heads", family)
+    head_dim = _required_int(config, "head_dim", family)
+    q_heads = _required_int(config, "num_attention_heads", family)
+    if q_heads % n_kv:
+        raise ValueError(f"{family}: attention heads are not divisible by KV heads")
+    rope = config.get("rope_parameters")
+    rope = rope if isinstance(rope, dict) else config
+    partial = rope.get("partial_rotary_factor", config.get("partial_rotary_factor", 1.0))
+    if (isinstance(partial, bool) or not isinstance(partial, (int, float)) or
+            not math.isfinite(partial) or partial <= 0):
+        raise ValueError(f"{family}: invalid partial_rotary_factor")
+    rotary_dim = int(head_dim * partial)
+    if rotary_dim < 1 or rotary_dim > head_dim or rotary_dim % 2:
+        raise ValueError(f"{family}: invalid derived rotary dimension")
+    index_kv = _required_int(config, "indexer_kv_heads", family)
+    index_dim = _required_int(config, "indexer_head_dim", family)
+    index_q = _required_int(config, "indexer_n_heads", family)
+    index_budget = _required_int(config, "indexer_budget", family)
+    index_ratio = _required_int(config, "indexer_compress_ratio", family)
+    if index_kv != 1 or index_dim < rotary_dim or index_budget % index_ratio:
+        raise ValueError(f"{family}: invalid sparse indexer geometry")
+    # Serve allocates this complete QSA bank once before publishing READY and
+    # never grows it in place. One context-sized bank is therefore both the
+    # steady allocation and the allocation peak; no old/new growth pair exists.
+    context_state = full * context * (2 * n_kv * head_dim + index_kv * index_dim) * 4
+
+    value_heads = _required_int(config, "linear_num_value_heads", family)
+    key_dim = _required_int(config, "linear_key_head_dim", family)
+    value_dim = _required_int(config, "linear_value_head_dim", family)
+    hc_count = _required_int(config, "hc_count", family)
+    hc_rank = _required_int(config, "hc_lowrank", family)
+    if hc_count > 16 or hc_rank > 65536:
+        raise ValueError(f"{family}: invalid hyper-connection geometry")
+    key_heads = _required_int(config, "linear_num_key_heads", family)
+    gdn_conv = _required_int(config, "linear_conv_kernel_dim", family, 2) - 1
+    if value_heads % key_heads or value_dim > 512:
+        raise ValueError(f"{family}: invalid Gated DeltaNet geometry")
+    gdn_conv_width = (2 * key_heads * key_dim + value_heads * value_dim)
+    fixed = linear * (value_heads * key_dim * value_dim +
+                      gdn_conv_width * gdn_conv) * 4
+
+    ple_ids = config.get("ple_layer_ids", [])
+    if (not isinstance(ple_ids, list) or len(ple_ids) != 1 or
+            isinstance(ple_ids[0], bool) or not isinstance(ple_ids[0], int) or
+            not 1 <= ple_ids[0] <= layers):
+        raise ValueError(f"{family}: invalid planning key 'ple_layer_ids'")
+    ple_conv = _required_int(config, "ple_conv_kernel_size", family, 2) - 1
+    ngram = _required_int(config, "ngram_size", family, 2)
+    heads_per_ngram = _optional_int(config, "heads_per_ngram", 8, 1)
+    ngram_heads = (ngram - 1) * heads_per_ngram
+    ple_dim = _required_int(config, "ple_embed_dim", family)
+    ngram_parts = _optional_int(config, "split_ngram_parts", 1, 1)
+    if (ngram != 3 or not 1 <= ngram_heads <= 64 or ple_dim % ngram_heads or
+            ple_dim // ngram_heads > 512 or ngram_parts > 512):
+        raise ValueError(f"{family}: invalid PLE geometry")
+    # PLE's retained convolution ring is per hyper-connection stream: the
+    # runtime allocates hc_count * hidden, not the projection embed dimension.
+    hc_width = hc_count * hidden
+    fixed += len(ple_ids) * (hc_width * ngram * ple_conv * 4 +
+                             (ngram - 1) * 8)
+
+    # The one-slot serve path keeps an exact prompt-prefix checkpoint. QSA rows
+    # remain in their existing append-only cache, while every recurrent/PLE
+    # payload is copied once so decode can mutate the live state without
+    # damaging the reusable prompt. It also retains the prompt token IDs and
+    # final prompt logits. The adapter/runtime base reserve covers allocator and
+    # pointer metadata; these are the complete model-sized payloads.
+    prefix_snapshot = fixed + vocab * 4
+    fixed += prefix_snapshot
+    context_state += context * 4
+
+    # Match the peak buffers held concurrently by step(): the persistent
+    # hyper/mixed/inject/block rows plus the largest layer-local row set. The
+    # base planner reserve still covers allocator and non-scaling overhead.
+    base_row = hc_width + 2 * hidden + hc_count
+    gated_residual_row = base_row + 2 * hc_width + hc_rank
+    qsa_row = (base_row + 2 * q_heads * head_dim + 2 * n_kv * head_dim +
+               (index_q + index_kv) * index_dim + q_heads * head_dim)
+    ple_row = base_row + hc_width
+
+    experts = _required_int(config, "num_experts", family)
+    topk = _required_int(config, "num_experts_per_tok", family)
+    if experts > 1024 or topk > 256 or topk > experts:
+        raise ValueError(f"{family}: invalid routed-expert geometry")
+    intermediate = _required_int(config, "moe_intermediate_size", family)
+    shared = _required_int(config, "shared_expert_intermediate_size", family)
+    moe_fixed = experts + 3 * shared + 3 * intermediate + 2 * hidden
+    gdn_fixed = (2 * gdn_conv_width + 3 * value_heads * value_dim +
+                 2 * value_heads + 2 * value_heads * key_dim)
+    ple_fixed = ple_dim + 5 * hc_width + hidden
+    qsa_fixed = (index_q * index_dim + index_dim + index_budget + index_ratio - 1 +
+                 max(2 * (context // index_ratio),
+                     head_dim + index_budget + index_ratio - 1))
+    workspace = (context * max(gated_residual_row, qsa_row, ple_row) +
+                 max(moe_fixed, gdn_fixed, ple_fixed, qsa_fixed)) * 4
+
+    # q38_moe_prefill() and q38_deltanet() batch only a bounded row chunk.
+    # Account their exact simultaneous allocations beside the context-sized
+    # outer hyper/mixed/inject/block rows. Q38RouteAssignment is one int plus
+    # one float (8 bytes), and supported hosts use 64-bit pointers.
+    moe_assignment_bytes = 2 * (hidden + intermediate) * 4 + 8 + 2 * 4
+    moe_row_bytes = (experts + 3 * shared + hidden + 1) * 4 + \
+        topk * moe_assignment_bytes
+    moe_fixed_bytes = experts * (4 * 4 + 8) + 4
+    moe_rows = _qwen38_bounded_prefill(
+        context, moe_fixed_bytes, moe_row_bytes)
+    moe_chunk_bytes = moe_fixed_bytes + moe_rows * moe_row_bytes
+
+    delta_row_bytes = (gdn_conv_width + 2 * value_heads * value_dim +
+                       2 * value_heads) * 4
+    delta_fixed_bytes = (gdn_conv_width +
+                         2 * value_heads * key_dim +
+                         value_heads * value_dim) * 4
+    delta_rows = _qwen38_bounded_prefill(
+        context, delta_fixed_bytes, delta_row_bytes)
+    delta_chunk_bytes = delta_fixed_bytes + delta_rows * delta_row_bytes
+    prefill_workspace = context * base_row * 4 + max(
+        moe_chunk_bytes, delta_chunk_bytes)
+    workspace = max(workspace, prefill_workspace)
+    return PlannerGeometry(context_state, fixed, workspace,
+                           experts)
 
 
 def _olmoe_geometry(config, context, _model_dir):
@@ -484,6 +689,66 @@ def _dsv4_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
+def _dsv41_geometry(config, context, _model_dir):
+    """DeepSeek V4.1 Flash: window ring, compressed KV and index keys, engram rows.
+
+    What the engine keeps resident per layer (deepseek_v41.c model_load):
+
+        window ring   n_layers * window_size * head_dim * 4      (fixed)
+        compressed KV ceil(context / ratio) * head_dim * 4       (per kv source)
+        index keys    ceil(context / ratio) * index_head_dim * 4 (per kv source)
+
+    The engram tables are NOT in here on purpose: 203 GB of the released
+    checkpoint is n-gram memory read row by row from disk (264 bytes per row,
+    at most (max_ngram - 1) * n_heads rows per layer per token), with a small
+    LRU whose size is a runtime knob rather than a function of the context.
+    Counting them as resident would tell a user with 128 GB that this model
+    cannot be served, which is the opposite of true.
+
+    Workspace mirrors forward()'s per-chunk buffers: hc_mult residual copies
+    plus the sublayer scratch, at batch == context.
+    """
+    section = config.get("text_config", config)
+    layers = _required_int(section, "num_hidden_layers", "deepseek_v41")
+    experts = _required_int(section, "n_routed_experts", "deepseek_v41")
+    hidden = _required_int(section, "hidden_size", "deepseek_v41")
+    head_dim = _required_int(section, "head_dim", "deepseek_v41")
+    window = _required_int(section, "sliding_window", "deepseek_v41") \
+        if "sliding_window" in section else _required_int(section, "window_size", "deepseek_v41")
+    index_hd = _required_int(section, "index_head_dim", "deepseek_v41")
+    hc_mult = _required_int(section, "hc_mult", "deepseek_v41")
+
+    ratios = section.get("compress_ratios")
+    if not isinstance(ratios, list) or len(ratios) < layers:
+        raise ValueError("deepseek_v41: compress_ratios must be a list of at least "
+                         "num_hidden_layers entries")
+    sources = section.get("kv_source_layer_ids") or section.get("kv_source_layers") or []
+    if not isinstance(sources, list):
+        raise ValueError("deepseek_v41: kv_source_layer_ids must be a list")
+
+    # The DSpark stages keep a window ring each, on the same terms as a layer: their
+    # attention is window-only, and the window holds the main stream's keys.
+    stages = section.get("n_mtp_layers") or 0
+    if not isinstance(stages, int) or isinstance(stages, bool) or stages < 0:
+        raise ValueError("deepseek_v41: n_mtp_layers must be a non-negative integer")
+    fixed = (layers + stages) * window * head_dim * 4
+    state = 0
+    for layer in sources:
+        if not isinstance(layer, int) or isinstance(layer, bool) or not 0 <= layer < layers:
+            raise ValueError("deepseek_v41: kv_source_layer_ids entries must index a layer")
+        ratio = ratios[layer]
+        if not isinstance(ratio, int) or isinstance(ratio, bool) or ratio < 1:
+            raise ValueError("deepseek_v41: a kv source layer must compress")
+        compressed = (context + ratio - 1) // ratio
+        state += compressed * (head_dim + index_hd) * 4
+
+    workspace = (context * hc_mult * hidden * 2 + context * hidden * 2 + hidden) * 4
+    return PlannerGeometry(state, fixed, workspace, experts)
+
+
+_DSV41_MTP_EXPERT = re.compile(r"^mtp\.(\d+)\.ffn\.experts\.(\d+)\.")
+
+
 _GLM_EXPERT = re.compile(
     r"(?:^|\.)model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
@@ -499,10 +764,22 @@ _INKLING_EXPERT = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\."
     r"(?:gate_up_proj|down_proj)(?:\.|$)"
 )
+_QWEN38_EXPERT = re.compile(
+    r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts\."
+    r"(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+)
+_QWEN38_EXPERT_SCALE = re.compile(
+    r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts\."
+    r"(\d+)\.(gate_proj|up_proj|down_proj)\.weight_scale_inv$"
+)
+_QWEN38_FUSED_EXPERT = re.compile(
+    r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts\."
+    r"(gate_up_proj|down_proj)$"
+)
 
 
 def _individual_expert_inventory(pattern):
-    def inventory(name, size, _config):
+    def inventory(name, size, _config, _dtype=None):
         match = pattern.search(name)
         if match is None:
             return ()
@@ -510,7 +787,48 @@ def _individual_expert_inventory(pattern):
     return inventory
 
 
-def _inkling_expert_inventory(name, size, config):
+def _dsv41_expert_inventory(name, size, config, _dtype=None):
+    """Routed experts, the backbone's and the DSpark head's alike.
+
+    A draft stage streams its experts exactly as a layer does -- its own LRU, its own
+    smaller set -- so they belong in the expert inventory and not in the resident
+    weights, where three stages of 128 experts would be 7 GB of RAM the engine never
+    holds. They are filed after the last real layer, which is where the vendor's own
+    numbering puts them: `DSparkBlock(args.n_layers + stage_id, args)`. The planner
+    then prices one cache slot per stage, which is what the engine allocates.
+    """
+    match = _V4_EXPERT.search(name)
+    if match is not None:
+        return ((int(match.group(1)), int(match.group(2)), size),)
+    match = _DSV41_MTP_EXPERT.search(name)
+    if match is None:
+        return ()
+    section = config.get("text_config", config)
+    layers = section.get("num_hidden_layers")
+    if not isinstance(layers, int) or isinstance(layers, bool) or layers < 1:
+        raise ValueError("deepseek_v41: num_hidden_layers is required to place the "
+                         "DSpark stages after the backbone")
+    return ((layers + int(match.group(1)), int(match.group(2)), size),)
+
+
+_DSV41_ENGRAM = re.compile(r"^layers\.(\d+)\.engram\.embed\.(weight|scale)$")
+
+
+def _dsv41_resident_inventory(name, size, _config, _dtype=None):
+    """Resident bytes for what the engine actually holds in RAM.
+
+    The two n-gram tables are 203 GB of the released checkpoint, 40% of it, and
+    the engine never holds them: it reads one 264-byte row at a time from disk
+    behind a small LRU whose size is a runtime knob. Counted as dense they turn
+    a 552B model that fits a workstation into one that needs 214 GB of RAM, and
+    the plan then plans nothing: measured against the real checkpoint on a 61 GB
+    box, `coli plan` reported 214.3 GB of dense weights, 0% projected expert
+    residency and a cap of zero, for a model whose resident trunk is 11 GB.
+    """
+    return 0 if _DSV41_ENGRAM.match(name) else size
+
+
+def _inkling_expert_inventory(name, size, config, _dtype=None):
     match = _INKLING_EXPERT.fullmatch(name)
     if match is None:
         return ()
@@ -523,6 +841,173 @@ def _inkling_expert_inventory(name, size, config):
     return tuple((layer, expert, per_expert) for expert in range(experts))
 
 
+def _qwen38_expert_inventory(name, size, config, dtype=None):
+    """Index per-expert FP8 and fused BF16 expert tensor layouts.
+
+    Resource planning calls this once per tensor; summing the returned byte
+    counts therefore combines gate/up and down tensors for each expert without
+    multiplying either tensor by the expert count a second time. FP8 scale
+    sidecars are validated here but accounted for by the fixed resident
+    inventory because the native loader shares their normalized bank.
+    """
+    match = _QWEN38_EXPERT.fullmatch(name)
+    if match:
+        hidden = _required_int(config, "hidden_size", "qwen38")
+        intermediate = _required_int(config, "moe_intermediate_size", "qwen38")
+        elements = hidden * intermediate
+        if size not in (elements, elements * 2, elements * 4):
+            raise ValueError(f"qwen38: expert tensor {name!r} has unexpected size {size}")
+        inferred = {elements: "F8_E4M3", elements * 2: "BF16",
+                    elements * 4: "F32"}[size]
+        dtype = inferred if dtype is None else dtype
+        expected = {"F8_E4M3": elements, "F8_E4M3FN": elements,
+                    "float8_e4m3fn": elements, "BF16": elements * 2,
+                    "F16": elements * 2, "F32": elements * 4}.get(dtype)
+        if expected != size:
+            raise ValueError(f"qwen38: expert tensor {name!r} has unsupported "
+                             f"dtype/size {dtype}/{size}")
+        # Native FP8/BF16 retain their source representation. F16 is accepted
+        # by the engine but expands to F32, so its two-byte file size is not a
+        # safe cache budget.
+        retained = size if dtype not in ("F16",) else elements * 4
+        return ((int(match.group(1)), int(match.group(2)), retained),)
+    match = _QWEN38_EXPERT_SCALE.fullmatch(name)
+    if match:
+        # The native loader normalizes all scales into one fixed per-layer
+        # bank. They are deliberately excluded from per-slot accounting;
+        # _qwen38_fixed_resident_inventory() accounts for that bank once.
+        _qwen38_scale_bytes(name, size, config, dtype)
+        return ()
+    match = _QWEN38_FUSED_EXPERT.fullmatch(name)
+    if not match:
+        return ()
+    experts = _required_int(config, "num_experts", "qwen38")
+    hidden = _required_int(config, "hidden_size", "qwen38")
+    intermediate = _required_int(config, "moe_intermediate_size", "qwen38")
+    matrices = 2 if match.group(2) == "gate_up_proj" else 1
+    elements = experts * matrices * hidden * intermediate
+    if size not in (elements * 2, elements * 4):
+        raise ValueError(f"qwen38: fused expert tensor {name!r} has unexpected size {size}")
+    inferred = "BF16" if size == elements * 2 else "F32"
+    dtype = inferred if dtype is None else dtype
+    expected = {"BF16": elements * 2, "F16": elements * 2,
+                "F32": elements * 4}.get(dtype)
+    if expected != size:
+        raise ValueError(f"qwen38: fused expert tensor {name!r} has unsupported "
+                         f"dtype/size {dtype}/{size}")
+    per_expert = (elements * 4 if dtype == "F16" else size) // experts
+    layer = int(match.group(1))
+    return tuple((layer, expert, per_expert) for expert in range(experts))
+
+
+def _qwen38_scale_bytes(name, size, config, dtype=None):
+    """Validate a Qwen3.8 FP8 scale sidecar and return its retained bytes.
+
+    The source sidecar may be BF16 or F32, while the native engine always
+    retains the decoded values as F32. This helper is shared by the expert
+    inventory and fixed-resident inventory so validation and sizing cannot
+    drift apart.
+    """
+    match = _QWEN38_EXPERT_SCALE.fullmatch(name)
+    if match is None:
+        return 0
+    hidden = _required_int(config, "hidden_size", "qwen38")
+    intermediate = _required_int(config, "moe_intermediate_size", "qwen38")
+    projection = match.group(3)
+    rows = intermediate if projection != "down_proj" else hidden
+    cols = hidden if projection != "down_proj" else intermediate
+    scale_count = math.ceil(rows / 128) * math.ceil(cols / 128)
+    if dtype is None:
+        if size == scale_count * 4:
+            dtype = "F32"
+        elif size == scale_count * 2:
+            dtype = "BF16"
+    source_bytes = {"BF16": 2, "F16": 2, "F32": 4}.get(dtype)
+    if source_bytes is None or size != scale_count * source_bytes:
+        raise ValueError(f"qwen38: expert scale {name!r} has unsupported "
+                         f"dtype/size {dtype}/{size}")
+    return scale_count * 4
+
+
+def _qwen38_fixed_resident_inventory(name, size, config, dtype=None):
+    """Return bytes for the native loader's fixed normalized scale bank.
+
+    A sidecar contributes its normalized F32 footprint exactly once. For a
+    native official checkpoint, summing all sidecars produces the complete
+    bank (layers x experts x three projections), independent of cache slots.
+    For a fallback layout the same charge is conservative: expanded loaders
+    do not retain the bank, but reserving it cannot understate memory.
+    """
+    return _qwen38_scale_bytes(name, size, config, dtype)
+
+
+_QWEN38_NATIVE_MATRIX_SUFFIXES = (
+    "embed_tokens.weight",
+    "input_mix_weight_down.weight",
+    "input_mix_weight_up.weight",
+    "block_inject_weight.weight",
+    "mlp.gate.weight",
+    "mlp.shared_expert.gate_proj.weight",
+    "mlp.shared_expert.up_proj.weight",
+    "mlp.shared_expert.down_proj.weight",
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight",
+    "self_attn.indexer.index_qk_proj.weight",
+    "linear_attn.in_proj_qkv.weight",
+    "linear_attn.in_proj_z.weight",
+    "linear_attn.in_proj_b.weight",
+    "linear_attn.in_proj_a.weight",
+    "linear_attn.out_proj.weight",
+    "ple.key_proj.weight",
+    "ple.value_proj.weight",
+)
+
+
+def _qwen38_resident_inventory(name, size, _config, dtype=None):
+    """Resident bytes for tensors the native text engine actually loads.
+
+    The official checkpoints store non-quantized text tensors as BF16.  Major
+    rank-two matrices stay in that two-byte representation; the comparatively
+    small norms, gates and convolution vectors still expand through st_read_f32.
+    """
+    if _QWEN38_EXPERT_SCALE.fullmatch(name):
+        # Expert scales belong to the fixed normalized bank, not dense
+        # residency. The dedicated inventory hook accounts them once.
+        return 0
+    if name.startswith("mtp.") or name.startswith("model.visual."):
+        return 0
+    if ".ple.ple_embedding.ngram_embedding." in name and name.endswith(".weight"):
+        return 0  # 51B-parameter PLE table stays pageable in st.h.
+    if name.endswith((".ple.ple_embedding.layer_multipliers",
+                      ".ple.ple_embedding.ngram_heads_vocab_sizes",
+                      ".ple.ple_embedding.ngram_heads_offsets",
+                      ".ple.ple_embedding.ngram_embedding.weight_scale")):
+        # These few values are read into fixed fields in Model, not retained as
+        # separately allocated source tensors.
+        return 0
+    text_tensor = (name == "lm_head.weight" or
+                   name.startswith("model.language_model.") or
+                   (name.startswith("model.") and
+                    not name.startswith("model.visual.")))
+    if not text_tensor:
+        return 0
+    # Direct registry tests predate dtype-bearing planner entries and use BF16
+    # sizes; real scans always supply the safetensors dtype.
+    dtype = "BF16" if dtype is None else dtype
+    element_bytes = {"BF16": 2, "F16": 2, "F32": 4}.get(dtype)
+    if not element_bytes:
+        raise ValueError(f"qwen38: resident tensor {name!r} has unsupported dtype {dtype}")
+    elements = size // element_bytes
+    if elements * element_bytes != size:
+        raise ValueError(f"qwen38: resident tensor {name!r} has invalid byte size {size}")
+    if (name == "lm_head.weight" or
+            name.endswith(_QWEN38_NATIVE_MATRIX_SUFFIXES)) and dtype == "BF16":
+        return size
+    return elements * 4
+
+
 COMMON_CAP = FamilyCapabilities(False, False, False, True)
 
 FAMILIES = (
@@ -532,6 +1017,12 @@ FAMILIES = (
         # export di solo testo dichiara "glm5_next_text" al primo livello.
         model_types=("glm5_next", "glm5_next_text"),
         display_name="GLM-5.3-Flash",
+        # Niente ebits/io_bits/xbits: questo convertitore tiene i densi e
+        # l'embedding in BF16 e la precisione la sceglie il motore a load time
+        # (GLM53_BITS). Accettare quelle opzioni per poi ignorarle sarebbe la
+        # versione silenziosa dello stesso guasto.
+        converter="convert_glm53.py",
+        converter_accepts=("group_size",),
         display_scale="321B",
         engine_artifact="glm53",
         engine_aliases=(),
@@ -551,8 +1042,18 @@ FAMILIES = (
         # implicit_cap 0, non 8: questo motore dimensiona la cache degli
         # esperti dalla RAM disponibile, quindi "nessuna scelta esplicita"
         # deve arrivargli come 0 e non come otto slot per layer.
-        limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 0, "GLM53_MAXT"),
-        capabilities=COMMON_CAP,
+        # L'interattivo era 1024, uguale al default non interattivo: l'unica
+        # famiglia che ragiona a cui non era stato alzato. Su un modello che
+        # riflette prima di rispondere quel tetto non e' una rete di sicurezza,
+        # e' una ghigliottina che cade DENTRO al blocco di pensiero e chiude il
+        # turno senza risposta (#1278). 16384 e' il valore che hanno gia' tutte
+        # le famiglie con lo stesso contesto massimo di 1048576.
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 16, 0, "GLM53_MAXT"),
+        # tools=True: this family DOES render and parse tool calls. It used to
+        # share COMMON_CAP, which says otherwise -- the flag is descriptive
+        # (it only feeds the capability dict) so nothing broke, but a client
+        # reading it programmatically was told the opposite of the truth.
+        capabilities=FamilyCapabilities(True, False, False, True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
         # Dal chat_template.jinja del checkpoint: nessun a capo, e <think>
@@ -562,7 +1063,26 @@ FAMILIES = (
     FamilyDescriptor(
         id="glm",
         model_types=("glm_moe_dsa", "glm5_moe", "glm"),
-        display_name="GLM-5.2",
+        # Two model names, one family, and that is not a shortcut. Z.ai state
+        # it on GLM-5.3's own card: "GLM-5.3 uses the same base model as
+        # GLM-5.2 -- every gain comes from post-training." The checkpoints
+        # agree. Diffing the two config.json leaves exactly one extra key
+        # (moe_router_dtype) and the transformers_version that wrote the file:
+        # same 78 layers, 256 experts, hidden 6144, moe_intermediate 2048, same
+        # parameter count. There is nothing architectural to tell them apart,
+        # so no rule over the configuration can name one and not the other, now
+        # or later. #1326's approach for Qwen -- name a checkpoint by its
+        # geometry -- cannot apply here, because the geometry is identical.
+        #
+        # Announcing a GLM-5.3 container as "GLM-5.2" was wrong in the one way
+        # that matters: the engine ran the right weights and the banner named a
+        # different model. Naming both is the honest statement of what this
+        # family loads. If a future release ever adds a real discriminator,
+        # split this then, on evidence.
+        display_name="GLM-5.2/5.3",
+        converter="convert_fp8_to_int4.py",
+        converter_accepts=("ebits", "io_bits", "xbits", "group_size"),
+        converter_mtp_pass=True,
         display_scale="744B",
         engine_artifact="colibri",
         engine_aliases=("glm",),
@@ -603,7 +1123,13 @@ FAMILIES = (
         planner_unsupported_reason="",
         expert_inventory=_inkling_expert_inventory,
         config_section="text_config",
-        limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 8, "CTX_MAX"),
+        # L'interattivo era 1024, uguale al default non interattivo: l'unica
+        # famiglia che ragiona a cui non era stato alzato. Su un modello che
+        # riflette prima di rispondere quel tetto non e' una rete di sicurezza,
+        # e' una ghigliottina che cade DENTRO al blocco di pensiero e chiude il
+        # turno senza risposta (#1278). 16384 e' il valore che hanno gia' tutte
+        # le famiglie con lo stesso contesto massimo di 1048576.
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 8, "CTX_MAX"),
         capabilities=FamilyCapabilities(False, False, True, True),
         has_gateway_adapter=True,
         tune_prompt_template="<|user|>{prompt}<|assistant|>",
@@ -631,8 +1157,18 @@ FAMILIES = (
         planner_unsupported_reason="",
         expert_inventory=_individual_expert_inventory(_KIMI_EXPERT),
         config_section="text_config",
-        limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 8, "K3_MAXT"),
-        capabilities=COMMON_CAP,
+        # L'interattivo era 1024, uguale al default non interattivo: l'unica
+        # famiglia che ragiona a cui non era stato alzato. Su un modello che
+        # riflette prima di rispondere quel tetto non e' una rete di sicurezza,
+        # e' una ghigliottina che cade DENTRO al blocco di pensiero e chiude il
+        # turno senza risposta (#1278). 16384 e' il valore che hanno gia' tutte
+        # le famiglie con lo stesso contesto massimo di 1048576.
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 8, "K3_MAXT"),
+        # tools=True: this family DOES render and parse tool calls. It used to
+        # share COMMON_CAP, which says otherwise -- the flag is descriptive
+        # (it only feeds the capability dict) so nothing broke, but a client
+        # reading it programmatically was told the opposite of the truth.
+        capabilities=FamilyCapabilities(True, False, False, True),
         has_gateway_adapter=True,
         tune_prompt_template="K3CHAT1\nM user {prompt_len}\n{prompt}G 0\n\n",
     ),
@@ -655,7 +1191,14 @@ FAMILIES = (
         planner_unsupported_reason="",
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="root",
-        limits=FamilyLimits(4096, 4096, 1024, 1024, 1, 8, "CTX"),
+        # implicit_cap 0, not 8: the engine sizes its expert cache from the RAM
+        # budget once the dense weights are resident (#1443), so "nobody chose a
+        # number" has to arrive as the sentinel. Eight slots per layer knows
+        # nothing about the model or the machine, and on OLMoE it is five times
+        # slower than the cache the same machine could hold: measured on a
+        # 1204-token prefill, cap 8 gives 22.8% expert hit rate and 0.045 tok/s,
+        # cap 64 gives 99.4% and 0.215 tok/s.
+        limits=FamilyLimits(4096, 4096, 1024, 1024, 1, 0, "CTX"),
         capabilities=FamilyCapabilities(False, False, False, False),
         has_gateway_adapter=True,
         has_cli_adapter=True,
@@ -693,10 +1236,49 @@ FAMILIES = (
             "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"),
     ),
     FamilyDescriptor(
+        id="qwen38",
+        model_types=("qwen4_exp", "qwen4_exp_text"),
+        display_name="Qwen3.8-Flash-Next",
+        display_scale="176B",
+        engine_artifact="qwen38",
+        engine_aliases=(),
+        engine_group="qwen38",
+        internal_arch="qwen38",
+        build_target="qwen38",
+        process_names=("qwen38",),
+        default_model_id="qwen3.8-flash-next-colibri",
+        cli_adapter="qwen38",
+        gateway_adapter="qwen38",
+        planner_id="qwen38_hybrid",
+        planner_geometry=_qwen38_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_qwen38_expert_inventory,
+        resident_inventory=_qwen38_resident_inventory,
+        fixed_resident_inventory=_qwen38_fixed_resident_inventory,
+        config_section="text_config",
+        limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 1, "Q38_MAXT"),
+        capabilities=FamilyCapabilities(True, False, False, True),
+        has_gateway_adapter=True,
+        # Like Qwen3.6, direct `coli run` is intentionally not exposed until
+        # an engine-specific CLI prompt path exists; chat/serve use the gateway.
+        has_cli_adapter=False,
+        tune_prompt_template=(
+            "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully "
+            "through the task, validate key assumptions, consider plausible alternatives, "
+            "and prioritize correctness, consistency, and clarity in the final answer."
+            "<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n"),
+        supports_accelerator=False,
+    ),
+    FamilyDescriptor(
         id="deepseek_v4",
         model_types=("deepseek_v4",),
         display_name="DeepSeek V4 Flash",
         display_scale="284B",
+        # deepseek-ai/DeepSeek-V4-Flash-0731 config.json: 43 layer, 256
+        # esperti, top-k 6. Il REAP a 150B (#1310) ne ha 132 sugli stessi 43
+        # layer: e' quello che fa scattare la geometria misurata nel banner.
+        reference_experts=256,
         engine_artifact="deepseek_v4",
         engine_aliases=(),
         engine_group="deepseek_v4",
@@ -716,6 +1298,43 @@ FAMILIES = (
         has_gateway_adapter=True,
         has_cli_adapter=True,
     ),
+    FamilyDescriptor(
+        id="deepseek_v41",
+        model_types=("deepseek_v41", "deepseek_v41_text"),
+        display_name="DeepSeek V4.1 Flash",
+        display_scale="552B",
+        # deepseek-ai/DeepSeek-V4.1-Flash: 40 layers, 384 experts, top-6, plus
+        # two 384M-row engram tables that never enter RAM.
+        reference_experts=384,
+        engine_artifact="deepseek_v41",
+        engine_aliases=(),
+        engine_group="deepseek_v41",
+        internal_arch="deepseek_v41",
+        build_target="deepseek_v41",
+        process_names=("deepseek_v41",),
+        default_model_id="deepseek-v4.1-flash-colibri",
+        cli_adapter="deepseek_v41",
+        gateway_adapter="deepseek_v41",
+        planner_id="deepseek_v41",
+        planner_geometry=_dsv41_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_dsv41_expert_inventory,
+        resident_inventory=_dsv41_resident_inventory,
+        config_section="text_config",
+        limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 8, "CTX"),
+        # tools yes (DSML, see v41_dsml.py), grammars no: the engine reads the six-field
+        # SUBMIT header and has no constrained decoder, so a grammar has to be refused
+        # at the gateway rather than desync the wire.
+        capabilities=FamilyCapabilities(True, False, False, True),
+        has_gateway_adapter=True,
+        # coli run stays unwired, for the reason qwen36 gives above and one more:
+        # cmd_run dispatches per arch after this gate, and with no deepseek_v41
+        # branch of its own the launcher would fall through to GLM's binary and
+        # GLM's prompt template. The engine speaks the SERVE protocol and nothing
+        # else, so a one-shot has nowhere to go but the gateway -- which is what
+        # coli chat, coli serve and coli web already use.
+        has_cli_adapter=False,
+    ),
 )
 
 
@@ -729,7 +1348,12 @@ def _build_registry(families):
         if (not family.model_types or
                 (not callable(family.planner_geometry) and
                   not family.planner_unsupported_reason) or
-                not callable(family.expert_inventory) or
+                 not callable(family.expert_inventory) or
+                (family.resident_inventory is not None and
+                 not callable(family.resident_inventory)) or
+                (family.fixed_resident_inventory is not None and
+                 not callable(family.fixed_resident_inventory)) or
+                not isinstance(family.supports_accelerator, bool) or
                 not isinstance(family.has_gateway_adapter, bool) or
                 not isinstance(family.has_cli_adapter, bool) or
                 not isinstance(family.tune_prompt_template, str) or
@@ -837,15 +1461,49 @@ def planner_geometry(resolved, context):
     return geometry
 
 
-def expert_contributions(resolved, name, size):
+def expert_contributions(resolved, name, size, dtype=None):
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
         raise ValueError("tensor size must be a non-negative integer")
+    if dtype is not None and not isinstance(dtype, str):
+        raise ValueError("tensor dtype must be a string")
     contributions = resolved.descriptor.expert_inventory(
-        name, size, resolved.family_config)
+        name, size, resolved.family_config, dtype)
     for layer, expert, byte_count in contributions:
         if layer < 0 or expert < 0 or byte_count < 0:
             raise RegistryError(f"invalid expert inventory for {resolved.descriptor.id}")
     return contributions
+
+
+def resident_contribution(resolved, name, size, dtype=None):
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise ValueError("tensor size must be a non-negative integer")
+    inventory = resolved.descriptor.resident_inventory
+    if dtype is not None and not isinstance(dtype, str):
+        raise ValueError("tensor dtype must be a string")
+    contribution = size if inventory is None else inventory(
+        name, size, resolved.family_config, dtype)
+    if isinstance(contribution, bool) or not isinstance(contribution, int) or contribution < 0:
+        raise RegistryError(f"invalid resident inventory for {resolved.descriptor.id}")
+    return contribution
+
+
+def fixed_resident_contribution(resolved, name, size, dtype=None):
+    """Return resident bytes that do not belong to dense or cache storage.
+
+    This pool is model-owned and independent of cache capacity. Families
+    without such an allocation return zero.
+    """
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise ValueError("tensor size must be a non-negative integer")
+    if dtype is not None and not isinstance(dtype, str):
+        raise ValueError("tensor dtype must be a string")
+    inventory = resolved.descriptor.fixed_resident_inventory
+    contribution = 0 if inventory is None else inventory(
+        name, size, resolved.family_config, dtype)
+    if isinstance(contribution, bool) or not isinstance(contribution, int) or contribution < 0:
+        raise RegistryError(
+            f"invalid fixed resident inventory for {resolved.descriptor.id}")
+    return contribution
 
 
 def public_metadata(family):
@@ -864,6 +1522,7 @@ def public_metadata(family):
         "cli_adapter": family.cli_adapter,
         "gateway_adapter": family.gateway_adapter,
         "planner_id": family.planner_id,
+        "supports_accelerator": family.supports_accelerator,
         "limits": {
             "default_context": family.limits.default_context,
             "max_context": family.limits.max_context,
