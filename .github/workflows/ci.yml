@@ -9,7 +9,7 @@ on:
 jobs:
   engine:
     name: Engine (Linux, CPU)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     steps:
       - uses: actions/checkout@v4
       - name: Build colibri + inkling
@@ -33,7 +33,7 @@ jobs:
   # syntax instead.
   docker:
     name: Container image
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     steps:
       - uses: actions/checkout@v4
       - name: Build the slim image
@@ -74,7 +74,7 @@ jobs:
   # reproduces it locally.
   sanitizers:
     name: Sanitizers (ASan + UBSan)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     steps:
       - uses: actions/checkout@v4
       - name: C suite under ASan + UBSan
@@ -98,7 +98,7 @@ jobs:
   # tier initialises, and the code path executes at all.
   vulkan:
     name: Vulkan (Lavapipe, software)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     steps:
       - uses: actions/checkout@v4
       - name: Install the Vulkan toolchain and a software driver
@@ -146,10 +146,12 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            runner: '["self-hosted","linux","x64","dev-pool","colibri"]'
             name: linux
             shell: bash
             v4: "1"
           - os: macos-latest
+            runner: '"macos-latest"'
             name: macos
             shell: bash
             # arm64 macOS joined COLI_V4_SUPPORTED: compat.h carries the
@@ -158,11 +160,14 @@ jobs:
             v4: "1"
 
           - os: windows-latest
+            runner: '"windows-latest"'
             name: windows
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'.
             shell: "msys2 {0}"
             v4: "1"
-    runs-on: ${{ matrix.os }}
+    # Keep matrix.os as the platform discriminator while routing only its x64
+    # Linux leg to the private Colibri runner hosted on yellow.
+    runs-on: ${{ fromJSON(matrix.runner) }}
     defaults:
       run:
         shell: ${{ matrix.shell }}
@@ -306,9 +311,13 @@ jobs:
 
   engine-cuda-syntax:
     name: CUDA syntax check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     steps:
       - uses: actions/checkout@v4
+      - name: Install CUDA action prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends software-properties-common
       - name: Install CUDA toolkit (compiler only)
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
@@ -338,7 +347,7 @@ jobs:
 
   qwen36-tiny-check:
     name: Qwen3.6 tiny oracle (token-exact + ASan/UBSan)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -443,7 +452,7 @@ jobs:
 
   inkling-oracle:
     name: Inkling oracle (token-exact vs transformers)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -493,7 +502,7 @@ jobs:
   # two identical greedy runs diverging.
   efficiency:
     name: Efficiency suite (tiny oracle)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -554,7 +563,7 @@ jobs:
   # (bind to port 0), so it is safe on a shared runner.
   cluster-parity:
     name: Cluster parity gate (fmt6/fmt4, token-exact)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -573,7 +582,7 @@ jobs:
 
   engine-hip-syntax:
     name: HIP syntax check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     steps:
       - uses: actions/checkout@v4
       - name: Free runner disk
@@ -704,7 +713,7 @@ jobs:
 
   web:
     name: Web UI
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     defaults:
       run:
         working-directory: web
@@ -723,7 +732,7 @@ jobs:
 
   python:
     name: Python tests
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

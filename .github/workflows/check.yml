@@ -22,7 +22,7 @@ env:
 jobs:
   linux:
     name: Linux
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -67,7 +67,7 @@ jobs:
 
   k3-tiny:
     name: Linux (generated tiny K3 vendor oracle)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -83,7 +83,7 @@ jobs:
 
   v4-tiny:
     name: Linux (generated tiny V4 target oracle)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -99,7 +99,7 @@ jobs:
 
   glm53-oracle:
     name: Linux (generated GLM-5.3 oracle contract)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
