@@ -80,6 +80,78 @@ class EnvDefaultsTest(unittest.TestCase):
             self.assertNotIn(k, e)
 
 
+class SiblingPlanRefusalTest(unittest.TestCase):
+    """A sibling auto-tier refusal is a launcher diagnostic, never a traceback
+    or a child started with an implicit over-budget cache."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.model = Path(self.directory.name)
+        (self.model / "config.json").write_text(
+            json.dumps({"model_type": "qwen4_exp_text"}), encoding="utf-8")
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def refusal_args(self, **overrides):
+        values = dict(
+            model=str(self.model), policy="quality", ram=0, ngen=8, topp=0,
+            topk=0, temp=None, repin=0, ctx=0, auto_tier=True, gpu=None,
+            vram=0, kv_slots=1, no_tune_profile=True, cap=None,
+            no_attach=True, attach=None, api_key=None,
+        )
+        values.update(overrides)
+        return types.SimpleNamespace(**values)
+
+    def plan_refusal(self):
+        return mock.patch(
+            "resource_plan.build_plan",
+            return_value={"model": {"family_id": "qwen38"}},
+        ), mock.patch(
+            "resource_plan.environment_for_plan",
+            side_effect=ValueError(
+                "Qwen3.8 RAM budget cannot hold one expert slot per loaded layer"
+            ),
+        )
+
+    def test_chat_refuses_before_popen_without_traceback(self):
+        build_plan, environment = self.plan_refusal()
+        with mock.patch.object(coli, "need_model"), \
+             mock.patch.object(coli, "engine_for", return_value="/engines/qwen38"), \
+             mock.patch.object(coli, "resource_request", return_value=(0, 0, [], 0)), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=8), \
+             mock.patch.object(coli, "banner"), build_plan, environment, \
+             mock.patch.object(coli.subprocess, "Popen") as popen:
+            with self.assertRaises(SystemExit) as stopped:
+                coli.cmd_chat(self.refusal_args())
+        message = str(stopped.exception)
+        self.assertIn("invalid resource plan", message)
+        self.assertIn("one expert slot", message)
+        self.assertNotIn("Traceback", message)
+        popen.assert_not_called()
+
+    def test_serve_refuses_without_starting_or_leaving_pidfile(self):
+        build_plan, environment = self.plan_refusal()
+        pidfile = self.model / "serve.pid"
+        arguments = self.refusal_args(
+            port=9123, host="127.0.0.1", model_id=None,
+            cluster_coordinator=None, cluster_workers=None,
+        )
+        with mock.patch.object(coli, "need_model"), \
+             mock.patch.object(coli, "engine_for", return_value="/engines/qwen38"), \
+             mock.patch.object(coli, "resource_request", return_value=(0, 0, [], 0)), \
+             mock.patch("resource_plan.physical_cpu_count", return_value=8), \
+             mock.patch.object(coli, "serve_pidfile", return_value=str(pidfile)), \
+             mock.patch.object(coli, "banner"), build_plan, environment, \
+             mock.patch("openai_server.ARCH", "glm"), \
+             mock.patch("openai_server.serve") as serve:
+            with self.assertRaises(SystemExit) as stopped:
+                coli.cmd_serve(arguments)
+        self.assertIn("invalid resource plan", str(stopped.exception))
+        serve.assert_not_called()
+        self.assertFalse(pidfile.exists())
+
+
 class CudaAutoEnableTest(unittest.TestCase):
     """Windows bare `coli chat` (no --gpu/--vram/--auto-tier) used to ALWAYS run
     CPU-only even on a CUDA build with a GPU present. env_for now auto-enables
@@ -131,8 +203,63 @@ class CudaAutoEnableTest(unittest.TestCase):
         # so it must be present and positive — never a guess or zero.
         self.assertIn("CUDA_EXPERT_GB", e)
         self.assertGreater(float(e["CUDA_EXPERT_GB"]), 0.0)
-        # Dense offload is an explicit opt-in (matches --auto-tier): not set here.
+        # No dense size in this plan: dense placement is not decided here.
         self.assertNotIn("CUDA_DENSE", e)
+
+    def test_win32_puts_the_dense_trunk_on_a_card_that_holds_it(self):
+        """#1409: a 5090 (30.7 GB tier) with a 12.5 GB dense trunk ran the trunk
+        on the CPU because the auto path never set CUDA_DENSE. When the plan says
+        the trunk fits with room for experts, it goes on the card and its bytes
+        leave the expert budget, or the lazy dense uploads fail against a full
+        tier (#687)."""
+        GPB = 1024 ** 3
+        gpus = [self._fake_gpu(name="NVIDIA GeForce RTX 5090", total_mib=34000, free_mib=33000)]
+        plan = {"tiers": {"ram": {"budget_bytes": 120 * GPB, "cache_slots_per_layer": 62,
+                                  "dense_bytes": int(12.5 * GPB)},
+                          "vram": {"budget_bytes": int(30.7 * GPB), "devices": gpus}}}
+        e = self._env_for("win32", cuda=True, gpus=gpus, plan=plan)
+        self.assertEqual(e["CUDA_DENSE"], "1")
+        self.assertAlmostEqual(float(e["CUDA_EXPERT_GB"]), 30.7 - 12.5, places=2)
+
+    def test_win32_keeps_the_dense_trunk_on_cpu_when_the_card_is_too_small(self):
+        GPB = 1024 ** 3
+        gpus = [self._fake_gpu(total_mib=16384, free_mib=15000)]
+        plan = {"tiers": {"ram": {"budget_bytes": 64 * GPB, "cache_slots_per_layer": 8,
+                                  "dense_bytes": int(12.5 * GPB)},
+                          "vram": {"budget_bytes": int(13.0 * GPB), "devices": gpus}}}
+        e = self._env_for("win32", cuda=True, gpus=gpus, plan=plan)
+        self.assertNotIn("CUDA_DENSE", e)          # 0.5 GB left for experts: not worth it
+        self.assertAlmostEqual(float(e["CUDA_EXPERT_GB"]), 13.0, places=2)
+
+    def test_win32_preserves_explicit_expert_budget_before_dense_placement(self):
+        """Automatic dense placement must not resize an explicit expert tier.
+
+        Exercise the real environment_for_plan: it preserves the user's value,
+        so env_for must not overwrite it afterwards or add an unbudgeted trunk.
+        Device discovery and the size plan are synthetic; no GPU is required.
+        """
+        import resource_plan
+        GPB = 1024 ** 3
+        gpus = [self._fake_gpu(total_mib=34000, free_mib=33000)]
+        for requested in ("20.000", "auto", "0"):
+            with self.subTest(CUDA_EXPERT_GB=requested):
+                budget = 20.0 if requested == "20.000" else 30.7
+                plan = {"policy": {"name": "quality"},
+                        "cpu": {"physical_cores": 8},
+                        "tiers": {"ram": {"budget_bytes": 120 * GPB,
+                                          "cache_slots_per_layer": 62,
+                                          "dense_bytes": int(12.5 * GPB)},
+                                  "vram": {"budget_bytes": int(budget * GPB),
+                                           "devices": gpus}}}
+                with mock.patch.dict(os.environ, {"CUDA_EXPERT_GB": requested}, clear=True), \
+                     mock.patch.object(sys, "platform", "win32"), \
+                     mock.patch.object(coli, "cuda_binary", return_value=True), \
+                     mock.patch.object(resource_plan, "discover_gpus", return_value=gpus), \
+                     mock.patch.object(resource_plan, "physical_cpu_count", return_value=8), \
+                     mock.patch.object(resource_plan, "build_plan", return_value=plan):
+                    e = coli.env_for(args())
+                self.assertEqual(e["CUDA_EXPERT_GB"], requested)
+                self.assertNotIn("CUDA_DENSE", e)
 
     def test_win32_falls_back_to_cpu_when_nvidia_smi_missing(self):
         # coli_cuda.dll present (cuda=True) but nvidia-smi absent (no GPUs found)
@@ -242,3 +369,37 @@ class Dsv4CudaDetectTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClusterWorkerCapTest(unittest.TestCase):
+    """`coli cluster worker` must hand the engine a number, never "None".
+
+    --cap comes from the shared parser and defaults to None, meaning "auto".
+    The worker used to stringify it straight into argv, so a launch without an
+    explicit --cap died on the engine's own argument check with
+    `cache/layer: expected a whole number, got "None"` (#1452). Every other
+    direct-engine launcher resolves it through cap_for_launch; this one now
+    does too.
+    """
+
+    def _worker_argv(self, cap):
+        captured = {}
+
+        def fake_call(cmd, env=None, **kwargs):
+            captured["cmd"] = cmd
+            return 0
+
+        a = args(cap=cap, ebits=8, dbits=8, port=9100, layers="0-1",
+                 coordinator=None, advertise_host=None, node_id=None)
+        with mock.patch.object(coli, "need_worker_model", return_value="/tmp/engine"), \
+             mock.patch.object(coli.subprocess, "call", fake_call):
+            coli.cmd_cluster_worker(a)
+        return captured["cmd"]
+
+    def test_auto_cap_becomes_a_number(self):
+        argv = self._worker_argv(None)
+        self.assertNotIn("None", argv)
+        int(argv[1])                       # raises if it is not a whole number
+
+    def test_explicit_cap_is_passed_through(self):
+        self.assertEqual(self._worker_argv(24)[1], "24")

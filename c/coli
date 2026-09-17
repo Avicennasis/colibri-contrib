@@ -69,7 +69,8 @@ except ModuleNotFoundError:
         _version = "unknown"
 
 from family_registry import (FamilyConfigError, UnknownFamilyError, all_families,
-                             family_by_id, resolve_model, tuning_replay_prompt)
+                             family_by_id, family_for_config, resolve_model,
+                             tuning_replay_prompt)
 
 _TUNE_ROTATION_PROMPT = (
     "A service has high median throughput but poor tail latency. Explain how "
@@ -174,7 +175,13 @@ def model_banner_line(model):
     this runs before every command, and a banner may not cost a scan of a
     400 GB checkpoint.
     """
-    generic = "GLM-5.2 · 744B MoE · int4 · streaming CPU"
+    # Senza un modello non si nomina un modello. Diceva "GLM-5.2 · 744B", che
+    # era la famiglia di punta quando e' stata scritta e che dal #1367 non si
+    # chiama nemmeno piu' cosi'; una riga che invecchia perche' cita un caso
+    # invece di descrivere il programma. Il conto viene dal registry: aggiungere
+    # una famiglia lo aggiorna, dimenticarsene non lo sbaglia.
+    generic = (f"{len(_BANNER_MODELS)} model families · "
+               f"MoE experts streamed from disk · CPU")
     if not model:
         return generic
     try:
@@ -186,6 +193,13 @@ def model_banner_line(model):
     try:
         family = resolve_model(model).descriptor
         name, scale = family.display_name, family.display_scale
+        # display_scale e' la taglia del checkpoint di riferimento. Un REAP ha
+        # lo stesso model_type e meno esperti: "284B" su un 150B e' #1367
+        # di nuovo. Quando la geometria non e' quella del riferimento si
+        # lascia parlare la geometria, che e' misurata e non puo' mentire.
+        experts = cfg.get("n_routed_experts")
+        if family.reference_experts and experts and experts != family.reference_experts:
+            scale = ""
     except (FamilyConfigError, UnknownFamilyError):
         # Unknown checkpoint: say so with its own words rather than guess.
         name = kind or "unknown model"
@@ -369,6 +383,7 @@ def ngen_for(a, interactive=False, family=None):
     return 16384 if interactive else 1024
 
 _PROFILE_CAP_ENV = "COLI_PROFILE_CAP"
+_PLAN_CAP_ENV = "COLI_PLAN_CAP"
 
 def apply_measured_profile(env, profile, explicit_env, explicit_cap):
     """Apply scheduling/resource results while preserving CLI precedence."""
@@ -391,7 +406,11 @@ def cap_for_launch(explicit_cap, env, fallback):
         measured=int(env.pop(_PROFILE_CAP_ENV,""))
     except (TypeError,ValueError):
         measured=0
-    return measured if measured>=1 else fallback
+    try:
+        planned=int(env.pop(_PLAN_CAP_ENV,""))
+    except (TypeError,ValueError):
+        planned=0
+    return measured if measured>=1 else planned if planned>=1 else fallback
 
 def operator_cap(a, arch):
     """Return a real operator cap, including GLM's documented CAP channel."""
@@ -410,6 +429,8 @@ def env_for_engine(a, arch, plan=None):
     explicit_env = set(os.environ)
     env = os.environ.copy()
     env.pop(_PROFILE_CAP_ENV,None)
+    env.pop(_PLAN_CAP_ENV,None)
+    family=family_by_id(arch)
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
     # OMP_NUM_THREADS for the sister engines that do not size their own team.
     #
@@ -455,7 +476,7 @@ def env_for_engine(a, arch, plan=None):
     # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
     # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
     # user's session ran itself out of memory with the flag apparently set.
-    if arch in ("deepseek_v4", "kimi", "glm53"):
+    if arch in ("deepseek_v4", "kimi", "glm53", "olmoe"):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "glm53":
         # I densi vanno a int4 di default: sono 9,7 B parametri su 321, e in
@@ -471,7 +492,14 @@ def env_for_engine(a, arch, plan=None):
             except (TypeError, ValueError):
                 pass
     if a.ctx:
-        env[family_by_id(arch).limits.context_env] = str(a.ctx)
+        limits = family_by_id(arch).limits
+        # #1376: the engine clamps silently to its hard ceiling. A flag that is
+        # accepted and then ignored is worse than one refused with the number.
+        if limits.max_context and a.ctx > limits.max_context:
+            sys.exit(f"{C.yel}--ctx {a.ctx} exceeds what {family_by_id(arch).display_name} "
+                     f"supports ({limits.max_context} tokens).{C.r}\n"
+                     f"  Pass --ctx {limits.max_context} or less.")
+        env[limits.context_env] = str(a.ctx)
     if arch == "deepseek_v4":
         # Speculation stays opt-in. Real multi-turn chat measured only 1/15
         # accepted prompt-lookup candidates; recurrent-state replay dominated
@@ -495,6 +523,11 @@ def env_for_engine(a, arch, plan=None):
     # getattr: tests build partial Namespaces for env_for_engine.
     gpu = getattr(a, "gpu", None)
     vram = getattr(a, "vram", None)
+    if not family.supports_accelerator:
+        if gpu not in (None,"none"):
+            sys.exit(f"{C.yel}{family.display_name} currently supports CPU only; --gpu is unavailable{C.r}")
+        if vram and gpu!="none":
+            sys.exit(f"{C.yel}{family.display_name} currently supports CPU only; --vram is unavailable{C.r}")
     if gpu is not None:
         env.pop("COLI_GPU", None); env.pop("COLI_GPUS", None)
         if gpu == "none":
@@ -524,18 +557,21 @@ def env_for_engine(a, arch, plan=None):
         # code path, so #1196 could measure and save a perfectly valid Kimi,
         # Inkling, OLMoE, Qwen or V4 profile that chat/serve never loaded.
         from resource_plan import build_plan, environment_for_plan
-        if plan is None:
-            ram,ctx,devices,vram=resource_request(a,env)
-            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
-                            kv_slots=requested_kv_slots(a,env))
-        # Preserve the existing non-GLM GPU contract: explicit --gpu/--vram
-        # selects a capable build above. Merely asking for auto-tier must not
-        # turn a CPU-only sibling binary into an attempted CUDA launch.
-        plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
-                                  and (arch == "deepseek_v4"
-                                       or env.get("COLI_NO_OMP_TUNE")))
-        env=environment_for_plan(plan,env,
-                                 cuda_enabled=env.get("COLI_CUDA") == "1")
+        try:
+            if plan is None:
+                ram,ctx,devices,vram=resource_request(a,env)
+                plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
+                                kv_slots=requested_kv_slots(a,env))
+            # Preserve the existing non-GLM GPU contract: explicit --gpu/--vram
+            # selects a capable build above. Merely asking for auto-tier must not
+            # turn a CPU-only sibling binary into an attempted CUDA launch.
+            plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
+                                      and (arch == "deepseek_v4"
+                                           or env.get("COLI_NO_OMP_TUNE")))
+            env=environment_for_plan(plan,env,
+                                     cuda_enabled=env.get("COLI_CUDA") == "1")
+        except (OSError,ValueError,json.JSONDecodeError) as error:
+            sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         if plan_must_not_choose_omp:
             # environment_for_plan supplies the physical-core default used by
             # the other engines. V4 deliberately computes logical CPUs minus
@@ -642,6 +678,7 @@ def env_for(a):
     explicit_env = set(os.environ)
     e = dict(os.environ, SNAP=a.model)
     e.pop(_PROFILE_CAP_ENV,None)
+    e.pop(_PLAN_CAP_ENV,None)
     if getattr(a,"ram",0): explicit_env.add("RAM_GB")
     # A GLM resource winner is a measured pair (RAM ceiling + argv cap). An
     # explicit cap asks the engine to size against the current RAM plan, not a
@@ -789,6 +826,23 @@ def env_for(a):
                                         kv_slots=requested_kv_slots(a,e))
                         e.update(environment_for_plan(plan,e,cuda_enabled=True))
                         vt=plan["tiers"]["vram"]
+                        # #1409: the dense trunk is read on every token; leaving
+                        # it on the CPU next to a 30 GB expert tier is the
+                        # slowest possible placement of a card that could hold
+                        # it. Put it on the GPU when the plan says it fits with
+                        # room for experts, and take its bytes out of the expert
+                        # budget: dense uploads are lazy, and a tier that already
+                        # filled the card makes them fail (#687). Explicit
+                        # CUDA_DENSE / CUDA_EXPERT_GB from the user always win.
+                        dense=int(plan["tiers"].get("ram",{}).get("dense_bytes",0) or 0)
+                        room=int(vt.get("budget_bytes",0) or 0)-dense
+                        # An explicit expert budget owns the placement decision:
+                        # do not shrink it or add a trunk outside that budget.
+                        if (dense>0 and room>=4*(1024**3) and "CUDA_DENSE" not in e
+                                and "CUDA_EXPERT_GB" not in explicit_env):
+                            e["CUDA_DENSE"]="1"
+                            if "CUDA_EXPERT_GB" in e:
+                                e["CUDA_EXPERT_GB"]=f"{room/(1024**3):.3f}"
                         names=",".join(g["name"].strip() for g in gpus)
                         print(f"  {C.dim}[GPU] auto-enabled CUDA · {names} · "
                               f"{format_bytes(vt['budget_bytes'])} expert tier{C.r}", file=sys.stderr)
@@ -1006,8 +1060,10 @@ def cmd_info(a):
     if not a.model:
         sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
     cfgp=os.path.join(a.model,"config.json")
+    resolved=None
     try:
-        family=resolve_model(a.model).descriptor
+        resolved=resolve_model(a.model)
+        family=resolved.descriptor
     except (FamilyConfigError,UnknownFamilyError) as error:
         if os.path.exists(cfgp):
             sys.exit(f"{C.yel}unsupported model:{C.r} {error}")
@@ -1015,9 +1071,15 @@ def cmd_info(a):
     def row(k,v): print(f"   {C.gray}{k:<10}{C.r} {v}")
     if os.path.exists(cfgp):
         c=json.load(open(cfgp))
+        # Multimodal wrappers such as Qwen3.8 keep the language architecture
+        # below text_config.  The registry has already resolved that section;
+        # using the root here produced a recognized family followed by four
+        # misleading `None` dimensions in `coli info`.
+        arch_c=resolved.family_config if resolved else c
+        experts=arch_c.get("n_routed_experts",arch_c.get("num_experts"))
         row("model", a.model)
-        row("arch", f"hidden {c.get('hidden_size')} · {c.get('num_hidden_layers')} layer · "
-                    f"{c.get('n_routed_experts')} expert/layer · top-{c.get('num_experts_per_tok')}")
+        row("arch", f"hidden {arch_c.get('hidden_size')} · {arch_c.get('num_hidden_layers')} layer · "
+                    f"{experts} expert/layer · top-{arch_c.get('num_experts_per_tok')}")
         sts=[x for x in os.listdir(a.model) if x.endswith('.safetensors')]
         sz=sum(os.path.getsize(os.path.join(a.model,x)) for x in sts)
         row("shards", f"{len(sts)} files · {sz/1e9:.0f} GB on disk")
@@ -1223,7 +1285,12 @@ def cmd_run(a):
         sys.exit(result)
     if arch=="glm53":
         e=env_for_engine(a,arch)
-        cmd=[engine,"--model",os.path.abspath(a.model),"--prompt",prompt,
+        # GLM53 accepts cache/layer as a positional numeric argument.  Keep the
+        # same cap_for_launch contract used by the persistent gateway so an
+        # explicit `coli run --cap N` reaches the engine instead of being
+        # silently ignored by the one-shot path.
+        cap = cap_for_launch(a.cap, e, 0)
+        cmd=[engine,str(cap),"--model",os.path.abspath(a.model),"--prompt",prompt,
              "--greedy",str(ngen_for(a,interactive=True,family=family))]
         sys.exit(subprocess.call(cmd,env=e))
     if arch=="olmoe":
@@ -1967,7 +2034,14 @@ def cmd_cluster_worker(a):
               "COLI_MMAP":os.environ.get("COLI_MMAP", "1")})
     print(f"  {C.dim}[CLUSTER] expert worker · {host}:{a.port} · layers {a.layers}{C.r}")
     try:
-        return subprocess.call([engine,str(a.cap),str(a.ebits),str(a.dbits)],env=e)
+        # cap_for_launch, not a.cap: --cap defaults to None and str(None) is the
+        # literal "None", which the engine's argument parser refuses with
+        # `cache/layer: expected a whole number, got "None"` -- so the worker
+        # could only ever start with an explicit --cap (#1452). Fallback 0 is
+        # what the other GLM launch sites pass: the engine resolves its own cap
+        # when the argument is zero.
+        return subprocess.call([engine,str(cap_for_launch(a.cap,e,0)),
+                                str(a.ebits),str(a.dbits)],env=e)
     finally:
         stop_heartbeat.set()
 
@@ -2112,6 +2186,42 @@ def cmd_bench(a):
     print(f"  {C.dim}decode is disk-bound: this takes HOURS on slow hardware. Raise --limit on faster machines.{C.r}\n")
     sys.exit(subprocess.call(cmd, env=e))
 
+#: Le opzioni di precisione di `coli convert`: nome sulla riga di comando e
+#: default. Il parser le dichiara con default=None apposta, cosi' "l'utente
+#: l'ha scritta" e' semplicemente "non e' None" -- vale per --ebits 3,
+#: --ebits=3 e per le abbreviazioni che argparse accetta, senza frugare in
+#: sys.argv. Un default non passato al convertitore non fa danno; un valore
+#: scritto e ignorato si'.
+_CONVERT_PRECISION_FLAGS = {"ebits": "--ebits", "io_bits": "--io-bits",
+                            "xbits": "--xbits", "group_size": "--group-size"}
+_CONVERT_DEFAULTS = {"ebits": 4, "io_bits": 8, "xbits": 0, "group_size": 64}
+
+
+def checkpoint_family(repo):
+    """La famiglia del checkpoint, letta dal solo config.json.
+
+    Cinque KB decidono quale convertitore ha senso per i prossimi 300 GB, ed e'
+    lo stesso appiglio che usa la guardia dentro convert_fp8_to_int4.py.
+
+    None quando non si riesce a stabilirlo -- rete assente, huggingface_hub non
+    installato, repo senza config.json. In quel caso si prosegue come prima: la
+    guardia del convertitore scarica lo stesso file e rifiuta lei. Meglio
+    proseguire che fermare una conversione valida per un errore di rete.
+    """
+    try:
+        local = os.path.join(os.path.expanduser(repo), "config.json")
+        if os.path.isfile(local):
+            with open(local, encoding="utf-8") as handle:
+                return family_for_config(json.load(handle))
+        from huggingface_hub import hf_hub_download
+        with open(hf_hub_download(repo, "config.json"), encoding="utf-8") as handle:
+            return family_for_config(json.load(handle))
+    except SystemExit:
+        raise
+    except Exception:
+        return None
+
+
 def cmd_convert(a):
     banner("convert")
     # here --model is the DESTINATION the converted weights are written to, not an
@@ -2121,15 +2231,59 @@ def cmd_convert(a):
                  f"  --model <dir> is where the converted model is written")
     # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
     py = project_python()
-    base=[py, os.path.join(TOOLS,"convert_fp8_to_int4.py"),
-          "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits),
-          "--group-size", str(a.group_size)]
-    if a.xbits: base+=["--xbits",str(a.xbits)]
-    # passo 1: modello principale (78 layer). Resumabile: riparte dagli shard mancanti.
-    print(f"  {C.dim}[1/2] model: {' '.join(base)}{C.r}")
-    rc=subprocess.call(base)
-    if rc!=0: sys.exit(rc)
-    if a.no_mtp: sys.exit(0)
+
+    # #1368: quale convertitore, deciso dal checkpoint e non dal fatto che GLM-5.2
+    # e' arrivato per primo. Prima di questo, una GLM-5.3-Flash passava per il
+    # convertitore di GLM-5.2, che le quantizzava l'embedding perche' il suo nome
+    # annidato non corrisponde a nessuna delle sue regole; il contenitore usciva
+    # senza un errore e moriva ore dopo, dentro `coli web`.
+    family = checkpoint_family(a.repo)
+    script = family.converter if family else "convert_fp8_to_int4.py"
+    if family and not script:
+        # Famiglia nota che coli non guida: il suo convertitore ha un'altra riga
+        # di comando, o non serve. La guardia dentro convert_fp8_to_int4.py tiene
+        # le indicazioni per famiglia, sotto test; le si lascia dire a lei
+        # invece di tenerne una seconda copia qui.
+        script = "convert_fp8_to_int4.py"
+    written_names = [name for name in _CONVERT_PRECISION_FLAGS
+                     if getattr(a, name) is not None]
+    for name, value in _CONVERT_DEFAULTS.items():
+        if getattr(a, name) is None:
+            setattr(a, name, value)
+    if family:
+        print(f"  {C.dim}checkpoint: {family.display_name} -> tools/{script}{C.r}")
+        written = [_CONVERT_PRECISION_FLAGS[name] for name in written_names
+                   if name not in family.converter_accepts]
+        if written and family.converter:
+            sys.exit(f"{C.yel}{' '.join(written)}: tools/{script} does not take "
+                     f"{'them' if len(written) > 1 else 'it'}.{C.r}\n"
+                     f"  {family.display_name} keeps its dense weights and embedding "
+                     f"wide and picks the precision when the engine loads them.\n"
+                     f"  Re-run without {' '.join(written)}.")
+
+    # Quando la famiglia non si e' potuta stabilire si passano tutte le opzioni,
+    # cioe' esattamente il comando di prima: nessuna conversione che funzionava
+    # cambia comportamento perche' la rete non ha risposto.
+    accepts = family.converter_accepts if family and family.converter else \
+        tuple(_CONVERT_PRECISION_FLAGS)
+    base = [py, os.path.join(TOOLS, script), "--repo", a.repo, "--outdir", a.model]
+    if "ebits" in accepts:
+        base += ["--ebits", str(a.ebits), "--io-bits", str(a.io_bits)]
+    if "group_size" in accepts:
+        base += ["--group-size", str(a.group_size)]
+    if a.xbits and "xbits" in accepts:
+        base += ["--xbits", str(a.xbits)]
+
+    mtp_pass = family.converter_mtp_pass if family and family.converter else True
+    steps = 2 if (mtp_pass and not a.no_mtp) else 1
+    print(f"  {C.dim}[1/{steps}] model: {' '.join(base)}{C.r}")
+    rc = subprocess.call(base)
+    if rc != 0: sys.exit(rc)
+    if steps == 1:
+        # Non tutte le famiglie hanno una testa MTP da convertire a parte, e
+        # convert_glm53.py non ha proprio --mtp: chiamarlo con quel flag e' un
+        # errore di argomenti dopo che il modello e' gia' stato scritto.
+        sys.exit(0)
     # passo 2: testa MTP (layer 78). SEMPRE int8: a int4 i draft sbagliano quasi sempre
     # (acceptance 0-4% vs 39-59%, misurato — issue #8) e la speculazione non parte mai.
     mtp_cmd=list(base); i=mtp_cmd.index("--ebits"); mtp_cmd[i+1]=str(max(8,a.ebits))
@@ -2282,8 +2436,14 @@ def main():
     _bench_cache = os.path.join(_cache_root, "colibri", "bench")
     pb.add_argument("--data",default=_bench_cache)
     pc=sub.add_parser("convert", parents=[common]); pc.add_argument("--repo",default="zai-org/GLM-5.2-FP8")
-    pc.add_argument("--ebits",type=int,default=4); pc.add_argument("--io-bits",type=int,default=8); pc.add_argument("--xbits",type=int,default=0)
-    pc.add_argument("--group-size",type=int,default=64,
+    # default=None e non il valore: cosi' e' argparse a dire se l'opzione e'
+    # stata SCRITTA (--ebits 3, --ebits=3, o abbreviata), e cmd_convert puo'
+    # rifiutarla su un convertitore che non la prende invece di ignorarla.
+    # I valori di default veri stanno in _CONVERT_DEFAULTS.
+    pc.add_argument("--ebits",type=int,default=None,help="routed expert bits (default 4)")
+    pc.add_argument("--io-bits",type=int,default=None,help="embedding/head bits (default 8)")
+    pc.add_argument("--xbits",type=int,default=None,help="streaming expert bits (default = ebits)")
+    pc.add_argument("--group-size",type=int,default=None,
         help="int4 scale group size: 64 (default, group-scaled quality) or 0 (legacy per-row)")
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
     a=ap.parse_args()

@@ -57,6 +57,8 @@ static int qwen36_max_ctx(void) {
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#include "serve_poll.h"       /* CANCEL a meta' turno (#1332) */
+#include "cli_args.h"
 #include "st.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "qwen36_tier.h"   /* optional transparent Vulkan compute backend for MoE experts */
@@ -97,7 +99,7 @@ static int hexnib(char c){
  * pre-tokenize + per-piece ByteLevel map + BPE merges. */
 typedef struct { char **keys; int *vals; int *used; int cap; } SMap;
 static unsigned shash(const char *s){ unsigned h=2166136261u; while(*s){ h^=(unsigned char)*s++; h*=16777619u; } return h; }
-static void smap_init(SMap *m,int cap){ m->cap=cap; m->keys=calloc(cap,sizeof(char*)); m->vals=malloc(cap*sizeof(int)); m->used=calloc(cap,sizeof(int)); }
+static void smap_init(SMap *m,int cap){ m->cap=cap; m->keys=calloc((size_t)cap,sizeof(char*)); m->vals=malloc((size_t)cap*sizeof(int)); m->used=calloc((size_t)cap,sizeof(int)); }
 static void smap_put(SMap *m,const char *k,int v){ if(!k)return; unsigned h=shash(k)&(m->cap-1); while(m->used[h]){ if(m->keys[h]&&strcmp(m->keys[h],k)==0){m->vals[h]=v;return;} h=(h+1)&(m->cap-1);} m->used[h]=1; m->keys[h]=(char*)k; m->vals[h]=v; }
 static int smap_get(SMap *m,const char *k){ if(!m||!m->cap||!k)return -1; unsigned h=shash(k)&(m->cap-1); while(m->used[h]){ if(m->keys[h]&&strcmp(m->keys[h],k)==0)return m->vals[h]; h=(h+1)&(m->cap-1);} return -1; }
 
@@ -292,11 +294,29 @@ static void load_tokenizer(const char *path){
     jval *merges = json_get(model, "merges");
     if (merges && merges->t==J_ARR){
         for (int r=0;r<merges->len;r++){
-            const char *e = merges->kids[r]->str; if(!e) continue;
-            const char *sp = strchr(e, ' '); if(!sp) continue;
-            int la=(int)(sp-e), lb=(int)strlen(sp+1);
+            /* Two on-disk spellings for one merge table: legacy tokenizer.json
+             * writes "a b" strings, tokenizers >= 0.20 (transformers 4.45+,
+             * the Qwen3.6 checkpoints included) writes ["a","b"] pairs.  The
+             * string-only reader SILENTLY indexed zero merges from the pair
+             * form, and encode_text degraded to one token per byte-symbol --
+             * 24 tokens for a 24-char prompt, real-model run -- because
+             * bpe_piece treats an empty merge table as "nothing to merge",
+             * not as an error. */
+            jval *mk = merges->kids[r];
+            const char *a, *b;
+            int la, lb;
+            if (mk && mk->t==J_STR && mk->str){
+                const char *sp = strchr(mk->str, ' '); if(!sp) continue;
+                a = mk->str; la = (int)(sp - mk->str);
+                b = sp + 1;  lb = (int)strlen(b);
+            } else if (mk && mk->t==J_ARR && mk->len==2 &&
+                       mk->kids[0] && mk->kids[0]->t==J_STR && mk->kids[0]->str &&
+                       mk->kids[1] && mk->kids[1]->t==J_STR && mk->kids[1]->str){
+                a = mk->kids[0]->str; la = (int)strlen(a);
+                b = mk->kids[1]->str; lb = (int)strlen(b);
+            } else continue;
             char *key=malloc(la+1+lb+1);
-            memcpy(key,e,la); key[la]=0x1F; memcpy(key+la+1,sp+1,lb); key[la+1+lb]=0;
+            memcpy(key,a,la); key[la]=0x1F; memcpy(key+la+1,b,lb); key[la+1+lb]=0;
             smap_put(&g_merge, key, r);
         }
     }
@@ -362,7 +382,7 @@ static int json_escape(const unsigned char *s, int n, char *out, int outsz){
     return o;
 }
 
-/* Append b[0..n) into buf/*bn, extract as many LEADING complete UTF-8
+/* Append b[0..n) into buf (*bn), extract as many LEADING complete UTF-8
  * codepoints as possible into out[0..*outn) (max 255). Trailing partial
  * sequence stays in buf. Returns bytes written to out. */
 static int utf8_drain(unsigned char *buf, int *bn, const unsigned char *b, int n, unsigned char *out, int *outn){
@@ -484,7 +504,7 @@ static void stream_token(int id){
     if (g_openai){
         if (g_ttft < 0) g_ttft = now_s() - g_gen_t0;   /* TTFT on first token */
         if (!g_tok){
-            char jb[160];
+            char jb[512];
             snprintf(jb, sizeof jb,
               "{\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
               "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%d\"},\"finish_reason\":null}]}",
@@ -497,7 +517,7 @@ static void stream_token(int id){
         utf8_drain(g_sbuf, &g_sbn, tmp, tn, chunk, &cn);
         if (cn > 0){
             char esc[1024]; json_escape(chunk, cn, esc, sizeof esc);
-            char jb[1200];
+            char jb[2048];
             snprintf(jb, sizeof jb,
               "{\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
               "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}",
@@ -531,7 +551,7 @@ static void emit_openai_result(const int *out, int np, int n_new, int stream){
             for (int k=0;k<g_sbn;k++) chunk[cn++] = g_sbuf[k]; g_sbn = 0;
             if (cn > 0){
                 char esc[256]; json_escape(chunk, cn, esc, sizeof esc);
-                char jb[400];
+                char jb[768];
                 snprintf(jb, sizeof jb,
                   "{\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
                   "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}",
@@ -613,6 +633,10 @@ typedef struct {
     float **DN_rec;         /* [n_layers] recurrent state S[h]=[kdim,vdim] for DeltaNet layers (NULL for attn) */
     float **DN_conv;        /* [n_layers] conv ring [conv_dim, convk-1] for DeltaNet layers (NULL for attn) */
     uint64_t clock, hits, miss;
+    /* Telemetria per la dashboard (Brain/Profile): tempo di lettura esperti
+     * accumulato dall'avvio, e bitmap degli esperti toccati nel turno. */
+    double t_disk;
+    uint8_t **ehit;
     float **K, **V; int kv_len, max_t, kv_cap;
     float *attn_sc;            /* [attn_sc_thr * kv_cap] score rows, one per thread */
     int attn_sc_thr;
@@ -716,7 +740,7 @@ static void tm_add(int S, int idx, double ms){
         g_tm_dec[idx]+=ms;
         if(idx==2) g_tm_win_moe+=ms;
         if(idx==5 && ++g_tm_win_n==32){
-            fprintf(stderr,"[timers] window: moe %.0f ms/token (last 32)\n", g_tm_win_moe/32.0);
+            if(tm_on()) fprintf(stderr,"[timers] window: moe %.0f ms/token (last 32)\n", g_tm_win_moe/32.0);
             g_tm_win_moe=0; g_tm_win_n=0;
         }
     } else g_tm_pre[idx]+=ms;
@@ -931,6 +955,25 @@ static void matmul_q_batch(float *y, const float *x, const int8_t *q,
 /* Group-scaled int8 GEMV: one f32 scale per `gs` input elements per row
  * (gs64 expert containers). Row layout of `scale`: [O][I/gs] row-major. */
 static int g_expert_gs = 0;   /* set from qwen36_meta.json (expert_gs) at load */
+/* 1 = expert container packs int4 (tier fmt=4); 0 = int8 per-row (tier fmt=1).
+ * Same signal main's nbytes probe and tier_warmstart receive; the decode path
+ * needs it to offer int8 experts (#1391): on an int8 container e->g4 is NULL. */
+static int g_expert_is_int4 = 1;
+
+/* The single offer decision the decode path makes for a routed expert: offer
+ * whichever format the container actually packed, exactly what tier_warmstart
+ * does (int4 → the packed g4/u4/d4, int8 → the live RAM weights, tier fmt=1
+ * since #1334). moe()'s resident offer, the pilot-prefetch lookahead, and the
+ * #1391 test all call THIS function, so the gate can't drift between them.
+ * Read-only: never frees, never rewrites -- ownership stays in warmstart
+ * (#1341). */
+static void tier_offer_slot(int layer, int eid, const Slot *s) {
+    if (s->g4)
+        qt_note(layer, eid, s->g4, s->u4, s->d4, s->gs, s->us, s->ds);
+    else if (!g_expert_is_int4 && s->g)
+        qt_note(layer, eid, (const uint8_t *)s->g, (const uint8_t *)s->u,
+                (const uint8_t *)s->d, s->gs, s->us, s->ds);
+}
 static void matmul_q_gs(float *y, const float *x, const int8_t *q, const float *scale,
                         int I, int O, int gs) {
     int ng = (I + gs - 1) / gs;
@@ -1072,7 +1115,8 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->n_experts = 256; c->topk = 8; c->inter = 512; c->shared_inter = 512;
     c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->has_qk_norm = 1; c->has_bias = 0;
     c->attn_output_gate = 1; c->n_active = 0;
-    c->is_attn = calloc(c->n_layers, sizeof(uint8_t));
+    if (c->n_layers <= 0 || c->n_layers > 512) { fprintf(stderr, "load_cfg: n_layers=%d out of range 1..512\n", c->n_layers); exit(1); }
+    c->is_attn = calloc((size_t)c->n_layers, sizeof(uint8_t));
     for (int i = 0; i < c->n_layers; i++) c->is_attn[i] = (i % 4 == 3) ? 1 : 0;
 }
 
@@ -1145,6 +1189,9 @@ static void validate_cfg(const Cfg *c, int n_layers_from_config) {
 }
 
 static void load_meta(Cfg *c, const char *snap) {
+    /* is_attn was sized by load_cfg from config.json and is NOT resized here, so
+     * every write below is bounded by this count, not by whatever the meta says. */
+    const int is_attn_len = c->n_layers;
     char path[2048]; snprintf(path, sizeof(path), "%s/qwen36_meta.json", snap);
     FILE *f = fopen(path, "rb"); if (!f) { printf("[meta] %s not found; using i%%4==3 + defaults\n", path); return; }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
@@ -1165,6 +1212,16 @@ static void load_meta(Cfg *c, const char *snap) {
         G("dn_vheads", dn_vheads); G("dn_kheads", dn_kheads); G("dn_kdim", dn_kdim);
         G("dn_vdim", dn_vdim); G("dn_convk", dn_convk); G("dn_conv_dim", dn_conv_dim);
         #undef G
+        /* validate_cfg makes exactly this check, and used to be the only one --
+         * but it runs AFTER load_meta returns, one line too late to stop the
+         * is_attn writes below. A container whose config.json said 4 layers and
+         * whose meta said 8 therefore wrote past a 4-byte allocation before
+         * anything refused it: ASan heap-buffer-overflow at the layer_types
+         * loop, reached from an ordinary model directory. Refuse here, while
+         * is_attn is still the only thing that has been sized. */
+        CFG_NEED(c->n_layers == is_attn_len,
+                 "config.json says %d layers, qwen36_meta.json says %d",
+                 is_attn_len, c->n_layers);
         if((v=json_get(r,"partial_rotary_factor"))&&v->t==J_NUM) c->partial_rotary_factor=(float)v->num;
         if((v=json_get(r,"rope_theta"))&&v->t==J_NUM) c->theta=(float)v->num;
         if((v=json_get(r,"rms_eps"))&&v->t==J_NUM) c->eps=(float)v->num;
@@ -1229,6 +1286,9 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     int n_layers_from_config = m->c.n_layers;
     load_meta(&m->c, snap);
     validate_cfg(&m->c, n_layers_from_config);
+    /* load_cfg and validate_cfg both guard n_layers, but the compiler can't see
+     * across function boundaries, so re-assert here to silence -Walloc-size-larger-than. */
+    if (m->c.n_layers <= 0) { fprintf(stderr, "model_init: n_layers=%d invalid\n", m->c.n_layers); exit(1); }
     if (m->c.rotary_dim > m->c.head_dim || m->c.rotary_dim % 2 != 0) {
         fprintf(stderr, "rotary_dim %d invalid for head_dim %d\n", m->c.rotary_dim, m->c.head_dim); exit(1);
     }
@@ -1247,7 +1307,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->lm_head    = load_t_n(m, "lm_head.weight", (int64_t)c->vocab * c->hidden);
         m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
     }
-    m->L = calloc(c->n_layers, sizeof(Layer));
+    m->L = calloc((size_t)c->n_layers, sizeof(Layer));
     /* Phase 2: the converter stores EVERY layer (Gated-Attention + Gated DeltaNet)
      * under its OWN original index model.layers.{i}. So active_of is the identity
      * map; experts and dense weights are read from model.layers.{i} for all i. */
@@ -1310,17 +1370,17 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             #undef LD4
         }
     }
-    m->cache = calloc(c->n_layers, sizeof(LCache));
+    m->cache = calloc((size_t)c->n_layers, sizeof(LCache));
     for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
-        m->cache[i].slots = calloc(cap, sizeof(Slot));
+        m->cache[i].slots = calloc((size_t)cap, sizeof(Slot));
         m->cache[i].slot_by_expert = malloc((size_t)c->n_experts * sizeof(int));
         if (!m->cache[i].slot_by_expert) { fprintf(stderr,"OOM expert cache index\n"); exit(1); }
         for (int e = 0; e < c->n_experts; e++) m->cache[i].slot_by_expert[e] = -1;
     }
     /* per-layer DeltaNet recurrent + conv state (only for linear_attention layers) */
-    m->DN_rec = calloc(c->n_layers, sizeof(float*));
-    m->DN_conv = calloc(c->n_layers, sizeof(float*));
+    m->DN_rec = calloc((size_t)c->n_layers, sizeof(float*));
+    m->DN_conv = calloc((size_t)c->n_layers, sizeof(float*));
     for (int i = layer_begin; allocate_state && i < layer_end; i++) {
         if (c->is_attn[i]) { m->DN_rec[i] = NULL; m->DN_conv[i] = NULL; continue; }
         if (c->dn_vheads <= 0) { fprintf(stderr, "layer %d is DeltaNet but dn dims missing from meta\n", i); exit(1); }
@@ -1375,6 +1435,64 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
     s->g4 = s->u4 = s->d4 = NULL;   /* packed int4 (allocated on int4 load if GPU int4 active) */
 }
 
+
+/* Unpack packed signed-int4 experts to int8. Two nibbles per byte; LOW nibble is
+ * element 2k, HIGH is 2k+1, each signed 4-bit two's complement. Must stay in step
+ * with pack_int4 in c/tools/convert_qwen36.py.
+ *
+ * This is the hottest thing on this engine's CPU decode path. Every expert cache
+ * miss unpacks a whole expert -- 3*inter*hidden = 6.29M values on
+ * Qwen3.6-35B-A3B -- and a fit of decode time against miss count put ~60% of
+ * decode inside it.
+ *
+ * The loop this replaces was indexed by ELEMENT, so it reloaded raw[i>>1], did an
+ * i&1 select and took a branch for every value. Walking BYTES and sign-extending
+ * by shifting removes the branch. Vectorising then needs an INTERLEAVING store,
+ * which is why no compiler gets there from the scalar form: the two nibble
+ * streams are consecutive in the output, so it needs vst2q on NEON or
+ * unpacklo/unpackhi on AVX2 rather than a strided store. Checking the
+ * disassembly after the branchless rewrite confirmed zero vector registers.
+ *
+ * Sign extension is branchless in both paths. In vectors the signed value of a
+ * nibble n is (n ^ 8) - 8; the scalar tail gets the same result more cheaply by
+ * casting the nibble into the top four bits and arithmetic-shifting back down.
+ *
+ * Integer throughout, so unlike a float reduction this is bit-exact by
+ * construction rather than by tolerance -- verified identical to the original
+ * branching form over all 256 byte values, at every length around a vector
+ * boundary, and on a full-size 6.29M-value random expert, on AVX2 and NEON. */
+static void unpack_int4_to_int8(int8_t *out, const uint8_t *raw, int64_t n)
+{
+    int64_t nb = n / 2, b = 0;                  /* n is 3*inter*hidden, always even */
+#if defined(__AVX2__)
+    const __m128i m4 = _mm_set1_epi8(0x0F), e8 = _mm_set1_epi8(8);
+    for (; b + 16 <= nb; b += 16) {
+        __m128i by = _mm_loadu_si128((const __m128i *)(raw + b));
+        __m128i lo = _mm_and_si128(by, m4);
+        __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);   /* 16-bit shift: mask after */
+        lo = _mm_sub_epi8(_mm_xor_si128(lo, e8), e8);
+        hi = _mm_sub_epi8(_mm_xor_si128(hi, e8), e8);
+        _mm_storeu_si128((__m128i *)(out + 2 * b),      _mm_unpacklo_epi8(lo, hi));
+        _mm_storeu_si128((__m128i *)(out + 2 * b + 16), _mm_unpackhi_epi8(lo, hi));
+    }
+#elif defined(__ARM_NEON)
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const int8x16_t e8 = vdupq_n_s8(8);
+    for (; b + 16 <= nb; b += 16) {
+        uint8x16_t by = vld1q_u8(raw + b);
+        int8x16x2_t z;
+        z.val[0] = vsubq_s8(veorq_s8(vreinterpretq_s8_u8(vandq_u8(by, m4)), e8), e8);
+        z.val[1] = vsubq_s8(veorq_s8(vreinterpretq_s8_u8(vshrq_n_u8(by, 4)), e8), e8);
+        vst2q_s8(out + 2 * b, z);               /* the interleaved store is the trick */
+    }
+#endif
+    for (; b < nb; b++) {                       /* tail, and the whole loop if scalar */
+        uint8_t byte = raw[b];
+        out[2 * b]     = (int8_t)(byte << 4) >> 4;
+        out[2 * b + 1] = (int8_t)(byte & 0xF0) >> 4;
+    }
+}
+
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     char nm[256], qsnm[256];
     int la = m->active_of[layer];   /* container stores experts under active index */
@@ -1403,12 +1521,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         uint8_t *raw = (uint8_t *)malloc((size_t)(want_w / 2));
         if (!raw) { fprintf(stderr, "OOM reading int4 expert %s\n", nm); exit(1); }
         st_read_raw(&m->S, nm, raw, 1);
-        for (int64_t i = 0; i < want_w; i++) {
-            uint8_t byte = raw[i >> 1];
-            int8_t v = (int8_t)((i & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF));
-            if (v & 8) v -= 16;                 /* sign-extend signed 4-bit */
-            s->g[i] = v;
-        }
+        unpack_int4_to_int8(s->g, raw, want_w);
         s->is_int4 = 1;
         /* Free any previous occupant first (LRU slot reuse). */
         free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
@@ -1479,7 +1592,33 @@ static void slot_ensure_int8(Model *m, Slot *s) {
     s->g = w; s->u = w + ng; s->d = w + ng + ng;
 }
 
+/* Segna l'esperto instradato per la bitmap HITS della dashboard. Vive qui,
+ * fuori dalla regione QWEN36_NO_MAIN: expert_get la chiama anche nel build
+ * del segment adapter, dove il resto della telemetria serve non esiste. */
+static pthread_mutex_t g_ehit_mx = PTHREAD_MUTEX_INITIALIZER;
+static void ehit_mark(Model *m, int layer, int eid){
+    const Cfg *c=&m->c;
+    /* The first touch can come from a parallel region (qwen36: the tier
+     * warmstart's omp loop calls expert_get from twelve threads at once):
+     * one thread published m->ehit while it was still filling the rows and
+     * a sibling dereferenced m->ehit[layer] == NULL -- SIGSEGV in about one
+     * run in twelve on a CUDA warmstart. Build the table privately, publish
+     * it once under a lock (double-checked), and read it with acquire order. */
+    uint8_t **ehit=__atomic_load_n(&m->ehit,__ATOMIC_ACQUIRE);
+    if(!ehit){
+        pthread_mutex_lock(&g_ehit_mx);
+        ehit=m->ehit;
+        if(!ehit){
+            ehit=calloc((size_t)c->n_layers,sizeof(uint8_t*));
+            for(int i=0;i<c->n_layers;i++) ehit[i]=calloc((size_t)c->n_experts,1);
+            __atomic_store_n(&m->ehit,ehit,__ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&g_ehit_mx);
+    }
+    if(layer>=0&&layer<c->n_layers&&eid>=0&&eid<c->n_experts) ehit[layer][eid]=1;
+}
 static void expert_get(Model *m, int layer, int eid, Slot **out) {
+    ehit_mark(m, layer, eid);   /* tocca solo m->ehit[layer][eid] */
     LCache *lc = &m->cache[layer];
     pthread_mutex_lock(&g_pilot_mx);
     Slot *hit = slot_indexed(m, layer, eid);
@@ -1528,8 +1667,11 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     }
     cache_hide(m, layer, s); s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
+    double t_read0 = now_s();
     load_expert_merged(m, layer, eid, s);
+    double t_read = now_s() - t_read0;
     pthread_mutex_lock(&g_pilot_mx);
+    m->t_disk += t_read;        /* sotto lock: qui arrivano anche i thread del PILOT */
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer * c->n_experts + eid]; s->used = ++m->clock;
     *out = s; pthread_mutex_unlock(&g_pilot_mx);
 }
@@ -1750,7 +1892,7 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
                                     float *out, float *g, float *u, float *hh) {
     Cfg *c=&m->c; int D=c->hidden, I=c->shared_inter;
     int B=qwen_shared_batch_rows(S,D,I);
-    double _ts=tm_on()?tm_now():0.0;
+    double _ts=tm_now();
     if (B == 1) {
         for (int s=0;s<S;s++) {
             const float *xs=x+(int64_t)s*D;
@@ -1782,7 +1924,7 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
         }
         free(bg);free(bh);
     }
-    if(tm_on())tm_add(S,3,tm_now()-_ts);
+    tm_add(S,3,tm_now()-_ts);
 }
 
 /* MoE: grouped top-k routing (+ optional router bias) + shared expert.
@@ -1791,9 +1933,9 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     float *logits = falloc((int64_t)S*E);
-    double _tr = tm_on() ? tm_now() : 0.0;
+    double _tr = tm_now();
     matmul_d(logits, x, l->gate, S, D, E);
-    if (tm_on()) tm_add(S, 4, tm_now()-_tr);
+    tm_add(S, 4, tm_now()-_tr);
     if (c->has_bias && l->gate_bias) {
         for (int s = 0; s < S; s++) { float *pr = logits + (int64_t)s*E; for (int e = 0; e < E; e++) pr[e] += l->gate_bias[e]; }
     }
@@ -1857,11 +1999,16 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
              * collect the GPU results. */
             for (int kk = 0; kk < K; kk++) {
                 Slot *e; expert_get(m, layer, idx[kk], &e);
-                if (e->g4) qt_note(layer, idx[kk], e->g4, e->u4, e->d4, e->gs, e->us, e->ds);
+                /* Offer whichever format the container actually packed. The old
+                 * gate `if (e->g4)` never fired on an int8 container (g4 is
+                 * NULL there), so the tier stayed at 0 uploads for the life of
+                 * the process (#1391). tier_offer_slot is the shared decision:
+                 * same pointer choice tier_warmstart makes, one place. */
+                tier_offer_slot(layer, idx[kk], e);
             }
-            double _q0 = tm_on()? tm_now():0;
+            double _q0 = tm_now();
             uint32_t qmask = qt_issue(layer, idx, K, xs);
-            double _q1 = tm_on()? tm_now():0;
+            double _q1 = tm_now();
             for (int kk = 0; kk < K; kk++) {
                 if (qmask & (1u<<kk)) continue;
                 Slot *e; expert_get(m, layer, idx[kk], &e);
@@ -1876,7 +2023,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             /* Compute the shared expert NOW so it overlaps with the GPU
              * groups; the common block below is skipped. */
             {
-                double _ts2 = tm_on() ? tm_now() : 0.0;
+                double _ts2 = tm_now();
                 int Ish = c->shared_inter;
                 matmul_d(sh, xs, l->sh_g, 1, D, Ish);
                 matmul_d(shu, xs, l->sh_u, 1, D, Ish);
@@ -1890,9 +2037,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                 }
                 float *os = out + (int64_t)s*D;
                 for (int d = 0; d < D; d++) os[d] += sgate * shd[d];
-                if (tm_on()) tm_add(S, 3, tm_now()-_ts2);
+                tm_add(S, 3, tm_now()-_ts2);
             }
-            double _q2 = tm_on()? tm_now():0;
+            double _q2 = tm_now();
             qt_take(qmask, val, K, out + (int64_t)s*D);
             if (tm_on() && S==1) {
                 extern double g_qt_iss, g_qt_cpu, g_qt_tak;
@@ -1942,8 +2089,12 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     float scale = 1.f / sqrtf((float)kdim);
     int H = c->hidden;
 
-    float *qkv = falloc(conv_dim);
-    float *z   = falloc(value_dim);
+    /* qkv and z live in ONE buffer: the fused GPU projection writes
+     * [conv_dim ++ value_dim] in a single GEMV, and the CPU fallback fills the
+     * same two regions. Either way the code below reads qkv/z unchanged. */
+    float *qkvz = falloc((int64_t)conv_dim + value_dim);
+    float *qkv = qkvz;
+    float *z   = qkvz + conv_dim;
     float *b   = falloc(vh);
     float *a   = falloc(vh);
     float *beta= falloc(vh);
@@ -1962,10 +2113,13 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
     for (int s = 0; s < S; s++) {
         const float *xs = x + (int64_t)s * H;
         extern double g_dn_sub[4];
-        double _d0 = tm_on()? tm_now():0;
-        /* projections (single-token matmuls) */
-        matmul_d(qkv, xs, l->dn_qkv, 1, H, conv_dim);
-        matmul_d(z,   xs, l->dn_z,   1, H, value_dim);
+        double _d0 = tm_now();
+        /* projections (single-token matmuls). One fused GEMV when this layer's
+         * dnproj is placed on a GPU, the two CPU matmuls otherwise. */
+        if (!qt_dnproj_matmul(layer, qkvz, xs, H, conv_dim + value_dim)) {
+            matmul_d(qkv, xs, l->dn_qkv, 1, H, conv_dim);
+            matmul_d(z,   xs, l->dn_z,   1, H, value_dim);
+        }
         matmul(b,   xs, l->dn_b,   1, H, vh);
         matmul(a,   xs, l->dn_a,   1, H, vh);
         if (tm_on() && S==1){ double t=tm_now(); g_dn_sub[0]+=t-_d0; _d0=t; }
@@ -2081,7 +2235,8 @@ static void deltanet(Model *m, Layer *l, int layer, float *x, int S, int pos_bas
             }
         }
     }
-    free(qkv); free(z); free(b); free(a); free(beta); free(gg);
+    free(qkvz);   /* qkv and z are regions of this one allocation */
+    free(b); free(a); free(beta); free(gg);
     free(conv_out); free(q); free(k); free(outv); free(outr); free(kv); free(delta);
 }
 
@@ -2094,13 +2249,13 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
     for (int i = layer_begin; i < layer_end; i++) {
         Layer *l = &m->L[i];
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
-        double _t0 = tm_on() ? tm_now() : 0.0;
+        double _t0 = tm_now();
         if (c->is_attn[i]) {
             attention(m, l, i, nrm, S, pos_base, tmp);
-            if (tm_on()) tm_add(S, 1, tm_now()-_t0);
+            tm_add(S, 1, tm_now()-_t0);
         } else {
             deltanet(m, l, i, nrm, S, pos_base, tmp);
-            if (tm_on()) tm_add(S, 0, tm_now()-_t0);
+            tm_add(S, 0, tm_now()-_t0);
         }
         if (lf) fwrite(tmp + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* sublayer output */
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
@@ -2108,9 +2263,9 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         if (allow_prefetch && g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
             pilot_prefetch(m, i + 1, x, S);
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
-        _t0 = tm_on() ? tm_now() : 0.0;
+        _t0 = tm_now();
         moe(m, l, i, nrm, S, tmp);
-        if (tm_on()) tm_add(S, 2, tm_now()-_t0);
+        tm_add(S, 2, tm_now()-_t0);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);
         if (allow_prefetch && g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
@@ -2153,8 +2308,9 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     float *last = falloc(D);
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
-    double _th = tm_on() ? tm_now() : 0.0;
-    matmul_d(logit, last, m->lm_head, 1, D, c->vocab);
+    double _th = tm_now();
+    if (!qt_lmhead_matmul(logit, last, D, c->vocab))
+        matmul_d(logit, last, m->lm_head, 1, D, c->vocab);
     if (tm_on()) { tm_add(S, 5, tm_now()-_th); if (S==1) g_tm_dec_tokens++; else g_tm_pre_tokens += S; }
     free(x); free(last);
     if (lf) fclose(lf);
@@ -2185,8 +2341,11 @@ static void pilot_realload(Model *m, int layer, int eid) {
     }
     cache_hide(m, layer, s); s->used = ++m->clock;
     pthread_mutex_unlock(&g_pilot_mx);
+    double t_read0 = now_s();
     load_expert_merged(m, layer, eid, s);
+    double t_read = now_s() - t_read0;
     pthread_mutex_lock(&g_pilot_mx);
+    m->t_disk += t_read;        /* sotto lock: qui arrivano anche i thread del PILOT */
     cache_publish(m, layer, s, eid); s->pinned = m->is_pinned[layer*c->n_experts+eid]; s->used = ++m->clock;
     m->is_queued[layer*c->n_experts+eid] = 0; pthread_mutex_unlock(&g_pilot_mx);
 }
@@ -2250,7 +2409,10 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
             /* Lookahead: RAM-resident layer-L+1 candidates go to VRAM asynchronously */
             if (found && fz >= 0 && qt_ready()) {
                 Slot *ps = &lc->slots[fz];
-                if (ps->g4) qt_note(lnext, eid, ps->g4, ps->u4, ps->d4, ps->gs, ps->us, ps->ds);
+                /* Same int8 container case as the resident offer in moe():
+                 * on an int8 container ps->g4 is NULL and the prefetch offer
+                 * never fired (#1391). tier_offer_slot handles both formats. */
+                tier_offer_slot(lnext, eid, ps);
             }
             if (!found) {
                 int gidx = lnext*E + eid;
@@ -2296,7 +2458,7 @@ static void ensure_kv(Model *m){
         for (int i = 0; i < c->n_layers; i++){ if (m->K[i]) free(m->K[i]); if (m->V[i]) free(m->V[i]); }
         free(m->K); free(m->V); m->K = NULL; m->V = NULL;
     }
-    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    m->K = calloc((size_t)c->n_layers, sizeof(float*)); m->V = calloc((size_t)c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]){
             m->K[i] = falloc((int64_t)c->kv_heads * m->max_t * c->k_head_dim);
@@ -2348,7 +2510,7 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
         }
         free(logit); out[len++] = best;
         int one = best;
-        { extern double g_tm_step; double _s0 = tm_on()? tm_now():0;
+        { extern double g_tm_step; double _s0 = tm_now();
           logit = step(m, &one, 1, len - 1);
           if (tm_on()) g_tm_step += tm_now()-_s0; }
     }
@@ -2474,6 +2636,67 @@ static int serve_eos_ids(int *ids, int cap){
     return n;
 }
 
+/* Un CANCEL per la richiesta in corso, visto SENZA bloccare (#1332).
+ *
+ * Prima serve_read_req era l'unico posto che leggeva un CANCEL, e viene
+ * chiamata solo fra una richiesta e l'altra: quando il comando arrivava, il
+ * turno che doveva fermare era gia' finito. Il gateway intanto manda CANCEL e
+ * aspetta l'ack tenendo l'ammissione dello scheduler, quindi un client che si
+ * disconnette non liberava niente.
+ *
+ * Ritorna 1 se e' arrivato un CANCEL/STOP per `id`. Le righe che non
+ * riconosciamo si scartano, com'e' sempre stato: la regola di compatibilita'
+ * del protocollo vale in tutte e due le direzioni. Un SUBMIT non puo'
+ * legalmente arrivare mentre l'unico slot e' occupato; se arriva viene
+ * ignorato qui e sara' la lettura normale a rifiutarlo.
+ *
+ * Non legge MAI se stdin non e' pronto: una getline bloccante qui fermerebbe la
+ * generazione in attesa di un comando che potrebbe non arrivare mai. */
+static int serve_cancel_pending(const char *id){
+    int cancelled = 0;
+    while(coli_serve_stdin_ready()){
+        char line[512], cmd[16], who[64];
+        if(!fgets(line,sizeof(line),stdin)) break;
+        if(sscanf(line,"%15s %63s",cmd,who)<2) continue;
+        if((!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")) && !strcmp(who,id)) cancelled = 1;
+    }
+    return cancelled;
+}
+
+/* --- Dashboard: Brain e Profile ------------------------------------------
+ * Stesse quattro righe di colibri.c/glm53.c, stessi byte: EMAP dopo READY,
+ * HITS e PROF prima di DONE. Qui ogni layer e' MoE, quindi la griglia e'
+ * n_layers x n_experts. Il tier VRAM non espone una query di residenza:
+ * la griglia distingue solo disco (0) e cache RAM (1). Le fasi del Profile
+ * vengono dai timer che il motore ha gia' (deltanet, attention, moe, head),
+ * ora accumulati sempre e riportati a schermo solo con COLI_TIMERS=1; il
+ * disco e' misurato attorno a load_expert_merged su entrambi i percorsi.
+ * L'attesa asincrona resta 0 per costruzione. */
+static void dash_hex(const uint8_t *bytes,int n,char *hex){
+    for(int b=0;b<n;b++){ hex[2*b]="0123456789abcdef"[bytes[b]>>4]; hex[2*b+1]="0123456789abcdef"[bytes[b]&15]; }
+    hex[2*n]=0;
+}
+static void emap_emit(Model *m){
+    const Cfg *c=&m->c; const int rows=c->n_layers, cols=c->n_experts;
+    uint8_t *cells=calloc((size_t)rows*cols,1);
+    pthread_mutex_lock(&g_pilot_mx);
+    for(int i=0;i<rows;i++) for(int e=0;e<cols;e++)
+        cells[(size_t)i*cols+e]=(uint8_t)((slot_indexed(m,i,e)?1:0)<<6);
+    pthread_mutex_unlock(&g_pilot_mx);
+    char *hex=malloc((size_t)rows*cols*2+1); dash_hex(cells,rows*cols,hex);
+    printf("EMAP %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(cells);
+}
+static void hits_emit(Model *m){
+    const Cfg *c=&m->c; const int rows=c->n_layers, cols=c->n_experts, nb=(rows*cols+7)/8;
+    if(!m->ehit) ehit_mark(m,-1,-1);
+    uint8_t *bm=calloc((size_t)nb,1); int bit=0;
+    for(int i=0;i<rows;i++) for(int e=0;e<cols;e++,bit++)
+        if(m->ehit[i][e]){ bm[bit>>3]|=(uint8_t)(1<<(bit&7)); m->ehit[i][e]=0; }
+    char *hex=malloc((size_t)nb*2+1); dash_hex(bm,nb,hex);
+    printf("HITS %d %d %s\n",rows,cols,hex); fflush(stdout); free(hex); free(bm);
+}
+static double tm_sum(int idx){ return (g_tm_dec[idx]+g_tm_pre[idx])/1e3; }   /* ms -> s */
+
 static void serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0;
     encode_text(q->payload, &ids, &np);          /* payload is raw prompt text; qwen36 adds no BOS */
@@ -2497,7 +2720,8 @@ static void serve_one(Model *m, ServeReq *q){
     double pf0=now_s();        /* #50495: prefill forwards -- same window mux_done reports */
     float *lo = step(m, ids, np, 0);
     double pf_s=now_s()-pf0;
-    int gen=0, limited=1;
+    int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
+    const double s_disk=m->t_disk, s_attn=tm_sum(0)+tm_sum(1), s_moe=tm_sum(2), s_head=tm_sum(5);
     int eos_ids[4]; int n_eos=serve_eos_ids(eos_ids,4);
     double t0=now_s();
     unsigned char sbuf[16]; int sbn=0;
@@ -2510,15 +2734,33 @@ static void serve_one(Model *m, ServeReq *q){
         unsigned char chunk[256]; int cn=0; utf8_drain(sbuf,&sbn,tmp,tn,chunk,&cn);
         if(cn>0) serve_data(q->id,(char*)chunk,cn);
         gen++;
+        /* #1332: una guardata a stdin per token. Il costo e' una select con
+         * timeout zero; il guadagno e' che il gateway smette di aspettare un
+         * turno che nessuno vuole piu'. */
+        if(serve_cancel_pending(q->id)){
+            free(lo); lo=NULL;
+            if(sbn>0) serve_data(q->id,(char*)sbuf,sbn);
+            printf("ERROR %s CANCELLED\n",q->id); fflush(stdout);
+            free(ids);
+            return;
+        }
         /* The next logits are not needed after the final requested token.
          * serve_one() resets the recurrent/KV state for every request, so
          * stepping here would only run a full discarded decode pass. */
         if(s == q->max_tok - 1) break;
-        lo = step(m, &tk, 1, np+s);
+        lo = step(m, &tk, 1, np+s); forwards++;
     }
     if(sbn>0) serve_data(q->id,(char*)sbuf,sbn);   /* flush trailing partial UTF-8 */
     free(lo); free(ids);
     double dt=now_s()-t0;
+    hits_emit(m);
+    {
+        double disk=m->t_disk-s_disk, moe=tm_sum(2)-s_moe;
+        printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n", dt, np, gen,
+               disk, 0.0, moe>disk?moe-disk:0.0, tm_sum(0)+tm_sum(1)-s_attn, tm_sum(5)-s_head,
+               (unsigned long long)forwards);   /* contati, non dedotti: l'ultimo token non ne fa uno */
+        fflush(stdout);
+    }
     printf("DONE %s STAT %d %.3f %.1f %.2f %d %d %.3f\n",q->id,gen,
            dt>0?gen/dt:0.0,0.0,rss_gb(),np,limited,pf_s);
     fflush(stdout);
@@ -2530,12 +2772,86 @@ static void serve_loop(Model *m){
     fputs("\x01\x01READY\x01\x01\n",stdout);
     printf("STAT 0 0.00 0.0 %.2f\n",rss_gb());
     fflush(stdout);
+    emap_emit(m);          /* dopo READY e STAT: il boot reader legge STAT dopo il sentinel */
+    fflush(stdout);
     for(;;){
         ServeReq q={0}; int r;
         do r=serve_read_req(&q); while(r==0);
         if(r<0) return;
         if(r==2){ serve_one(m,&q); free(q.payload); }
     }
+}
+
+/* Warmstart body, lifted out of main so a test can drive it against an
+ * in-memory model without a container (the QT_NO_WARMSTART check stays at the
+ * call site). expert_is_int4 is what main probed from the on-disk expert size.
+ */
+static void tier_warmstart(Model *m, int expert_is_int4) {
+    /* Plan the set (heat order), then load+stage IN PARALLEL. The
+     * load path is thread-safe: expert_get locks the layer cache
+     * (g_pilot_mx), st_read_raw uses pread; entries are unique. */
+    double t0 = now_s();
+    int cap_total = m->c.n_layers * m->c.n_experts;
+    int *wpl = malloc((size_t)cap_total*sizeof(int));
+    int *wpe = malloc((size_t)cap_total*sizeof(int));
+    int wn = qt_plan_fill(wpl, wpe, cap_total);
+    /* Load ALL experts into RAM, not just the planned (VRAM) set:
+     * otherwise the first touch of a CPU-fallback expert triggers a
+     * ~12 ms container read in the middle of decode (measured: 139
+     * ms/token on a single-GPU run). Planned ones also go to VRAM. */
+    uint8_t *planned = calloc((size_t)cap_total, 1);
+    for (int i = 0; i < wn; i++) planned[wpl[i]*m->c.n_experts + wpe[i]] = 1;
+    int keep8 = getenv("COLI_KEEP_INT8") != NULL;
+    #pragma omp parallel for schedule(dynamic, 16)
+    for (int gi = 0; gi < cap_total; gi++) {
+        int l = gi / m->c.n_experts, eidw = gi % m->c.n_experts;
+        Slot *e; expert_get(m, l, eidw, &e);
+        /* int4: i puntatori impacchettati; int8: i pesi stessi. Prima
+         * qui si esigeva e->g4, che su un container int8 e' NULL: la
+         * promozione non partiva mai e il budget restava riservato a
+         * vuoto (#1331). */
+        const uint8_t *wg = expert_is_int4 ? e->g4 : (const uint8_t *)e->g;
+        const uint8_t *wu = expert_is_int4 ? e->u4 : (const uint8_t *)e->u;
+        const uint8_t *wd = expert_is_int4 ? e->d4 : (const uint8_t *)e->d;
+        if (planned[gi]) {
+            /* Reported even when wg is NULL: the tier reserved budget for
+             * this expert in qt_plan_fill, and a planned expert that is never
+             * reported keeps that reservation forever. With no weights the
+             * tier hands the bytes back instead of uploading. */
+            qt_note_planned(l, eidw, wg, wu, wd, e->gs, e->us, e->ds);
+            if (!wg) continue;
+            /* The staging copy is done. On an int4 container the int8 copy
+             * can go RIGHT AWAY so it never shows up in peak RSS: g4/u4/d4
+             * stay as the source of truth, and slot_ensure_int8() rebuilds
+             * the int8 block on an LFRU eviction with no container access.
+             * An int8 container has no second copy -- e->g4 is NULL -- so
+             * freeing e->g there both dangles the pointer qt_note_planned
+             * just stored (any later stage() reads freed memory) and leaves
+             * slot_ensure_int8() unable to bring the expert back: it returns
+             * early without g4, and the CPU fallback in the decode loop then
+             * dereferences NULL. Keep it (#1341). COLI_KEEP_INT8 keeps its
+             * meaning for int4.
+             * The condition is ownership, not format: do not free what was
+             * just handed over. int4 handed g4 (wg != e->g), so the int8
+             * copy is spare; int8 handed e->g itself, so it stays. A future
+             * format that also aliases e->g is then correct without anyone
+             * remembering to extend a format check here. */
+            if (!keep8 && e->g && wg != (const uint8_t *)e->g) { free(e->g); e->g = e->u = e->d = NULL; }
+        }
+    }
+    qt_fill_wait();
+    free(wpl); free(wpe); free(planned);
+    /* The parenthesis used to read "int8 only for non-residents", which was
+     * true only while the int8 copy of every resident was freed. Since #1341
+     * that free is int4-only: on an int8 container every resident keeps its
+     * weights, so the RSS saving the old line implied does not exist there.
+     * Say which container this is instead of promising a saving the reader
+     * will not see. */
+    fprintf(stderr, "[qtier] warmstart (parallel): all %d experts in RAM (%s), %d in VRAM -- %.1f s\n",
+            cap_total,
+            expert_is_int4 ? "int8 copy dropped for residents, kept for non-residents"
+                           : "int8 container: all experts keep their weights in RAM",
+            wn, now_s()-t0);
 }
 
 int main(int argc, char **argv) {
@@ -2547,8 +2863,8 @@ int main(int argc, char **argv) {
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
     const char *mv = getenv("MODEL"); if (mv && *mv) g_model = mv;
     int hot_n = getenv("HOT") ? atoi(getenv("HOT")) : 0;
-    int cap   = argc > 1 ? atoi(argv[1]) : 16;
-    int bits  = argc > 2 ? atoi(argv[2]) : 4;
+    int cap   = argc > 1 ? coli_arg_int(argv[1], "cache/layer") : 16;
+    int bits  = argc > 2 ? coli_arg_int(argv[2], "expert bits") : 4;
     /* cap < 1 leaves every layer cache empty, so expert_get finds no slot to
      * evict and waits for a publish that can never come. The old lru=0 fallback
      * turned that into a heap OOB instead; neither is a failure mode to ship. */
@@ -2559,8 +2875,11 @@ int main(int argc, char **argv) {
     float smooth = getenv("SMOOTH") ? (float)atof(getenv("SMOOTH")) : 0.3f;
     float conf   = getenv("CONF_LIMIT") ? (float)atof(getenv("CONF_LIMIT")) : 0.92f;
 
-    fprintf(stderr, "== qwen36 Phase-2 engine | cache=%d/layer bits=%d pilot=%d wide=%d hot=%d smooth=%.2f conf=%.2f ==\n",
-           cap, bits, g_pilot, g_wide, hot_n, smooth, conf);
+    /* #1376: every capacity knob announced itself here except the one that
+     * refuses requests. The context ceiling surfaced only in the
+     * CONTEXT_EXCEEDED line, i.e. after a request had already failed. */
+    fprintf(stderr, "== qwen36 Phase-2 engine | cache=%d/layer bits=%d ctx=%d pilot=%d wide=%d hot=%d smooth=%.2f conf=%.2f ==\n",
+           cap, bits, qwen36_max_ctx(), g_pilot, g_wide, hot_n, smooth, conf);
 
 
     int is_ref = 0;
@@ -2608,7 +2927,13 @@ int main(int argc, char **argv) {
         if (getenv("ENC_DEBUG") && np <= 300) { fprintf(stderr, "[enc] prompt ids: "); for (int i=0;i<np;i++) fprintf(stderr, "%d ", prompt[i]); fprintf(stderr, "\n"); }
     }
 
-    Model m; model_init(&m, snap, cap, bits);
+    /* static, not a stack local: the PILOT prefetch worker is detached and
+     * loops forever, and it keeps this address in the global pilot_m. A stack
+     * Model dies when main returns while that thread is still dereferencing
+     * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
+     * with the run's tokens already correct (#1262). Static storage outlives
+     * every thread, so the pointer the worker holds stays valid. */
+    static Model m; model_init(&m, snap, cap, bits);
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
@@ -2646,47 +2971,95 @@ int main(int argc, char **argv) {
     /* Optional CUDA VRAM expert tier (COLI_CUDA=1): hot experts live in
      * DEVICE_LOCAL memory across the configured GPUs, misses fall back to the
      * CPU int8 path. See qwen36_tier.h. */
-    if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk, m.c.expert_gs)) {
+    /* Formato degli esperti dalla TAGLIA SU DISCO del primo, non da meta.ebits:
+     * esiste un container i8 il cui meta dichiara ebits=4 (stesso motivo per cui
+     * il loader piu' sopra guarda nbytes). Il tier ne ha bisogno prima di
+     * riservare qualunque budget: e' int4 impacchettato che va in VRAM come
+     * fmt=4, int8 come fmt=1. Sbagliare qui era #1331 -- budget riservato,
+     * planned=1, e zero promozioni per tutta la vita del processo. */
+    int expert_is_int4 = 1;
+    {
+        char probe[256];
+        snprintf(probe, sizeof(probe),
+                 "model.layers.%d.mlp.experts.0.merged_weight", m.active_of[0]);
+        st_tensor *pt = st_find(&m.S, probe);
+        int64_t want = 2*(int64_t)m.c.inter*m.c.hidden + (int64_t)m.c.hidden*m.c.inter;
+        if (pt && pt->nbytes == want) expert_is_int4 = 0;   /* int8: un byte per elemento */
+    }
+    /* Una riga, sempre: e' l'unico modo di verificare il probe dall'esterno
+     * (CI sul container tiny int8, #1331) senza una scheda. */
+    fprintf(stderr, "[qwen36] expert format on disk: %s\n",
+            expert_is_int4 ? "int4 packed (tier fmt=4)" : "int8 (tier fmt=1)");
+    g_expert_is_int4 = expert_is_int4;
+    /* Offer the dense trunk to the placer before the tier decides its budget:
+     * sizes only, from the same dense-i8 entries the uploads below will use.
+     * No entry (dense-i8 off) means nothing to offer, and the CPU path stands. */
+    {
+        int O_qkv = m.c.dn_conv_dim, O_z = m.c.dn_vheads * m.c.dn_vdim;
+        for (int i = 0; i < g_qdw_n; i++)
+            if (g_qdw[i].w == m.lm_head)
+                qt_trunk_offer("lmhead", 0, (size_t)g_qdw[i].I * g_qdw[i].O + (size_t)g_qdw[i].O * sizeof(float));
+        for (int i = 0; i < m.c.n_layers; i++) {
+            if (m.c.is_attn[i]) continue;
+            int have = 0;
+            for (int j = 0; j < g_qdw_n; j++)
+                if (g_qdw[j].w == m.L[i].dn_qkv || g_qdw[j].w == m.L[i].dn_z) have++;
+            if (have == 2)
+                qt_trunk_offer("dnproj", i, (size_t)(O_qkv + O_z) * m.c.hidden + (size_t)(O_qkv + O_z) * sizeof(float));
+        }
+    }
+    if (qt_init(m.c.n_layers, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk,
+                m.c.expert_gs, expert_is_int4)) {
         fprintf(stderr, "[gpu] MoE experts -> CUDA VRAM tier\n");
         atexit(qt_shutdown);
+        /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
+         * qdw entry keyed by m.lm_head holds the int8 rows + per-row scales
+         * the CPU path uses; the GPU applies the identical semantics. */
+        for (int i = 0; i < g_qdw_n; i++)
+            if (g_qdw[i].w == m.lm_head) {
+                qt_lmhead_init(g_qdw[i].q, g_qdw[i].sc, g_qdw[i].I, g_qdw[i].O);
+                break;
+            }
+        /* R4 step 2: DeltaNet input projections, per layer, wherever
+         * COLI_PLACE puts them. qkv and z are both [O_x, hidden] int8 with
+         * per-row scales, so fusing them is a concatenation along O -- two
+         * memcpys, no requantization, and the GPU sees one GEMV per layer
+         * instead of two. The host copy is freed right after the upload. */
+        {
+            int placed = 0, O_qkv = m.c.dn_conv_dim, O_z = m.c.dn_vheads * m.c.dn_vdim;
+            int Of = O_qkv + O_z, Hd = m.c.hidden;
+            double vram = 0;
+            for (int i = 0; i < m.c.n_layers; i++) {
+                if (m.c.is_attn[i]) continue;
+                int dev = qt_place_of("dnproj", i);
+                if (dev == QT_PLACE_CPU) continue;
+                const int8_t *q1 = NULL, *q2 = NULL; const float *s1 = NULL, *s2 = NULL;
+                for (int j = 0; j < g_qdw_n; j++) {
+                    if (g_qdw[j].w == m.L[i].dn_qkv) { q1 = g_qdw[j].q; s1 = g_qdw[j].sc; }
+                    if (g_qdw[j].w == m.L[i].dn_z)   { q2 = g_qdw[j].q; s2 = g_qdw[j].sc; }
+                }
+                if (!q1 || !q2) continue;      /* dense-i8 off: CPU path stands */
+                int8_t *qf = malloc((size_t)Of * Hd);
+                float  *sf = malloc((size_t)Of * sizeof(float));
+                if (!qf || !sf) { free(qf); free(sf); break; }
+                memcpy(qf, q1, (size_t)O_qkv * Hd);
+                memcpy(qf + (size_t)O_qkv * Hd, q2, (size_t)O_z * Hd);
+                memcpy(sf, s1, (size_t)O_qkv * sizeof(float));
+                memcpy(sf + O_qkv, s2, (size_t)O_z * sizeof(float));
+                if (qt_dnproj_init(i, qf, sf, Hd, Of, dev)) {
+                    placed++; vram += (double)Of * Hd;
+                }
+                free(qf); free(sf);
+            }
+            if (placed)
+                fprintf(stderr, "[dnp] %d DeltaNet-Projektionen auf GPU (%.2f GB VRAM)\n",
+                        placed, vram / 1073741824.0);
+        }
         /* Warmstart: fill the VRAM budget BEFORE the first token (heat order
          * when HEAT_FILE exists, natural order otherwise), loading all RAM
          * slots along the way. */
         const char *nws = getenv("QT_NO_WARMSTART");
-        if (!(nws && *nws=='1')) {
-            /* Plan the set (heat order), then load+stage IN PARALLEL. The
-             * load path is thread-safe: expert_get locks the layer cache
-             * (g_pilot_mx), st_read_raw uses pread; entries are unique. */
-            double t0 = now_s();
-            int cap_total = m.c.n_layers * m.c.n_experts;
-            int *wpl = malloc((size_t)cap_total*sizeof(int));
-            int *wpe = malloc((size_t)cap_total*sizeof(int));
-            int wn = qt_plan_fill(wpl, wpe, cap_total);
-            /* Load ALL experts into RAM, not just the planned (VRAM) set:
-             * otherwise the first touch of a CPU-fallback expert triggers a
-             * ~12 ms container read in the middle of decode (measured: 139
-             * ms/token on a single-GPU run). Planned ones also go to VRAM. */
-            uint8_t *planned = calloc((size_t)cap_total, 1);
-            for (int i = 0; i < wn; i++) planned[wpl[i]*m.c.n_experts + wpe[i]] = 1;
-            int keep8 = getenv("COLI_KEEP_INT8") != NULL;
-            #pragma omp parallel for schedule(dynamic, 16)
-            for (int gi = 0; gi < cap_total; gi++) {
-                int l = gi / m.c.n_experts, eidw = gi % m.c.n_experts;
-                Slot *e; expert_get(&m, l, eidw, &e);
-                if (planned[gi] && e->g4) {
-                    qt_note_planned(l, eidw, e->g4, e->u4, e->d4, e->gs, e->us, e->ds);
-                    /* The staging copy is done; free the int8 copy RIGHT AWAY
-                     * so it never shows up in peak RSS. On LFRU eviction
-                     * slot_ensure_int8() rematerializes from g4 (no container
-                     * access). */
-                    if (!keep8 && e->g) { free(e->g); e->g = e->u = e->d = NULL; }
-                }
-            }
-            qt_fill_wait();
-            free(wpl); free(wpe); free(planned);
-            fprintf(stderr, "[qtier] warmstart (parallel): all %d experts in RAM (int8 only for non-residents), %d in VRAM -- %.1f s\n",
-                    cap_total, wn, now_s()-t0);
-        }
+        if (!(nws && *nws=='1')) tier_warmstart(&m, expert_is_int4);
     }
 
     /* coli serve mode: speak the gateway wire protocol instead of argv

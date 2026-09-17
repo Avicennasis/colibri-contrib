@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -17,12 +18,25 @@ from family_registry import (
     UnknownFamilyError,
     PlannerUnsupportedError,
     _build_registry,
+    expert_contributions,
+    fixed_resident_contribution,
     family_for_config,
     planner_geometry,
     public_metadata,
+    resident_contribution,
     resolve_model,
     tuning_replay_prompt,
 )
+
+
+def _readmes(repo):
+    """Ogni README del repo, trovato e non elencato.
+
+    Una lista scritta a mano qui avrebbe lo stesso difetto che questi test
+    esistono per prendere: chi aggiunge README.fr.md non tocca il test, il
+    test continua a passare, e il lettore francese non trova il modello.
+    """
+    return sorted(repo.glob("README*.md"))
 
 
 def qwen_geometry(config, context, _model_dir):
@@ -47,7 +61,7 @@ def minimax_geometry(config, context, _model_dir):
     return PlannerGeometry(state, 0, 0, config["num_local_experts"])
 
 
-TEST_INVENTORY = lambda _name, _size, _config: ()
+TEST_INVENTORY = lambda _name, _size, _config, _dtype=None: ()
 QWEN36_FIXTURE = FamilyDescriptor(
     id="qwen36",
     model_types=("qwen3_5_moe_text",),
@@ -105,6 +119,10 @@ class FamilyRegistryTest(unittest.TestCase):
                 json.dumps(public_metadata(family))
                 self.assertIn(family.id, by_id)
 
+    def test_glm53_exposes_engine_kv_slot_limit(self):
+        by_id, _ = _build_registry(FAMILIES)
+        self.assertEqual(by_id["glm53"].limits.max_kv_slots, 16)
+
     def test_unknown_or_invalid_config_never_falls_back_to_glm(self):
         with self.assertRaises(UnknownFamilyError):
             family_for_config({"model_type": "qwen3_moe"})
@@ -150,6 +168,163 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(geometry.fixed_state_bytes, 6 * (8 * 8 * 8 + 128 * 3) * 4)
         for model_type in ("qwen2", "qwen3_moe", "my_qwen_model"):
             self.assertNotIn(model_type, by_type)
+
+    def test_qwen38_fixture_resolves_nested_text_config_and_sizes_all_state(self):
+        config = {
+            "model_type": "qwen4_exp",
+            "text_config": {
+                "model_type": "qwen4_exp_text",
+                "num_hidden_layers": 48,
+                "hidden_size": 2560,
+                "vocab_size": 248320,
+                "max_position_embeddings": 262144,
+                "eos_token_id": 248044,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "rope_parameters": {"partial_rotary_factor": 0.25},
+                "layer_types": ["linear_attention"] * 36 + ["full_attention"] * 12,
+                "indexer_kv_heads": 1, "indexer_head_dim": 128,
+                "indexer_n_heads": 4, "indexer_budget": 2048,
+                "indexer_compress_ratio": 4,
+                "linear_num_value_heads": 48,
+                "linear_num_key_heads": 16,
+                "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "hc_count": 4, "hc_lowrank": 320,
+                "ple_layer_ids": [2], "ple_embed_dim": 2560,
+                "ple_conv_kernel_size": 4, "ngram_size": 3,
+                "heads_per_ngram": 8, "split_ngram_parts": 128,
+                "num_experts": 512, "moe_intermediate_size": 640,
+                "num_experts_per_tok": 10,
+                "shared_expert_intermediate_size": 640,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            resolved = resolve_model(root)
+        self.assertEqual(resolved.descriptor.id, "qwen38")
+        self.assertEqual(resolved.family_config["model_type"], "qwen4_exp_text")
+        geometry = planner_geometry(resolved, 32)
+        self.assertEqual(geometry.configured_experts, 512)
+        live_context = 12 * 32 * (2 * 2 * 256 + 128) * 4
+        self.assertEqual(geometry.context_state_bytes,
+                         live_context + 32 * 4)
+        live_fixed = (36 * (48 * 128 * 128 + 10240 * 3) * 4 +
+                      10240 * 9 * 4 + 2 * 8)
+        expected_fixed = live_fixed * 2 + 248320 * 4
+        self.assertEqual(geometry.fixed_state_bytes, expected_fixed)
+        base_row = 4 * 2560 + 2 * 2560 + 4
+        gated_residual_row = base_row + 2 * 4 * 2560 + 320
+        qsa_row = (base_row + 2 * 24 * 256 + 2 * 2 * 256 +
+                   (4 + 1) * 128 + 24 * 256)
+        ple_row = base_row + 4 * 2560
+        moe_fixed = 512 + 3 * 640 + 3 * 640 + 2 * 2560
+        gdn_width = 2 * 16 * 128 + 48 * 128
+        gdn_fixed = (2 * gdn_width + 3 * 48 * 128 +
+                     2 * 48 + 2 * 48 * 128)
+        ple_fixed = 2560 + 5 * 4 * 2560 + 2560
+        qsa_fixed = 4 * 128 + 128 + 2048 + 4 - 1 + max(
+            2 * (32 // 4), 256 + 2048 + 4 - 1)
+        legacy_workspace = (
+            32 * max(gated_residual_row, qsa_row, ple_row) +
+            max(moe_fixed, gdn_fixed, ple_fixed, qsa_fixed)) * 4
+        moe_assignment_bytes = 2 * (2560 + 640) * 4 + 8 + 2 * 4
+        moe_row_bytes = (512 + 3 * 640 + 2560 + 1) * 4 + \
+            10 * moe_assignment_bytes
+        moe_fixed_bytes = 512 * (4 * 4 + 8) + 4
+        moe_chunk_bytes = moe_fixed_bytes + 32 * moe_row_bytes
+        delta_row_bytes = (gdn_width + 2 * 48 * 128 + 2 * 48) * 4
+        delta_fixed_bytes = (gdn_width + 2 * 48 * 128 + 48 * 128) * 4
+        delta_chunk_bytes = delta_fixed_bytes + 32 * delta_row_bytes
+        batched_workspace = 32 * base_row * 4 + max(
+            moe_chunk_bytes, delta_chunk_bytes)
+        expected_workspace = max(legacy_workspace, batched_workspace)
+        self.assertEqual(geometry.workspace_bytes, expected_workspace)
+
+        family = resolved.descriptor
+        invalid = {
+            "ngram_size": 2,
+            "indexer_kv_heads": 2,
+            "indexer_budget": 2047,
+            "hc_count": 17,
+            "ple_embed_dim": 2561,
+            "linear_num_value_heads": 47,
+            "num_attention_heads": 25,
+        }
+        for key, value in invalid.items():
+            broken = json.loads(json.dumps(config["text_config"]))
+            broken[key] = value
+            bad = type("R", (), {"descriptor": family, "family_config": broken,
+                                   "model_dir": "."})()
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                planner_geometry(bad, 32)
+        short = json.loads(json.dumps(config["text_config"]))
+        short["max_position_embeddings"] = 16
+        bad = type("R", (), {"descriptor": family, "family_config": short,
+                               "model_dir": "."})()
+        with self.assertRaisesRegex(ValueError, "max_position_embeddings"):
+            planner_geometry(bad, 32)
+
+    def test_qwen38_inventory_aggregates_per_expert_and_fused_tensor_sizes(self):
+        family = next(family for family in FAMILIES if family.id == "qwen38")
+        resolved = type("R", (), {"descriptor": family,
+                                   "family_config": {"num_experts": 512,
+                                                     "hidden_size": 32,
+                                                     "moe_intermediate_size": 8},
+                                   "model_dir": "."})()
+        prefix = "model.language_model.layers.7.mlp.experts.23"
+        self.assertEqual(expert_contributions(
+            resolved, prefix + ".gate_proj.weight", 256, "F8_E4M3"),
+            ((7, 23, 256),))
+        self.assertEqual(expert_contributions(
+            resolved, prefix + ".up_proj.weight", 512, "BF16"),
+            ((7, 23, 512),))
+        self.assertEqual(expert_contributions(
+            resolved, prefix + ".down_proj.weight", 1024, "F32"),
+            ((7, 23, 1024),))
+        self.assertEqual(expert_contributions(
+            resolved, prefix + ".down_proj.weight", 512, "F16"),
+            ((7, 23, 1024),))
+        # FP8 sidecars are normalized into a fixed per-model scale bank, not
+        # copied into every cache slot.
+        self.assertEqual(expert_contributions(
+            resolved, prefix + ".down_proj.weight_scale_inv", 4, "F32"), ())
+        self.assertEqual(fixed_resident_contribution(
+            resolved, prefix + ".down_proj.weight_scale_inv", 4, "F32"), 4)
+        with self.assertRaisesRegex(ValueError, "unsupported dtype/size"):
+            expert_contributions(
+                resolved, prefix + ".down_proj.weight_scale_inv", 16, "F32")
+        fused = "model.layers.7.mlp.experts.gate_up_proj"
+        fused_size = 512 * 2 * 32 * 8 * 2
+        contributions = expert_contributions(resolved, fused, fused_size, "BF16")
+        self.assertEqual(len(contributions), 512)
+        self.assertEqual(contributions[23], (7, 23, 1024))
+        contributions = expert_contributions(resolved, fused, fused_size, "F16")
+        self.assertEqual(contributions[23], (7, 23, 2048))
+
+        self.assertEqual(resident_contribution(
+            resolved, "model.language_model.layers.0.self_attn.q_proj.weight",
+            100, "BF16"), 100)
+        self.assertEqual(resident_contribution(
+            resolved, "model.language_model.layers.0.self_attn.q_proj.weight",
+            100, "F16"), 200)
+        self.assertEqual(resident_contribution(
+            resolved, "model.language_model.layers.0.self_attn.q_norm.weight",
+            100, "BF16"), 200)
+        self.assertEqual(resident_contribution(
+            resolved, "model.visual.blocks.0.attn.qkv.weight", 100), 0)
+        self.assertEqual(resident_contribution(
+            resolved, "mtp.layers.0.mlp.gate.weight", 100), 0)
+        self.assertEqual(resident_contribution(
+            resolved,
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_7.weight",
+            100), 0)
+        self.assertEqual(resident_contribution(
+            resolved,
+            "model.language_model.layers.1.ple.ple_embedding.layer_multipliers",
+            24), 0)
 
     def test_minimax_fixture_can_share_colibri_without_becoming_glm(self):
         config = {
@@ -846,7 +1021,15 @@ class FamilyRegistryTest(unittest.TestCase):
             # there lands on an EOS special (measured gen=0).
             "qwen36": "<|im_start|>user\nhello {world}<|im_end|>\n"
                       "<|im_start|>assistant\n<think>\n",
+            "qwen38": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully "
+                      "through the task, validate key assumptions, consider plausible alternatives, "
+                      "and prioritize correctness, consistency, and clarity in the final answer."
+                      "<|im_end|>\n<|im_start|>user\nhello {world}<|im_end|>\n"
+                      "<|im_start|>assistant\n<think>\n",
             "deepseek_v4": "hello {world}",
+            # V4.1 ships its chat encoding as a Python module (encoding/encoding.py),
+            # not a jinja template, so the replay prompt stays the bare text like V4.
+            "deepseek_v41": "hello {world}",
         }
         self.assertEqual(
             {family.id: tuning_replay_prompt(family, prompt) for family in FAMILIES},
@@ -857,6 +1040,10 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertFalse(QWEN36_FIXTURE.has_cli_adapter)
         self.assertFalse(QWEN36_FIXTURE.has_gateway_adapter)
         self.assertEqual(tuning_replay_prompt(QWEN36_FIXTURE, "hello"), "hello")
+
+        with self.assertRaises(RegistryError):
+            _build_registry((replace(QWEN36_FIXTURE,
+                                     resident_inventory="not callable"),))
 
         for template in ("static", "{unknown}", "{prompt", "{prompt[foo]}"):
             with self.subTest(template=template), self.assertRaises(RegistryError):
@@ -897,6 +1084,270 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(checks["engine.binary"]["status"], "fail")
         self.assertEqual(report["status"], "error")
 
+    def test_tools_capability_matches_what_the_renderer_actually_does(self):
+        """The `tools` flag must agree with the gateway's behaviour.
+
+        It is descriptive -- it only feeds the capability dict -- which is
+        exactly why it drifted: glm53 and kimi both render and parse tool calls
+        while sharing a COMMON_CAP that said they do not, and nothing failed to
+        tell anyone. A client asking what a family supports was told the
+        opposite of the truth. Ask the renderer instead of trusting the flag.
+        """
+        import openai_server
+
+        probe = [{"role": "user", "content": "hi"}]
+        tool = [{"type": "function",
+                 "function": {"name": "f", "description": "d",
+                              "parameters": {"type": "object", "properties": {}}}}]
+        for family in FAMILIES:
+            renderer = getattr(openai_server, f"render_chat_{family.id}", None)
+            if renderer is None:          # kimi/deepseek build their payload in C
+                continue
+            refused = False
+            try:
+                renderer(probe, tools=tool)
+            except openai_server.APIError as exc:
+                refused = getattr(exc, "code", None) == "unsupported_parameter"
+            except Exception:             # nothing else here is a capability answer
+                continue
+            self.assertEqual(
+                family.capabilities.tools, not refused,
+                f"{family.id}: registry says tools={family.capabilities.tools} but the "
+                f"renderer {'refuses' if refused else 'accepts'} them")
+
+    def test_a_reasoning_family_gets_more_room_than_a_single_answer(self):
+        """Chi ragiona deve avere un budget interattivo piu' largo del default.
+
+        Il tetto sui token e' una rete di sicurezza: la fine vera la decidono
+        gli stop token. Ma su un modello che riflette prima di rispondere, un
+        tetto stretto non ti prende DOPO la risposta, ti prende DENTRO al
+        pensiero, e il turno finisce senza che l'utente veda niente (#1278).
+
+        glm53, inkling e kimi erano rimaste all'interattivo uguale al default,
+        mentre ogni altra famiglia che ragiona lo aveva gia' alzato. Nessuno se
+        n'e' accorto perche' il registro accetta qualsiasi valore >= 1: questo
+        controllo esiste perche' la prossima non passi allo stesso modo.
+        """
+        for family in FAMILIES:
+            if not family.capabilities.thinking:
+                continue          # senza ragionamento il default e' la risposta intera
+            self.assertGreater(
+                family.limits.interactive_max_output, family.limits.default_max_output,
+                f"{family.id}: reasons, but its interactive budget "
+                f"({family.limits.interactive_max_output}) is no larger than the "
+                f"non-interactive default ({family.limits.default_max_output}) -- "
+                f"reasoning can consume it before the answer starts")
+
+    def test_every_readme_names_every_family(self):
+        """Ogni README, tradotto compreso, deve nominare ogni famiglia.
+
+        E' la terza volta oggi che un conteggio ripetuto in due posti diverge:
+        release.yml costruiva sei motori e ne copiava sette, i contatori degli
+        adapter dicevano 7 con 8 famiglie registrate, e i README dichiaravano
+        sei, sette e otto famiglie contemporaneamente -- l'inglese si
+        contraddiceva da solo fra riga 21 e riga 586.
+
+        Il nome della famiglia e' il controllo giusto, non il numerale: sono
+        quattro lingue e il numerale si scrive in quattro modi, mentre
+        `Qwen3.8-Flash-Next` si scrive uguale ovunque. Chi aggiunge una famiglia
+        e dimentica le traduzioni lo scopre qui invece che da un utente che
+        legge la sua lingua e non trova il modello.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        for path in _readmes(repo):
+            name = path.name
+            text = path.read_text(encoding="utf-8")
+            for family in FAMILIES:
+                # Il nome senza il suffisso di taglia: i README scrivono
+                # "**Qwen3.6** (35B-A3B)", non "Qwen3.6-35B-A3B", perche' la
+                # dimensione sta fra parentesi. Cercare il display_name intero
+                # fallirebbe su una differenza di formattazione invece che su
+                # una famiglia mancante, che e' quello che qui interessa.
+                parts = []
+                for piece in family.display_name.split("-"):
+                    if re.fullmatch(r"A?\d+(\.\d+)?B", piece):
+                        break
+                    parts.append(piece)
+                token = "-".join(parts) or family.display_name
+                # assertTrue e non assertIn: assertIn stampa il README intero
+                # nel messaggio di errore, e mille righe di markdown nascondono
+                # la riga che dice cosa manca.
+                self.assertTrue(token in text,
+                                f"{name}: does not mention {family.display_name} "
+                                f"({family.id}); a reader in that language cannot "
+                                f"tell the family is supported")
+
+    def test_release_ships_everything_coli_reaches(self):
+        """L'archivio deve contenere ogni file Python che coli raggiunge.
+
+        #1296: il pacchetto v1.10.0 aveva quattro comandi rotti. release.yml
+        copiava sette .py scelti a mano piu' un solo file in tools/, e il
+        codice era andato avanti. Mancavano convert_fp8_to_int4.py,
+        eval_glm.py, fetch_benchmarks.py, mirror_plan.py, e i moduli cluster,
+        glm53_image, qwen38_image.
+
+        Ora la lista la calcola c/tools/pack_python.py. Questo test fissa i
+        due punti ciechi che avevano fatto passare il difetto, perche' sono i
+        due modi in cui un file sfugge a chi guarda a occhio:
+
+        - un import dentro una funzione, dopo un sys.path.insert. E' il caso
+          di qwen38_image in openai_server.py, e l'ImportError li' e'
+          catturato e riscritto come "image support needs Pillow and numpy":
+          nel pacchetto pubblicato mandare un'immagine dava la colpa
+          all'ambiente dell'utente per un file che non avevamo spedito.
+        - un sottoprocesso scritto con lo spazio dopo la virgola,
+          os.path.join(TOOLS, "mirror_plan.py"). La mia prima grep cercava
+          TOOLS," senza spazio e non lo vedeva: quattro invocazioni, non tre.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(repo / "c" / "tools"))
+        try:
+            import pack_python
+        finally:
+            sys.path.pop(0)
+
+        reached = {path.name for path in pack_python.needed(repo / "c")}
+
+        # I sette file che mancavano davvero dall'archivio v1.10.0.
+        for name in ("convert_fp8_to_int4.py", "eval_glm.py",
+                     "fetch_benchmarks.py", "mirror_plan.py",
+                     "cluster.py", "glm53_image.py", "qwen38_image.py"):
+            self.assertIn(name, reached,
+                          f"{name} mancava dall'archivio v1.10.0 e il calcolo "
+                          f"non lo ritrova: #1296 si ripeterebbe")
+
+        release = (repo / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8")
+        self.assertIn("pack_python.py c dist", release,
+                      "release.yml non calcola piu' i file da copiare")
+        self.assertIn("--check", release,
+                      "release.yml non verifica piu' l'archivio estratto")
+
+    def test_the_python_job_builds_every_engine_a_test_skips_without(self):
+        """Un test protetto da skipUnless(ENGINE.exists()) sparisce se il job
+        non compila quel motore, e sparisce in silenzio: la classe si salta,
+        il job resta verde, e nessuno distingue "passato" da "mai eseguito".
+
+        E' successo davvero. Il job Python non compilava nessun motore, quindi
+        sette test fra test_kimi_usage_cli e test_inkling_prefix_serve non
+        giravano da sempre, e uno era rosso da quando il messaggio di kimi_k3
+        e' stato riscritto. E' la stessa forma del job dei sanitizer che
+        rieseguiva un binario senza strumentazione: verde perche' vuoto.
+
+        Il controllo va nella direzione che serve. Non chiede che il job
+        compili una certa lista, che sarebbe un'altra costante da tenere
+        allineata a mano: parte dai test, guarda su quale binario si saltano,
+        e pretende che il job lo costruisca.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        tests_dir = repo / "c" / "tests"
+        guard = re.compile(r'ENGINE\s*=\s*HERE\s*/\s*\(?\s*"([a-z0-9_]+)\.exe"'
+                           r'.*?else\s*"([a-z0-9_]+)"', re.S)
+        needed = {}
+        for path in sorted(tests_dir.glob("test_*.py")):
+            text = path.read_text(encoding="utf-8")
+            if "skipUnless" not in text or "ENGINE.exists()" not in text:
+                continue
+            m = guard.search(text)
+            if m:
+                needed[m.group(2)] = path.name
+        self.assertTrue(needed,
+                        "nessun test guardato da ENGINE.exists() trovato: il "
+                        "controllo non sta piu' guardando niente")
+        ci = (repo / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        # Il corpo del job va da "  python:" fino al job successivo, cioe' la
+        # prossima riga indentata di due spazi esatti. Tagliare al primo "\n  "
+        # non funziona: le righe interne sono indentate di quattro e cominciano
+        # anch'esse per due spazi, quindi il corpo verrebbe vuoto e il test
+        # fallirebbe sempre, per la ragione sbagliata.
+        job = re.search(r"(?m)^  python:\n(.*?)(?=^  \S|\Z)", ci, re.S)
+        self.assertIsNotNone(job, "il job 'python:' non esiste piu' in ci.yml")
+        body = job.group(1)
+        # I bersagli veri di make, non il corpo del job: un commento che nomina
+        # "test_inkling_prefix_serve.py" contiene la parola "inkling" e farebbe
+        # passare il controllo senza che nulla venga compilato. Il controllo
+        # negativo di questo test lo ha dimostrato togliendo inkling dalla
+        # riga di build: passava lo stesso.
+        built = set()
+        for run_line in re.findall(r"(?m)^\s*run:\s*(.+)$", body):
+            m = re.search(r"\bmake\b(?:\s+-C\s+\S+)?\s+(.*)", run_line)
+            if m:
+                built.update(tok for tok in m.group(1).split() if not tok.startswith("-"))
+        for engine, where in sorted(needed.items()):
+            self.assertIn(engine, built,
+                          f"{where} si salta se '{engine}' non e' compilato, e il "
+                          f"job Python della CI non lo compila: quei test non "
+                          f"girano mai e il job resta verde perche' e' vuoto")
+
+    def test_every_readme_banner_matches_the_declared_version(self):
+        """Il banner dei README deve dire la versione che dichiara version.py.
+
+        Il numero vive in cinque posti e finora niente li legava. Il modo in
+        cui questo sbaglia non e' rumoroso: si aggiornano quattro file su
+        cinque, la release esce, e il banner del quinto annuncia la versione
+        precedente a chiunque legga quella lingua. E' la stessa forma che ha
+        fatto uscire la v1.9.0 senza archivi -- una costante, piu' consumatori,
+        nessun controllo -- solo su un file diverso.
+
+        Qui il confronto e' con version.py e non fra i README fra loro: se
+        divergessero tutti insieme dal codice, un test di sola coerenza
+        reciproca li troverebbe d'accordo e non direbbe niente.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        declared = re.search(r'__version__\s*=\s*"([^"]+)"',
+                             (repo / "c" / "version.py").read_text(encoding="utf-8"))
+        self.assertIsNotNone(declared, "c/version.py: __version__ non trovato")
+        version = declared.group(1)
+        seen = 0
+        for path in _readmes(repo):
+            for banner in re.findall(r"colibri v(\d+\.\d+\.\d+)",
+                                     path.read_text(encoding="utf-8")):
+                seen += 1
+                self.assertEqual(
+                    banner, version,
+                    f"{path.name}: il banner dice v{banner} ma version.py "
+                    f"dichiara {version}; la release annuncerebbe due numeri "
+                    f"diversi a seconda della lingua che il lettore apre")
+        # Se un giorno il banner cambia forma questo test smetterebbe di
+        # guardare qualcosa senza mai fallire: meglio che lo dica.
+        self.assertGreater(seen, 0,
+                           "nessun banner 'colibri vX.Y.Z' trovato in alcun "
+                           "README: il test non sta piu' controllando niente")
+
+    def test_the_site_shows_the_version_and_every_family(self):
+        """site/index.html deve dire la versione vera e nominare ogni famiglia.
+
+        Trovato fermo a "Currently shipping v1.7.0" con sei famiglie su otto:
+        quattro release e due modelli indietro. E' la sesta copia del numero di
+        versione e la quinta lista di famiglie, e ne' il contratto dei banner
+        (#1288) ne' quello dei README (#1287) la guardavano. Il sito e' la
+        prima cosa che un visitatore vede e l'ultima che ci si ricorda di
+        aggiornare: esattamente il posto per un contratto.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        site = (repo / "site" / "index.html").read_text(encoding="utf-8")
+        declared = re.search(r'__version__\s*=\s*"([^"]+)"',
+                             (repo / "c" / "version.py").read_text(encoding="utf-8"))
+        shown = re.search(r"Currently shipping <b>v([\d.]+)</b>", site)
+        self.assertIsNotNone(shown,
+                             "site/index.html: la riga 'Currently shipping' non "
+                             "c'e' piu'; il contratto non sta controllando niente")
+        self.assertEqual(shown.group(1), declared.group(1),
+                         f"il sito dice v{shown.group(1)} ma version.py dichiara "
+                         f"{declared.group(1)}: il visitatore legge una versione "
+                         f"vecchia")
+        for family in FAMILIES:
+            parts = []
+            for piece in family.display_name.split("-"):
+                if re.fullmatch(r"A?\d+(\.\d+)?B", piece):
+                    break
+                parts.append(piece)
+            token = "-".join(parts) or family.display_name
+            self.assertTrue(token in site,
+                            f"site/index.html non nomina {family.display_name} "
+                            f"({family.id}): il sito mostra meno famiglie di "
+                            f"quante ne girano")
+
     def test_build_install_ci_and_release_cover_registered_engines(self):
         repo = Path(__file__).resolve().parents[2]
         makefile = (repo / "c" / "Makefile").read_text(encoding="utf-8")
@@ -904,6 +1355,7 @@ class FamilyRegistryTest(unittest.TestCase):
         release = (repo / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8")
         docker = (repo / "docker" / "Dockerfile.slim").read_text(encoding="utf-8")
+        clean = (repo / "c" / "tools" / "clean.py").read_text(encoding="utf-8")
         make_rules = re.sub(r"\\\n[ \t]*", " ", makefile)
         install_rule = re.search(r"(?m)^install:\s*(.*)$", make_rules)
         self.assertIsNotNone(install_rule)
@@ -937,11 +1389,88 @@ class FamilyRegistryTest(unittest.TestCase):
                                   f"{family.id}: release.yml copies "
                                   f"c/{family.engine_artifact} but never builds it")
                     self.assertIn(f"$(LIBEXECDIR)/{family.engine_artifact}", makefile)
+                    # `make clean` must actually remove the engine. When it does
+                    # not, a rebuild with different EXTRA_CFLAGS reports "up to
+                    # date" and the caller silently keeps the OLD binary. The
+                    # ASan step of the Qwen3.6 oracle job re-ran an
+                    # un-instrumented qwen36 that way for as long as it existed
+                    # (#1262): green, with the sanitizer never having run.
+                    self.assertIn(f'"{family.engine_artifact}"', clean,
+                                  f"{family.id}: tools/clean.py does not remove "
+                                  f"c/{family.engine_artifact}, so a rebuild with "
+                                  f"different flags is a silent no-op")
                 else:
                     self.assertIn("deepseek-v4", ci)
                     self.assertIn("cp c/deepseek_v4", release)
-        for text in (makefile, release, docker):
+        for text in (makefile, docker):
             self.assertIn("family_registry.py", text)
+        # release.yml non nomina piu' i singoli .py: da #1296 la lista la
+        # calcola pack_python.py seguendo gli import a partire da coli. Il
+        # contratto qui e' sempre lo stesso -- family_registry.py deve finire
+        # nell'archivio -- ma va verificato alla fonte nuova, se no si
+        # controlla che esista una riga invece che il file venga spedito.
+        sys.path.insert(0, str(repo / "c" / "tools"))
+        try:
+            import pack_python
+        finally:
+            sys.path.pop(0)
+        shipped = {path.name for path in pack_python.needed(repo / "c")}
+        self.assertIn("family_registry.py", shipped,
+                      "l'archivio non spedirebbe family_registry.py")
+
+
+class GlmFamilyNamesBothModelsTest(unittest.TestCase):
+    """#1365 follow-up: a GLM-5.3 container was announced as "GLM-5.2 744B".
+
+    The engine loaded the right weights; only the banner named a different
+    model. The fix is the name, and the reason the name covers two models
+    rather than choosing between them is worth pinning here, because the
+    obvious "improvement" later is to add detection.
+
+    There is nothing to detect. Z.ai say so on GLM-5.3's own card -- "GLM-5.3
+    uses the same base model as GLM-5.2; every gain comes from post-training"
+    -- and the checkpoints agree: diffing the two real config.json leaves one
+    extra key and the transformers_version that wrote the file. If a release
+    ever ships a genuine discriminator, split the family then, on evidence,
+    and this test is where to record it.
+    """
+
+    #: The two configs, reduced to what the registry reads plus the only two
+    #: keys that actually differ between the real files.
+    BASE = {
+        "model_type": "glm_moe_dsa",
+        "num_hidden_layers": 78,
+        "n_routed_experts": 256,
+        "hidden_size": 6144,
+        "moe_intermediate_size": 2048,
+    }
+
+    def test_both_checkpoints_resolve_to_the_same_family(self):
+        v52 = dict(self.BASE, transformers_version="5.12.0")
+        v53 = dict(self.BASE, transformers_version="5.15.0",
+                   moe_router_dtype="float32")
+        self.assertEqual(family_for_config(v52).id, family_for_config(v53).id)
+        self.assertEqual(family_for_config(v53).engine_artifact, "colibri")
+
+    def test_the_only_differences_are_not_discriminators(self):
+        """Neither key can carry the decision, so neither may be read as if it
+        could. `transformers_version` records the library that wrote the file
+        and changes when anyone re-exports; `moe_router_dtype` is a precision
+        hint that a re-export of GLM-5.2 could equally carry."""
+        source = Path(__file__).resolve().parents[1] / "family_registry.py"
+        text = source.read_text(encoding="utf-8")
+        for key in ("transformers_version", "moe_router_dtype"):
+            self.assertNotIn(f'"{key}"', text,
+                             f"{key} is not a version discriminator; naming a "
+                             f"checkpoint from it would be a guess wearing a "
+                             f"rule's clothes")
+
+    def test_the_name_states_both_models(self):
+        family = family_for_config(dict(self.BASE))
+        for model in ("5.2", "5.3"):
+            self.assertIn(model, family.display_name,
+                          "a user running one of the two must not read the "
+                          "name of the other")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,15 @@ FILES = [
     "inkling", "inkling.exe",
     "kimi_k3", "kimi_k3.exe",
     "olmoe", "olmoe.exe",
+    # Missing here means `make clean` leaves the binary in place, and a rebuild
+    # with different EXTRA_CFLAGS then reports "up to date". That is how the
+    # `Qwen3.6 tiny oracle` job re-ran an UN-INSTRUMENTED binary from its ASan
+    # step for as long as it existed (#1262), reporting green while the
+    # sanitizer had never run. test_family_registry keeps this list and the
+    # registry in step.
+    "qwen36", "qwen36.exe",
+    "qwen38", "qwen38.exe",
+    "glm53", "glm53.exe",
     "glm", "glm.exe",                       # pre-rename name of the colibri engine
     "iobench", "iobench.exe",
     "backend_cuda.o", "backend_loader.o",
@@ -24,6 +33,7 @@ FILES = [
     # hipcc emits an import library, export file and PDB alongside the DLL.
     "coli_hip.dll", "coli_hip.lib", "coli_hip.exp", "coli_hip.pdb",
     "deepseek_v4", "deepseek_v4.exe",
+    "deepseek_v41", "deepseek_v41.exe",
     "native_quant.o", "native_quant_parallel.o", "native_quant_dual.o",
     "native_quant_batch_avx512.o", "native_quant_fp4_rows16.o",
 ]

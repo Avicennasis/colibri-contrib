@@ -9,9 +9,11 @@
  * easy to break by "tidying" the header into a comment line or moving the engine hash
  * into the second field, so it is asserted here against a literal copy of that loop.
  *
- * This test includes route_trace.h and nothing else: no Model, no Cfg, no st.h. That is
- * the point of the header — any engine can use it — and compiling this file proves it. */
+ * This test includes route_trace.h (plus compat.h) and nothing else: no Model, no Cfg, no st.h.
+ * That is the point of the header — any engine can use it — and compiling this file proves it. */
 #include "../route_trace.h"
+
+#include "../compat.h"   /* setenv/unsetenv: MinGW has neither */
 
 static int g_nfails = 0;
 static void check(int cond, const char *what){
@@ -128,6 +130,8 @@ int main(void){
          * #700 completed), so its id must resolve to a name like every sibling's */
         check(strcmp(rt_engine_of(rt_hash("deepseek_v4")), "deepseek_v4") == 0,
               "the deepseek_v4 writer can be named");
+        check(strcmp(rt_engine_of(rt_hash("qwen38")), "qwen38") == 0,
+              "the qwen38 writer can be named");
     }
 
     /* 7. inkling's IKU1 layout is refused by any engine that is not inkling */
@@ -306,26 +310,14 @@ int main(void){
      * staying frozen. Enforced in rt_save itself so every engine gets it. */
     {
         rt_counts(3)[4] = 99;
-#ifdef _WIN32
-        _putenv_s("USAGE_SAVE", "0");
-#else
         setenv("USAGE_SAVE", "0", 1);
-#endif
         long before = fsize(TMP);
         check(rt_save(TMP, 1) == 1, "USAGE_SAVE=0: a requested skip is not a failure");
         check(fsize(TMP) == before, "USAGE_SAVE=0: the history file is not rewritten");
-#ifdef _WIN32
-        _putenv_s("USAGE_SAVE", "1");
-#else
         setenv("USAGE_SAVE", "1", 1);
-#endif
         check(rt_save(TMP, 1) == 1, "USAGE_SAVE=1: saving works again");
         check(fsize(TMP) != before, "USAGE_SAVE=1: the new counter reaches the file");
-#ifdef _WIN32
-        _putenv_s("USAGE_SAVE", "");
-#else
         unsetenv("USAGE_SAVE");
-#endif
     }
 
     remove(TMP);
