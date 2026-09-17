@@ -13,13 +13,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            runner: '["self-hosted","linux","x64","dev-pool","colibri"]'
             name: linux-x86_64
             ext: ""
             make_args: "ARCH=x86-64-v3"
             v4: "1"
           - os: macos-latest
-            runner: '"macos-latest"'
             name: macos-arm64
             ext: ""
             make_args: ""
@@ -28,7 +26,6 @@ jobs:
             v4: "1"
 
           - os: windows-latest
-            runner: '"windows-latest"'
             name: windows-x86_64
             ext: ".exe"
             make_args: ""
@@ -36,9 +33,7 @@ jobs:
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'
             # (the v1.0.0 tag build failed on exactly this). Same as ci.yml.
             shell: "msys2 {0}"
-    # Keep matrix.os for platform-specific steps while routing only its x64
-    # Linux leg to the private Colibri runner hosted on yellow.
-    runs-on: ${{ fromJSON(matrix.runner) }}
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         shell: ${{ matrix.shell || 'bash' }}
@@ -285,7 +280,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: [self-hosted, linux, x64, dev-pool, colibri]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
