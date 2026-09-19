@@ -39,7 +39,7 @@ static int fails = 0;
  * loop. gcc happens to keep it, which is why this passed on Linux and failed
  * on Apple silicon for reasons that had nothing to do with either platform.
  *
- * Measured 2026-08-25 on Apple silicon (clang -O3): the loop was elided,
+ * Measured 2026-08-25 on Apple silicon (M1 Max, clang -O3): the loop was elided,
  * ru_maxrss stayed at 0.006 GB across 690 MB of "touches", so rss_guard's
  * lim*1.02+0.3 gate was never crossed and sections B and F reported 8 failed
  * assertions -- against an engine that was behaving CORRECTLY. It declined to
@@ -545,7 +545,7 @@ static void section_g_reachability(void){
 
 int main(void){
 #ifdef _WIN32
-    /* #51279: instant crash under UCRT64 before any section output
+    /* Windows (#51279): instant crash under UCRT64 before any section output
      * (stdout buffering hides even section A/B prints). Skipped wholesale
      * pending a Windows debug pass; Linux + macOS keep the full suite. */
     puts("ram rebalance tests: skipped on Windows (#51279)");
