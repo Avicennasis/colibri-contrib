@@ -28,7 +28,7 @@ USO:
 EN: a finished conversion is fingerprinted (file list + size + mtime/blob id + the resolved
 quant parameters) in the outdir, so rerunning it on unchanged sources skips instead of
 walking the container; --force redoes it. COLI_CONVERT_PROGRESS=1 adds parseable
-`COLICONVERT <phase> <done> <total>` lines for a supervising process (#50404).
+`COLICONVERT <phase> <done> <total>` lines for a supervising process.
 """
 import os, sys, glob, hashlib, json, shutil, argparse, threading
 import numpy as np
@@ -134,7 +134,7 @@ def _positioned_write(fd, data, offset):
             remaining = remaining[written:]
 
 
-# ---------- machine-readable progress + source fingerprint (#50404) ----------
+# ---------- machine-readable progress + source fingerprint () ----------
 # Ported from FreeToken checkpoint/convert.py (_progress, _source_fingerprint:32-56).
 
 def _progress(phase, done=0, total=0):
@@ -820,7 +820,7 @@ def main():
                       f"{prefix}*.safetensors shards to redo).")
                 return
         done = prog.setdefault("shards", {}); prog["params"] = params
-        # SOURCE FINGERPRINT (#50404, FreeToken checkpoint/convert.py:32-56): the file
+        # SOURCE FINGERPRINT (FreeToken checkpoint/convert.py:32-56): the file
         # list + each file's size and mtime + the resolved parameters, hashed and cached
         # in the outdir. Two things the per-shard manifest above cannot do. A finished
         # conversion re-run on unchanged sources exits at once instead of walking the
@@ -1207,7 +1207,7 @@ def main():
               "group_size": a.group_size, "n_layers": a.n_layers, "bits_map": bits_map,
               "proj_bits": dict(PROJ_BITS)}
     if not check_or_record_params(a.outdir, "out-", params): return
-    # SOURCE FINGERPRINT (#50404), the remote twin of the --indir path's. A repo has no
+    # SOURCE FINGERPRINT), the remote twin of the --indir path's. A repo has no
     # mtime, so a file's signature is its size plus the store's blob id -- repo_info
     # (files_metadata=True, fetched above for the segmented downloader) already carries
     # both, so this costs no extra request. Unlike --indir this only SKIPS or WARNS: the

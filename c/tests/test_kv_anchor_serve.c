@@ -1,4 +1,4 @@
-/* test_kv_anchor_serve — the ENGINE side of #50403: the anchor ring as a serve
+/* test_kv_anchor_serve — the ENGINE side of the anchor ring as a serve
  * slot actually owns it.
  *
  * test_kv_anchor.c pins the decision rule against synthetic planes. This one

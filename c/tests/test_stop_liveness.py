@@ -25,7 +25,7 @@ class StopLivenessTest(unittest.TestCase):
         self.coli = load_coli()
 
     def test_probe_exists(self):
-        """cmd_stop must not use the raw POSIX idiom for liveness. #50404's
+        """cmd_stop must not use the raw POSIX idiom for liveness. The stop-hardening
         PID-reuse guard moved the call one level down: stop now asks
         _pid_is_same_process(), which starts with the same _pid_alive() probe
         and then also refuses a pid whose start time changed. Assert the whole

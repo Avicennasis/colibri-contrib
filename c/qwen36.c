@@ -2717,7 +2717,7 @@ static void serve_one(Model *m, ServeReq *q){
     if (m->momentum_logits)
         memset(m->momentum_logits, 0,
                (size_t)m->c.n_layers * m->c.n_experts * sizeof(float));
-    double pf0=now_s();        /* #50495: prefill forwards -- same window mux_done reports */
+    double pf0=now_s();        /* prefill forwards -- same window mux_done reports */
     float *lo = step(m, ids, np, 0);
     double pf_s=now_s()-pf0;
     int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */

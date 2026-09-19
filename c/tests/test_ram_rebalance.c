@@ -1,4 +1,4 @@
-/* test_ram_rebalance.c -- #50402: the serve request-boundary rebalance must be
+/* test_ram_rebalance.c -- the serve request-boundary rebalance must be
  * shrink-only, floored at dense-resident + KV + pinned, hysteretic past the same
  * 2% + 300 MB band rss_guard uses, inert when RSS_GUARD_GB is explicit, and
  * default-off on unified memory.
@@ -32,14 +32,14 @@
 static int fails = 0;
 #define CHECK(c) do{ if(!(c)){ printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } }while(0)
 
-/* Pump REAL resident memory (#50504).
+/* Pump REAL resident memory.
  *
  * The obvious idiom -- `char *p=malloc(n); for(i+=4096) p[i]=(char)i;` -- is a
  * DEAD STORE: nothing ever reads the buffer, so at -O3 clang deletes the whole
  * loop. gcc happens to keep it, which is why this passed on Linux and failed
  * on Apple silicon for reasons that had nothing to do with either platform.
  *
- * Measured 2026-08-25 on an M1 Max (clang -O3): the loop was elided,
+ * Measured 2026-08-25 on Apple silicon (M1 Max, clang -O3): the loop was elided,
  * ru_maxrss stayed at 0.006 GB across 690 MB of "touches", so rss_guard's
  * lim*1.02+0.3 gate was never crossed and sections B and F reported 8 failed
  * assertions -- against an engine that was behaving CORRECTLY. It declined to
@@ -53,7 +53,7 @@ static void rr_pump(volatile char *p, size_t n){
 /* The guard's OWN gate: rss_guard() returns early unless rss_gb() exceeds
  * lim*1.02+0.3. Every eviction assertion in sections B and F is meaningless
  * unless that is satisfied -- if it is not, the engine correctly does nothing
- * and reading that as a defect is precisely the #50504 misdiagnosis.
+ * and reading that as a defect is precisely the misdiagnosis.
  *
  * Deliberately NOT an RSS delta. Two different delta sensors were tried and
  * both gave false alarms: rss_gb() is a PEAK, so a later section's pump raises
@@ -66,7 +66,7 @@ static int rr_gate_satisfied(const char *sec, double floor_gb){
     printf("%s. HARNESS BROKEN: rss_gb()=%.3f GB does not exceed the guard's gate of\n"
            "   %.3f GB, so rss_guard will correctly NOT evict. The pump did not raise\n"
            "   real RSS -- at -O3 a non-volatile store loop is dead-code eliminated.\n"
-           "   This is a harness failure, NOT an engine failure. (#50504)\n",
+           "   This is a harness failure, NOT an engine failure.\n",
            sec, rss, gate);
     return 0;
 }
@@ -248,7 +248,7 @@ static void section_c_real_sensors(void){
      *     and shrink the budget for memory this very process asked for. */
     size_t pump=(size_t)2<<30; volatile char *p=malloc(pump);
     if(!p){ printf("C. SKIP: 2 GB pump alloc failed\n"); rr_free(&m); return; }
-    rr_pump(p,pump);   /* section C reports the sensor gap; no control needed (#50504) */
+    rr_pump(p,pump);   /* section C reports the sensor gap; no control needed */
     ram_rebalance_boundary(&m,4096);
     CHECK(g_ram_budget_gb==8.0);
     CHECK(g_ram_ceded_gb==0.0);
@@ -326,8 +326,8 @@ static void section_d_wiring(void){
     printf("D. done\n");
 }
 
-/* ===================== #50405: IDLE SHRINK-TO-FLOOR =========================
- * A different axis from #50402: that one shrinks when the WORLD takes RAM, this
+/* ===================== IDLE SHRINK-TO-FLOOR =========================
+ * A different axis from the rebalance: that one shrinks when the WORLD takes RAM, this
  * one shrinks when WE stop using it. Same floor, same guard, same shrink-only
  * rule -- so E/F/G below deliberately re-test those invariants on the new entry
  * point rather than assuming they carry over.
@@ -337,7 +337,7 @@ static void section_d_wiring(void){
  * with a NULL timeout and the engine owns no timer thread. The shrink is
  * therefore reachable ONLY IF that select takes a finite timeout while a shrink
  * is pending -- so G asserts the timeout, not just the call. Asserting the call
- * alone is precisely the check that let #50402 ship dead code. */
+ * alone is precisely the check that let ship dead code. */
 
 static void is_reset(Model *m){
     rr_reset(m);
@@ -397,7 +397,7 @@ static void section_e_idle_arithmetic(void){
     CHECK(idle_shrink_core(&m,4096,1e6)==0);
     CHECK(g_ram_budget_gb==24.0);                   /* untouched, not raised to 30 */
 
-    /* E8. Explicit RSS_GUARD_GB stays authoritative (#379 rule, as in #50402). */
+    /* E8. Explicit RSS_GUARD_GB stays authoritative (#379 rule, as in). */
     is_reset(&m); m.resident_bytes=8e9; setenv("RSS_GUARD_GB","4",1);
     CHECK(idle_shrink_core(&m,4096,1e6)==0);
     CHECK(g_ram_budget_gb==24.0);
@@ -476,7 +476,7 @@ static void section_f_idle_evicts(void){
     printf("F. done\n");
 }
 
-/* G. REACHABILITY. The section that would have caught #50402's shipped-dead-code
+/* G. REACHABILITY. The section that would have caught the rebalance's shipped-dead-code
  * defect, applied to this feature before it can repeat it.
  *
  * An idle run_serve_mux blocks in select() forever, so calling idle_shrink_poll
@@ -516,12 +516,12 @@ static void section_g_reachability(void){
     CHECK(fn_body_has(src,"static void run_serve(","idle_shrink_poll(")==0);
 
     /* The idle clock is armed by a COMPLETED request, so the flag has to be
-     * raised where requests complete -- mux_done, next to #50402's boundary
+     * raised where requests complete -- mux_done, next to the rebalance's boundary
      * flag. Without this the clock never starts and E11's gate never opens. */
     CHECK(fn_body_has(src,"static void mux_done(","g_idle_served=1;")==1);
 
-    /* #50402's boundary must survive intact in both loops -- this ticket edits
-     * that same region and a merge slip there would silently un-ship #50402. */
+    /*'s boundary must survive intact in both loops -- this ticket edits
+     * that same region and a merge slip there would silently un-ship. */
     CHECK(fn_body_has(src,"static void run_serve_mux(","ram_rebalance_boundary(")==1);
     CHECK(fn_body_has(src,"static void run_serve(","ram_rebalance_boundary(")==1);
 
@@ -545,7 +545,7 @@ static void section_g_reachability(void){
 
 int main(void){
 #ifdef _WIN32
-    /* Windows: instant crash under UCRT64 before any section output
+    /* Windows (#51279): instant crash under UCRT64 before any section output
      * (stdout buffering hides even section A/B prints). Skipped wholesale
      * pending a Windows debug pass; Linux + macOS keep the full suite. */
     puts("ram rebalance tests: skipped on Windows (#51279)");

@@ -5,9 +5,9 @@
  * prefix of the new token ids against the ids the slot currently holds
  * (colibri.c mux_submit). Positions past the divergence are simply abandoned —
  * this KV is position-addressed, so truncation is free. Measured on v1.7.0
- * (#50401, 6-turn bench): context grew 25 -> 181 tokens while prefill work
+ * (6-turn bench): context grew 25 -> 181 tokens while prefill work
  * stayed flat at 11-25 tokens. For an APPEND-ONLY conversation that is already
- * optimal and kv_anchor buys exactly nothing; the rescope note on #50403 says
+ * optimal and kv_anchor buys exactly nothing; the rescope note on says
  * so in as many words.
  *
  * The gap is that a slot remembers ONE state: the last one. The moment a

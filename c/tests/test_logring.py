@@ -1,4 +1,4 @@
-"""LogRing (#50404): bounded ring + all-time `?since=` cursor, ported from
+"""LogRing: bounded ring + all-time `?since=` cursor, ported from
 FreeToken's daemon logring.py. The cursor semantics are the contract scripts
 poll with — the tests pin them: exclusive lower bound, monotonic next that
 survives eviction, dropped-count derivable from (next - since - len)."""

@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
-import logring                      # bounded in-memory log ring for /logs (#50404)
+import logring                      # bounded in-memory log ring for /logs
 
 
 HERE = Path(__file__).resolve().parent
@@ -222,7 +222,7 @@ class GenerationScheduler:
 
 
 class EngineStats:
-    """Sliding-window token rates + lifetime totals for /v1/stats (#50404).
+    """Sliding-window token rates + lifetime totals for /v1/stats.
 
     Fed from frames the serve protocol already carries — no new counters:
     ACCEPT states the turn's prompt tokens, every DATA frame is exactly one
@@ -262,7 +262,7 @@ class EngineStats:
         self.completion_tokens_total = 0
         self.completed = 0
         self.last = None                    # most recent DONE snapshot verbatim
-        self.prefill_seconds_total = 0.0    # #50495: sum of DONE prefill_seconds, present ones only
+        self.prefill_seconds_total = 0.0    # sum of DONE prefill_seconds, present ones only
         self.prefill_last = None            # last turn's value; None until one arrives
         self.prefill_seen = False           # False => the engine cannot supply the signal
 
@@ -3128,7 +3128,7 @@ class Engine:
             "rss_gb": float(fields[4]),
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
-            # #50495: prefill wall seconds, appended by the engine. Absent for an
+            # prefill wall seconds, appended by the engine. Absent for an
             # engine build predating the field -- None, never 0.0, so /v1/stats can
             # report the signal as missing rather than silently misreporting it.
             "prefill_seconds": float(fields[7]) if len(fields) > 7 else None,
@@ -3544,7 +3544,7 @@ class APIServer(ThreadingHTTPServer):
         self.allowed_hosts = tuple(
             h.strip().lower() for h in allowed_hosts if h and h.strip())
         self.created = int(time.time())
-        # Bounded log ring behind /logs?since= (#50404): request lines and
+        # Bounded log ring behind /logs?since=: request lines and
         # lifecycle notes in RAM, pull-only. COLI_LOG_RING bounds it; 0 disables.
         self.logs = logring.LogRing(_positive_env("COLI_LOG_RING", 4000))
         self._conn_lock = threading.Lock()
@@ -3745,7 +3745,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # One line per response, at the single choke point no responder can
         # skip: method, path, status, latency. Recorded once the status line is
         # committed (before the body write), so a client hanging up mid-body
-        # still leaves its request behind in /logs (#50404).
+        # still leaves its request behind in /logs.
         ring = getattr(self.server, "logs", None)
         if ring is not None:
             started = getattr(self, "_t0", None)
@@ -3952,7 +3952,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_json(200, payload, request_id)
                 return
             if path == "/logs":
-                # Bounded ring + all-time cursor (#50404): scripts poll
+                # Bounded ring + all-time cursor: scripts poll
                 # /logs?since=N without any file plumbing. Same pre-auth
                 # placement and _is_authed() gate as /profile — request lines
                 # say what the operator runs, an anonymous caller gets the
@@ -3971,13 +3971,13 @@ class APIHandler(BaseHTTPRequestHandler):
             if path == "/v1/stats":
                 # Sliding-window decode/prefill rates that decay to zero when
                 # idle + lifetime token totals, over the ACCEPT/DATA/DONE frames
-                # the serve protocol already carries (#50404). Same pre-auth
+                # the serve protocol already carries. Same pre-auth
                 # placement and _is_authed() gate as /profile (#SEC-8): token
                 # counts say how much the operator is running. Degraded shape (no engine yet, or an
                 # engine build without stats) is served honestly with zeros.
                 payload = {"model": None, "uptime_s": 0,
                            "throughput": {"decode_tps": 0.0, "prefill_tps": 0.0},
-                           # #50495: prefill compute seconds. null (absent), never
+                           # prefill compute seconds. null (absent), never
                            # 0.0, until a DONE carrying the field has arrived -- an
                            # engine that cannot supply the signal must not read as
                            # "prefills are free".

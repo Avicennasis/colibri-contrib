@@ -1390,7 +1390,7 @@ static int g_kv8_gs=0;                          /* KV8_GS=<n>: one scale per n l
                                                  * 512-dim latent). 0 = per-row (unchanged). */
 static int g_tq=0, g_tq_bits=4, g_tq_codec=1;   /* KV_TQ: codec 1=rotated int4 (default), 0=PolarQuant */
 #include "kv_persist.h"
-#include "kv_anchor.h"                            /* #50403: multi-state prefix reuse per serve slot */
+#include "kv_anchor.h"                            /* multi-state prefix reuse per serve slot */
 #include "telemetry.h"
 
 /* Aligned allocator for dense QT weights/scales: under METAL, page-align + register so the
@@ -8554,15 +8554,15 @@ static void repin_pass_limit(Model *m,int limit){
  * al resume kv_start=-1 e la finestra di draft riparte da sola. */
 
 typedef struct { KVState kv; int *hist, len, first;
-                 kv_anchor_ring anch;   /* #50403: states this slot still remembers */
+                 kv_anchor_ring anch;   /* states this slot still remembers */
                } ServeCtx;
 static double kv_pool_bytes(Model *m, int max_ctx);
-static void ram_rebalance_boundary(Model *m,int maxctx);   /* #50402: def accanto a mem_available_gb */
-static int  idle_shrink_poll(Model *m,int maxctx);         /* #50405: def accanto a ram_rebalance_boundary */
+static void ram_rebalance_boundary(Model *m,int maxctx);   /* def accanto a mem_available_gb */
+static int  idle_shrink_poll(Model *m,int maxctx);         /* def accanto a ram_rebalance_boundary */
 static int  idle_poll_wanted(void);
 static void idle_mark(int active);
-static int g_mux_boundary=0;   /* #50402: un request e' appena finito nel path MUX */
-/* #50405: stato dell'idle shrink. Vive qui e non accanto alle sue funzioni
+static int g_mux_boundary=0;   /* un request e' appena finito nel path MUX */
+/* stato dell'idle shrink. Vive qui e non accanto alle sue funzioni
  * perche' run_serve_mux (piu' sotto ma prima di quelle) legge g_idle_poll_s per
  * decidere il timeout del select. Il commento che spiega il meccanismo sta con
  * le funzioni, vicino a ram_rebalance_boundary. */
@@ -8588,7 +8588,7 @@ static int    g_idle_shrunk  = 0;       /* latch: uno shrink per periodo di idle
  * EN: permanently caps the cache it has not had a chance to fill yet. */
 static int    g_idle_served  = 0;
 
-/* #50403 anchor policy. Opt-in: an anchor is a COPY of the KV rows it covers
+/* anchor policy. Opt-in: an anchor is a COPY of the KV rows it covers
  * (~217 KB per position on GLM-5.2), so arming this by default would quietly
  * price a second KV pool into every serve. COLI_KV_ANCHOR=<slots> arms it;
  * COLI_KV_ANCHOR_MB caps the ring's total (default 1024 MB, and one anchor
@@ -8688,7 +8688,7 @@ typedef struct {
                                             top-k count from SUBMIT logprobs=k; 0 = off */
     float temp, top_p;
     double started;
-    double prefill_s;                   /* #50495: wall time of the prefill step() call --
+    double prefill_s;                   /* wall time of the prefill step() call --
                                            the expert-cache work DONE now reports (0 before
                                            first submit; memset covers every path) */
     uint64_t hits0, miss0;
@@ -8873,7 +8873,7 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
            r->emitted/dt,(dh+dm)>0?100.0*dh/(dh+dm):0.0,rss_gb(),
            r->prompt_tokens,r->length_limited,r->prefill_s);
     fflush(stdout); kv_bind(m,&sc->kv); kv_disk_append(m,sc->hist,sc->len);
-    /* #50403: a reply that opened a tool call is about to be resent to us as
+    /* a reply that opened a tool call is about to be resent to us as
      * history. Remember the state that produced it before the next prompt --
      * possibly a different conversation on this same slot -- overwrites it. */
     if(sc->anch.n && g_kvanchor_tok>=0 && sc->len>r->prompt_tokens){
@@ -8887,9 +8887,9 @@ static void mux_done(Model *m, ServeCtx *sc, ServeReq *r){
     if(r->spec_logit){ free(r->spec_logit); r->spec_logit=NULL; }
     r->spec=0;
     r->active=0;
-    g_mux_boundary=1;                    /* #50402: run_serve_mux reads this at the top of its
+    g_mux_boundary=1;                    /* run_serve_mux reads this at the top of its
                                           * loop, where no forward is in flight (see there). */
-    g_idle_served=1;                     /* #50405: da adesso il silenzio conta come abbandono
+    g_idle_served=1;                     /* da adesso il silenzio conta come abbandono
                                           * (prima della prima richiesta e' solo attesa). */
 }
 
@@ -9019,7 +9019,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     if(!echo) while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
-    /* #50403 anchors. The slot now holds the longest prefix its OWN last state
+    /* anchors. The slot now holds the longest prefix its OWN last state
      * agrees with. A remembered state may agree for longer -- the conversation
      * that was interleaved off this slot, the branch the agent abandoned and
      * came back to, the prompt end whose reply the client re-rendered. Same
@@ -9094,7 +9094,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);
-    /* #50495: the prefill compute -- the only forwards between ACCEPT and the
+    /* the prefill compute -- the only forwards between ACCEPT and the
      * first decoded token. Anchor restore / cross-slot adopt above are memcpys,
      * not compute, so they are deliberately outside this window. Upstream's
      * echo path is prefill too, so it belongs inside the window. */
@@ -9104,7 +9104,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
                                 : step(m,sc->hist+sc->len-1,1,sc->len-1);
     double pf_s=now_s()-pf0;
     sc->len+=add; sc->first=0;
-    kvanchor_capture(m,sc,sc->len,"prompt_end");   /* #50403: the boundary the client resends */
+    kvanchor_capture(m,sc,sc->len,"prompt_end");   /* the boundary the client resends */
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
     r->logprobs=sub.logprobs;
@@ -9145,7 +9145,7 @@ static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
     kvanchor_arm_tok(&T);
-    /* #50403: the loop name is part of the marker on purpose. #50402 shipped a
+    /* the loop name is part of the marker on purpose. shipped a
      * feature wired only into run_serve and nothing noticed, because a marker
      * both loops emit cannot say which one ran -- and production is THIS one
      * (openai_server.py spawns with SERVE_BATCH=1). */
@@ -9194,7 +9194,7 @@ static void run_serve_mux(Model *m, const char *snap){
          * ends. With no active request select() blocks with a NULL timeout, so the
          * EINTR from an un-restarted SIGTERM is what wakes us to reach this line. */
         if(g_shutdown) break;
-        /* #50402: THE serve request boundary for the production path. `coli serve`
+        /* THE serve request boundary for the production path. `coli serve`
          * runs run_serve_mux (openai_server.py spawns the engine with SERVE_BATCH=1),
          * never run_serve, so the rebalance has to live here too. Top of the loop is
          * the safe point: step_decode_batch has returned, no expert pointer is held
@@ -9203,10 +9203,10 @@ static void run_serve_mux(Model *m, const char *snap){
          * request: mux_done raises the flag, we consume it exactly once. */
         if(g_mux_boundary){ g_mux_boundary=0; ram_rebalance_boundary(m,maxctx); }
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
-        /* #50405: la coda e' vuota o no. Da qui parte il cronometro dell'idle;
+        /* la coda e' vuota o no. Da qui parte il cronometro dell'idle;
          * riempirsi riarma il latch ma non rialza mai il budget. */
         idle_mark(active);
-        /* #50405: e qui si CONSUMA il risveglio che ci siamo procurati sotto —
+        /* e qui si CONSUMA il risveglio che ci siamo procurati sotto —
          * scaduto il select idle si guarda l'orologio, e se il silenzio dura da
          * abbastanza il budget scende al pavimento. Stesso safe point del
          * rebalance qui sopra (nessun forward in volo), e per definizione
@@ -9221,7 +9221,7 @@ static void run_serve_mux(Model *m, const char *snap){
         if(!eof){
 #if defined(__APPLE__) || defined(__linux__) ||	defined(__FreeBSD__)
             fd_set rfds; FD_ZERO(&rfds); FD_SET(STDIN_FILENO,&rfds);
-            /* #50405: QUESTA riga e' il feature. A coda vuota il timeout era
+            /* QUESTA riga e' il feature. A coda vuota il timeout era
              * NULL — il loop dormiva finche' non arrivava una richiesta, quindi
              * un engine abbandonato non poteva accorgersi di essere abbandonato
              * (l'engine non ha thread timer). Finche' resta uno shrink da fare
@@ -9456,7 +9456,7 @@ static void run_serve(Model *m, const char *snap){
                 if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
                 kv_disk_truncate(m,len);           /* il prossimo append sovrascrive solo la coda */
             }
-            if(sc->anch.n){                        /* #50403: see mux_submit */
+            if(sc->anch.n){                        /* see mux_submit */
                 int ai=kv_anchor_match(&sc->anch,tmp,prompt_tokens,len);
                 if(ai>=0){
                     const int *aids=kv_anchor_ids(&sc->anch,ai);
@@ -9500,7 +9500,7 @@ static void run_serve(Model *m, const char *snap){
         ProfBase pb; if(g_prof) prof_base(m,&pb);
         float *logit;
         if(k>0){ logit=step(m,hist+len,k,len); len+=k;
-                 kvanchor_capture(m,sc,len,"prompt_end"); }   /* #50403 */
+                 kvanchor_capture(m,sc,len,"prompt_end"); }   /* */
         else logit=step(m,hist+len-1,1,len-1);   /* prompt identico/prefisso: rigenera i logits */
         EmitStream es={&T,m,now_s(),0,1};
         int prod=0;
@@ -9529,7 +9529,7 @@ static void run_serve(Model *m, const char *snap){
         free(raw); g_temp=base_temp; g_nuc=base_nuc;
         usage_save(m);                   /* la cache che impara: storia aggiornata a ogni turno */
         kv_disk_append(m,hist,len);      /* KV su disco: il prossimo avvio riparte da qui */
-        ram_rebalance_boundary(m,maxctx); /* #50402: stringe il budget PRIMA del guard */
+        ram_rebalance_boundary(m,maxctx); /* stringe il budget PRIMA del guard */
         repin_pass(m);                   /* safe request boundary: adapt session-local hot tier */
     }
     free(line); free(buf);
@@ -10318,9 +10318,9 @@ static double mem_available_gb(void){
     return compat_mem_available_gb();
 }
 
-/* ---- RAM REBALANCE SHRINK-ONLY (#50402) -----------------------------------
+/* ---- RAM REBALANCE SHRINK-ONLY () -----------------------------------
  * cap_for_ram() fissa il budget sulla MemAvailable MISURATA ALL'AVVIO: un engine
- * partito a macchina tranquilla se lo tiene anche dopo che ~85 container Docker
+ * partito a macchina tranquilla se lo tiene anche dopo che decine di container Docker
  * occupano la RAM — la classe di swap-pressure che ha motivato l'idle-reaper.
  * Alla confine di richiesta del serve (la stessa sede safe di repin_pass) si
  * rilegge MemAvailable e si STRINGE g_ram_budget_gb — mai allargare — poi ci
@@ -10348,7 +10348,7 @@ static int g_ram_rebalance =
 #else
     1;
 #endif
-static double g_ram_ceded_gb=0;          /* GB gia' ceduti al mondo esterno (#50402) */
+static double g_ram_ceded_gb=0;          /* GB gia' ceduti al mondo esterno () */
 
 /* Il nostro footprint NON RECUPERABILE, ADESSO (GB) — il termine "quanto di
  * questo calo di MemAvailable e' colpa NOSTRA" del conto qui sopra.
@@ -10408,7 +10408,7 @@ static void ram_rebalance_core(Model *m,int maxctx,double avail_now,double own_n
     if(target>=g_ram_budget_gb*0.98-0.3) return;            /* banda 2%+300MB: niente stillicidio */
     g_ram_ceded_gb+=g_ram_budget_gb-target;
     fprintf(stderr,"[RAM-REBALANCE] MemAvailable %.1f GB now vs %.1f GB at boot "
-                   "(ours %.1f, others +%.1f): budget %.1f -> %.1f GB (#50402, shrink-only)\n",
+                   "(ours %.1f, others +%.1f): budget %.1f -> %.1f GB (shrink-only)\n",
             avail_now,g_mem_avail_boot,own_now,ext,g_ram_budget_gb,target);
     g_ram_budget_gb=target;
     g_rssg_last = m->n_emit>=16 ? m->n_emit-16 : 0;         /* fora il throttle a 16 token:
@@ -10419,8 +10419,8 @@ static void ram_rebalance_boundary(Model *m,int maxctx){    /* adapter: sensori 
     ram_rebalance_core(m,maxctx,mem_available_gb(),self_footprint_gb());
 }
 
-/* ---- IDLE SHRINK-TO-FLOOR (#50405) ----------------------------------------
- * #50402 stringe il budget quando il MONDO prende RAM. Questo stringe quando
+/* ---- IDLE SHRINK-TO-FLOOR () ----------------------------------------
+ * stringe il budget quando il MONDO prende RAM. Questo stringe quando
  * NOI non la usiamo: a coda vuota da N minuti il budget scende al PAVIMENTO
  * (densa residente + KV + pinnati) e rss_guard libera tutta la LRU. Un engine
  * abbandonato passa da ~25 GB a densa+KV senza morire: resta caldo-caricabile.
@@ -10433,7 +10433,7 @@ static void ram_rebalance_boundary(Model *m,int maxctx){    /* adapter: sensori 
  * scadenza e' l'occasione per controllare l'orologio. Fatto lo shrink il
  * timeout torna NULL e il loop ridorme a costo zero. Senza quella riga il
  * resto di questo blocco e' codice morto — la stessa trappola che ha fatto
- * fallire il primo giro di #50402, e per questo il test la asserisce.
+ * fallire il primo giro di, e per questo il test la asserisce.
  *
  * run_serve (interattivo) NON e' agganciato, ED E' VOLUTO: quel loop blocca in
  * getline() e non ha un punto di poll; l'unico momento in cui potrebbe
@@ -10523,11 +10523,11 @@ static int64_t idle_pin_release(Model *m){
     pthread_mutex_unlock(&g_pilot_mx);
     m->resident_bytes-=freed; if(m->resident_bytes<0) m->resident_bytes=0;
     if(nslot) fprintf(stderr,"[IDLE-SHRINK] unpinned %d experts (%.1f GB) from the AUTOPIN tier "
-                             "(#50405, IDLE_SHRINK_UNPIN)\n", nslot, freed/1e9);
+                             "(IDLE_SHRINK_UNPIN)\n", nslot, freed/1e9);
     return freed;
 }
 
-/* idle_s arriva per parametro (come avail/rss in #50402) cosi' il test simula
+/* idle_s arriva per parametro (come avail/rss in) cosi' il test simula
  * ore di silenzio senza aspettarle. Ritorna 1 se ha stretto. */
 static int idle_shrink_core(Model *m,int maxctx,double idle_s){
     if(!g_idle_shrink || getenv("RSS_GUARD_GB")) return 0;   /* esplicito vince (#379) */
@@ -10538,7 +10538,7 @@ static int idle_shrink_core(Model *m,int maxctx,double idle_s){
     double floor_gb=((double)m->resident_bytes+kv_pool_bytes(m,maxctx))/1e9;
     if(floor_gb>=g_ram_budget_gb) return 0;                  /* gia' al pavimento: niente da fare */
     fprintf(stderr,"[IDLE-SHRINK] queue empty for %.0f s: budget %.1f -> %.1f GB "
-                   "(dense+KV%s floor, #50405, shrink-only)\n",
+                   "(dense+KV%s floor, shrink-only)\n",
             idle_s,g_ram_budget_gb,floor_gb,g_idle_unpin?"":"+pinned");
     g_ram_budget_gb=floor_gb;
     g_rssg_last = m->n_emit>=16 ? m->n_emit-16 : 0;           /* fora il throttle a 16 token */
@@ -11455,8 +11455,8 @@ int main(int argc, char **argv){
     corpus_load();                                       /* COLI_DRAFT_CORPUS: external draft source */
     rt_trace_open();                     /* same place as before, so the log order is identical */
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
-    if(getenv("RAM_REBALANCE")) g_ram_rebalance=atoi(getenv("RAM_REBALANCE")); /* #50402: 1 opt-in (mac unified), 0 force-off */
-    /* #50405: idle shrink-to-floor. IDLE_SHRINK=1/0 come sopra; IDLE_SHRINK_MIN
+    if(getenv("RAM_REBALANCE")) g_ram_rebalance=atoi(getenv("RAM_REBALANCE")); /* 1 opt-in (mac unified), 0 force-off */
+    /* idle shrink-to-floor. IDLE_SHRINK=1/0 come sopra; IDLE_SHRINK_MIN
      * e' in MINUTI (default 10, sotto i 30 del reaper cosi' si vede chi spara
      * per primo); <=0 spegne. IDLE_SHRINK_UNPIN=1 molla anche il tier AUTOPIN:
      * default OFF perche' non e' mai stato verificato su hardware. */

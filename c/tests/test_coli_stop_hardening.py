@@ -1,4 +1,4 @@
-"""`coli stop` hardening (#50404): /proc starttime PID-reuse guard, identity-checked
+"""`coli stop` hardening: /proc starttime PID-reuse guard, identity-checked
 group signalling, PSS via smaps_rollup. Ported from FreeToken's daemon osproc.py
 (Apache-2.0) -- read_starttime / proc_pgid / signal_group / read_pss_bytes.
 

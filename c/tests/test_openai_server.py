@@ -590,7 +590,7 @@ class SchedulerTest(unittest.TestCase):
 
 
 class EngineStatsTest(unittest.TestCase):
-    """#50404: sliding-window rates that DECAY TO ZERO when idle, plus lifetime
+    """sliding-window rates that DECAY TO ZERO when idle, plus lifetime
     token totals — ported from FreeToken stats.py, fed from the serve protocol's
     own ACCEPT (prompt count) / DATA (one decoded piece) / DONE (totals)."""
 
@@ -655,7 +655,7 @@ class EngineStatsTest(unittest.TestCase):
         self.assertEqual(stats.last["completion_tokens"], 12)
 
     def test_prefill_seconds_accumulate_only_from_dones_that_carry_them(self):
-        # #50495: DONE gained an appended prefill-seconds field. A turn whose
+        # DONE gained an appended prefill-seconds field. A turn whose
         # DONE lacks it contributes nothing and never flips the seen flag, so
         # "engine cannot measure prefill" stays distinguishable from "prefill
         # took 0.0 s" -- a real zero (pure KV hit) IS a value and counts.
@@ -834,7 +834,7 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(chunks, ["A\né"])
         self.assertEqual(stats["completion_tokens"], 1)
         self.assertEqual(stats["prompt_tokens"], 42)
-        self.assertEqual(stats["prefill_seconds"], 17.0)   # #50495: 8th DONE field
+        self.assertEqual(stats["prefill_seconds"], 17.0)   # 8th DONE field
 
     def test_kimi_request_and_response_transcript_is_byte_exact(self):
         prompt = render_chat_kimi([
@@ -873,7 +873,7 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(tool_chunks, ["", "call"])
         self.assertEqual(stats["completion_tokens"], 1)
         self.assertEqual(stats["prompt_tokens"], 42)
-        self.assertIsNone(stats["prefill_seconds"])         # #50495: absent, not zero
+        self.assertIsNone(stats["prefill_seconds"])         # absent, not zero
 
     def test_kimi_tool_sideband_is_authoritative_over_data_lookalikes(self):
         prompt = "K3CHAT1\nM user 2\nhiG 0\n"
@@ -941,7 +941,7 @@ class DispatcherTest(unittest.TestCase):
         # incidental to that, but the assertions below name "a" as `first`, so
         # leaving the start order to the scheduler made this flaky -- when "b"
         # won the race the responses swapped and it failed 'B-2' != 'A-1A-2'
-        # (#50489, reproducible by starting the threads in reverse).
+        # (reproducible by starting the threads in reverse).
         #
         # So pin the submit order with a handshake. This removes the race
         # WITHOUT touching a single assertion, which is the point: the test is
@@ -1085,7 +1085,7 @@ class DispatcherTest(unittest.TestCase):
         }])
 
     def test_serve_frames_feed_the_stats_tracker(self):
-        """#50404: /v1/stats is fed off the protocol's own frames — ACCEPT holds
+        """/v1/stats is fed off the protocol's own frames — ACCEPT holds
         the prompt count, each DATA is one decoded piece, DONE closes the turn."""
         def respond(process, frame):
             request_id = frame.split()[1]
@@ -1289,7 +1289,7 @@ class DispatcherTest(unittest.TestCase):
 
 
 class EngineLivenessTest(unittest.TestCase):
-    """#50404: the engine's death gets a decoded reason (signal name / exit code)
+    """the engine's death gets a decoded reason (signal name / exit code)
     recorded for /health and said on stderr -- during load and after ready. Ported
     from FreeToken supervisor.py: the real death reason must win over the generic
     "exited unexpectedly" (an OOM-kill must not read like a gateway bug)."""
@@ -1573,7 +1573,7 @@ class HTTPTest(unittest.TestCase):
         """engine=loading while the port is bound but the engine is still
         draining to READY; engine=dead (+reason) after a post-ready death. Both
         public: attach probes and monitors must not need the API key to tell a
-        serving box from a half-alive one (#50404)."""
+        serving box from a half-alive one."""
         server_engine = self.server.engine
         self.server.engine = None
         try:
@@ -1593,7 +1593,7 @@ class HTTPTest(unittest.TestCase):
             del self.engine.engine_exit
 
     def test_stats_endpoint_reports_rates_and_totals(self):
-        """/v1/stats over the engine's own DONE telemetry (#50404): anonymous
+        """/v1/stats over the engine's own DONE telemetry (): anonymous
         callers get the degraded zeros shape (token counts say how much the
         operator runs — same gate as /profile); authed callers get counters."""
         tracker = EngineStats(window_s=60.0)
@@ -1613,7 +1613,7 @@ class HTTPTest(unittest.TestCase):
         finally:
             del self.engine.stats, self.engine.ready_at
         self.assertIsNone(anonymous["model"])
-        self.assertIsNone(anonymous["prefill"])    # #50495: degraded shape is absent, not zero
+        self.assertIsNone(anonymous["prefill"])    # degraded shape is absent, not zero
         self.assertEqual(anonymous["tokens"], {"prompt_total": 0, "completion_total": 0})
         self.assertEqual(authed["model"], "test-model")
         self.assertEqual(authed["tokens"],
@@ -1643,7 +1643,7 @@ class HTTPTest(unittest.TestCase):
                                  "requests": {"completed": 0}})
 
     def test_stats_prefill_seconds_absent_until_a_done_carries_the_field(self):
-        """#50495: an engine whose DONE frames carry no prefill-seconds field
+        """an engine whose DONE frames carry no prefill-seconds field
         (a build predating it) must read as ABSENT, not as zero -- /v1/stats
         reporting prefill: null is the honest 'cannot supply', and a 0.0 there
         would silently claim prefills are free."""
@@ -1664,7 +1664,7 @@ class HTTPTest(unittest.TestCase):
 
     def test_logs_cursor_polling(self):
         """/logs?since= lets a script tail the serve log over HTTP, no file
-        plumbing (#50404). `since` is exclusive; `next` is the next cursor."""
+        plumbing. `since` is exclusive; `next` is the next cursor."""
         with self.request("/v1/models") as response:      # seed a request line
             pass
         with self.request("/logs") as response:
