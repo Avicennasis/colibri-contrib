@@ -6,11 +6,20 @@ product must match double precision to float accuracy. Anything above 1e-5
 of sum|w*x| is a kernel bug, not rounding. Shapes cover a single row and
 prefill-sized batches, rows of 32-element and 256-element blocks.
 """
+import os
 import struct, subprocess, sys, unittest
 from pathlib import Path
 import numpy as np
 HERE = Path(__file__).resolve().parent.parent
-BIN = HERE / "tests" / ("test_gq_dot.exe" if sys.platform == "win32" else "test_gq_dot")
+# GQ_TEST_BIN_DIR / GQ_TEST_WRAP run the same checks on another build, e.g. an
+# aarch64 one under qemu: GQ_TEST_BIN_DIR=/tmp/arm GQ_TEST_WRAP="qemu-aarch64 -cpu max"
+def _bin(name):
+    d = os.environ.get("GQ_TEST_BIN_DIR")
+    return (Path(d) if d else HERE / "tests") / name
+def _wrap(cmd):
+    w = os.environ.get("GQ_TEST_WRAP")
+    return (w.split() if w else []) + [str(c) for c in cmd]
+BIN = _bin("test_gq_dot.exe" if sys.platform == "win32" else "test_gq_dot")
 sys.path.insert(0, str(HERE / "tests"))
 try:
     from gguf.constants import GGMLQuantizationType as QT
@@ -33,7 +42,7 @@ class GqDot(unittest.TestCase):
                         raw[:, 0] = rng.integers(110, 140, raw.shape[0], dtype=np.uint8)
                     x = rng.standard_normal((S, I)).astype(np.float32)
                     x[:, :3] *= 20   # a few large activations, as real hidden states have
-                    p = subprocess.run([str(BIN)], input=struct.pack("<iiii", TYPE_ID.get(name) or int(QT[name]), O, I, S) + raw.tobytes() + x.tobytes(),
+                    p = subprocess.run(_wrap([BIN]), input=struct.pack("<iiii", TYPE_ID.get(name) or int(QT[name]), O, I, S) + raw.tobytes() + x.tobytes(),
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                     self.assertEqual(p.returncode, 0, p.stderr)
                     err = float(p.stdout.decode())

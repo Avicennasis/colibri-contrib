@@ -17,7 +17,15 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent.parent
-BIN = HERE / "tests" / ("test_gguf_c.exe" if sys.platform == "win32" else "test_gguf_c")
+# GQ_TEST_BIN_DIR / GQ_TEST_WRAP run the same checks on another build, e.g. an
+# aarch64 one under qemu: GQ_TEST_BIN_DIR=/tmp/arm GQ_TEST_WRAP="qemu-aarch64 -cpu max"
+def _bin(name):
+    d = os.environ.get("GQ_TEST_BIN_DIR")
+    return (Path(d) if d else HERE / "tests") / name
+def _wrap(cmd):
+    w = os.environ.get("GQ_TEST_WRAP")
+    return (w.split() if w else []) + [str(c) for c in cmd]
+BIN = _bin("test_gguf_c.exe" if sys.platform == "win32" else "test_gguf_c")
 sys.path.insert(0, str(HERE / "tests"))
 
 try:
@@ -67,7 +75,7 @@ def write_gguf(path, rng, tensors_only=None):
 
 
 def run(*args):
-    return subprocess.run([str(BIN), *map(str, args)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return subprocess.run(_wrap([BIN, *args]), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 @unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")

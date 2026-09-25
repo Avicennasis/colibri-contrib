@@ -2860,6 +2860,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         if (m->resident_collecting) {
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) m->seen[(int64_t)layer * E + idx[kk]] = 1;
         }
+        if (s == S - 1 && getenv("ROUTE_DEBUG")) {   /* routing of the last token: chosen experts and the margin to the first one left out */
+            float nxt = -1e30f; for (int e = 0; e < E; e++) { int t = 0; for (int j = 0; j < K; j++) if (idx[j] == e) t = 1; if (!t && pr[e] > nxt) nxt = pr[e]; }
+            fprintf(stderr, "[route] layer %d:", layer); for (int j = 0; j < K; j++) fprintf(stderr, " %d(%.7f)", idx[j], val[j]);
+            fprintf(stderr, " | next %.7f margin %.2e\n", nxt, val[K - 1] - nxt);
+        }
         /* HF renormalizes the top-k router weights unconditionally */
         { float sm=0; for (int kk=0;kk<K;kk++) sm+=val[kk]; if (sm>0) for (int kk=0;kk<K;kk++) val[kk]/=sm; }
         if (!m->hot_pinned && m->freq) {

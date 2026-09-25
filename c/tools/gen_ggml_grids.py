@@ -67,6 +67,11 @@ def main():
     parts.append("/* 2048 entries x 8, values in {-1, 0, 1} */")
     parts.append(emit_i8("GGML_IQ1S_GRID", g1.astype(np.int64)))
     parts.append(emit_u8("GGML_KSIGNS_IQ2XS", np.frombuffer(q.IQ2_XXS.ksigns, dtype=np.uint8)))
+    # sign byte -> eight int8 of +1 / -1 (bit j set = element j negative): a
+    # constant, so no thread ever sees it half built
+    sign8 = np.array([[(-1 if (v >> j) & 1 else 1) for j in range(8)] for v in range(256)], dtype=np.int8)
+    parts.append("/* 256 sign bytes x 8, +1 / -1 */")
+    parts.append(emit_i8("GGML_SIGN8", sign8))
     parts.append(emit_i8("GGML_KVALUES_IQ4NL", q.IQ4_NL.kvalues))
     parts.append(emit_i8("GGML_KVALUES_MXFP4", q.MXFP4.kvalues))
     parts.append("#endif")
