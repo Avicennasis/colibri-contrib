@@ -2663,6 +2663,38 @@ static void route_footer(FILE *f, const Model *m) {
                 m->route.kl_n ? m->route.kl_sum/(double)m->route.kl_n : 0.0);
 }
 
+/* GGUF mode: the routed experts of S tokens, one expert at a time. Each expert
+ * is fetched once and its rows unpacked once for every token routed to it
+ * (prefill), and an expert is only referenced while it is being computed, so
+ * any cache capacity works. out += sum_k val * expert(x). */
+static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
+    Cfg *c = &m->c; const int D = c->hidden, K = c->topk, I = c->inter, E = c->n_experts;
+    const GqExp *gx = &m->gqx[layer];
+    int *cnt = calloc((size_t)E + 1, sizeof(int)), *tok = malloc(sizeof(int) * (size_t)S * K);
+    float *wt = falloc((int64_t)S * K);
+    for (int r = 0; r < S * K; r++) if (idx[r] >= 0) cnt[idx[r] + 1]++;
+    for (int e = 0; e < E; e++) cnt[e + 1] += cnt[e];            /* start offsets */
+    int *fill = malloc(sizeof(int) * (size_t)E); memcpy(fill, cnt, sizeof(int) * (size_t)E);
+    for (int r = 0; r < S * K; r++) if (idx[r] >= 0) { int p = fill[idx[r]]++; tok[p] = r / K; wt[p] = val[r]; }
+    int nmax = 0; for (int e = 0; e < E; e++) { int n = cnt[e + 1] - cnt[e]; if (n > nmax) nmax = n; }
+    float *X = falloc((int64_t)nmax * D), *G = falloc((int64_t)nmax * I), *U = falloc((int64_t)nmax * I), *Y = falloc((int64_t)nmax * D);
+    for (int e = 0; e < E; e++) {
+        int n = cnt[e + 1] - cnt[e]; if (!n) continue;
+        const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
+        Slot *sl; expert_get(m, layer, e, &sl);
+        for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
+        gq_matmul(G, X, sl->gqe, gx->tg, n, D, I);
+        gq_matmul(U, X, sl->gqe + gx->eb_g, gx->tu, n, D, I);
+        for (int64_t q = 0; q < (int64_t)n * I; q++) { float gv = G[q]; G[q] = (gv / (1.f + expf(-gv))) * U[q]; }
+        gq_matmul(Y, G, sl->gqe + gx->eb_g + gx->eb_u, gx->td, n, I, D);
+        for (int r = 0; r < n; r++) {
+            float *os = out + (int64_t)tl[r] * D; const float *ys = Y + (int64_t)r * D; const float w = wl[r];
+            for (int d = 0; d < D; d++) os[d] += w * ys[d];
+        }
+    }
+    free(cnt); free(tok); free(wt); free(fill); free(X); free(G); free(U); free(Y);
+}
+
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     float *logits = falloc((int64_t)S*E);
@@ -2677,8 +2709,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     float *sh = falloc(I), *shu = falloc(I), *shd = falloc(D);  /* shared expert scratch */
     int use_qt = !g_gguf && qt_ready();
     int use_xf = !use_qt && !g_gguf && xf_mode(m);
-    int *xidx = use_xf ? malloc(sizeof(int) * (size_t)S * K) : NULL;
-    float *xval = use_xf ? falloc((int64_t)S * K) : NULL;
+    int use_gq = g_gguf && !use_qt;
+    int *xidx = (use_xf || use_gq) ? malloc(sizeof(int) * (size_t)S * K) : NULL;
+    float *xval = (use_xf || use_gq) ? falloc((int64_t)S * K) : NULL;
     for (int s = 0; s < S; s++) {
         float *pr = logits + (int64_t)s*E;
         if (m->momentum_logits && m->pilot_smooth > 0.f) {
@@ -2738,7 +2771,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
         const float *xs = x + (int64_t)s*D;
-        if (use_xf) {
+        if (use_xf || use_gq) {
             for (int kk = 0; kk < K; kk++) { xidx[s*K+kk] = idx[kk]; xval[s*K+kk] = val[kk]; }
         } else if (use_qt) {
             /* CUDA expert tier: run the resident experts as async groups on
@@ -2818,6 +2851,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
         }
     }
     if (use_xf) { moe_xf_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
+    else if (use_gq) { moe_gq_run(m, layer, x, S, out, xidx, xval); free(xidx); free(xval); }
     /* The CUDA tier keeps its per-token shared block above because it overlaps
      * resident GPU experts.  CPU prefill instead traverses each shared matrix
      * once per bounded chunk. */
@@ -4174,6 +4208,10 @@ int main(int argc, char **argv) {
         if (!g_tok) { fprintf(stderr, "[enc] no tokenizer loaded; cannot encode text. Put tokenizer.json in SNAP or set TOK.\n"); free(txt); return 1; }
         encode_text(txt, &prompt, &np);
         free(txt);
+        if (getenv("TOK_ONLY")) {   /* tokenizer check: the ids, nothing else */
+            for (int i = 0; i < np; i++) printf("%d%c", prompt[i], i + 1 < np ? ' ' : '\n');
+            return 0;
+        }
         n_new = getenv("N_NEW") ? atoi(getenv("N_NEW")) : 64;
         if (n_new < 1) n_new = 1;
         fprintf(stderr, "[enc] prompt tokens: %d | generating %d new tokens\n", np, n_new);

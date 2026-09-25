@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <omp.h>
+#include <math.h>
 #include "../ggml_quants.h"
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
 int main(int argc, char **argv){
@@ -15,9 +16,13 @@ int main(int argc, char **argv){
         int t = types[k]; int64_t rb = gq_row_bytes(t, I);
         uint8_t *W = malloc((size_t)rb*O); for (int64_t i = 0; i < rb*O; i++) W[i] = (uint8_t)(i*131u + 7u);
         for (int64_t o = 0; o < O; o++) for (int64_t b = 0; b < rb; b += GQ_TYPES[t].bytes) { if (t != GQ_MXFP4 && t != GQ_IQ1_M) { W[o*rb+b] = 0x00; W[o*rb+b+1] = 0x30; } }
-        gq_matmul(y, x, W, t, 1, I, O);
-        double t0 = now(); for (int r = 0; r < reps; r++) gq_matmul(y, x, W, t, 1, I, O); double dt = (now()-t0)/reps;
-        printf("%-8s %7.3f ms  %6.2f GB/s weights  %6.2f Gelem/s\n", gq_type_name(t), dt*1e3, rb*O/dt/1e9, (double)O*I/dt/1e9);
+        float *yr = malloc((size_t)O*4);
+        gq_matmul_f32(yr, x, W, t, 1, I, O); gq_matmul(y, x, W, t, 1, I, O);
+        double err = 0, mag = 0; for (int o = 0; o < O; o++) { err = fmax(err, fabs(y[o]-yr[o])); mag = fmax(mag, fabs(yr[o])); }
+        double t0 = now(); for (int r = 0; r < reps; r++) gq_matmul_f32(y, x, W, t, 1, I, O); double df = (now()-t0)/reps;
+        t0 = now(); for (int r = 0; r < reps; r++) gq_matmul(y, x, W, t, 1, I, O); double dt = (now()-t0)/reps;
+        printf("%-8s f32 %7.3f ms | int8 %7.3f ms  %5.1fx  %6.2f GB/s  | max|diff|/max|y| %.2e\n", gq_type_name(t), df*1e3, dt*1e3, df/dt, rb*O/dt/1e9, err/mag);
+        free(yr);
         free(W);
     }
     return 0;
