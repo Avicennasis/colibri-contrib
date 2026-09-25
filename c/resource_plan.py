@@ -103,10 +103,18 @@ def _gguf_tensor_sizes(parts):
     gr = importlib.util.module_from_spec(spec); spec.loader.exec_module(gr)
     fused = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
     packed = re.compile(r"^blk\.(\d+)\.ffn_exps_colibri$")
+    last = None
     for part in parts:
         reader = gr.GGUFReader(str(part))
         try:
             meta = reader.metadata
+            arch = meta.get("general.architecture", "")
+            # a multi-token-prediction head is stored as extra layers past the
+            # model's own (nextn_predict_layers); the engine does not load it.
+            # Only the first part of a split model carries the metadata.
+            blocks = meta.get(f"{arch}.block_count")
+            if blocks:
+                last = int(blocks) - int(meta.get(f"{arch}.nextn_predict_layers", 0) or 0)
             stride_bytes = None
             if meta.get("colibri.layout") == "expert-packed-v1":
                 b = meta.get("colibri.expert_bytes") or []
@@ -114,6 +122,8 @@ def _gguf_tensor_sizes(parts):
             for t in reader.tensors:
                 dtype = "GGUF_" + t["type_name"]
                 m = fused.match(t["name"])
+                if m and last is not None and int(m.group(1)) >= last:
+                    continue
                 if m:
                     n = int(t["dims"][-1])
                     for e in range(n):
