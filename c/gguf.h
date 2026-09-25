@@ -52,6 +52,7 @@ typedef struct {
     int file;                 /* which part holds it */
     uint64_t off;             /* absolute offset in that part */
     int64_t nbytes;
+    int used;                 /* set by the loader that consumed it (see gguf_mark) */
 } gguf_tensor;
 
 typedef struct {
@@ -64,6 +65,12 @@ typedef struct {
     int *idx; int idx_cap;
     char err[512];
 } gguf_ctx;
+
+/* Header-only mode (GGUF_CHECK): the file is the header of a model fetched
+ * with an HTTP range request, so tensor data is legitimately absent. Offsets
+ * and sizes are still parsed and checked for alignment and overflow; only the
+ * "lies inside the file" check is skipped. Reading a tensor then fails. */
+static int gguf_header_only;
 
 /* ---------------- header reader ---------------- */
 typedef struct { FILE *f; uint64_t pos, size; int bad; char *err; } gguf_rd;
@@ -123,6 +130,13 @@ static int gguf_find_idx(const gguf_ctx *g, const char *name) {
 }
 static const gguf_tensor *gguf_find(const gguf_ctx *g, const char *name) {
     int i = gguf_find_idx(g, name); return i < 0 ? NULL : &g->t[i];
+}
+/* Find and record that the caller consumed it: an engine can then name every
+ * tensor of the file it did NOT use, instead of silently ignoring it. */
+static const gguf_tensor *gguf_mark(const gguf_ctx *g, const char *name) {
+    const gguf_tensor *t = gguf_find(g, name);
+    if (t) ((gguf_tensor *)t)->used = 1;
+    return t;
 }
 static const gguf_kv *gguf_get(const gguf_ctx *g, const char *key) {
     for (int i = 0; i < g->n_kv; i++) if (!strcmp(g->kv[i].key, key)) return &g->kv[i];
@@ -231,7 +245,7 @@ static int gguf_parse_one(gguf_ctx *g, int part, const char *path, int want_kv) 
         uint64_t data = (r.pos + alignment - 1) / alignment * alignment;
         for (int i = t0; i < g->n_tensors; i++) {
             gguf_tensor *t = &g->t[i];
-            if (t->off % alignment || t->off > r.size || data > r.size - t->off || (uint64_t)t->nbytes > r.size - data - t->off) {
+            if (t->off % alignment || (!gguf_header_only && (t->off > r.size || data > r.size - t->off || (uint64_t)t->nbytes > r.size - data - t->off))) {
                 r.bad = 1; snprintf(g->err, sizeof g->err, "%s: tensor %s lies outside the file (offset %llu, %lld bytes)", path, t->name, (unsigned long long)t->off, (long long)t->nbytes); break;
             }
             t->off += data;

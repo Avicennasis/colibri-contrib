@@ -81,6 +81,7 @@ static int qwen36_max_ctx(void) {
 static gguf_ctx g_gg;
 static int   g_gguf = 0;
 static float g_norm_off = 1.0f;
+static int   g_gguf_dry = 0;       /* GGUF_CHECK=1: validate every tensor the loader wants, read none */
 static int   g_ssm_a_direct = 0, g_dn_tiled = 0;
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
@@ -777,7 +778,7 @@ typedef struct {
  * reads; ng = I/64 groups per row. */
 /* gq/gq_type: the matrix as the GGUF stores it (O rows of ggml blocks), used
  * as is by gq_matmul; set only in GGUF mode, and then w/q/q4 stay NULL. */
-typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng; uint8_t *gq; int gq_type; } QW;
+typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng; uint8_t *gq; int gq_type; float gs; } QW;
 static void qw_free(QW *w) {
     free((void*)w->w); free(w->q); free(w->sc); free(w->q4); free(w->sg); free(w->gq);
     w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0; w->gq = NULL;
@@ -813,7 +814,8 @@ typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g
  * e*eb_g. The types can differ per matrix and per layer (a Q4_K_M file keeps
  * down in Q5_K or Q6_K), so each keeps its own. */
 typedef struct { const gguf_tensor *g, *u, *d; int tg, tu, td; int64_t eb_g, eb_u, eb_d;
-                 const gguf_tensor *packed; int64_t stride; } GqExp;   /* packed: tools/gguf_import.py --mode copy */
+                 const gguf_tensor *packed; int64_t stride;
+                 float *sg, *su, *sd; } GqExp;   /* per-expert ".scale" factors, NULL when the file has none */   /* packed: tools/gguf_import.py --mode copy */
 typedef struct {
     Slot *slots;
     int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
@@ -834,6 +836,7 @@ typedef struct {
     int quant_bits;
     float *embed, *final_norm;
     uint8_t *embed_gq; int embed_type; int64_t embed_rb;   /* GGUF: embedding rows kept in their ggml type */
+    float embed_gs;                                         /* its ".scale" factor, 1 when absent */
     GqExp *gqx; int64_t gqe_max;                            /* GGUF: per-layer expert tensors, largest expert */
     QW lm_head;
     Layer *L;
@@ -1321,6 +1324,7 @@ static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O)
         if (gq_matmul(y, x, w->gq, w->gq_type, S, I, O)) {
             fprintf(stderr, "qwen36: GGUF matrix of type %s is not supported\n", gq_type_name(w->gq_type)); exit(1);
         }
+        if (w->gs != 1.f) for (int64_t i = 0; i < (int64_t)S * O; i++) y[i] *= w->gs;
         return;
     }
     if (w->q) {
@@ -1617,9 +1621,24 @@ static const char *gg_name(const char *hf, char *out, size_t cap) {
 }
 static const gguf_tensor *gg_tensor(const char *hf) {
     char nm[256]; const char *g = gg_name(hf, nm, sizeof nm);
-    return g ? gguf_find(&g_gg, g) : NULL;
+    return g ? gguf_mark(&g_gg, g) : NULL;
 }
 static int64_t gg_numel(const gguf_tensor *t) { return t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3]; }
+/* The optional "<name>.scale" companion of a weight: a global factor on the
+ * product (NVFP4's weight_scale_2, and llama.cpp's generic per-tensor scale):
+ * n values, one per tensor (n = 1) or one per expert. Returns them in out
+ * (NULL-safe in GGUF_CHECK mode), 1 when present, 0 when absent. */
+static int gg_scale(const gguf_tensor *w, int64_t n, float *out) {
+    char nm[256]; size_t L = strlen(w->name);
+    if (L < 8 || strcmp(w->name + L - 7, ".weight") || L + 1 > sizeof nm) return 0;
+    snprintf(nm, sizeof nm, "%.*s.scale", (int)(L - 7), w->name);
+    const gguf_tensor *t = gguf_mark(&g_gg, nm);
+    if (!t) return 0;
+    if (t->type != GQ_F32 || gg_numel(t) != n) { fprintf(stderr, "GGUF %s: expected %lld F32 values, found %lld of %s\n", nm, (long long)n, (long long)gg_numel(t), gq_type_name(t->type)); exit(1); }
+    if (g_gguf_dry || !out) return 1;
+    if (gguf_read(&g_gg, t, out, 0, n * 4)) { fprintf(stderr, "GGUF %s: read failed\n", nm); exit(1); }
+    return 1;
+}
 /* st_has / st_read_f32 for either source. */
 static int mt_has(Model *m, const char *name) { return g_gguf ? gg_tensor(name) != NULL : st_has(&m->S, name); }
 
@@ -1631,8 +1650,15 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
         if (want > 0 && n != want) {
             fprintf(stderr, "GGUF %s: %lld elements, config implies %lld -- refusing\n", t->name, (long long)n, (long long)want); exit(1);
         }
+        if (t->type != GQ_F32 && t->type != GQ_F16 && t->type != GQ_BF16 && !gq_blk_decoder(t->type)) {
+            fprintf(stderr, "GGUF %s: type %s is not supported\n", t->name, gq_type_name(t->type)); exit(1);
+        }
+        float s1;
+        int has_s = gg_scale(t, 1, &s1);
+        if (g_gguf_dry) return NULL;
         float *p = falloc(n);
         if (gguf_read_f32(&g_gg, t, p)) { fprintf(stderr, "GGUF %s: read failed (type %s)\n", t->name, gq_type_name(t->type)); exit(1); }
+        if (has_s) for (int64_t i = 0; i < n; i++) p[i] *= s1;
         return p;
     }
     int64_t n = st_numel(&m->S, name);
@@ -1670,6 +1696,8 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         }
         if (t->type == GQ_F32 || t->type == GQ_F16 || t->type == GQ_BF16) { out->w = load_t_n(m, name, (int64_t)I * O); return; }
         if (!gq_blk_decoder(t->type)) { fprintf(stderr, "GGUF %s: type %s is not supported\n", t->name, gq_type_name(t->type)); exit(1); }
+        if (!gg_scale(t, 1, &out->gs)) out->gs = 1.f;
+        if (g_gguf_dry) { out->gq_type = t->type; return; }
         out->gq = malloc((size_t)t->nbytes); out->gq_type = t->type;
         if (!out->gq || gguf_read(&g_gg, t, out->gq, 0, t->nbytes)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
         return;
@@ -1687,6 +1715,10 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
 static void gguf_load_cfg(Cfg *c) {
     const gguf_ctx *g = &g_gg;
     const char *arch = gguf_get_str(g, "general.architecture");
+    const char *gtype = gguf_get_str(g, "general.type");
+    if (!arch && ((gtype && !strcmp(gtype, "imatrix")) || gguf_get(g, "imatrix.datasets") || gguf_get(g, "imatrix.chunk_count"))) {
+        fprintf(stderr, "this GGUF is an importance matrix (imatrix): calibration data for quantizing, not a model to run\n"); exit(1);
+    }
     if (!arch || strcmp(arch, "qwen35moe")) { fprintf(stderr, "GGUF architecture '%s' is not qwen35moe (Qwen3.6): this engine cannot run it\n", arch ? arch : "?"); exit(1); }
     #define GK(k) "qwen35moe." k
     memset(c, 0, sizeof *c);
@@ -1748,6 +1780,19 @@ static void gguf_load_cfg(Cfg *c) {
             c->n_layers, c->n_active, c->hidden, c->n_experts, c->topk, c->inter, c->vocab, c->dn_vheads, c->dn_kheads);
 }
 
+/* blk.L.ffn_{gate,up,down}_exps.scale: one factor per expert, by name so the
+ * packed container (which keeps them as separate tensors) finds them too. */
+static void gguf_expert_scales(Model *m, int L) {
+    Cfg *c = &m->c; GqExp *x = &m->gqx[L]; float **dst[3] = { &x->sg, &x->su, &x->sd };
+    const char *kind[3] = { "gate", "up", "down" };
+    for (int k = 0; k < 3; k++) {
+        char nm[96]; snprintf(nm, sizeof nm, "blk.%d.ffn_%s_exps.weight", L, kind[k]);
+        gguf_tensor fake; memset(&fake, 0, sizeof fake); fake.name = nm;
+        float *v = g_gguf_dry ? NULL : falloc(c->n_experts);
+        if (gg_scale(&fake, c->n_experts, v)) *dst[k] = v; else { free(v); *dst[k] = NULL; }
+    }
+}
+
 /* GGUF mode: locate every layer's fused expert tensors and size the slot. */
 static void gguf_map_experts(Model *m) {
     Cfg *c = &m->c; char nm[96];
@@ -1766,7 +1811,7 @@ static void gguf_map_experts(Model *m) {
         for (int i = 0; i < c->n_layers; i++) {
             GqExp *x = &m->gqx[i];
             snprintf(nm, sizeof nm, "blk.%d.ffn_exps_colibri", i);
-            x->packed = gguf_find(&g_gg, nm);
+            x->packed = gguf_mark(&g_gg, nm);
             x->tg = (int)tt[3 * i]; x->tu = (int)tt[3 * i + 1]; x->td = (int)tt[3 * i + 2];
             x->eb_g = (int64_t)bb[3 * i]; x->eb_u = (int64_t)bb[3 * i + 1]; x->eb_d = (int64_t)bb[3 * i + 2]; x->stride = (int64_t)ss[i];
             int ok = x->packed && x->packed->ne[0] == x->stride && x->packed->ne[1] == c->n_experts &&
@@ -1776,6 +1821,7 @@ static void gguf_map_experts(Model *m) {
             int64_t tot = x->eb_g + x->eb_u + x->eb_d;
             if (tot > m->gqe_max) m->gqe_max = tot;
         }
+        for (int i = 0; i < c->n_layers; i++) gguf_expert_scales(m, i);
         fprintf(stderr, "[gguf] colibri container: experts packed, one read each (layer 0 gate %s up %s down %s, %.2f MB)\n",
                 gq_type_name(m->gqx[0].tg), gq_type_name(m->gqx[0].tu), gq_type_name(m->gqx[0].td), m->gqe_max / 1048576.0);
         return;
@@ -1786,7 +1832,7 @@ static void gguf_map_experts(Model *m) {
         const char *kind[3] = { "gate", "up", "down" };
         for (int k = 0; k < 3; k++) {
             snprintf(nm, sizeof nm, "blk.%d.ffn_%s_exps.weight", i, kind[k]);
-            const gguf_tensor *t = gguf_find(&g_gg, nm);
+            const gguf_tensor *t = gguf_mark(&g_gg, nm);
             int64_t in = k == 2 ? c->inter : c->hidden, outd = k == 2 ? c->hidden : c->inter;
             if (!t || t->n_dims != 3 || t->ne[0] != in || t->ne[1] != outd || t->ne[2] != c->n_experts) {
                 fprintf(stderr, "GGUF %s: missing or not [%lld x %lld x %d]\n", nm, (long long)in, (long long)outd, c->n_experts); exit(1);
@@ -1797,12 +1843,41 @@ static void gguf_map_experts(Model *m) {
             *dst[k] = t;
         }
         x->tg = x->g->type; x->tu = x->u->type; x->td = x->d->type;
+        gguf_expert_scales(m, i);
         x->eb_g = x->g->nbytes / c->n_experts; x->eb_u = x->u->nbytes / c->n_experts; x->eb_d = x->d->nbytes / c->n_experts;
         int64_t tot = x->eb_g + x->eb_u + x->eb_d;
         if (tot > m->gqe_max) m->gqe_max = tot;
     }
     fprintf(stderr, "[gguf] experts: layer 0 gate %s up %s down %s, %.2f MB per expert at most\n",
             gq_type_name(m->gqx[0].tg), gq_type_name(m->gqx[0].tu), gq_type_name(m->gqx[0].td), m->gqe_max / 1048576.0);
+}
+
+/* After loading: every tensor of the file the engine did not consume. The
+ * MTP head (layers past n_layers) and FP4 activation calibration
+ * (.input_scale) are known and skipped; anything else is a part of the model
+ * this engine would silently drop, so it is refused unless GGUF_IGNORE_UNUSED=1. */
+static int gguf_report_unused(const Cfg *c) {
+    int n = 0; char seen[16][96]; int ns = 0;
+    for (int i = 0; i < g_gg.n_tensors; i++) {
+        const gguf_tensor *t = &g_gg.t[i];
+        if (t->used) continue;
+        size_t L = strlen(t->name);
+        if (L > 12 && !strcmp(t->name + L - 12, ".input_scale")) continue;
+        int layer = -1;
+        if (sscanf(t->name, "blk.%d.", &layer) == 1 && layer >= c->n_layers) continue;   /* MTP / nextn */
+        n++;
+        char pat[96]; const char *d = t->name; int o = 0;   /* blk.N. -> blk.*. for a short summary */
+        while (*d && o < 90) { if (d[0] == '.' && d[1] >= '0' && d[1] <= '9') { pat[o++] = '.'; pat[o++] = '*'; d++; while (*d >= '0' && *d <= '9') d++; } else pat[o++] = *d++; }
+        pat[o] = 0;
+        int dup = 0; for (int k = 0; k < ns; k++) if (!strcmp(seen[k], pat)) dup = 1;
+        if (!dup && ns < 16) { snprintf(seen[ns++], 96, "%s", pat); }
+    }
+    if (n) {
+        fprintf(stderr, "GGUF: %d tensor(s) of this file are not used by the qwen36 engine:", n);
+        for (int k = 0; k < ns; k++) fprintf(stderr, " %s", seen[k]);
+        fprintf(stderr, "\n");
+    }
+    return n;
 }
 
 static void model_init_range(Model *m, const char *snap, int cap, int bits,
@@ -1846,7 +1921,12 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     int qcount = 0; double qfreed = 0;
     if (load_boundaries) {
         const gguf_tensor *et = g_gguf ? gg_tensor("model.embed_tokens.weight") : NULL;
-        if (et && gq_blk_decoder(et->type)) {
+        if (et && !gg_scale(et, 1, &m->embed_gs)) m->embed_gs = 1.f;
+        if (et && g_gguf_dry) {
+            if (et->ne[0] != c->hidden || et->ne[1] != c->vocab || (!gq_blk_decoder(et->type) && et->type != GQ_F32 && et->type != GQ_F16 && et->type != GQ_BF16)) {
+                fprintf(stderr, "GGUF token_embd.weight: [%lld x %lld] %s does not fit\n", (long long)et->ne[0], (long long)et->ne[1], gq_type_name(et->type)); exit(1);
+            }
+        } else if (et && gq_blk_decoder(et->type)) {
             /* rows decoded per token in step(): a Q8_0 embedding stays ~1 byte/weight */
             m->embed_type = et->type; m->embed_rb = gq_row_bytes(et->type, c->hidden);
             m->embed_gq = malloc((size_t)et->nbytes);
@@ -1935,7 +2015,12 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     #undef QCOUNT
     if (quantize_dense)
         fprintf(stderr, "[dense-i8] %d matrices quantized during load, %.1f GB f32 freed\n", qcount, qfreed/1073741824.0);
-    if (g_gguf) gguf_map_experts(m);
+    if (g_gguf) {
+        gguf_map_experts(m);
+        if (load_boundaries && gguf_report_unused(c) && !g_gguf_dry && !getenv("GGUF_IGNORE_UNUSED")) {
+            fprintf(stderr, "refusing: running without them would compute a different model (GGUF_IGNORE_UNUSED=1 to run anyway)\n"); exit(1);
+        }
+    }
     m->cache = calloc((size_t)c->n_layers, sizeof(LCache));
     for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
@@ -2738,7 +2823,9 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
         else        gq_row_all(GU + (int64_t)k * 2 * I + rr, 1, pax, base + gx->eb_g + (int64_t)(rr - I) * rbu, gx->tu, D);
     }
     for (int k = 0; k < n; k++) {
-        const float *g = GU + (int64_t)k * 2 * I, *u = g + I; float *h = H + (int64_t)k * I;
+        float *g = GU + (int64_t)k * 2 * I, *u = g + I; float *h = H + (int64_t)k * I;
+        if (gx->sg) for (int i = 0; i < I; i++) g[i] *= gx->sg[ids[k]];
+        if (gx->su) for (int i = 0; i < I; i++) u[i] *= gx->su[ids[k]];
         for (int i = 0; i < I; i++) { float gv = g[i]; h[i] = (gv / (1.f + expf(-gv))) * u[i]; }
     }
     if (gq_act_set(pah, H, n, I)) return -1;   /* row k of ah is expert k's hidden */
@@ -2751,7 +2838,11 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     /* accumulate in expert-id order, as the general path does: same sums, same bits */
     int ord[64]; for (int k = 0; k < n; k++) ord[k] = k;
     for (int a = 1; a < n; a++) { int v = ord[a], b = a; while (b > 0 && ids[ord[b - 1]] > ids[v]) { ord[b] = ord[b - 1]; b--; } ord[b] = v; }
-    for (int j = 0; j < n; j++) { int k = ord[j]; const float *ys = Y + (int64_t)k * D; for (int d = 0; d < D; d++) out[d] += w[k] * ys[d]; }
+    for (int j = 0; j < n; j++) {
+        int k = ord[j]; float *ys = Y + (int64_t)k * D;
+        if (gx->sd) for (int d = 0; d < D; d++) ys[d] *= gx->sd[ids[k]];
+        for (int d = 0; d < D; d++) out[d] += w[k] * ys[d];
+    }
     return 0;
 }
 
@@ -2780,8 +2871,11 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
             gq_matmul(G, X, sl->gqe, gx->tg, n, D, I);
             gq_matmul(U, X, sl->gqe + gx->eb_g, gx->tu, n, D, I);
         }
+        if (gx->sg) for (int64_t q = 0; q < (int64_t)n * I; q++) G[q] *= gx->sg[e];
+        if (gx->su) for (int64_t q = 0; q < (int64_t)n * I; q++) U[q] *= gx->su[e];
         for (int64_t q = 0; q < (int64_t)n * I; q++) { float gv = G[q]; G[q] = (gv / (1.f + expf(-gv))) * U[q]; }
         gq_matmul(Y, G, sl->gqe + gx->eb_g + gx->eb_u, gx->td, n, I, D);
+        if (gx->sd) for (int64_t q = 0; q < (int64_t)n * D; q++) Y[q] *= gx->sd[e];
         for (int r = 0; r < n; r++) {
             float *os = out + (int64_t)tl[r] * D; const float *ys = Y + (int64_t)r * D; const float w = wl[r];
             for (int d = 0; d < D; d++) os[d] += w * ys[d];
@@ -3356,7 +3450,10 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
                     ids[s], c->vocab - 1);
             exit(1);
         }
-        if (m->embed_gq) gq_dequant_row(m->embed_type, m->embed_gq + (int64_t)ids[s]*m->embed_rb, x + (int64_t)s*D, D);
+        if (m->embed_gq) {
+            gq_dequant_row(m->embed_type, m->embed_gq + (int64_t)ids[s]*m->embed_rb, x + (int64_t)s*D, D);
+            if (m->embed_gs != 1.f) for (int d = 0; d < D; d++) x[(int64_t)s*D + d] *= m->embed_gs;
+        }
         else memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     }
     layers_forward_range(m, x, S, pos_base, 0, c->n_layers, 1, lf);
@@ -4245,7 +4342,20 @@ int main(int argc, char **argv) {
     }
     if (gguf_dir || gguf_is_file(snap)) {
         const char *gp = gguf_dir ? gguf_path : snap;
+        if (getenv("GGUF_CHECK")) gguf_header_only = 1;
         if (gguf_open(&g_gg, gp)) { fprintf(stderr, "GGUF: %s\n", g_gg.err); return 1; }
+        if (getenv("GGUF_CHECK")) {
+            /* everything the engine would load, checked against the header alone */
+            g_gguf = 1; g_gguf_dry = 1; g_norm_off = 0.f; g_ssm_a_direct = 1; g_dn_tiled = 1;
+            static Model mc; model_init(&mc, snap, 1, 4);
+            int unused = gguf_report_unused(&mc.c);
+            int tok = load_tokenizer_gguf(&g_gg);
+            int64_t bytes = 0; for (int i = 0; i < g_gg.n_tensors; i++) bytes += g_gg.t[i].nbytes;
+            if (unused) { printf("GGUF CHECK FAIL: %s | %d tensors the engine would not use (listed above)\n", gp, unused); return 3; }
+            printf("GGUF CHECK OK: %s | %d layers, %d experts top-%d | %d tensors, %.2f GB of weights | tokenizer %s\n",
+                   gp, mc.c.n_layers, mc.c.n_experts, mc.c.topk, g_gg.n_tensors, bytes / 1e9, tok ? "MISSING" : "ok");
+            return tok ? 2 : 0;
+        }
         g_gguf = 1; g_norm_off = 0.f; g_ssm_a_direct = 1; g_dn_tiled = 1;
         fprintf(stderr, "[gguf] %s: %d file(s), %d tensors, read in place (native ggml types, no conversion)\n",
                 gp, g_gg.n_files, g_gg.n_tensors);

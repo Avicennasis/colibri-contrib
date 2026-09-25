@@ -35,7 +35,23 @@ BLOCKS = {  # type -> (block elems, block bytes, fp16 offsets); IQ1_M / MXFP4 sp
     "IQ1_S": (256, 50, [0]), "IQ1_M": (256, 56, []), "IQ4_NL": (32, 18, [0]),
     "IQ4_XS": (256, 136, [0]), "MXFP4": (32, 17, []), "TQ1_0": (256, 54, [52]),
     "TQ2_0": (256, 66, [64]),
+    "NVFP4": (64, 36, []), "Q1_0": (128, 18, [0]), "Q2_0": (64, 18, [0]),
 }
+
+
+def dequant(quants, qt, name, raw):
+    """gguf-py where it implements the type; Q1_0 / Q2_0 from the ggml C
+    reference (dequantize_row_q1_0 / _q2_0), transcribed."""
+    raw = raw.reshape(-1, BLOCKS[name][1])
+    if name == "Q1_0":
+        d = raw[:, 0:2].copy().view(np.float16).astype(np.float32)
+        bits = (raw[:, 2:18, None] >> np.arange(8, dtype=np.uint8)) & 1
+        return np.where(bits.reshape(-1, 128) == 1, d, -d).astype(np.float32).reshape(-1)
+    if name == "Q2_0":
+        d = raw[:, 0:2].copy().view(np.float16).astype(np.float32)
+        q = (raw[:, 2:18, None] >> (np.arange(4, dtype=np.uint8) * 2)) & 3
+        return ((q.reshape(-1, 64).astype(np.int32) - 1).astype(np.float32) * d).reshape(-1)
+    return quants.dequantize(raw.reshape(-1), qt).astype(np.float32).reshape(-1)
 
 
 def load_gguf_modules(llama_dir):
@@ -67,6 +83,14 @@ def synth_quant(quants, qt, name, shape, target_std, rng):
     blck, size, _ = BLOCKS[name]
     rows = int(np.prod(shape[:-1])); nb = shape[-1] // blck
     raw = rng.integers(0, 256, (rows * nb, size), dtype=np.uint8)
+    if name == "Q4_0":
+        # nibbles 1..15 (values -7..+7): symmetric, so the lm_head is not biased toward one token
+        c = rng.integers(1, 16, (rows * nb, 16, 2), dtype=np.uint8)
+        raw[:, 2:18] = c[..., 0] | (c[..., 1] << 4)
+    if name == "Q2_0":
+        # same bias as TQ2_0 (codes -1..+2): keep them in {-1, 0, +1} so the synthetic model is not pinned to one token
+        c = rng.integers(0, 3, (rows * nb, 16, 4), dtype=np.uint8)
+        raw[:, 2:18] = c[..., 0] | (c[..., 1] << 2) | (c[..., 2] << 4) | (c[..., 3] << 6)
     if name == "TQ2_0":
         # ternary weights: 2-bit codes 0..2 (-1, 0, +1); code 3 never occurs in real files
         c = rng.integers(0, 3, (rows * nb, 64, 4), dtype=np.uint8)
@@ -90,6 +114,15 @@ def synth_quant(quants, qt, name, shape, target_std, rng):
         raw[:, f0:f0 + 2] = np.array([d], dtype=np.float16).view(np.uint8)
         raw[:, f1:f1 + 2] = np.array([m], dtype=np.float16).view(np.uint8)
         return raw.reshape(*shape[:-1], nb * size)
+    if name == "NVFP4":
+        # four UE4M3 block scales per 64: pick one code giving the target magnitude
+        codes = np.arange(1, 0x7F, dtype=np.uint8)
+        vals = quants.NVFP4.ue4m3_to_fp32(codes)
+        probe = raw.copy(); probe[:, 0:4] = 0x38   # 1.0 * 0.5
+        s = float(np.std(quants.dequantize(probe.reshape(-1), qt)))
+        want = 0.5 * target_std / s if s > 0 else 0.5
+        raw[:, 0:4] = codes[int(np.argmin(np.abs(vals - want)))]
+        return raw.reshape(*shape[:-1], nb * size)
     if name == "MXFP4":
         probe = raw.copy(); set_scale(probe, name, 128)
         s = float(np.std(quants.dequantize(probe.reshape(-1), qt)))
@@ -97,7 +130,7 @@ def synth_quant(quants, qt, name, shape, target_std, rng):
         set_scale(raw, name, max(2, min(250, e)))
     else:
         probe = raw.copy(); set_scale(probe, name, 1.0)
-        s = float(np.std(quants.dequantize(probe.reshape(-1), qt)))
+        s = float(np.std(dequant(quants, qt, name, probe)))
         set_scale(raw, name, target_std / s if s > 0 else target_std)
     return raw.reshape(*shape[:-1], nb * size)
 
@@ -188,6 +221,9 @@ def write_variant(gguf, reader, out_path, replace):
         vtype = f.types[0]
         sub = f.types[-1] if vtype == gguf.GGUFValueType.ARRAY and len(f.types) > 1 else None
         w.add_key_value(f.name, f.contents(), vtype, sub_type=sub)
+    for name, (qt, raw) in replace.items():
+        if qt is None:                          # a new F32 companion (".scale")
+            w.add_tensor(name, raw)
     for t in reader.tensors:
         if t.name in replace:
             qt, raw = replace[t.name]
@@ -212,6 +248,9 @@ def main():
     ap.add_argument("--caps", default="1,8")
     ap.add_argument("--workdir", default=None)
     ap.add_argument("--max-new", type=int, default=16)
+    ap.add_argument("--scales", action="store_true",
+                    help="also give every quantized matrix a '.scale' companion (per tensor, per expert for the fused experts), "
+                         "as NVFP4 files and llama.cpp's generic per-tensor scales do")
     args = ap.parse_args()
 
     gguf, quants = load_gguf_modules(args.llama)
@@ -259,6 +298,8 @@ def main():
                                    "blk.0.ffn_gate_exps.weight": "IQ2_XXS", "blk.1.ffn_down_exps.weight": "IQ3_S",
                                    "blk.2.ffn_up_exps.weight": "MXFP4", "blk.3.attn_output.weight": "Q5_K"}))
     results = []
+    if args.scales:
+        variants = [(l + "+S", m) for l, m in variants]
     for label, mix in variants:
       for attempt in range(6):
         rng = np.random.default_rng(sum(label.encode()) * 7919 + 17 + 1000003 * attempt)
@@ -266,7 +307,7 @@ def main():
         for name, t in tensors.items():
             if not is_quantizable(name):
                 continue
-            tname = label if mix is None else mix.get(name, mix.get(name.split(".", 2)[-1] if name.startswith("blk.") else name, mix["*"]))
+            tname = label.replace("+S", "") if mix is None else mix.get(name, mix.get(name.split(".", 2)[-1] if name.startswith("blk.") else name, mix["*"]))
             if mix is None and attempt >= 3 and name in ("token_embd.weight", "output.weight"):
                 # a type whose synthetic codes are biased (TQ2_0: -1..2) can pin
                 # every step to one token through the lm_head; keep the two
@@ -287,7 +328,12 @@ def main():
                 qt = QT[tname]
                 raw = synth_quant(quants, qt, tname, shape, std, rng)
                 replace[name] = (qt, raw)
-                deq = quants.dequantize(raw.reshape(-1), qt).astype(np.float32).reshape(shape)
+                deq = dequant(quants, qt, name if False else tname, raw).reshape(shape)
+            if label.endswith("+S"):
+                experts = name.endswith("_exps.weight")
+                sc = rng.uniform(0.5, 2.0, shape[0] if experts else 1).astype(np.float32)
+                replace[name[:-len(".weight")] + ".scale"] = (None, sc)
+                deq = deq * (sc.reshape(-1, 1, 1) if experts else sc[0])
             updates.update(to_hf(name, deq, cfg))
         vpath = work / f"variant_{label}.gguf"
         write_variant(gguf, reader, vpath, replace)
