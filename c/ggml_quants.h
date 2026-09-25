@@ -49,7 +49,7 @@ enum {
     GQ_IQ3_XXS = 18, GQ_IQ1_S = 19, GQ_IQ4_NL = 20, GQ_IQ3_S = 21, GQ_IQ2_S = 22,
     GQ_IQ4_XS = 23, GQ_I8 = 24, GQ_I16 = 25, GQ_I32 = 26, GQ_I64 = 27,
     GQ_F64 = 28, GQ_IQ1_M = 29, GQ_BF16 = 30, GQ_TQ1_0 = 34, GQ_TQ2_0 = 35,
-    GQ_MXFP4 = 39, GQ_TYPE_MAX = 40
+    GQ_MXFP4 = 39, GQ_NVFP4 = 40, GQ_Q1_0 = 41, GQ_Q2_0 = 42, GQ_TYPE_MAX = 43
 };
 
 typedef struct { const char *name; int blck; int bytes; int supported; } gq_type_info;
@@ -87,6 +87,9 @@ static const gq_type_info GQ_TYPES[GQ_TYPE_MAX] = {
     [GQ_TQ1_0]   = { "TQ1_0",   256, 54, 1 },
     [GQ_TQ2_0]   = { "TQ2_0",   256, 66, 1 },
     [GQ_MXFP4]   = { "MXFP4",   32,  17, 1 },
+    [GQ_NVFP4]   = { "NVFP4",   64,  36, 1 },
+    [GQ_Q1_0]    = { "Q1_0",    128, 18, 1 },
+    [GQ_Q2_0]    = { "Q2_0",    64,  18, 1 },
 };
 
 static inline int gq_type_ok(int t) { return t >= 0 && t < GQ_TYPE_MAX && GQ_TYPES[t].blck > 0 && GQ_TYPES[t].supported; }
@@ -413,6 +416,35 @@ GQ_EXACT_FN static void gq_blk_tq2_0(const uint8_t *b, float *y) {
     }
 }
 
+/* NVFP4 block scale: unsigned E4M3 (bias 7), halved like the MXFP4 exponent
+ * because the value table holds e2m1 values doubled; 0 and 0x7F decode to 0. */
+static inline float gq_ue4m3_half(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.f;
+    int e = (x >> 3) & 0xF, m = x & 7;
+    return e == 0 ? ldexpf((float)m, -10) : ldexpf((float)(8 + m), e - 11);
+}
+GQ_EXACT_FN static void gq_blk_nvfp4(const uint8_t *b, float *y) {
+    GQ_EXACT_BEGIN
+    const uint8_t *qs = b + 4;
+    for (int sb = 0; sb < 4; sb++) {
+        const float d = gq_ue4m3_half(b[sb]);
+        for (int j = 0; j < 8; j++) {
+            y[16 * sb + j]     = d * (float)GGML_KVALUES_MXFP4[qs[8 * sb + j] & 0x0F];
+            y[16 * sb + 8 + j] = d * (float)GGML_KVALUES_MXFP4[qs[8 * sb + j] >> 4];
+        }
+    }
+}
+GQ_EXACT_FN static void gq_blk_q1_0(const uint8_t *b, float *y) {
+    GQ_EXACT_BEGIN
+    const float d = gq_f16(gq_rd16(b)), nd = -d; const uint8_t *qs = b + 2;
+    for (int j = 0; j < 128; j++) y[j] = (qs[j >> 3] >> (j & 7)) & 1 ? d : nd;
+}
+GQ_EXACT_FN static void gq_blk_q2_0(const uint8_t *b, float *y) {
+    GQ_EXACT_BEGIN
+    const float d = gq_f16(gq_rd16(b)); const uint8_t *qs = b + 2;
+    for (int j = 0; j < 64; j++) y[j] = (float)((int)((qs[j >> 2] >> ((j & 3) * 2)) & 3) - 1) * d;
+}
+
 typedef void (*gq_blk_fn)(const uint8_t *, float *);
 static inline gq_blk_fn gq_blk_decoder(int t) {
     switch (t) {
@@ -427,6 +459,8 @@ static inline gq_blk_fn gq_blk_decoder(int t) {
     case GQ_IQ1_M: return gq_blk_iq1_m;   case GQ_IQ4_NL: return gq_blk_iq4_nl;
     case GQ_IQ4_XS: return gq_blk_iq4_xs; case GQ_MXFP4: return gq_blk_mxfp4;
     case GQ_TQ1_0: return gq_blk_tq1_0;   case GQ_TQ2_0: return gq_blk_tq2_0;
+    case GQ_NVFP4: return gq_blk_nvfp4;   case GQ_Q1_0: return gq_blk_q1_0;
+    case GQ_Q2_0: return gq_blk_q2_0;
     default: return NULL;
     }
 }
@@ -870,6 +904,18 @@ GQ_EXACT_FN static void gq_ublk(int t, const uint8_t *b, int8_t *w, float *sw, f
     case GQ_TQ2_0: { const uint8_t *qs = b; const float d = gq_f16(gq_rd16(b + 64));
         for (int i = 0; i < 256; i++) { int c = i >> 7, s = (i >> 5) & 3, j = i & 31; w[i] = (int8_t)((int)((qs[c * 32 + j] >> (2 * s)) & 3) - 1); }
         gq_set_g(sw, mw, 0, 16, d, 0.f); break; }
+    case GQ_NVFP4: { const uint8_t *qs = b + 4;
+        for (int sb = 0; sb < 4; sb++) {
+            sw[sb] = gq_ue4m3_half(b[sb]); mw[sb] = 0.f;
+            for (int j = 0; j < 8; j++) { w[16 * sb + j] = GGML_KVALUES_MXFP4[qs[8 * sb + j] & 0x0F]; w[16 * sb + 8 + j] = GGML_KVALUES_MXFP4[qs[8 * sb + j] >> 4]; }
+        }
+        break; }
+    case GQ_Q1_0: { const float d = gq_f16(gq_rd16(b)); const uint8_t *qs = b + 2;
+        for (int j = 0; j < 128; j++) w[j] = (qs[j >> 3] >> (j & 7)) & 1 ? 1 : -1;
+        gq_set_g(sw, mw, 0, 8, d, 0.f); break; }
+    case GQ_Q2_0: { const float d = gq_f16(gq_rd16(b)); const uint8_t *qs = b + 2;
+        for (int j = 0; j < 64; j++) w[j] = (int8_t)((int)((qs[j >> 2] >> ((j & 3) * 2)) & 3) - 1);
+        gq_set_g(sw, mw, 0, 4, d, 0.f); break; }
     }
 }
 /* 1 if type t has an integer form (every block type does; F32/F16/BF16 do not). */

@@ -34,7 +34,23 @@ TYPES = {
     "IQ1_S": (256, 50, [0]), "IQ1_M": (256, 56, []), "IQ4_NL": (32, 18, [0]),
     "IQ4_XS": (256, 136, [0]), "MXFP4": (32, 17, []), "TQ1_0": (256, 54, [52]),
     "TQ2_0": (256, 66, [64]),
+    "NVFP4": (64, 36, []), "Q1_0": (128, 18, [0]), "Q2_0": (64, 18, [0]),
 }
+TYPE_ID = {"NVFP4": 40, "Q1_0": 41, "Q2_0": 42}
+
+
+def ref_dequant(name, raw):
+    """gguf-py where it has the type; for Q1_0 / Q2_0, which it does not, the
+    ggml C reference (dequantize_row_q1_0 / _q2_0) transcribed to numpy."""
+    if name == "Q1_0":
+        d = raw[:, 0:2].copy().view(np.float16).astype(np.float32)
+        bits = (raw[:, 2:18, None] >> np.arange(8, dtype=np.uint8)) & 1
+        return np.where(bits.reshape(-1, 128) == 1, d, -d).astype(np.float32).reshape(-1)
+    if name == "Q2_0":
+        d = raw[:, 0:2].copy().view(np.float16).astype(np.float32)
+        q = (raw[:, 2:18, None] >> (np.arange(4, dtype=np.uint8) * 2)) & 3
+        return ((q.reshape(-1, 64).astype(np.int32) - 1).astype(np.float32) * d).reshape(-1)
+    return gq.dequantize(raw.reshape(-1), QT[name]).astype(np.float32).reshape(-1)
 
 
 def finite_f16(rng, n):
@@ -72,9 +88,8 @@ class GgmlQuantsExact(unittest.TestCase):
     def check(self, name, n_blocks=64, seed=1):
         rng = np.random.default_rng(seed)
         raw = make_blocks(name, n_blocks, rng)
-        qt = QT[name]
-        ref = gq.dequantize(raw.reshape(-1), qt).astype(np.float32).reshape(-1)
-        got = run_c(int(qt), ref.size, raw.tobytes())
+        ref = ref_dequant(name, raw)
+        got = run_c(TYPE_ID.get(name) or int(QT[name]), ref.size, raw.tobytes())
         self.assertEqual(got.size, ref.size)
         diff = np.flatnonzero(got.view(np.uint32) != ref.view(np.uint32))
         self.assertEqual(diff.size, 0,

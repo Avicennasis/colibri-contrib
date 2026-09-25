@@ -14,7 +14,7 @@ BIN = HERE / "tests" / ("test_gq_dot.exe" if sys.platform == "win32" else "test_
 sys.path.insert(0, str(HERE / "tests"))
 try:
     from gguf.constants import GGMLQuantizationType as QT
-    from test_ggml_quants import make_blocks, TYPES
+    from test_ggml_quants import make_blocks, TYPES, TYPE_ID
 except ImportError:  # pragma: no cover
     QT = None
 
@@ -33,7 +33,7 @@ class GqDot(unittest.TestCase):
                         raw[:, 0] = rng.integers(110, 140, raw.shape[0], dtype=np.uint8)
                     x = rng.standard_normal((S, I)).astype(np.float32)
                     x[:, :3] *= 20   # a few large activations, as real hidden states have
-                    p = subprocess.run([str(BIN)], input=struct.pack("<iiii", int(QT[name]), O, I, S) + raw.tobytes() + x.tobytes(),
+                    p = subprocess.run([str(BIN)], input=struct.pack("<iiii", TYPE_ID.get(name) or int(QT[name]), O, I, S) + raw.tobytes() + x.tobytes(),
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                     self.assertEqual(p.returncode, 0, p.stderr)
                     err = float(p.stdout.decode())
