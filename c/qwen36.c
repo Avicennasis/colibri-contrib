@@ -2667,9 +2667,63 @@ static void route_footer(FILE *f, const Model *m) {
  * is fetched once and its rows unpacked once for every token routed to it
  * (prefill), and an expert is only referenced while it is being computed, so
  * any cache capacity works. out += sum_k val * expert(x). */
+/* Decode (one token, cache can hold all K at once): every routed expert's
+ * gate and up rows in ONE parallel region, then every down row in another,
+ * instead of two regions per expert. Returns 0, or -1 to take the general path. */
+static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const int *idx, const float *val) {
+    Cfg *c = &m->c; const int D = c->hidden, K = c->topk, I = c->inter;
+    const GqExp *gx = &m->gqx[layer];
+    if (m->cache[layer].cap < K || K > 64 || !gq_int_ok(gx->tg, D) || !gq_int_ok(gx->tu, D) || !gq_int_ok(gx->td, I)) return -1;
+    Slot *sl[64]; int ids[64]; float w[64]; int n = 0;
+    for (int k = 0; k < K; k++) if (idx[k] >= 0) { ids[n] = idx[k]; w[n] = val[k]; n++; }
+    for (int k = 0; k < n; k++) expert_get(m, layer, ids[k], &sl[k]);
+    for (int k = 0; k < n; k++) if (sl[k]->eid != ids[k]) {   /* evicted while fetching the others */
+        for (int j = 0; j < n; j++) expert_get(m, layer, ids[j], &sl[j]);
+        for (int j = 0; j < n; j++) if (sl[j]->eid != ids[j]) return -1;
+        break;
+    }
+    /* moe() runs on the engine's thread; the worker threads get these through
+     * the local pointers below (thread-local storage here would hand each
+     * worker its own empty copy) */
+    static gq_act ax_s, ah_s; static float *GU_s, *H_s, *Y_s; static int cap;
+    gq_act *pax = &ax_s, *pah = &ah_s;
+    if (n * 2 * I > cap || n * D > cap) {
+        free(GU_s); free(H_s); free(Y_s); cap = (2 * I > D ? 2 * I : D) * 64;
+        GU_s = falloc((int64_t)cap); H_s = falloc((int64_t)cap); Y_s = falloc((int64_t)cap);
+    }
+    float *GU = GU_s, *H = H_s, *Y = Y_s;
+    if (gq_act_set(pax, x, 1, D)) return -1;
+    const int64_t rbg = gq_row_bytes(gx->tg, D), rbu = gq_row_bytes(gx->tu, D), rbd = gq_row_bytes(gx->td, I);
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < n * 2 * I; r++) {
+        int k = r / (2 * I), rr = r % (2 * I);
+        const uint8_t *base = sl[k]->gqe;
+        if (rr < I) gq_row_all(GU + (int64_t)k * 2 * I + rr, 1, pax, base + (int64_t)rr * rbg, gx->tg, D);
+        else        gq_row_all(GU + (int64_t)k * 2 * I + rr, 1, pax, base + gx->eb_g + (int64_t)(rr - I) * rbu, gx->tu, D);
+    }
+    for (int k = 0; k < n; k++) {
+        const float *g = GU + (int64_t)k * 2 * I, *u = g + I; float *h = H + (int64_t)k * I;
+        for (int i = 0; i < I; i++) { float gv = g[i]; h[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+    }
+    if (gq_act_set(pah, H, n, I)) return -1;   /* row k of ah is expert k's hidden */
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < n * D; r++) {
+        int k = r / D, o = r % D;
+        gq_act one = *pah; one.S = 1; one.q = pah->q + (int64_t)k * I; one.d = pah->d + (int64_t)k * (I / 32); one.s = pah->s + (int64_t)k * (I / 16);
+        gq_row_all(Y + (int64_t)k * D + o, 1, &one, sl[k]->gqe + gx->eb_g + gx->eb_u + (int64_t)o * rbd, gx->td, I);
+    }
+    /* accumulate in expert-id order, as the general path does: same sums, same bits */
+    int ord[64]; for (int k = 0; k < n; k++) ord[k] = k;
+    for (int a = 1; a < n; a++) { int v = ord[a], b = a; while (b > 0 && ids[ord[b - 1]] > ids[v]) { ord[b] = ord[b - 1]; b--; } ord[b] = v; }
+    for (int j = 0; j < n; j++) { int k = ord[j]; const float *ys = Y + (int64_t)k * D; for (int d = 0; d < D; d++) out[d] += w[k] * ys[d]; }
+    return 0;
+}
+
 static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
     Cfg *c = &m->c; const int D = c->hidden, K = c->topk, I = c->inter, E = c->n_experts;
     const GqExp *gx = &m->gqx[layer];
+    static int nodec = -1; if (nodec < 0) { const char *e = getenv("GQ_NODECODE"); nodec = e && *e == '1'; }
+    if (S == 1 && !nodec && !moe_gq_decode(m, layer, x, out, idx, val)) return;
     int *cnt = calloc((size_t)E + 1, sizeof(int)), *tok = malloc(sizeof(int) * (size_t)S * K);
     float *wt = falloc((int64_t)S * K);
     for (int r = 0; r < S * K; r++) if (idx[r] >= 0) cnt[idx[r] + 1]++;
@@ -2678,13 +2732,18 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
     for (int r = 0; r < S * K; r++) if (idx[r] >= 0) { int p = fill[idx[r]]++; tok[p] = r / K; wt[p] = val[r]; }
     int nmax = 0; for (int e = 0; e < E; e++) { int n = cnt[e + 1] - cnt[e]; if (n > nmax) nmax = n; }
     float *X = falloc((int64_t)nmax * D), *G = falloc((int64_t)nmax * I), *U = falloc((int64_t)nmax * I), *Y = falloc((int64_t)nmax * D);
+    gq_act act; memset(&act, 0, sizeof act);
     for (int e = 0; e < E; e++) {
         int n = cnt[e + 1] - cnt[e]; if (!n) continue;
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
         Slot *sl; expert_get(m, layer, e, &sl);
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
-        gq_matmul(G, X, sl->gqe, gx->tg, n, D, I);
-        gq_matmul(U, X, sl->gqe + gx->eb_g, gx->tu, n, D, I);
+        if (gq_int_ok(gx->tg, D) && gq_int_ok(gx->tu, D) && !gq_act_set(&act, X, n, D))
+            gq_matmul2_act(G, sl->gqe, gx->tg, U, sl->gqe + gx->eb_g, gx->tu, &act, I);   /* x quantized once */
+        else {
+            gq_matmul(G, X, sl->gqe, gx->tg, n, D, I);
+            gq_matmul(U, X, sl->gqe + gx->eb_g, gx->tu, n, D, I);
+        }
         for (int64_t q = 0; q < (int64_t)n * I; q++) { float gv = G[q]; G[q] = (gv / (1.f + expf(-gv))) * U[q]; }
         gq_matmul(Y, G, sl->gqe + gx->eb_g + gx->eb_u, gx->td, n, I, D);
         for (int r = 0; r < n; r++) {
@@ -2692,6 +2751,7 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
             for (int d = 0; d < D; d++) os[d] += w * ys[d];
         }
     }
+    gq_act_free(&act);
     free(cnt); free(tok); free(wt); free(fill); free(X); free(G); free(U); free(Y);
 }
 

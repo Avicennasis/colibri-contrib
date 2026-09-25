@@ -807,30 +807,95 @@ static float gq_dot_i8(const int8_t *w8, const float *sw, const float *mw, int h
 
 static int gq_exact_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("GQ_EXACT"); v = e && *e && *e != '0'; } return v; }
 
+/* Q8_0 needs no unpack: the block already is 32 int8 codes and one scale. */
+static inline float gq_dot_q8_0(const uint8_t *row, const int8_t *xq, const float *dx, int64_t n) {
+    float acc = 0.f;
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 vacc = _mm256_setzero_ps(); const __m256i ones = _mm256_set1_epi16(1);
+    for (int64_t b = 0; b < n / 32; b++) {
+        const uint8_t *blk = row + b * 34;
+        __m256i w = _mm256_loadu_si256((const __m256i *)(blk + 2)), x = _mm256_loadu_si256((const __m256i *)(xq + b * 32));
+        __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(x, w)), ones);
+        vacc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(gq_f16(gq_rd16(blk)) * dx[b]), vacc);
+    }
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(vacc), _mm256_extractf128_ps(vacc, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h)); h = _mm_add_ss(h, _mm_movehdup_ps(h));
+    acc = _mm_cvtss_f32(h);
+#else
+    for (int64_t b = 0; b < n / 32; b++) {
+        const uint8_t *blk = row + b * 34; const int8_t *w = (const int8_t *)(blk + 2); int32_t si = 0;
+        for (int i = 0; i < 32; i++) si += (int32_t)w[i] * xq[b * 32 + i];
+        acc += gq_f16(gq_rd16(blk)) * dx[b] * (float)si;
+    }
+#endif
+    return acc;
+}
+
+/* An activation block quantized once and shared by every matrix that reads it
+ * (gate and up read the same x). */
+typedef struct { int8_t *q; float *d; int32_t *s; int S, I, cap; } gq_act;
+static int gq_act_set(gq_act *a, const float *x, int S, int I) {
+    if ((int64_t)S * I > a->cap) {
+        free(a->q); free(a->d); free(a->s);
+        a->cap = S * I; a->q = (int8_t *)malloc((size_t)a->cap); a->d = (float *)malloc((size_t)(a->cap / 32 + 1) * sizeof(float));
+        a->s = (int32_t *)malloc((size_t)(a->cap / 16 + 1) * sizeof(int32_t));
+        if (!a->q || !a->d || !a->s) { a->cap = 0; return -1; }
+    }
+    a->S = S; a->I = I;
+    for (int s = 0; s < S; s++) gq_quant_act(x + (int64_t)s * I, I, a->q + (int64_t)s * I, a->d + (int64_t)s * (I / 32), a->s + (int64_t)s * (I / 16));
+    return 0;
+}
+static void gq_act_free(gq_act *a) { free(a->q); free(a->d); free(a->s); memset(a, 0, sizeof *a); }
+
+/* per-thread unpack buffers, grown on demand and kept */
+static __thread int8_t *gq_tw8; static __thread float *gq_tsw, *gq_tmw; static __thread int gq_tcap;
+static inline int gq_tbuf(int I) {
+    if (I > gq_tcap) {
+        free(gq_tw8); free(gq_tsw); free(gq_tmw);
+        gq_tw8 = (int8_t *)malloc((size_t)I); gq_tsw = (float *)malloc((size_t)(I / 16 + 1) * sizeof(float)); gq_tmw = (float *)malloc((size_t)(I / 16 + 1) * sizeof(float));
+        gq_tcap = (gq_tw8 && gq_tsw && gq_tmw) ? I : 0;
+    }
+    return gq_tcap >= I;
+}
+/* one output row of W against every activation row */
+static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint8_t *row, int t, int I) {
+    if (t == GQ_Q8_0) {
+        for (int s = 0; s < a->S; s++) y[(int64_t)s * ystride] = gq_dot_q8_0(row, a->q + (int64_t)s * I, a->d + (int64_t)s * (I / 32), I);
+        return;
+    }
+    if (!gq_tbuf(I)) return;
+    gq_unpack_row(t, row, I, gq_tw8, gq_tsw, gq_tmw);
+    const int hm = gq_has_min(t);
+    for (int s = 0; s < a->S; s++)
+        y[(int64_t)s * ystride] = gq_dot_i8(gq_tw8, gq_tsw, gq_tmw, hm, a->q + (int64_t)s * I, a->d + (int64_t)s * (I / 32), a->s + (int64_t)s * (I / 16), I);
+}
+static inline int gq_int_ok(int t, int I) { return !gq_exact_mode() && gq_has_int(t) && I % 32 == 0; }
+
+/* y = W x on an already quantized activation block (types with an integer form). */
+static void gq_matmul_act(float *y, const gq_act *a, const uint8_t *W, int t, int O) {
+    const int I = a->I; const int64_t rb = gq_row_bytes(t, I);
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) gq_row_all(y + o, O, a, W + (int64_t)o * rb, t, I);
+}
+/* Two matrices on the same activations in one parallel region (gate and up). */
+static void gq_matmul2_act(float *y1, const uint8_t *W1, int t1, float *y2, const uint8_t *W2, int t2, const gq_act *a, int O) {
+    const int I = a->I; const int64_t rb1 = gq_row_bytes(t1, I), rb2 = gq_row_bytes(t2, I);
+    #pragma omp parallel for schedule(static)
+    for (int r = 0; r < 2 * O; r++) {
+        if (r < O) gq_row_all(y1 + r, O, a, W1 + (int64_t)r * rb1, t1, I);
+        else       gq_row_all(y2 + (r - O), O, a, W2 + (int64_t)(r - O) * rb2, t2, I);
+    }
+}
+
 /* y[s*O + o] = W[o,:] . x[s,:]; integer path for every block type, the float
  * reference for F32/F16/BF16, odd widths, or GQ_EXACT=1. 0 or -1. */
 static int gq_matmul(float *y, const float *x, const uint8_t *W, int t, int S, int I, int O) {
-    if (gq_exact_mode() || !gq_has_int(t) || I % 32) return gq_matmul_f32(y, x, W, t, S, I, O);
-    const int64_t rb = gq_row_bytes(t, I);
-    if (rb < 0) return -1;
-    int8_t *xq = (int8_t *)malloc((size_t)S * I); float *dx = (float *)malloc((size_t)S * (I / 32) * sizeof(float));
-    int32_t *xs = (int32_t *)malloc((size_t)S * (I / 16) * sizeof(int32_t));
-    if (!xq || !dx || !xs) { free(xq); free(dx); free(xs); return gq_matmul_f32(y, x, W, t, S, I, O); }
-    for (int s = 0; s < S; s++) gq_quant_act(x + (int64_t)s * I, I, xq + (int64_t)s * I, dx + (int64_t)s * (I / 32), xs + (int64_t)s * (I / 16));
-    const int hm = gq_has_min(t);
-    #pragma omp parallel
-    {
-        int8_t *w8 = (int8_t *)malloc((size_t)I); float *sw = (float *)malloc((size_t)(I / 16) * sizeof(float)), *mw = (float *)malloc((size_t)(I / 16) * sizeof(float));
-        #pragma omp for schedule(static)
-        for (int o = 0; o < O; o++) {
-            if (!w8 || !sw || !mw) continue;
-            gq_unpack_row(t, W + (int64_t)o * rb, I, w8, sw, mw);
-            for (int s = 0; s < S; s++)
-                y[(int64_t)s * O + o] = gq_dot_i8(w8, sw, mw, hm, xq + (int64_t)s * I, dx + (int64_t)s * (I / 32), xs + (int64_t)s * (I / 16), I);
-        }
-        free(w8); free(sw); free(mw);
-    }
-    free(xq); free(dx); free(xs);
+    if (!gq_int_ok(t, I)) return gq_matmul_f32(y, x, W, t, S, I, O);
+    if (gq_row_bytes(t, I) < 0) return -1;
+    gq_act a; memset(&a, 0, sizeof a);
+    if (gq_act_set(&a, x, S, I)) { gq_act_free(&a); return gq_matmul_f32(y, x, W, t, S, I, O); }
+    gq_matmul_act(y, &a, W, t, O);
+    gq_act_free(&a);
     return 0;
 }
 
