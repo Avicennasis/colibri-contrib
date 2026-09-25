@@ -77,17 +77,74 @@ def _tensor_sizes(path):
         yield name, end - start, dtype
 
 
+def _gguf_sources(model_dir):
+    """A model directory made by tools/gguf_import.py: (gguf.json, [GGUF parts]) or None."""
+    link = Path(model_dir) / "gguf.json"
+    if not link.is_file():
+        return None
+    meta = json.loads(link.read_text(encoding="utf-8"))
+    target = Path(meta["gguf"])
+    if not target.is_absolute():
+        target = Path(model_dir) / target
+    m = re.match(r"^(.*)-00001-of-(\d{5})\.gguf$", str(target))
+    parts = [Path(f"{m.group(1)}-{i:05d}-of-{m.group(2)}.gguf") for i in range(1, int(m.group(2)) + 1)] if m else [target]
+    missing = [str(p) for p in parts if not p.is_file()]
+    if missing:
+        raise ValueError(f"GGUF named by {link} is missing: {', '.join(missing)}")
+    return link, parts
+
+
+def _gguf_tensor_sizes(parts):
+    """(name, bytes, dtype) for a GGUF model, named so the family's expert
+    inventory sees one entry per routed expert (the file stores each layer's
+    experts fused, or packed by tools/gguf_import.py --mode copy)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gguf_reader", Path(__file__).resolve().parent / "tools" / "gguf_reader.py")
+    gr = importlib.util.module_from_spec(spec); spec.loader.exec_module(gr)
+    fused = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+    packed = re.compile(r"^blk\.(\d+)\.ffn_exps_colibri$")
+    for part in parts:
+        reader = gr.GGUFReader(str(part))
+        try:
+            meta = reader.metadata
+            stride_bytes = None
+            if meta.get("colibri.layout") == "expert-packed-v1":
+                b = meta.get("colibri.expert_bytes") or []
+                stride_bytes = [sum(b[3 * i:3 * i + 3]) for i in range(len(b) // 3)]
+            for t in reader.tensors:
+                dtype = "GGUF_" + t["type_name"]
+                m = fused.match(t["name"])
+                if m:
+                    n = int(t["dims"][-1])
+                    for e in range(n):
+                        yield (f"model.layers.{m.group(1)}.mlp.experts.{e}.{m.group(2)}_proj.weight",
+                               t["nbytes"] // n, dtype)
+                    continue
+                m = packed.match(t["name"])
+                if m and stride_bytes is not None:
+                    layer, n = int(m.group(1)), int(t["dims"][1])
+                    for e in range(n):
+                        yield (f"model.layers.{layer}.mlp.experts.{e}.gguf", stride_bytes[layer], dtype)
+                    continue
+                yield t["name"], t["nbytes"], dtype
+        finally:
+            reader.close()
+
+
 def analyze_model(model):
     resolved = resolve_model(model)
     model = Path(resolved.model_dir)
     config = resolved.config
-    shards = sorted(model.glob("*.safetensors"))
+    gguf = _gguf_sources(model)
+    shards = gguf[1] if gguf else sorted(model.glob("*.safetensors"))
     if not shards:
         raise ValueError(f"no safetensors shards: {model}")
 
     # Sidecar cache: return the stored analysis if every shard + config is unchanged.
     # resolve_model() already read config.json, so it exists by this point.
     signature = _analysis_signature(shards, model / "config.json")
+    if gguf:
+        signature += f"|gguf.json:{gguf[0].stat().st_size}:{gguf[0].stat().st_mtime_ns}"
     cache_path = model / _ANALYSIS_CACHE_NAME
     try:
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -126,9 +183,9 @@ def analyze_model(model):
     trunk_int8_bytes = 0
     expert_groups = {}
     tensor_names = set()
-    for shard in shards:
+    for shard in ([None] if gguf else shards):
         try:
-            sizes = list(_tensor_sizes(shard))
+            sizes = list(_gguf_tensor_sizes(shards)) if gguf else list(_tensor_sizes(shard))
         except OSError as error:
             # Name the file. An OSError raised by read() on an already-open
             # stream carries no filename, so `coli doctor` reported bare

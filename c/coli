@@ -2458,6 +2458,30 @@ def convert_output_refusal(out_dir):
                        f"      python3 tools/{family.converter} --indir {out_dir} --outdir <new dir>")
     return head + "\n  To convert into a fresh directory: coli convert --repo <hf repo> --model <new dir>"
 
+def cmd_import(a):
+    """A GGUF already on disk -> a colibri model directory, no re-quantization.
+
+    --mode link (default) writes config, tokenizer and a pointer: the weights
+    are read from the GGUF where it is. --mode copy also writes the colibri
+    container, experts packed one per aligned slot (one read each)."""
+    banner("import")
+    src = os.path.abspath(os.path.expanduser(a.gguf))
+    if not os.path.isfile(src):
+        sys.exit(f"{C.yel}no such file:{C.r} {src}")
+    out = a.out or (a.model if a.model else None)
+    if not out:
+        stem = os.path.basename(src)
+        stem = re.sub(r"-00001-of-\d{5}\.gguf$", "", stem)
+        stem = re.sub(r"\.gguf$", "", stem)
+        out = os.path.join(os.path.dirname(src), stem + ".colibri")
+    out = os.path.abspath(os.path.expanduser(out))
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "gguf_import.py")
+    rc = subprocess.call([sys.executable, tool, src, out, "--mode", a.mode])
+    if rc:
+        sys.exit(rc)
+    print(f"\n  {C.grn}ready{C.r}: coli chat --model {out}   (or coli serve / coli web)")
+
+
 def cmd_convert(a):
     banner("convert")
     # here --model is the DESTINATION the converted weights are written to, not an
@@ -2694,6 +2718,12 @@ def main():
         _cache_root = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
     _bench_cache = os.path.join(_cache_root, "colibri", "bench")
     pb.add_argument("--data",default=_bench_cache)
+    pim=sub.add_parser("import", parents=[common],
+                       help="use a GGUF you already have: make a colibri model directory from it")
+    pim.add_argument("gguf", help="the .gguf file (first part of a split model)")
+    pim.add_argument("--out", default=None, help="model directory to write (default: next to the GGUF, NAME.colibri)")
+    pim.add_argument("--mode", choices=("link", "copy"), default="link",
+                     help="link: read the GGUF in place (default); copy: write the colibri container too")
     pc=sub.add_parser("convert", parents=[common])
     pc.add_argument("--repo",default=None,
                     help="HF repo to download and convert (default zai-org/GLM-5.2-FP8). "
@@ -2712,7 +2742,7 @@ def main():
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"mirror":cmd_mirror,
              "doctor":cmd_doctor,"tune":cmd_tune,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,
-             "convert":cmd_convert,"web":cmd_web}.get(a.cmd)
+             "convert":cmd_convert,"import":cmd_import,"web":cmd_web}.get(a.cmd)
     if a.cmd=="cluster":
         if a.cluster_cmd=="coordinator": handler=cmd_cluster_coordinator
         elif a.cluster_cmd=="worker": handler=cmd_cluster_worker

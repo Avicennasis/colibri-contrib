@@ -812,7 +812,8 @@ typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g
  * n_experts contiguous matrices each; expert e of gate is eb_g bytes at
  * e*eb_g. The types can differ per matrix and per layer (a Q4_K_M file keeps
  * down in Q5_K or Q6_K), so each keeps its own. */
-typedef struct { const gguf_tensor *g, *u, *d; int tg, tu, td; int64_t eb_g, eb_u, eb_d; } GqExp;
+typedef struct { const gguf_tensor *g, *u, *d; int tg, tu, td; int64_t eb_g, eb_u, eb_d;
+                 const gguf_tensor *packed; int64_t stride; } GqExp;   /* packed: tools/gguf_import.py --mode copy */
 typedef struct {
     Slot *slots;
     int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
@@ -1751,6 +1752,34 @@ static void gguf_load_cfg(Cfg *c) {
 static void gguf_map_experts(Model *m) {
     Cfg *c = &m->c; char nm[96];
     m->gqx = calloc((size_t)c->n_layers, sizeof(GqExp)); m->gqe_max = 0;
+    const char *layout = gguf_get_str(&g_gg, "colibri.layout");
+    if (layout && !strcmp(layout, "expert-packed-v1")) {
+        /* the colibri container: per layer one tensor [stride x n_experts], each
+         * expert's gate | up | down contiguous in a 4 KiB-aligned slot */
+        const gguf_kv *ty = gguf_get(&g_gg, "colibri.expert_types"), *by = gguf_get(&g_gg, "colibri.expert_bytes"), *st = gguf_get(&g_gg, "colibri.expert_stride");
+        if (!ty || !by || !st || ty->type != GGUF_T_ARRAY || by->type != GGUF_T_ARRAY || st->type != GGUF_T_ARRAY ||
+            ty->atype != GGUF_T_U32 || by->atype != GGUF_T_U64 || st->atype != GGUF_T_U64 ||
+            ty->n != (uint64_t)3 * c->n_layers || by->n != (uint64_t)3 * c->n_layers || st->n != (uint64_t)c->n_layers) {
+            fprintf(stderr, "colibri container: expert layout keys missing or not sized for %d layers\n", c->n_layers); exit(1);
+        }
+        const uint32_t *tt = (const uint32_t *)ty->arr; const uint64_t *bb = (const uint64_t *)by->arr, *ss = (const uint64_t *)st->arr;
+        for (int i = 0; i < c->n_layers; i++) {
+            GqExp *x = &m->gqx[i];
+            snprintf(nm, sizeof nm, "blk.%d.ffn_exps_colibri", i);
+            x->packed = gguf_find(&g_gg, nm);
+            x->tg = (int)tt[3 * i]; x->tu = (int)tt[3 * i + 1]; x->td = (int)tt[3 * i + 2];
+            x->eb_g = (int64_t)bb[3 * i]; x->eb_u = (int64_t)bb[3 * i + 1]; x->eb_d = (int64_t)bb[3 * i + 2]; x->stride = (int64_t)ss[i];
+            int ok = x->packed && x->packed->ne[0] == x->stride && x->packed->ne[1] == c->n_experts &&
+                     x->eb_g == gq_row_bytes(x->tg, c->hidden) * c->inter && x->eb_u == gq_row_bytes(x->tu, c->hidden) * c->inter &&
+                     x->eb_d == gq_row_bytes(x->td, c->inter) * c->hidden && x->eb_g + x->eb_u + x->eb_d <= x->stride;
+            if (!ok) { fprintf(stderr, "colibri container: layer %d expert tensor disagrees with its declared layout\n", i); exit(1); }
+            int64_t tot = x->eb_g + x->eb_u + x->eb_d;
+            if (tot > m->gqe_max) m->gqe_max = tot;
+        }
+        fprintf(stderr, "[gguf] colibri container: experts packed, one read each (layer 0 gate %s up %s down %s, %.2f MB)\n",
+                gq_type_name(m->gqx[0].tg), gq_type_name(m->gqx[0].tu), gq_type_name(m->gqx[0].td), m->gqe_max / 1048576.0);
+        return;
+    }
     for (int i = 0; i < c->n_layers; i++) {
         GqExp *x = &m->gqx[i];
         const gguf_tensor **dst[3] = { &x->g, &x->u, &x->d };
@@ -2050,6 +2079,13 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     if (g_gguf) {
         /* three reads, one per fused tensor: expert eid's gate, up, down rows */
         const GqExp *x = &m->gqx[layer];
+        if (x->packed) {
+            if (gguf_read(&g_gg, x->packed, s->gqe, (int64_t)eid * x->stride, x->eb_g + x->eb_u + x->eb_d)) {
+                fprintf(stderr, "GGUF: reading layer %d expert %d failed\n", layer, eid); exit(1);
+            }
+            s->is_int4 = 0;
+            return;
+        }
         if (gguf_read(&g_gg, x->g, s->gqe, (int64_t)eid * x->eb_g, x->eb_g) ||
             gguf_read(&g_gg, x->u, s->gqe + x->eb_g, (int64_t)eid * x->eb_u, x->eb_u) ||
             gguf_read(&g_gg, x->d, s->gqe + x->eb_g + x->eb_u, (int64_t)eid * x->eb_d, x->eb_d)) {
@@ -4188,11 +4224,26 @@ int main(int argc, char **argv) {
     coli_omp_tune_threads("qwen36");
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6"); return 1; }
-    if (gguf_is_file(snap)) {
-        if (gguf_open(&g_gg, snap)) { fprintf(stderr, "GGUF: %s\n", g_gg.err); return 1; }
+    static char gguf_path[4096]; int gguf_dir = 0;
+    {   /* a model directory made by tools/gguf_import.py: gguf.json names the file */
+        char gj[4096]; snprintf(gj, sizeof gj, "%s/gguf.json", snap);
+        FILE *f = fopen(gj, "rb");
+        if (f) {
+            char buf[8192]; size_t n = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[n] = 0;
+            char *arena = NULL; jval *r = json_parse(buf, &arena);
+            const char *g = r ? jstr(r, "gguf") : NULL;
+            if (!g || !*g) { fprintf(stderr, "%s: no \"gguf\" path\n", gj); return 1; }
+            if (g[0] == '/') snprintf(gguf_path, sizeof gguf_path, "%s", g);
+            else snprintf(gguf_path, sizeof gguf_path, "%s/%s", snap, g);
+            free(arena); gguf_dir = 1;
+        }
+    }
+    if (gguf_dir || gguf_is_file(snap)) {
+        const char *gp = gguf_dir ? gguf_path : snap;
+        if (gguf_open(&g_gg, gp)) { fprintf(stderr, "GGUF: %s\n", g_gg.err); return 1; }
         g_gguf = 1; g_norm_off = 0.f; g_ssm_a_direct = 1; g_dn_tiled = 1;
         fprintf(stderr, "[gguf] %s: %d file(s), %d tensors, read in place (native ggml types, no conversion)\n",
-                snap, g_gg.n_files, g_gg.n_tensors);
+                gp, g_gg.n_files, g_gg.n_tensors);
     }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
@@ -4246,7 +4297,7 @@ int main(int argc, char **argv) {
         const char *tokpath = getenv("TOK");
         if (tokpath && *tokpath) load_tokenizer(tokpath);
         else if (argc > 4 && argv[4] && *argv[4]) load_tokenizer(argv[4]);
-        else if (g_gguf) load_tokenizer_gguf(&g_gg);
+        else if (g_gguf && !gguf_dir) load_tokenizer_gguf(&g_gg);
         else { char tpb[2048]; snprintf(tpb,sizeof tpb,"%s/tokenizer.json",snap); load_tokenizer(tpb); }
     }
 
