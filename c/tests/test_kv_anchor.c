@@ -93,7 +93,7 @@ int main(void) {
           "an anchor longer than the live state must be installed");
 
     /* THE BOUNDARY THIS FEATURE IS MISREAD AS CROSSING. `edit` inserts two
-     * tokens after position 2 — the tool-result splice #50403 is about. The
+     * tokens after position 2 — the tool-result splice is about. The
      * tail (3,4,5) is present, at shifted positions, and an anchor MUST NOT
      * offer it: those rows never attended to the inserted tokens, and their
      * RoPE'd keys belong to different absolute positions. Reuse resumes only

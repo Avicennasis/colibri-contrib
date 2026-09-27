@@ -1,4 +1,4 @@
-"""#50404: the converter's source fingerprint and machine-readable progress lines.
+"""the converter's source fingerprint and machine-readable progress lines.
 
 The real conversion needs torch, safetensors and a ~700 GB FP8 checkpoint, so the
 end-to-end runs here drive main()'s --indir path over a fixture of empty stand-in

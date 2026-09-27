@@ -163,7 +163,7 @@ class ChatCapForwardingTest(unittest.TestCase):
         (Path(model) / "config.json").write_text(json.dumps({"model_type": "inkling"}))
         args = types.SimpleNamespace(model=model, cap=cap, ngen=256, api_key=None,
                                      no_attach=True, attach=None)
-        # wait_server_ready is stubbed because #50404's drain-to-ready moved the
+        # wait_server_ready is stubbed because's drain-to-ready moved the
         # private-server wait off server_probe: unstubbed, the spawn path polls a
         # real loopback gateway for its full 1800 s timeout (FakeProc never exits).
         with mock.patch.object(coli, "need_model"), \

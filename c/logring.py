@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""logring — bounded in-memory log ring for `coli serve` (#50404).
+"""logring — bounded in-memory log ring for `coli serve`.
 
 Ported from FreeToken's daemon logring.py (Apache-2.0), minus its SSE
 fan-out: colibri's gateway is a thread-per-connection http.server with no

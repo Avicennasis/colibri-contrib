@@ -1,4 +1,4 @@
-"""`coli chat`'s private-server drain-to-ready + post-ready liveness (#50404):
+"""`coli chat`'s private-server drain-to-ready + post-ready liveness ():
 surface the child's real exit reason when it dies during load, and refuse /
 name half-alive servers (HTTP up, engine dead — FreeToken supervisor.py pattern,
 issues #110/#123 class)."""

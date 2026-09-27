@@ -1388,11 +1388,6 @@ tests/test_int3_load$(EXE): tests/test_int3_load.c colibri.c st.h uring.h json.h
 tests/test_fp8_passthrough$(EXE): tests/test_fp8_passthrough.c quant.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_cap_precedence$(EXE): tests/test_cap_precedence.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h $(METAL_OBJ)
-	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
-tests/test_v4_hybrid_policy$(EXE): tests/test_v4_hybrid_policy.c deepseek_v4_hybrid.h hybrid_split.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-
 tests/test_k3_fill_budget$(EXE): tests/test_k3_fill_budget.c hybrid_split.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1775,9 +1770,13 @@ tests/test_kv_fp8$(EXE): tests/test_kv_fp8.c kv_fp8.h decode_batch.h
 tests/test_kv_tq$(EXE): tests/test_kv_tq.c kv_tq.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_kv_disk$(EXE): tests/test_kv_disk.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h kv_fp8.h kv_tq.h $(METAL_OBJ)
+tests/test_cap_precedence$(EXE): tests/test_cap_precedence.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h $(METAL_OBJ)
 	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 tests/test_mirror_stripe_split$(EXE): tests/test_mirror_stripe_split.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
+tests/test_v4_hybrid_policy$(EXE): tests/test_v4_hybrid_policy.c deepseek_v4_hybrid.h hybrid_split.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_kv_disk$(EXE): tests/test_kv_disk.c colibri.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h kv_fp8.h kv_tq.h $(METAL_OBJ)
 	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_cap_mixed_width$(EXE): tests/test_cap_mixed_width.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
@@ -1975,7 +1974,7 @@ bench: iobench$(EXE)
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
 
-# #50403: the reuse rule on its own (header only), and the seam between that
+# the reuse rule on its own (header only), and the seam between that
 # rule and colibri.c's real Lc/Rc/Ic planes (includes the engine, like
 # test_kvb_notice, so no snapshot on disk is needed).
 tests/test_kv_anchor$(EXE): tests/test_kv_anchor.c kv_anchor.h
