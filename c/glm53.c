@@ -2223,6 +2223,7 @@ static void glm53_pick_prefix(GModel *m) {
 #define GLM53_CLUSTER_VERSION 1u
 #define GLM53_CLUSTER_HELLO   0xFFFFFFFFu
 #define GLM53_CLUSTER_MAX     16
+#define GLM53_CLUSTER_MAX_ROWS 65536u        /* token rows in one request, all items */
 
 typedef struct {
     int fd, port, weight;
@@ -2579,10 +2580,16 @@ static int glm53_worker_serve_one(GModel *m, int fd, int weight) {
     int *eid = malloc(n * sizeof(int)), *nr = malloc(n * sizeof(int));
     float **in = calloc(n, sizeof(float *));
     int bad = !eid || !nr || !in;
+    /* The rows of a whole request are bounded, not just each item's: the
+     * buffers are allocated from the header before the data arrives, so a
+     * bad header must not be able to ask for n_experts x 65536 rows. The cap
+     * is one prefill chunk of 8192 tokens at top-8. */
+    uint64_t total_rows = 0;
     for (uint32_t j = 0; j < n && !bad; j++) {
         uint32_t item[2];
         if (glm53_net_get(fd, item, 2) || item[0] >= (uint32_t)c->n_experts ||
-            item[1] < 1 || item[1] > 65536) { bad = 1; break; }
+            item[1] < 1 || item[1] > GLM53_CLUSTER_MAX_ROWS ||
+            (total_rows += item[1]) > GLM53_CLUSTER_MAX_ROWS) { bad = 1; break; }
         for (uint32_t k = 0; k < j; k++)
             if (eid[k] == (int)item[0]) bad = 1;         /* the slot plan needs distinct ids */
         eid[j] = (int)item[0];
@@ -2636,35 +2643,45 @@ static int glm53_worker_serve_one(GModel *m, int fd, int weight) {
     return bad ? -1 : 0;
 }
 
-/* EXPERT_WORKER=1: serve this model's routed experts to a coordinator. Only
- * the expert table and the expert cache are loaded, so all the RAM the dense
- * weights would have taken goes to keeping experts warm. */
-static int glm53_expert_worker(const char *dir, int port) {
-    static GModel m;
-    memset(&m, 0, sizeof(m));
-    load_cfg(&m.c, dir);
-    st_init(&m.S, dir);
-    glm53_mirror_setup(&m, dir);
-    glm53_pick_prefix(&m);
-    m.layer_begin = 0;
-    m.layer_end = m.c.n_layers;
-    if (m.c.first_dense >= m.c.n_layers) {
+/* What a worker loads: the expert table and cache, nothing else. Returns 0,
+ * or 2 when the checkpoint has nothing a worker can serve. Split out of
+ * glm53_expert_worker so tests/fuzz_glm53_worker.c can drive
+ * glm53_worker_serve_one() without a listening socket. */
+static int glm53_worker_open(GModel *m, const char *dir) {
+    memset(m, 0, sizeof(*m));
+    load_cfg(&m->c, dir);
+    st_init(&m->S, dir);
+    glm53_mirror_setup(m, dir);
+    glm53_pick_prefix(m);
+    m->layer_begin = 0;
+    m->layer_end = m->c.n_layers;
+    if (m->c.first_dense >= m->c.n_layers) {
         fprintf(stderr, "[CLUSTER] this model has no MoE layers to serve\n");
         return 2;
     }
     char first[512];
     snprintf(first, sizeof(first), "%slayers.%d.mlp.experts.0.gate_proj.weight",
-             m.prefix, m.c.first_dense);
-    st_tensor *probe = st_find(&m.S, first);
+             m->prefix, m->c.first_dense);
+    st_tensor *probe = st_find(&m->S, first);
     if (!probe || probe->dtype != 3) {
         fprintf(stderr, "[CLUSTER] %s: expert workers serve streamed int4 experts; "
                         "this checkpoint's are resident\n", dir);
         return 2;
     }
-    m.streaming = 1;
-    expert_geometry(&m);
-    expert_table_init(&m);
-    expert_cache_init(&m);
+    m->streaming = 1;
+    expert_geometry(m);
+    expert_table_init(m);
+    expert_cache_init(m);
+    return 0;
+}
+
+/* EXPERT_WORKER=1: serve this model's routed experts to a coordinator. Only
+ * the expert table and the expert cache are loaded, so all the RAM the dense
+ * weights would have taken goes to keeping experts warm. */
+static int glm53_expert_worker(const char *dir, int port) {
+    static GModel m;
+    const int opened = glm53_worker_open(&m, dir);
+    if (opened) return opened;
 
     /* Routing weight: COLI_WORKER_WEIGHT, else this machine's measured disk
      * bandwidth summed over its mirror drives. */
@@ -3751,6 +3768,18 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
     if (!setting && !(g_echo_k > 0 && g_echo_id)) { int r = g53c_prefill_rows(m, s, n); if (r > 0) chunk = r; }
 #endif
     if (chunk < 1) chunk = 1;
+#if !defined(_WIN32)
+    /* A worker takes at most GLM53_CLUSTER_MAX_ROWS token rows per request,
+     * and one chunk can route every token's top-k to the same worker. */
+    if (g_glm53_cluster_n && (uint64_t)chunk * c->topk > GLM53_CLUSTER_MAX_ROWS) {
+        const int most = (int)(GLM53_CLUSTER_MAX_ROWS / (unsigned)c->topk);
+        static int told = 0;
+        if (!told++)
+            fprintf(stderr, "[CLUSTER] GLM53_PREFILL_CHUNK=%d lowered to %d: a worker request "
+                            "holds at most %u rows\n", chunk, most, GLM53_CLUSTER_MAX_ROWS);
+        chunk = most;
+    }
+#endif
     if (chunk > n) chunk = n;
 
     float *all = keep_all ? malloc((size_t)n * c->vocab * sizeof(float)) : NULL;
