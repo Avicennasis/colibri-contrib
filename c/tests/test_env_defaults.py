@@ -414,6 +414,14 @@ class ClusterWorkerCapTest(unittest.TestCase):
     def test_explicit_cap_is_passed_through(self):
         self.assertEqual(self._worker_argv(24)[1], "24")
 
+    def test_glm53_serve_env_carries_cluster_workers(self):
+        """`coli serve --cluster-workers` on a glm53 model must reach the
+        engine: env_for_engine, not env_for, builds glm53's environment."""
+        a = args(cluster_workers="10.0.0.2:9100,10.0.0.3:9100", cluster_coordinator=None)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            env = coli.env_for_engine(a, "glm53")
+        self.assertEqual(env["CLUSTER_WORKERS"], "10.0.0.2:9100,10.0.0.3:9100")
+
     def test_glm53_worker_gets_its_own_argv(self):
         """glm53 reads every bare number as the cache/layer cap, so the
         colibri.c `cap ebits dbits` triple would leave dbits as the cap; it

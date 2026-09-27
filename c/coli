@@ -604,6 +604,10 @@ def env_for_engine(a, arch, plan=None):
     if arch in ("deepseek_v4", "deepseek_v41", "kimi", "glm53", "olmoe", "mimo"):
         if a.ram: env["RAM_GB"] = str(a.ram)
     if arch == "glm53":
+        # Expert workers: env_for() wires these for glm; glm53 goes through
+        # here, and without them `serve --cluster-workers` ran on one machine.
+        if getattr(a, "cluster_workers", None): env["CLUSTER_WORKERS"] = a.cluster_workers
+        if getattr(a, "cluster_coordinator", None): env["CLUSTER_COORDINATOR"] = a.cluster_coordinator
         # I densi vanno a int4 di default: sono 9,7 B parametri su 321, e in
         # BF16 sono 19 GB che nessuno recupera. Chi vuole la precisione piena
         # mette GLM53_BITS=32, e questo setdefault gli lascia la scelta.
