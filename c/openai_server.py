@@ -4849,18 +4849,34 @@ def cap_for_arch(arch, cap, env=None, model=None):
             planned = 0
         if planned >= 1:
             return planned
-    if arch in ("deepseek_v41", "mimo") and model is not None:
-        # V4.1 and MiMo only read their argv cap, not RAM_GB. Without --auto-tier the
-        # legacy eight slots silently discarded both --ram and RAM_GB (#1666).
+    if arch in ("deepseek_v41", "mimo", "qwen36", "qwen38") and model is not None:
+        # V4.1, MiMo, Qwen3.6 and Qwen3.8 only read their argv cap, not RAM_GB.
+        # Without --auto-tier the legacy eight slots silently discarded both --ram
+        # and RAM_GB (#1666), and Qwen3.8's implicit one slot, Qwen3.6's eight, left
+        # a `coli web` or `coli serve` without --cap or a tune profile reading
+        # nearly every expert from the disk: the setup passes --auto-tier only
+        # for CUDA. Qwen3.8 on a 61 GB box planned 275 slots and started at 1;
+        # Qwen3.6 plans 153 at 20 GB, and coli tune measured 105 on a 32 GB laptop.
         from resource_plan import build_plan
         settings = env if env is not None else os.environ
         ram = settings.get("RAM_GB", "0")
         limits = family_by_id(arch).limits
-        plan = build_plan(model, ram_gb=0 if ram == "auto" else float(ram),
-                          context=int(settings.get(limits.context_env, limits.default_context)),
-                          gpu_indices=[])
-        slots = plan["tiers"]["ram"]["cache_slots_per_layer"]
+        try:
+            plan = build_plan(model, ram_gb=0 if ram == "auto" else float(ram),
+                              context=int(settings.get(limits.context_env, limits.default_context)),
+                              gpu_indices=[])
+            slots = plan["tiers"]["ram"]["cache_slots_per_layer"]
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            if arch in ("deepseek_v41", "mimo"):
+                raise
+            # The Qwen engines ran on their implicit cap before the plan was
+            # applied: a model the planner cannot read still starts as before.
+            print(f"[{arch}] no RAM plan ({error}); {limits.implicit_cap} expert cache "
+                  f"slots/layer, --cap or coli tune sets more", file=sys.stderr)
+            return limits.implicit_cap
         if slots < 1:
+            if arch in ("qwen36", "qwen38"):
+                return limits.implicit_cap
             raise ValueError(f"{family_by_id(arch).display_name} RAM budget cannot hold one "
                              f"expert slot per layer")
         print(f"[{'v41' if arch == 'deepseek_v41' else arch}] RAM plan: {slots} expert cache "

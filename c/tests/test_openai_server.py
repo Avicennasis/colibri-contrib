@@ -2748,6 +2748,37 @@ class CapSentinelShimTest(unittest.TestCase):
                                                 context=8192, gpu_indices=[])
                 self.assertEqual(popen.call_args[0][0], ["deepseek_v41", "96"])
 
+    def test_qwen_ram_plan_reaches_engine_argv(self):
+        # Qwen3.6 and Qwen3.8 read only their argv cap. Without --cap, a tune
+        # profile or --auto-tier they started on the registry's implicit cap
+        # (8 and 1 slots a layer) while the plan for the same RAM held 100+.
+        for executable, model_type in (("qwen36", "qwen3_5_moe_text"),
+                                       ("qwen38", "qwen4_exp_text")):
+            with self.subTest(engine=executable):
+                model = self._model(model_type)
+                process = FakeProcess(lambda _process, _frame: None)
+                with patch("resource_plan.build_plan", return_value={
+                        "tiers": {"ram": {"cache_slots_per_layer": 153}}}) as planner, \
+                        patch("openai_server.subprocess.Popen", return_value=process) as popen:
+                    engine = Engine(executable, model, env={})
+                    engine.close()
+                planner.assert_called_once()
+                self.assertEqual(popen.call_args[0][0][:2], [executable, "153"])
+
+    def test_qwen_without_a_plan_keeps_the_implicit_cap(self):
+        for arch, implicit in (("qwen36", 8), ("qwen38", 1)):
+            with self.subTest(arch=arch):
+                with patch("resource_plan.build_plan", side_effect=ValueError("no safetensors shards")):
+                    self.assertEqual(cap_for_arch(arch, None, {}, model="model"), implicit)
+                with patch("resource_plan.build_plan", return_value={
+                        "tiers": {"ram": {"cache_slots_per_layer": 0}}}):
+                    self.assertEqual(cap_for_arch(arch, None, {}, model="model"), implicit)
+                with patch("resource_plan.build_plan") as planner:
+                    self.assertEqual(cap_for_arch(arch, 5, {}, model="model"), 5)
+                    self.assertEqual(cap_for_arch(arch, None, {"COLI_PROFILE_CAP": "105"},
+                                                  model="model"), 105)
+                    planner.assert_not_called()
+
     def test_v41_explicit_and_calibrated_caps_bypass_planning(self):
         for cap, env, expected in ((7, {}, 7), (0, {}, 0),
                                    (None, {"COLI_PROFILE_CAP": "12"}, 12),
