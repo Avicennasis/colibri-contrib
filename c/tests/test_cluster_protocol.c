@@ -187,11 +187,12 @@ static void *cluster_protocol_worker_q8(void *opaque)
     ClusterProtocolArgs *args = opaque;
     int fd = args->fd;
     char magic[8];
-    uint32_t version, act, layer, D, I, n, eid, nr;
+    uint32_t version, act, layer, D, I, n, S, eid, nr, idx[2];
     float input[6], output[6];
     uint8_t wire[14], expect[14];   /* 2 rows x (1 scale + 3 int8): 14 bytes, not 24 */
 
-    /* v2 request: magic(8) version act layer D I n, then eid nr and nr rows in act. */
+    /* v2 request: magic(8) version act layer D I n, then S and the S rows once in
+     * act, then eid nr and nr row indices. */
     if (cluster_io(fd, magic, sizeof(magic), 0) || memcmp(magic, COLI_CLUSTER_MAGIC, 8) ||
         cluster_u32(fd, &version, 0) || version != COLI_CLUSTER_VERSION_ACT ||
         cluster_u32(fd, &act, 0) || act != COLI_ACT_Q8 ||
@@ -199,18 +200,21 @@ static void *cluster_protocol_worker_q8(void *opaque)
         cluster_u32(fd, &D, 0) || D != 3 ||
         cluster_u32(fd, &I, 0) || I != 5 ||
         cluster_u32(fd, &n, 0) || n != 1 ||
+        cluster_u32(fd, &S, 0) || S != 2 ||
+        cluster_act_bytes(act, S, D) != sizeof(wire) ||
+        cluster_io(fd, wire, sizeof(wire), 0) ||
         cluster_u32(fd, &eid, 0) || eid != 42 ||
         cluster_u32(fd, &nr, 0) || nr != 2 ||
-        cluster_act_bytes(act, nr, D) != sizeof(wire) ||
-        cluster_io(fd, wire, sizeof(wire), 0)) {
+        cluster_u32(fd, &idx[0], 0) || idx[0] != 0 ||
+        cluster_u32(fd, &idx[1], 0) || idx[1] != 1) {
         args->failed = 1;
         return NULL;
     }
     /* The bytes on the wire are exactly the q8 encoding of the sender's rows. */
-    cluster_q8_encode(q8_sent, nr, D, expect);
+    cluster_q8_encode(q8_sent, S, D, expect);
     if (memcmp(wire, expect, sizeof(wire))) { args->failed = 1; return NULL; }
-    cluster_q8_decode(wire, nr, D, input);
-    for (int i = 0; i < 6; i++) output[i] = input[i] * 2.0f;
+    cluster_q8_decode(wire, S, D, input);
+    for (int i = 0; i < 6; i++) output[i] = input[i] * 2.0f;   /* rows 0 and 1, gathered in order */
 
     /* v2 response: magic(8) version act status(0) n, then eid nr and nr rows in act. */
     version = COLI_CLUSTER_VERSION_ACT;
@@ -244,9 +248,12 @@ static void test_wire_round_trip_q8(void)
     value = 3;  assert(cluster_u32(sockets[0], &value, 1) == 0); /* D */
     value = 5;  assert(cluster_u32(sockets[0], &value, 1) == 0); /* moe_inter */
     value = 1;  assert(cluster_u32(sockets[0], &value, 1) == 0); /* n */
+    value = 2;  assert(cluster_u32(sockets[0], &value, 1) == 0); /* S: the rows once */
+    assert(cluster_act_send(sockets[0], COLI_ACT_Q8, q8_sent, 2, 3) == 0);
     value = 42; assert(cluster_u32(sockets[0], &value, 1) == 0); /* eid */
     value = 2;  assert(cluster_u32(sockets[0], &value, 1) == 0); /* nr */
-    assert(cluster_act_send(sockets[0], COLI_ACT_Q8, q8_sent, 2, 3) == 0);
+    value = 0;  assert(cluster_u32(sockets[0], &value, 1) == 0); /* row 0 */
+    value = 1;  assert(cluster_u32(sockets[0], &value, 1) == 0); /* row 1 */
 
     char magic[8];
     assert(cluster_io(sockets[0], magic, 8, 0) == 0);
@@ -374,8 +381,8 @@ static void *fake_v2_worker(void *opaque)
     FakeV2Worker *w = opaque;
     int fd = w->fd;
     char magic[8];
-    uint32_t act = COLI_ACT_F32, layer, D, I, zero = 0;
-    float *rows[4] = {0};
+    uint32_t act = COLI_ACT_F32, layer, D, I, S = 0, zero = 0;
+    float *rows[4] = {0}, batch[8 * 3];
     if (cluster_io(fd, magic, 8, 0) || memcmp(magic, COLI_CLUSTER_MAGIC, 8) || cluster_u32(fd, &w->ver, 0) ||
         (w->ver != COLI_CLUSTER_VERSION && w->ver != COLI_CLUSTER_VERSION_ACT) ||
         (w->ver == COLI_CLUSTER_VERSION_ACT && (cluster_u32(fd, &act, 0) || act != COLI_ACT_F32)) ||
@@ -384,10 +391,23 @@ static void *fake_v2_worker(void *opaque)
         w->failed = 1;
         return NULL;
     }
+    /* v2: the batch rows once, then indices per item; v1: rows per item. */
+    if (w->ver == COLI_CLUSTER_VERSION_ACT &&
+        (cluster_u32(fd, &S, 0) || S > 8 || cluster_io(fd, batch, (size_t)S * D * sizeof(float), 0))) {
+        w->failed = 1;
+        return NULL;
+    }
     for (uint32_t j = 0; j < w->n; j++) {
         if (cluster_u32(fd, &w->eid[j], 0) || cluster_u32(fd, &w->nr[j], 0) || w->nr[j] > 8) { w->failed = 1; break; }
         rows[j] = calloc((size_t)w->nr[j] * D, sizeof(float));
-        if (cluster_io(fd, rows[j], (size_t)w->nr[j] * D * sizeof(float), 0)) { w->failed = 1; break; }
+        if (w->ver == COLI_CLUSTER_VERSION_ACT) {
+            for (uint32_t r = 0; r < w->nr[j] && !w->failed; r++) {
+                uint32_t s;
+                if (cluster_u32(fd, &s, 0) || s >= S) w->failed = 1;
+                else memcpy(rows[j] + r * D, batch + s * D, D * sizeof(float));
+            }
+            if (w->failed) break;
+        } else if (cluster_io(fd, rows[j], (size_t)w->nr[j] * D * sizeof(float), 0)) { w->failed = 1; break; }
         float k = w->eid[j] == COLI_CLUSTER_EID_SHARED ? 10.0f : 2.0f;
         for (uint32_t z = 0; z < w->nr[j] * D; z++) rows[j][z] *= k;
     }
@@ -405,12 +425,89 @@ static void *fake_v2_worker(void *opaque)
     return NULL;
 }
 
+/* The exact v2 bytes of a two-expert, top-2 batch of layer 7 (D=3, I=5) where
+ * row 0 routes to experts 42 and 43 and row 1 to 42 only, with the shared
+ * expert riding too: the header, S and the two rows once, then each item's
+ * row indices -- no row twice. The worker reads precisely those bytes,
+ * gathers, and answers 2x (42), 3x (43) and 10x (shared). */
+static void wire_u32(uint8_t **p, uint32_t v)
+{
+    v = htonl(v);
+    memcpy(*p, &v, sizeof(v));
+    *p += sizeof(v);
+}
+typedef struct { int fd, failed; const uint8_t *expect; size_t len; } ExactWorker;
+static void *exact_v2_worker(void *opaque)
+{
+    ExactWorker *w = opaque;
+    uint8_t got[128];
+    if (w->len > sizeof(got) || cluster_io(w->fd, got, w->len, 0) || memcmp(got, w->expect, w->len)) {
+        w->failed = 1;
+        return NULL;
+    }
+    float x[6], y42[6], y43[3], ysh[6];
+    memcpy(x, got + 36, sizeof(x));             /* the rows, after magic + 7 words + S */
+    for (int i = 0; i < 6; i++) { y42[i] = 2.0f * x[i]; ysh[i] = 10.0f * x[i]; }
+    for (int i = 0; i < 3; i++) y43[i] = 3.0f * x[i];
+    uint32_t v;
+    if (cluster_io(w->fd, (void *)COLI_CLUSTER_MAGIC, 8, 1) ||
+        (v = COLI_CLUSTER_VERSION_ACT, cluster_u32(w->fd, &v, 1)) || (v = COLI_ACT_F32, cluster_u32(w->fd, &v, 1)) ||
+        (v = 0, cluster_u32(w->fd, &v, 1)) || (v = 3, cluster_u32(w->fd, &v, 1)) ||
+        (v = 42, cluster_u32(w->fd, &v, 1)) || (v = 2, cluster_u32(w->fd, &v, 1)) || cluster_io(w->fd, y42, sizeof(y42), 1) ||
+        (v = 43, cluster_u32(w->fd, &v, 1)) || (v = 1, cluster_u32(w->fd, &v, 1)) || cluster_io(w->fd, y43, sizeof(y43), 1) ||
+        (v = COLI_CLUSTER_EID_SHARED, cluster_u32(w->fd, &v, 1)) || (v = 2, cluster_u32(w->fd, &v, 1)) ||
+        cluster_io(w->fd, ysh, sizeof(ysh), 1))
+        w->failed = 1;
+    return NULL;
+}
+static void test_v2_sends_the_rows_once(void)
+{
+    static Model m;
+    memset(&m, 0, sizeof(m));
+    m.c.hidden = 3;
+    m.c.moe_inter = 5;
+    float x[6] = {1.0f, -2.0f, 0.5f, 3.0f, -4.0f, 0.25f};
+    int idxs[4] = {42, 43, 42, -1}, keff[2] = {2, 1}, uniq[2] = {42, 43};
+    float ws[4] = {0.5f, 0.25f, 0.125f, 0.0f};
+    uint8_t expect[104], *p = expect;
+    memcpy(p, COLI_CLUSTER_MAGIC, 8); p += 8;
+    wire_u32(&p, COLI_CLUSTER_VERSION_ACT); wire_u32(&p, COLI_ACT_F32);
+    wire_u32(&p, 7); wire_u32(&p, 3); wire_u32(&p, 5); wire_u32(&p, 3);        /* layer D I n */
+    wire_u32(&p, 2); memcpy(p, x, sizeof(x)); p += sizeof(x);                /* S, the rows once */
+    wire_u32(&p, 42); wire_u32(&p, 2); wire_u32(&p, 0); wire_u32(&p, 1);     /* expert 42: rows 0, 1 */
+    wire_u32(&p, 43); wire_u32(&p, 1); wire_u32(&p, 0);                      /* expert 43: row 0 */
+    wire_u32(&p, COLI_CLUSTER_EID_SHARED); wire_u32(&p, 2); wire_u32(&p, 0); wire_u32(&p, 1);
+    assert(p - expect == (ptrdiff_t)sizeof(expect));
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    g_cluster_n = 1;
+    g_cluster_workers[0].fd = sockets[0];
+    snprintf(g_cluster_workers[0].host, sizeof(g_cluster_workers[0].host), "mac-a");
+    g_cluster_workers[0].port = 9100;
+    ExactWorker w = {sockets[1], 0, expect, sizeof(expect)};
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, exact_v2_worker, &w) == 0);
+    float out[6] = {0}, sh[6] = {0};
+    int delivered = cluster_moe_batch(&m, 7, x, 2, out, idxs, ws, keff, 2, uniq, 0, 2, sh);
+    assert(pthread_join(thread, NULL) == 0);
+    g_cluster_n = 0;
+    assert(w.failed == 0);
+    assert(delivered == 1);
+    for (int d = 0; d < 3; d++) {
+        assert(out[d] == 0.5f * 2.0f * x[d] + 0.25f * 3.0f * x[d]);   /* row 0: 42 then 43 */
+        assert(out[3 + d] == 0.125f * 2.0f * x[3 + d]);                /* row 1: 42 only */
+    }
+    for (int z = 0; z < 6; z++) assert(sh[z] == 10.0f * x[z]);
+    close(sockets[0]);
+    close(sockets[1]);
+}
+
 /* Drives the real cluster_moe_batch over a socketpair: two rows, both routed
  * to expert 42 of layer 7, through one worker, with f32 activations. With a
- * shared buffer the request is v2 and carries a second item -- the shared
- * expert over every row -- whose rows come back unweighted into that buffer
- * while the routed rows are weighted into out; without the buffer the request
- * keeps v1's bytes exactly, as the default must. */
+ * shared buffer the request is v2 -- the rows once, then a second item, the
+ * shared expert over every row by index -- whose rows come back unweighted
+ * into that buffer while the routed rows are weighted into out; without the
+ * buffer the request keeps v1's bytes exactly, as the default must. */
 static void test_shared_expert_rides_the_routed_batch(void)
 {
     static Model m;
@@ -536,9 +633,9 @@ static void test_failed_link_refuses_later_exchanges_without_io(void)
         /* The first exchange fails on the worker's reply. */
         ClusterItem items[1];
         memset(items, 0, sizeof(items));
-        assert(cluster_item(idxs, ws, keff, 1, 2, 42, &items[0], 3, x) == 1);
+        assert(cluster_item(idxs, ws, keff, 1, 2, 42, &items[0], 3, x, 1) == 1);
         float out[6] = {0};
-        assert(cluster_exchange(&w, COLI_CLUSTER_VERSION, 7, 3, 5, items, 1, out, NULL) == -1);
+        assert(cluster_exchange(&w, COLI_CLUSTER_VERSION, 7, 3, 5, x, 2, items, 1, out, NULL) == -1);
         assert(w.failed == 1);
         for (int z = 0; z < 6; z++) assert(out[z] == 0.0f);   /* nothing of a failed reply lands */
 
@@ -558,10 +655,10 @@ static void test_failed_link_refuses_later_exchanges_without_io(void)
          * sends the worker nothing, and it reads nothing -- in FAIL_STALE the
          * well-formed 52-byte reply the worker queued is still there, unread. */
         memset(items, 0, sizeof(items));
-        assert(cluster_item(idxs, ws, keff, 1, 2, 42, &items[0], 3, x) == 1);
+        assert(cluster_item(idxs, ws, keff, 1, 2, 42, &items[0], 3, x, 1) == 1);
         float out2[6] = {0};
         alarm(5);
-        int rc = cluster_exchange(&w, COLI_CLUSTER_VERSION, 7, 3, 5, items, 1, out2, NULL);
+        int rc = cluster_exchange(&w, COLI_CLUSTER_VERSION, 7, 3, 5, x, 2, items, 1, out2, NULL);
         alarm(0);
         assert(rc == -1);
         assert(w.failed == 1);
@@ -594,6 +691,7 @@ int main(void)
     test_wire_round_trip_q8();
     test_hello_refuses_a_v1_worker_by_name();
     test_hello_accepts_a_v2_worker();
+    test_v2_sends_the_rows_once();
     test_shared_expert_rides_the_routed_batch();
     test_failed_link_refuses_later_exchanges_without_io();
     puts("cluster protocol tests: ok");
