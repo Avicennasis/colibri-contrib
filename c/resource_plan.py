@@ -2939,6 +2939,60 @@ def _family_expert_cache_knob(family_id, cache_bytes):
     return None
 
 
+# The context a chat server starts with when the operator set none. Each family's own
+# default (4096-8192) is what its engine assumes standing alone; a chat in `coli web` or
+# `coli chat` outgrew it in a few long answers (and was then compacted, or before that
+# refused). The step chosen is the largest whose conversation state, for every KV slot,
+# takes at most this share of the memory there is: the expert cache keeps the rest.
+CHAT_CONTEXT_STEPS = (16384, 32768, 65536)
+CHAT_CONTEXT_SHARE = 0.10
+
+
+def chat_context(model, env=None, kv_slots=1, available=None):
+    """(context, reason) for a text model whose context nobody set; (None, reason) leaves
+    the engine its own default. `available`: bytes, measured when not given (RAM_GB, when
+    set, is the budget instead)."""
+    from family_registry import checkpoint_decides, default_context
+    env = os.environ if env is None else env
+    resolved = resolve_model(model)
+    family = resolved.descriptor
+    limits = family.limits
+    if family.modality != "text" or checkpoint_decides(resolved) or not limits.context_env:
+        return None, "not a chat model"
+    for name in (limits.context_env,) + (("MIMO_CTX",) if family.id == "mimo" else ()):
+        if env.get(name):
+            return None, f"{name} is set"
+    ram = env.get("RAM_GB", "")
+    try:
+        budget = float(ram) * GB if ram not in ("", "auto") else None
+    except ValueError:
+        budget = None
+    if budget is None or budget <= 0:
+        try:
+            budget = available if available is not None else memory_available()
+        except Exception:                 # an unreadable cgroup: keep the default
+            budget = None
+    if not budget:
+        return None, "available memory unknown"
+    base = default_context(resolved)
+    chosen = base
+    for step in CHAT_CONTEXT_STEPS:
+        if step <= chosen or step > limits.max_context:
+            continue
+        try:
+            state = planner_geometry(resolved, step).context_state_bytes
+        except ValueError:
+            break
+        if state * kv_slots > CHAT_CONTEXT_SHARE * budget:
+            break
+        chosen = step
+    if chosen == base:
+        return None, f"{base} tokens is what {budget / GB:.1f} GB allows"
+    state = planner_geometry(resolved, chosen).context_state_bytes * kv_slots
+    return chosen, (f"{chosen} tokens of context ({state / GB:.1f} GB of conversation state "
+                    f"of {budget / GB:.1f} GB); --ctx sets it")
+
+
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                available_memory=None, available_disk=None, gpus=None,
                policy="quality", physical_cpus=None, cpu_sockets=None,

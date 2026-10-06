@@ -72,6 +72,9 @@ export interface HealthResponse {
   /* Whether a message list ending on an assistant turn is continued rather than
      answered fresh (COLI_CONTINUE_ASSISTANT). Absent on older servers. */
   continue_assistant?: boolean
+  /* the server compacts a chat that outgrows the context when asked (context_compaction) */
+  context_compaction?: boolean
+  context_tokens?: number
 }
 
 export interface ProfileTurn {
@@ -97,11 +100,19 @@ export interface TokenUsage {
   total_tokens: number
 }
 
+/* The server ran the turn on a summary of the conversation's first messages, which
+   no longer fitted the model's context (context_compaction). */
+export interface Compaction {
+  summarized_messages: number
+  summary: string
+}
+
 export interface StreamChatResult {
   finishReason: string | null
   usage: TokenUsage | null
   requestId: string | null
   queueWaitMs: number | null
+  compaction: Compaction | null
 }
 
 export function endpoint(baseUrl: string, path: string) {
@@ -214,6 +225,9 @@ export interface StreamChatOptions {
   maxTokens: number
   enableThinking: boolean
   cacheSlot?: number
+  /* ask the server to summarize a conversation that outgrows the context; only for a
+     colibrì server, since an OpenAI-compatible one may refuse a field it does not know */
+  compact?: boolean
   signal: AbortSignal
   onDelta: (text: string) => void
   onReasoning?: (text: string) => void
@@ -239,6 +253,9 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
       max_completion_tokens: options.maxTokens,
       enable_thinking: options.enableThinking,
       ...(options.cacheSlot === undefined ? {} : { cache_slot: options.cacheSlot }),
+      /* A conversation longer than the context goes on, on a summary of its
+         first messages, instead of ending in "maximum context length". */
+      ...(options.compact ? { context_compaction: "auto" } : {}),
       stream: true,
       stream_options: { include_usage: true },
     }),
@@ -251,13 +268,16 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
   let buffer = ""
   let finishReason: string | null = null
   let usage: TokenUsage | null = null
+  let compaction: Compaction | null = null
 
   const consume = (data: string) => {
     if (data === "[DONE]") return
     const event = JSON.parse(data) as {
       choices?: Array<{ delta?: { content?: string; reasoning_content?: string }; finish_reason?: string | null }>
       usage?: TokenUsage | null
+      compaction?: Compaction
     }
+    if (event.compaction) compaction = event.compaction
     const choice = event.choices?.[0]
     const text = choice?.delta?.content
     if (text) options.onDelta(text)
@@ -283,6 +303,7 @@ export async function streamChat(options: StreamChatOptions): Promise<StreamChat
     usage,
     requestId: response.headers.get("x-request-id"),
     queueWaitMs: parsedQueueWait !== null && Number.isFinite(parsedQueueWait) ? parsedQueueWait : null,
+    compaction,
   }
 }
 

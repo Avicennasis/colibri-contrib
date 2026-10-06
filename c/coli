@@ -1948,6 +1948,7 @@ def chat_attached(a, base, model_id):
     if arch in CHAT_THINK_OFF and getattr(a,"think",None) is None:
         print(f"  {C.dim}thinking is off here (--think turns it on){C.r}\n")
     msgs=[]
+    compaction_seen=None     # the summary the server compacted this chat into, once said
     brio_options=[]          # non vuoto = modalita System One accesa (/decide)
     w=term_w()-4
     while True:
@@ -1972,7 +1973,7 @@ def chat_attached(a, base, model_id):
         if name in ("quit",): break
         if name == "help": chat_commands_help(); continue
         if name == "reset":
-            msgs=[]; brio_options=[]
+            msgs=[]; brio_options=[]; compaction_seen=None
             print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
         # ---- modalita System One (/decide) ---------------------------------
         # Lo stesso modello con cui stai chattando smette di generare e comincia
@@ -2011,6 +2012,8 @@ def chat_attached(a, base, model_id):
         # di token di riflessione prima della prima parola di risposta.
         request = {"model":model_id,"messages":msgs,"stream":True,
                    "max_tokens":ngen_for(a,interactive=True),
+                   # a chat longer than the context goes on from a summary of its start
+                   "context_compaction":"auto",
                    "stream_options":{"include_usage":True}}   # exact completion_tokens in the last chunk
         if getattr(a,"effort",None): request["reasoning_effort"]=a.effort
         if getattr(a,"think",None) is not None: request["enable_thinking"]=a.think
@@ -2036,6 +2039,15 @@ def chat_attached(a, base, model_id):
                     usage=ev.get("usage")
                     if isinstance(usage,dict) and isinstance(usage.get("completion_tokens"),int):
                         exact_tokens=usage["completion_tokens"]
+                    compaction=ev.get("compaction")
+                    if (isinstance(compaction,dict)
+                            and compaction.get("summarized_messages")!=compaction_seen):
+                        # said when it happens: the turns after it run on the same summary
+                        compaction_seen=compaction.get("summarized_messages")
+                        sp.stop()
+                        print(f"  {C.dgray}✦ the first {compaction_seen} messages no longer fit the "
+                              f"model's context: the model now reads a summary of them{C.r}")
+                        sp=Spinner("thinking…"); sp.start()
                     for ch in ev.get("choices",[]):
                         d=ch.get("delta",{})
                         rtxt=d.get("reasoning_content")

@@ -39,7 +39,7 @@ import {
   presetOf, randomSeed, sizeKey, validSide, type ImageSize,
 } from "@/lib/images"
 import { resendFrom } from "@/lib/chat"
-import { activeRequests, supportsCacheSlots, supportsContinuation } from "@/lib/runtime"
+import { activeRequests, supportsCacheSlots, supportsCompaction, supportsContinuation } from "@/lib/runtime"
 import Brio from "./Brio"
 import { BrainWorkspace } from "./BrainWorkspace"
 import { Brand } from "./components/Brand"
@@ -267,6 +267,7 @@ export default function App() {
         maxTokens,
         enableThinking: thinking,
         cacheSlot: supportsCacheSlots(health) ? cacheSlot : undefined,
+        compact: supportsCompaction(health),
         signal: controller.signal,
         /* Reasoning tokens are tokens: they count toward the rate, and the
            first one is the real time-to-first-token. The answer's first token
@@ -601,6 +602,7 @@ export default function App() {
           </form>
           {empty && <div className="suggestions">{suggestions.map(({ key, Icon, label }) => <button key={key} onClick={() => { setDraft(t(key)); draftRef.current?.focus() }}><Icon />{t(label)}</button>)}</div>}
           {!empty && !imageMode && lastRun?.finishReason === "length" && <p className="truncation-note">{t("topbar.truncatedHelp")}</p>}
+          {!empty && !imageMode && lastRun?.compaction && <p className="truncation-note" title={lastRun.compaction.summary}>{t("chat.compacted", { n: lastRun.compaction.summarized_messages })}</p>}
         </div>
       </section>}
       <section className="brio-workspace" hidden={view !== "brio"}>

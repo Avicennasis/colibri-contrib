@@ -59,7 +59,7 @@ describe("chat request extensions", () => {
     headers: { "content-type": "text/event-stream" },
   })
 
-  async function requestBody(cacheSlot?: number) {
+  async function requestBody(cacheSlot?: number, compact?: boolean) {
     const fetchMock = vi.fn().mockResolvedValue(completedStream())
     vi.stubGlobal("fetch", fetchMock)
     await streamChat({
@@ -71,6 +71,7 @@ describe("chat request extensions", () => {
       maxTokens: 8,
       enableThinking: false,
       cacheSlot,
+      compact,
       signal: new AbortController().signal,
       onDelta: () => undefined,
     })
@@ -83,6 +84,34 @@ describe("chat request extensions", () => {
 
   it("sends cache_slot zero when colibrì advertises KV slots", async () => {
     expect(await requestBody(0)).toMatchObject({ cache_slot: 0 })
+  })
+
+  it("asks a colibrì server for context compaction, and only a colibrì server", async () => {
+    expect(await requestBody(undefined, true)).toMatchObject({ context_compaction: "auto" })
+    expect(await requestBody()).not.toHaveProperty("context_compaction")
+  })
+})
+
+describe("context compaction", () => {
+  /* The gateway says, in a chunk before the text, that the turn ran on a summary of
+     the conversation's first messages; the page tells the user why. */
+  it("returns the compaction the stream reported", async () => {
+    const compaction = { summarized_messages: 6, summary: "the user listed topics" }
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+      'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n'
+      + `data: ${JSON.stringify({ choices: [], compaction })}\n\n`
+      + 'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n'
+      + "data: [DONE]\n\n",
+      { headers: { "content-type": "text/event-stream" } },
+    )))
+    const content: string[] = []
+    const result = await streamChat({
+      baseUrl: "http://localhost:8000/v1", apiKey: "", model: "test-model", messages: [],
+      temperature: 0, maxTokens: 8, enableThinking: false,
+      signal: new AbortController().signal, onDelta: (text) => content.push(text),
+    })
+    expect(result.compaction).toEqual(compaction)
+    expect(content).toEqual(["answer"])
   })
 })
 
