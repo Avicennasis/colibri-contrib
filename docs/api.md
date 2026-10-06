@@ -545,6 +545,41 @@ key (`OPENAI_API_KEY` / `OPENAI_BASE_URL` for env-based tools).
 > API and mostly won't be worth the wait. If your client lets you trim or disable
 > its system preamble and tool catalog, do it.
 
+## Conversations longer than the context
+
+A chat request may opt into context compaction with the extension field
+`"context_compaction": "auto"` (`"off"` is the default, the standard behavior;
+`COLI_COMPACT=1` on the server makes `auto` the default for every client). The
+dashboard and `coli chat` send it, so a conversation there never ends in
+`context_length_exceeded`:
+
+1. When the conversation does not fit the context, or leaves the answer less
+   room than it asks for (up to a quarter of the context), the server asks the
+   model itself to summarize the conversation before the new message. The
+   request to summarize comes after the history the engine already holds, so
+   only that request is prefilled.
+2. The turn then runs on the system message, with the summary appended to it,
+   and the last messages verbatim (about a quarter of the context, at least the
+   new message).
+3. The server keeps the summary, keyed by the messages it replaces. The client
+   keeps sending its whole history; every later turn finds the same summary and
+   renders the same prompt, so the engine's prefix reuse works as before until
+   the next compaction. A restarted server summarizes once more.
+
+The reply says what happened: a `compaction` object,
+`{"summarized_messages": 8, "summary": "..."}`, in the JSON response and in a
+stream chunk (empty `choices`) before the first token, and the header
+`x-colibri-compacted-messages`. Pictures in the summarized messages become
+`[image]`. A last message longer than the context alone is still refused with
+`context_length_exceeded`.
+
+The context itself: a server whose context variable nobody set (`--ctx`, or the
+family's `CTX`, `Q36_MAXT`, ...) picks the largest of 16384, 32768 and 65536
+tokens whose conversation state, for every KV slot, takes at most a tenth of
+the memory (`RAM_GB` when set, the available memory otherwise), and the
+family's own default when even 16384 does not fit that. The startup log says
+which (`[gateway] 32768 tokens of context ...`).
+
 ## Isolated KV contexts
 
 `coli serve --kv-slots N` allocates up to 16 independent sequence contexts.

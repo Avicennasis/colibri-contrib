@@ -165,6 +165,7 @@ const en: Record<string, string> = {
   "topbar.tokens": "{{n}} tokens",
   "topbar.tokPerSec": "{{n}} tok/s",
   "topbar.slot": "slot {{n}}",
+  "chat.compacted": "The first {{n}} messages no longer fit the model's context: they were summarized, and the conversation goes on from the summary (hover to read it).",
   "topbar.truncated": "Truncated",
   "topbar.truncatedHelp": "The response hit the max output tokens limit and was cut off. Raise \"Max output tokens\" to see the full answer.",
   "topbar.clear": "Clear",

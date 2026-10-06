@@ -162,11 +162,17 @@ def _engine_error(fields, message):
         else:
             limit = fields[2] if len(fields) > 2 else "the context"
             used = fields[1] if len(fields) > 1 else "?"
-        return APIError(400,
-                        f"This model's maximum context length is {limit} tokens, however your "
-                        f"messages resulted in at least {used} tokens. Please shorten the "
-                        f"conversation, or restart the server with a larger CTX.",
-                        "messages", "context_length_exceeded")
+        error = APIError(400,
+                         f"This model's maximum context length is {limit} tokens, however your "
+                         f"messages resulted in at least {used} tokens. Please shorten the "
+                         f"conversation, or restart the server with a larger CTX.",
+                         "messages", "context_length_exceeded")
+        # the numbers themselves, for context compaction (None when the frame had none)
+        try:
+            error.context = (int(used), int(limit))
+        except ValueError:
+            error.context = None
+        return error
     return RuntimeError(message)
 
 
@@ -3929,6 +3935,179 @@ def conversation_cache_slot(messages, kv_slots):
     return int.from_bytes(digest[:8], "big") % kv_slots
 
 
+# ---- context compaction -------------------------------------------------------------------
+# A chat that outgrows the engine's context used to end in a 400 the user could do nothing
+# with but start over. A request that asks for it (`context_compaction: "auto"`, which the
+# dashboard and `coli chat` send) is compacted instead: the oldest turns are summarized by
+# the model itself, the summary joins the system message, and the turn runs on the summary
+# plus the last exchanges, which stay verbatim.
+#
+# The server keeps the summaries, keyed by the conversation prefix each one replaces. The
+# client keeps sending its whole history, as the API is stateless; every later turn finds
+# its summary here and renders the same compacted prompt, so the engine's prefix reuse works
+# across turns exactly as before. A restarted server summarizes once more.
+#
+# The summary is asked for at the end of the conversation the engine already holds (the
+# history before the new message, then the request to summarize), so the engine prefills
+# only the request: the state is the one the previous turn left.
+
+COMPACT_NOTE = ("Summary of the earlier part of this conversation (its messages were removed "
+                "to fit the context window):\n\n")
+COMPACT_ASK = ("Summarize our conversation so far so that it can continue from your summary "
+               "alone. Keep everything still needed: what I asked for and want, facts, names, "
+               "numbers, decisions, code and file names, and open questions. Write it in the "
+               "language of the conversation, in at most {words} words, and reply with the "
+               "summary only.")
+# What a kept tail may take of the context: the summary and the room to answer take the rest,
+# so the next compaction is many turns away.
+COMPACT_KEEP_SHARE = 0.25
+# Tokens per character before the server has measured any (UTF-8 prose runs near 0.25-0.3)
+COMPACT_DEFAULT_RATIO = 0.35
+COMPACT_IMAGE_TOKENS = 768
+
+
+def compaction_requested(body):
+    """True when the request opts into context compaction; COLI_COMPACT=1 makes it the default."""
+    value = body.get("context_compaction")
+    if value is None:
+        return os.environ.get("COLI_COMPACT", "0") == "1"
+    if value not in ("auto", "off", True, False):
+        raise APIError(400, "`context_compaction` must be \"auto\" or \"off\".", "context_compaction")
+    return value in ("auto", True)
+
+
+def _message_canon(message):
+    try:
+        return json.dumps(message, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return repr(message)
+
+
+def compaction_keys(lead, conversation):
+    """keys[k] names the conversation's first k messages after its leading system messages."""
+    digest = hashlib.sha256(_message_canon(lead).encode("utf-8", "replace")).digest()
+    keys = [digest]
+    for message in conversation:
+        digest = hashlib.sha256(digest + _message_canon(message).encode("utf-8", "replace")).digest()
+        keys.append(digest)
+    return keys
+
+
+def split_lead(messages):
+    """(the leading system/developer messages, the rest)"""
+    n = 0
+    while n < len(messages) and isinstance(messages[n], dict) and \
+            messages[n].get("role") in ("system", "developer"):
+        n += 1
+    return list(messages[:n]), list(messages[n:])
+
+
+def with_summary(lead, summary):
+    """The leading messages with the summary appended to the system message (or as one)."""
+    if summary is None:
+        return list(lead)
+    note = COMPACT_NOTE + summary.strip()
+    if lead and lead[0].get("role") == "system":
+        first = dict(lead[0])
+        content = first.get("content")
+        if isinstance(content, list):
+            first["content"] = list(content) + [{"type": "text", "text": "\n\n" + note}]
+        elif isinstance(content, str) and content.strip():
+            first["content"] = content.rstrip() + "\n\n" + note
+        else:
+            first["content"] = note
+        return [first] + list(lead[1:])
+    return [{"role": "system", "content": note}] + list(lead)
+
+
+def without_images(message):
+    """The message with its pictures as a mark: the summary reads text, and the engine
+    takes one picture per request."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message
+    parts, changed = [], False
+    for part in content:
+        if isinstance(part, dict) and part.get("type") not in ("text", "input_text"):
+            parts.append({"type": "text", "text": "[image]"})
+            changed = True
+        else:
+            parts.append(part)
+    return dict(message, content=parts) if changed else message
+
+
+def estimate_message_tokens(message, ratio):
+    content = message.get("content")
+    chars, images = 0, 0
+    if isinstance(content, str):
+        chars = len(content)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in ("text", "input_text"):
+                chars += len(str(part.get("text") or ""))
+            elif isinstance(part, dict):
+                images += 1
+    for key in ("reasoning_content", "tool_calls"):
+        if message.get(key):
+            chars += len(_message_canon(message[key]))
+    return int(chars * ratio) + 8 + images * COMPACT_IMAGE_TOKENS
+
+
+def compaction_tail_start(conversation, done, ratio, keep_tokens):
+    """Where the verbatim tail begins: the earliest user turn after `done` whose tail fits
+    `keep_tokens`, and never later than the last user turn (the new request). None when
+    nothing before that turn is left to summarize."""
+    users = [i for i in range(done, len(conversation))
+             if isinstance(conversation[i], dict) and conversation[i].get("role") == "user"]
+    if not users:
+        return None
+    start = users[-1]
+    for i in reversed(users[:-1]):
+        if i <= done:
+            break
+        if sum(estimate_message_tokens(m, ratio) for m in conversation[i:]) > keep_tokens:
+            break
+        start = i
+    return start if start > done else None
+
+
+def close_open_thinking(prompt):
+    """A prompt that opens the model's reasoning block, closed: the summary is written
+    without thinking, after the same prefix the conversation was rendered with.
+    Returns (prompt, whether it closed one)."""
+    if prompt.endswith(THINK_OPEN + "\n"):
+        return prompt + "\n" + THINK_CLOSE + "\n\n", True
+    if prompt.endswith(THINK_OPEN):
+        return prompt + THINK_CLOSE, True
+    return prompt, False
+
+
+class CompactionMemory:
+    """The summaries this server wrote, by the conversation prefix each one replaces."""
+
+    def __init__(self, capacity=256):
+        self.capacity = capacity
+        self._items = collections.OrderedDict()
+        self._lock = threading.Lock()
+
+    def find(self, keys):
+        """(k, summary) for the longest remembered prefix, (0, None) for none."""
+        with self._lock:
+            for k in range(len(keys) - 1, 0, -1):
+                summary = self._items.get(keys[k])
+                if summary is not None:
+                    self._items.move_to_end(keys[k])
+                    return k, summary
+        return 0, None
+
+    def remember(self, key, summary):
+        with self._lock:
+            self._items[key] = summary
+            self._items.move_to_end(key)
+            while len(self._items) > self.capacity:
+                self._items.popitem(last=False)
+
+
 def stop_policy(body, chat):
     sequences = parse_stop_sequences(body)
     ignore_leading = body.get("x_colibri_ignore_leading_stop", False)
@@ -4885,6 +5064,28 @@ def cap_for_arch(arch, cap, env=None, model=None):
     return family_by_id(arch).limits.implicit_cap
 
 
+def chat_context_env(env, family, model, kv_slots=1):
+    """The family's context variable, set from the memory there is when nobody set it
+    (resource_plan.chat_context: a chat outgrew the families' 4096-8192 in a few long
+    answers); returns the context the engine will hold, None when it cannot be told."""
+    limits = family.limits
+    if family.modality != "text" or not limits.context_env:
+        return None
+    try:
+        from resource_plan import chat_context
+        context, why = chat_context(model, env, kv_slots)
+    except Exception:                  # a synthetic model, an unreadable config: the default
+        context, why = None, None
+    if context:
+        env[limits.context_env] = str(context)
+        print(f"[gateway] {why}", file=sys.stderr)
+    try:
+        from family_registry import default_context
+        return int(env.get(limits.context_env) or default_context(resolve_model(model)))
+    except Exception:
+        return None
+
+
 def decision_head_env(env, model):
     """The dense trunk's width for a checkpoint with a decision head (Clef), when
     the operator set none: the head's precise width (f16) if the planner's RAM
@@ -5286,6 +5487,8 @@ class Engine:
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
         decision_head_env(child_env, model)
+        # before the cap: the RAM plan reserves the context it is given
+        self.context_limit = chat_context_env(child_env, family, model, kv_slots)
         resolved_cap = cap_for_arch(arch, cap, child_env, model=model)
         child_env.pop("COLI_PROFILE_CAP", None)
         child_env.pop("COLI_PLAN_CAP", None)
@@ -6102,6 +6305,11 @@ class APIServer(ThreadingHTTPServer):
         self._conn_live = 0
         self._conn_by_ip = {}
         self._conn_owner = {}
+        # context compaction: the summaries written, the context ceiling (the engine's,
+        # then the one its errors report) and the measured tokens per prompt character
+        self.compactions = CompactionMemory()
+        self.context_limit = None
+        self.tokens_per_char = None
 
     def model_entry(self):
         """The /v1/models object. An image model says so, and carries the size
@@ -6176,10 +6384,25 @@ class APIServer(ThreadingHTTPServer):
         if kwargs.get("on_tool") is not None:
             kwargs["on_tool"] = measured(kwargs["on_tool"])
         try:
-            return self.engine.generate(prompt, max_tokens, temperature, top_p,
-                                        measured(on_text), *args, **kwargs)
+            stats = self.engine.generate(prompt, max_tokens, temperature, top_p,
+                                         measured(on_text), *args, **kwargs)
         finally:
             self.scheduler.observe_timing("engine_call_seconds", time.monotonic() - started)
+        self.note_prompt_size(prompt, stats, kwargs.get("image") is not None)
+        return stats
+
+    def note_prompt_size(self, prompt, stats, image=False):
+        """Tokens per prompt character, measured on the prompts served (a picture's
+        tokens have no characters, so those are left out)."""
+        try:
+            tokens = int(stats.get("prompt_tokens") or 0)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if image or not isinstance(prompt, str) or len(prompt) < 256 or tokens < 1:
+            return
+        ratio = tokens / len(prompt)
+        self.tokens_per_char = (ratio if self.tokens_per_char is None
+                                else 0.7 * self.tokens_per_char + 0.3 * ratio)
 
     def process_request(self, request, client_address):
         """Refuse past the caps instead of spawning an unbounded thread."""
@@ -6614,6 +6837,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     payload["kv_slots"] = self.server.kv_slots
                     payload["input_modalities"] = self.server.input_modalities()
                     payload["continue_assistant"] = os.environ.get("COLI_CONTINUE_ASSISTANT", "1") != "0" and ARCH in CONTINUATION_FAMILIES
+                    # chat requests may send context_compaction; the context they fit in
+                    payload["context_compaction"] = True
+                    if getattr(self.server, "context_limit", None):
+                        payload["context_tokens"] = self.server.context_limit
                     tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
                     if tiers: payload["tiers"] = tiers
                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
@@ -7360,7 +7587,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
                    enable_thinking=False, audio=None, image=None,
-                   add_generation_prompt=True):
+                   add_generation_prompt=True, compaction=None):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -7420,6 +7647,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 contextlib.ExitStack() as stream_cleanup:
             queue_wait, cache_slot = admission
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
+            if compaction:
+                # the conversation ran on a summary of its first messages (context_compaction)
+                queue_headers["x-colibri-compacted-messages"] = str(compaction["summarized_messages"])
             if not stream:
                 output = []
                 stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop,
@@ -7510,9 +7740,11 @@ class APIHandler(BaseHTTPRequestHandler):
                                "logprobs": logprobs_obj, "finish_reason": length_finish} if chat else
                               {"index": 0, "text": text, "logprobs": logprobs_obj,
                                "finish_reason": length_finish})
-                self.send_json(200, {"id": completion_id, "object": object_name, "created": created,
-                    "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)},
-                    request_id, queue_headers)
+                reply = {"id": completion_id, "object": object_name, "created": created,
+                         "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)}
+                if compaction:
+                    reply["compaction"] = compaction
+                self.send_json(200, reply, request_id, queue_headers)
                 return
 
             stream_object = "chat.completion.chunk" if chat else object_name
@@ -7610,6 +7842,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 if chat:
                     event([{"index": 0, "delta": {"role": "assistant", "content": ""},
                             "logprobs": None, "finish_reason": None}])
+                if compaction:
+                    # before any text, so a client can say why the model's view is shorter
+                    data = json.dumps({"id": completion_id, "object": stream_object,
+                                       "created": created, "model": self.server.model_id,
+                                       "choices": [], "compaction": compaction},
+                                      ensure_ascii=False, separators=(",", ":"))
+                    with ka_lock:
+                        try:
+                            self.wfile.write(f"data: {data}\n\n".encode())
+                            self.wfile.flush()
+                        except OSError:
+                            connected = False
                 ka_thread[0] = threading.Thread(target=_keepalive, daemon=True)
                 ka_thread[0].start()
                 stream_cleanup.callback(ka_thread[0].join, timeout=2)
@@ -7809,21 +8053,171 @@ class APIHandler(BaseHTTPRequestHandler):
                         not isinstance(params.get("required", []), list)):
                     raise APIError(400, "Strict tool schemas need object `parameters`, "
                                    "object `properties` and array `required`.", f"tools.{index}")
-        audio_clips = [] if ARCH == "inkling" else None
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise APIError(400, "`messages` must be a non-empty array.", "messages")
-        messages, image = self.expand_images(messages)
-        add_generation_prompt = resolve_generation_prompt(messages, body)
-        prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
-                                      tools, tool_choice, audio_out=audio_clips,
-                                      add_generation_prompt=add_generation_prompt,
-                                      preserve_thinking=preserve_thinking)
-        self.generation(body, prompt, request_id, True, tools, tool_choice,
-                        enable_thinking=enable_thinking,
-                        add_generation_prompt=add_generation_prompt,
-                        audio=b"".join(audio_clips) if audio_clips else None,
-                        image=image)
+        compact = compaction_requested(body)
+        render = dict(enable_thinking=enable_thinking, reasoning_effort=reasoning_effort,
+                      tools=tools, tool_choice=tool_choice, preserve_thinking=preserve_thinking)
+        lead, conversation = split_lead(messages)
+        keys = compaction_keys(lead, conversation) if compact else None
+        # a summary of the whole request would leave it without its question (a history cut
+        # back to where an earlier compaction began): only shorter prefixes count
+        done, summary = (self.server.compactions.find(keys[:len(conversation)]) if compact
+                         else (0, None))
+        report = None
+        for attempt in range(4):
+            view = messages if summary is None else with_summary(lead, summary) + conversation[done:]
+            if summary is not None:
+                report = {"summarized_messages": done, "summary": summary}
+            audio_clips = [] if ARCH == "inkling" else None
+            expanded, image = self.expand_images(view)
+            add_generation_prompt = resolve_generation_prompt(expanded, body)
+            prompt = render_chat_for_arch(expanded, enable_thinking, reasoning_effort,
+                                          tools, tool_choice, audio_out=audio_clips,
+                                          add_generation_prompt=add_generation_prompt,
+                                          preserve_thinking=preserve_thinking)
+            exceeded = self._context_pressure(body, prompt) if compact and attempt == 0 else None
+            if exceeded is None:
+                try:
+                    self.generation(body, prompt, request_id, True, tools, tool_choice,
+                                    enable_thinking=enable_thinking,
+                                    add_generation_prompt=add_generation_prompt,
+                                    audio=b"".join(audio_clips) if audio_clips else None,
+                                    image=image, compaction=report)
+                    return
+                except APIError as error:
+                    context = getattr(error, "context", None)
+                    if not compact or error.code != "context_length_exceeded" or not context:
+                        raise
+                    used, limit = context
+                    self.server.context_limit = limit
+                    if image is None and len(prompt) >= 256:
+                        self.server.note_prompt_size(prompt, {"prompt_tokens": used})
+                    exceeded = error
+            moved = self._compact(body, messages, lead, conversation, keys, done, summary, render)
+            if moved is None:
+                if isinstance(exceeded, APIError):
+                    raise exceeded
+                compact = False          # nothing older to summarize: let the engine fit the answer
+                continue
+            done, summary = moved
+        raise APIError(400, "The conversation does not fit the model's context even after "
+                            "summarizing it: the last message alone is too long.",
+                       "messages", "context_length_exceeded")
+
+    def _context_pressure(self, body, prompt):
+        """True when the prompt, by the measured tokens per character, leaves the answer
+        less room than it asks for (up to a quarter of the context): the engine would cut
+        the answer short, so the conversation is compacted first. None otherwise, and
+        always before the server has measured a prompt."""
+        limit = getattr(self.server, "context_limit", None)
+        ratio = getattr(self.server, "tokens_per_char", None)
+        if not limit or not ratio:
+            return None
+        try:
+            maximum = generation_options(body, self.server.max_tokens)[0]
+        except APIError:
+            return None
+        if len(prompt) * ratio + min(maximum, limit // 4) <= limit:
+            return None
+        return True
+
+    def _compact(self, body, messages, lead, conversation, keys, done, summary, render):
+        """Summarize the conversation before its last exchanges; (new done, new summary),
+        or None when there is nothing older left to summarize.
+
+        The summary is asked for after the history the engine already holds (everything
+        before the new user message), rendered as the conversation was, so the engine
+        prefills only the request to summarize. A range too long for that is halved."""
+        limit = getattr(self.server, "context_limit", None) or 4096
+        ratio = getattr(self.server, "tokens_per_char", None) or COMPACT_DEFAULT_RATIO
+        start = compaction_tail_start(conversation, done, ratio, int(limit * COMPACT_KEEP_SHARE))
+        if start is None:
+            return None
+        users = [i for i in range(done, len(conversation))
+                 if isinstance(conversation[i], dict) and conversation[i].get("role") == "user"]
+        end = users[-1]                   # the summary covers everything before the new request
+        if end <= done:
+            return None
+        words = max(80, min(400, limit // 24))
+        budget = min(768, max(160, limit // 8))
+        cache_slot = body.get("cache_slot")
+        if cache_slot is None and self.server.kv_slots > 1:
+            cache_slot = conversation_cache_slot(messages, self.server.kv_slots)
+        covered, text = done, summary
+        while covered < end:
+            # the longest range from `covered` whose request fits by the estimate (halved
+            # if the engine refuses it); what is left is summarized next, after the summary
+            # so far. Each request is a generation, minutes on a slow machine: as few as fit.
+            head = with_summary(lead, text)
+            room = (limit - budget - 64 - int(len(COMPACT_ASK) * ratio)
+                    - sum(estimate_message_tokens(m, ratio) for m in head))
+            upto = covered + 1
+            while upto < end and room - sum(estimate_message_tokens(m, ratio)
+                                            for m in conversation[covered:upto + 1]) >= 0:
+                upto += 1
+            while True:
+                part = self._summarize(with_summary(lead, text),
+                                       [without_images(m) for m in conversation[covered:upto]],
+                                       render, words, budget, cache_slot, limit, ratio)
+                if part is not None:
+                    break
+                half = covered + (upto - covered) // 2
+                if half <= covered:
+                    # one message longer than the context: say it was there, without it
+                    part = ((text.strip() + "\n\n") if text else "") + \
+                        f"[a message of {estimate_message_tokens(conversation[covered], ratio)} " \
+                        "tokens was too long to keep]"
+                    upto = covered + 1
+                    break
+                upto = half
+            covered, text = upto, part
+        self.server.compactions.remember(keys[start], text)
+        print(f"[compact] {start} messages summarized into {len(text)} characters "
+              f"(context {limit} tokens)", file=sys.stderr)
+        return start, text
+
+    def _summarize(self, head, part, render, words, budget, cache_slot, limit, ratio):
+        """The model's summary of head + part, or None when that and the summary's room do
+        not fit the context."""
+        ask = {"role": "user", "content": COMPACT_ASK.format(words=words)}
+
+        def rendered(thinking, effort):
+            return render_chat_for_arch(head + part + [ask], thinking, effort, render["tools"],
+                                        render["tool_choice"],
+                                        audio_out=[] if ARCH == "inkling" else None,
+                                        add_generation_prompt=True,
+                                        preserve_thinking=render["preserve_thinking"])
+        # the conversation's own flags, so the prompt begins as the engine's state does,
+        # with the reasoning block closed; a family whose block this cannot close (its
+        # thinking switch is not a marker at the end) is asked with thinking off instead
+        prompt, closed = close_open_thinking(rendered(render["enable_thinking"],
+                                                      render["reasoning_effort"]))
+        thinking = False
+        if not closed and starts_in_reasoning(render["enable_thinking"], True):
+            prompt, closed = close_open_thinking(rendered(False, None))
+            thinking = not closed and starts_in_reasoning(False, True)
+        if len(prompt) * ratio + budget > limit:
+            return None
+        output = []
+        try:
+            with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+                _wait, slot = admission
+                self.server.generate(prompt, budget, 0.3, 0.9,
+                                     output.append, slot, self.client_disconnected)
+        except APIError as error:
+            if error.code == "context_length_exceeded":
+                return None
+            raise
+        text = "".join(output)
+        if ARCH == "inkling":
+            text, _reasoning = split_inkling(text)
+        else:
+            _reasoning, text = split_thinking_reply(text, thinking, True)
+        # it goes back in as a prompt, and a prompt refuses NUL bytes (a model can write one)
+        text = text.replace("\x00", "").strip()
+        return text or "[the earlier messages could not be summarized]"
 
     def expand_images(self, messages):
         """(messages with placeholders, the one image or None) for this engine's family.
@@ -8259,6 +8653,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                       file=sys.stderr)
                 sys.exit(1)
         server.engine = runtime
+        server.context_limit = getattr(runtime, "context_limit", None)
         if family.modality != "image":
             # Said once at start-up, so a checkpoint that declares a tower it does
             # not carry is visible in the log and not only in a client's 400.
