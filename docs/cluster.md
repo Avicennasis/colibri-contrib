@@ -68,8 +68,10 @@ chunk.
 The wire protocol (`COLIEX01` in `c/colibri.c`) has two versions. v1, the
 default, moves raw f32 rows and is what every coordinator speaks unless asked
 otherwise, so a cluster of mixed engine builds keeps working. v2 adds an `act`
-word to the header; a worker accepts both. The coordinator speaks v2 only when
-it needs one of:
+word to the header and sends a layer's batch rows once, each expert naming its
+rows by index, where v1 copies a row into every expert that routes it (at
+decode with top-8, the same row eight times); a worker accepts both. The
+coordinator speaks v2 only when it needs one of:
 
 - **q8 activations**, `COLI_CLUSTER_ACT=q8`: every row crosses the wire as int8
   blocks of 32 behind one f32 scale, both directions -- about 3.5x fewer bytes,

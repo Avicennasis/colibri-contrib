@@ -263,6 +263,29 @@ class ClusterShardingParityTest(unittest.TestCase):
                 worker_stderr,
             )
 
+        # v2 sends the batch rows once and names each item's rows by index; v1
+        # copies a row into every item that routes it, so with top-K the same
+        # row crosses K times. The bytes the coordinator SENDS must drop by
+        # about K (the shared item adds S indices, the headers a few words);
+        # what comes back is per item either way, plus the shared rows here.
+        v1_bytes, v2_bytes = _transfer_bytes(delegated), _transfer_bytes(shared)
+        self.assertIsNotNone(v1_bytes, f"no transfer summary:\n{delegated.stderr}")
+        self.assertIsNotNone(v2_bytes, f"no transfer summary:\n{shared.stderr}")
+        positions, k = int(base_sig[0][1]), int(cfg["num_experts_per_tok"])
+        print(
+            f"\n[rows-once] {fixture_dir.name}: {positions} positions, top-{k}: sent "
+            f"v1 (a row per expert) {v1_bytes[0] / positions:.0f} B/position, "
+            f"v2 (rows once, + the shared item) {v2_bytes[0] / positions:.0f} B/position "
+            f"({v1_bytes[0] / v2_bytes[0]:.2f}x); received "
+            f"{v1_bytes[1] / positions:.0f} -> {v2_bytes[1] / positions:.0f} B/position "
+            f"(+ the shared rows)",
+            flush=True,
+        )
+        self.assertGreaterEqual(
+            v1_bytes[0], 0.9 * k * v2_bytes[0],
+            "v2 did not send about K times fewer bytes than v1's row copies",
+        )
+
     def test_fmt6_parity(self):
         """fmt=6 (rotation-bearing) routed experts: worker must rotate the input."""
         self._run_parity(FMT6)
