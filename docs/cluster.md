@@ -5,6 +5,14 @@ disk-backed expert workers execute routed FFNs on other Macs. A layer's routed
 batch-union is sent as one persistent TCP request, so a token does not incur one
 round trip per expert.
 
+Two engines speak the wire (`COLIEX01`): GLM-5.2 (`colibri`) and GLM-5.3
+(`glm53`). A coordinator talks to workers of its own family only, since the
+expert math is the family's; `coli cluster worker` picks the binary from the
+model's `config.json`, as every other launcher does. On GLM-5.3 the workers
+serve the int4 expert container (the streamed experts); KDA, the indexer, the
+attention and the shared expert stay on the coordinator, and the answer is
+bit-identical to the single-machine run whatever the number of workers.
+
 Start the optional registration service:
 
 ```bash
@@ -29,3 +37,9 @@ HOST:PORT,...` for a static setup:
 The transport is disabled unless workers are configured, so the existing
 single-machine path remains unchanged. Dense-layer sharding and browser/WebGPU
 workers are separate follow-up seams.
+
+The gates: `tests/test_cluster_protocol.c` and `tests/test_glm53_cluster_protocol.c`
+pin the wire contract of each engine over a socketpair; `tests/test_cluster_sharding.py`
+(GLM-5.2) and `tests/test_glm53_cluster_sharding.py` (GLM-5.3) run the tiny
+oracle fixture with and without workers and require the same tokens, with zero
+oracle mismatches on both sides.

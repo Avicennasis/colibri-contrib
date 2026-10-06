@@ -761,11 +761,16 @@ def dsv4_cuda_build_hint():
         return "make deepseek-v4 CUDA=1 (this binary is CPU-only)"
     return "the DeepSeek V4 CUDA tier is supported only on Linux and Windows"
 
+# The engines whose binary serves routed experts over the COLIEX01 wire
+# (EXPERT_WORKER=1): colibri.c and glm53.c. A coordinator reaches workers of
+# its own family only, as the expert math is the family's.
+WORKER_FAMILIES = ("glm", "glm53")
+
 def need_worker_model(model):
     require_model(model, file="config.json")
     family = resolve_model(model).descriptor
-    if family.id != "glm":
-        sys.exit(f"{C.yel}cluster expert workers currently support the GLM engine only;{C.r} "
+    if family.id not in WORKER_FAMILIES:
+        sys.exit(f"{C.yel}cluster expert workers currently support the GLM-5.2 and GLM-5.3 engines only;{C.r} "
                  f"{family.display_name} models cannot serve experts")
     engine = engine_for(model)
     require_model(model, file="config.json", engine=engine, target=family.build_target,
@@ -3092,8 +3097,11 @@ def cmd_cluster_worker(a):
         # could only ever start with an explicit --cap (#1452). Fallback 0 is
         # what the other GLM launch sites pass: the engine resolves its own cap
         # when the argument is zero.
-        return subprocess.call([engine,str(cap_for_launch(a.cap,e,0)),
-                                str(a.ebits),str(a.dbits)],env=e)
+        argv=[engine,str(cap_for_launch(a.cap,e,0))]
+        # The expert and dense bits are GLM-5.2's positionals; glm53 reads every
+        # bare number as the cap and takes its precision from GLM53_BITS.
+        if resolve_model(a.model).descriptor.id=="glm": argv+=[str(a.ebits),str(a.dbits)]
+        return subprocess.call(argv,env=e)
     finally:
         stop_heartbeat.set()
 

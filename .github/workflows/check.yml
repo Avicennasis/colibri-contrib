@@ -171,6 +171,14 @@ jobs:
         run: |
           cd c && GLM53_TINY=/tmp/glm53_tiny GLM53_MM_TINY=/tmp/glm53_mm python -m unittest -v tests.test_glm53_oracles
           GLM53_TINY=/tmp/glm53_tiny COLI_GLM53_FIXTURE=/tmp/glm53_stream-i4 python -m unittest -v tests.test_glm53_prefill_batch
+      # The expert workers (CLUSTER_WORKERS, docs/cluster.md) on GLM-5.3: the
+      # int4 pair of the text oracle, with and without two workers, token-exact
+      # against transformers and bit-exact between the two runs. The text pair
+      # and not the multimodal one above: int4 keeps the oracle's tokens there.
+      - name: Check the GLM-5.3 cluster parity gate
+        run: |
+          python c/tools/make_glm53_streaming_pair.py --fixture /tmp/glm53_tiny --output /tmp/glm53_tiny_stream
+          cd c && GLM53_TINY_STREAM=/tmp/glm53_tiny_stream-i4 python -m unittest -v tests.test_glm53_cluster_sharding
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to

@@ -1782,6 +1782,10 @@ tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c
 tests/test_cluster_protocol$(EXE): tests/test_cluster_protocol.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+# The same wire contract as glm53.c speaks it (the expert workers of GLM-5.3).
+tests/test_glm53_cluster_protocol$(EXE): tests/test_glm53_cluster_protocol.c glm53.c $(METAL_OBJ) $(VK_OBJ) $(VK_SPV)
+	$(CC) $(CFLAGS) $< $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+
 tests/test_ue8m0$(EXE): tests/test_ue8m0.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
