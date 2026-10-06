@@ -28,3 +28,6 @@ requests>=2.31
 # Optional download-fallback backends (only needed for download_fp8.py's alt paths):
 #   modelscope>=1.9
 #   hf_transfer>=0.1
+
+# Transitive floor (OSV 2026-09-30): datasets resolves aiohttp 3.9.x; hold above GHSA-63hf-3vf5-4wqf (CRITICAL) + 15 HIGH.
+aiohttp>=3.14.3

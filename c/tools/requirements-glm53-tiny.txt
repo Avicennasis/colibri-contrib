@@ -3,3 +3,6 @@ torch==2.13.0+cpu; sys_platform != "darwin"
 torch==2.13.0; sys_platform == "darwin"
 transformers==5.16.1
 safetensors==0.8.0
+
+# Transitive floor (OSV 2026-09-30): hold anyio above GHSA-82r6-8w77-94w6 (CRITICAL, fixed 4.14.2).
+anyio>=4.14.2

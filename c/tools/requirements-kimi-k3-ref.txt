@@ -8,3 +8,6 @@ einops
 fla-core
 numpy
 packaging
+
+# Transitive floor (OSV 2026-09-30): requests above PYSEC-2018-28 / GHSA-x84v-xcm2-53pg (HIGH, fixed 2.20.0).
+requests>=2.20.0
