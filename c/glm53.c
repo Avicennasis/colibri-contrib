@@ -2419,8 +2419,16 @@ static int glm53_cluster_hello(const GModel *m, Glm53Worker *w) {
     return 0;
 }
 
+/* GLM53_VERBOSE: unset or empty is 0, a number is itself, anything else 1. */
+static int glm53_verbose_level(void) {
+    const char *v = getenv("GLM53_VERBOSE");
+    if (!v || !*v) return 0;
+    const int n = atoi(v);
+    return n > 0 ? n : 1;
+}
+
 static void glm53_cluster_report(void) {
-    if (!getenv("GLM53_VERBOSE")) return;
+    if (!glm53_verbose_level()) return;
     for (int w = 0; w < g_glm53_cluster_n; w++) {
         const Glm53Worker *k = &g_glm53_workers[w];
         fprintf(stderr, "[CLUSTER] %s:%d: %llu requests, %llu rows, %.1f ms mean reply\n",
@@ -2535,13 +2543,14 @@ static void glm53_cluster_moe(GModel *m, int layer, const float *x, int tokens,
     int *owner = malloc((size_t)n_ids * sizeof(int));
     int *rows = calloc((size_t)n_ids, sizeof(int));
     float **y = calloc((size_t)n_ids, sizeof(float *));
-    int items[GLM53_CLUSTER_MAX] = {0};
+    int items[GLM53_CLUSTER_MAX] = {0}, wrows[GLM53_CLUSTER_MAX] = {0};
+    double reply_ms[GLM53_CLUSTER_MAX] = {0};
     if (!owner || !rows || !y) { fprintf(stderr, "OOM in cluster MoE\n"); exit(1); }
     for (int i = 0; i < n_ids; i++) {
         owner[i] = glm53_cluster_owner(layer, ids[i]);
         for (int t = 0; t < tokens; t++)
             if (glm53_gate(chosen, weight, topk, t, ids[i]) != 0.0f) rows[i]++;
-        if (rows[i]) items[owner[i]]++;
+        if (rows[i]) { items[owner[i]]++; wrows[owner[i]] += rows[i]; }
     }
 
     /* every request first, so the workers read their disks at once */
@@ -2607,10 +2616,25 @@ static void glm53_cluster_moe(GModel *m, int layer, const float *x, int tokens,
                     glm53_cluster_fail(k, layer);
                 k->rows += (uint64_t)rows[i];
             }
-            k->t_reply += now_s() - t0;
+            reply_ms[w] = 1e3 * (now_s() - t0);
+            k->t_reply += reply_ms[w] / 1e3;
             done[w] = 1;
             pending--;
         }
+    }
+    /* GLM53_VERBOSE=2: what each worker was asked this layer and how long it
+     * took, and the wait for the slowest, which is what the layer cost. The
+     * numbers to set COLI_CLUSTER_WEIGHTS by. */
+    if (glm53_verbose_level() >= 2) {
+        double worst = 0.0;
+        fprintf(stderr, "[CLUSTER] layer %d:", layer);
+        for (int w = 0; w < g_glm53_cluster_n; w++) {
+            if (!items[w]) continue;
+            fprintf(stderr, " %s:%d %d rows %.0f ms", g_glm53_workers[w].host,
+                    g_glm53_workers[w].port, wrows[w], reply_ms[w]);
+            if (reply_ms[w] > worst) worst = reply_ms[w];
+        }
+        fprintf(stderr, " | waited %.0f ms\n", worst);
     }
 
     for (int i = 0; i < n_ids; i++) {

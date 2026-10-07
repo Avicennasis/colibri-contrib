@@ -223,6 +223,19 @@ class Glm53ClusterEngineTest(unittest.TestCase):
                     self.assertGreater(sum(int(r) > 0 for r, _ in served), 1,
                                        "every expert went to one worker")
 
+    def test_verbose_two_prints_each_layers_worker_times(self):
+        """GLM53_VERBOSE=2 prints, per MoE layer, what each worker was asked
+        and how long it took, and the time the layer waited for the slowest:
+        the numbers an operator needs to set COLI_CLUSTER_WEIGHTS."""
+        _, spec = self.start_workers(2)
+        result = self.run_engine({"CLUSTER_WORKERS": spec, "GLM53_VERBOSE": "2"})
+        self.assert_same_as_local(result)
+        lines = re.findall(r"\[CLUSTER\] layer (\d+):((?: \S+ \d+ rows \d+ ms)+) \| waited (\d+) ms",
+                           result.stderr)
+        self.assertTrue(lines, result.stderr)
+        for _, workers, waited in lines:
+            self.assertGreaterEqual(int(waited), max(int(ms) for ms in re.findall(r"(\d+) ms", workers)))
+
     def test_weights_override_and_route_everything_to_one_worker(self):
         """COLI_CLUSTER_WEIGHTS wins over the probes; a lopsided split still
         answers exactly, with the idle worker never asked."""
