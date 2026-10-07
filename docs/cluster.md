@@ -34,7 +34,10 @@ Each worker measures its disk at startup and gets a share in proportion to it.
 To set the shares yourself, pass one weight per listed worker with
 `COLI_CLUSTER_WEIGHTS=3,2,1` on the coordinator, or `COLI_WORKER_WEIGHT` on a
 worker. Requests for a layer go to every worker before any reply is read, so
-their disks read at the same time. Set `CLUSTER_WORKER_BIND` to a private
+their disks read at the same time, and while a worker computes one block of a
+layer's experts it reads the next block into the other half of that layer's
+cache slots, so its disk and its cores work at the same time too (a layer with
+one slot runs its blocks in turn). Set `CLUSTER_WORKER_BIND` to a private
 address to keep a worker off other interfaces. `GLM53_VERBOSE=1` on the
 coordinator prints each worker's mean reply time at exit; `GLM53_VERBOSE=2`
 prints every layer's per-worker reply time and the wait for the slowest, the
