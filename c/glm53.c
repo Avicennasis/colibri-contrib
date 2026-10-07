@@ -2225,6 +2225,7 @@ static void glm53_pick_prefix(GModel *m) {
 #define GLM53_CLUSTER_HELLO   0xFFFFFFFFu
 #define GLM53_CLUSTER_MAX     16
 #define GLM53_CLUSTER_MAX_ROWS 65536u        /* token rows in one request, all items */
+#define GLM53_CLUSTER_CHUNK   1024            /* default prefill chunk with workers, tokens */
 
 typedef struct {
     int fd, port, weight;
@@ -3889,6 +3890,19 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
 #endif
     if (chunk < 1) chunk = 1;
 #if !defined(_WIN32)
+    /* With expert workers a chunk is the unit of disk reads on every worker:
+     * each chunk reads a layer's experts again, so a 245-token prompt in two
+     * chunks of 128 pays for the whole expert set twice. Unset, the chunk is
+     * the whole prompt, up to GLM53_CLUSTER_CHUNK tokens (one chunk instead of
+     * two took that prompt's prefill from 618 s to 454 s on two SATA-SSD
+     * workers; see docs/experiments/glm53-cluster-prefill-chunk-2026-10-07). */
+    if (g_glm53_cluster_n && !setting) {
+        chunk = n < GLM53_CLUSTER_CHUNK ? n : GLM53_CLUSTER_CHUNK;
+        if (glm53_verbose_level())
+            fprintf(stderr, "[CLUSTER] prefill chunk %d tokens (%s)\n", chunk,
+                    chunk == n ? "the whole prompt"
+                               : "GLM53_CLUSTER_CHUNK; GLM53_PREFILL_CHUNK overrides");
+    }
     /* A worker takes at most GLM53_CLUSTER_MAX_ROWS token rows per request,
      * and one chunk can route every token's top-k to the same worker. */
     if (g_glm53_cluster_n && (uint64_t)chunk * c->topk > GLM53_CLUSTER_MAX_ROWS) {

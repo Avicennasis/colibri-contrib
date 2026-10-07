@@ -362,6 +362,22 @@ class Glm53ClusterEngineTest(unittest.TestCase):
         self.assertNotEqual(coordinator.returncode, 0)
         self.assertRegex(err, rf"\[CLUSTER\] expert worker {re.escape(hole)} did not answer in 2 s")
 
+    def test_cluster_prefills_the_whole_prompt_in_one_chunk(self):
+        """With workers, a prefill chunk is the unit of disk reads on every
+        worker (each chunk re-reads a layer's experts), so the default chunk
+        becomes the whole prompt, up to GLM53_CLUSTER_CHUNK tokens, and the
+        coordinator says so. The tokens are the local run's, which prefills
+        in chunks of 128. GLM53_PREFILL_CHUNK still wins when set."""
+        _, spec = self.start_workers(1)
+        n = len(self.args[self.args.index("--ids") + 1].split(","))
+        result = self.run_engine({"CLUSTER_WORKERS": spec, "GLM53_VERBOSE": "1"})
+        self.assert_same_as_local(result)
+        self.assertIn(f"[CLUSTER] prefill chunk {n} tokens (the whole prompt)", result.stderr)
+        forced = self.run_engine({"CLUSTER_WORKERS": spec, "GLM53_VERBOSE": "1",
+                                  "GLM53_PREFILL_CHUNK": "3"})
+        self.assert_same_as_local(forced)
+        self.assertNotIn("(the whole prompt)", forced.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

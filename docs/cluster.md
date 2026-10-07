@@ -40,6 +40,14 @@ coordinator prints each worker's mean reply time at exit; `GLM53_VERBOSE=2`
 prints every layer's per-worker reply time and the wait for the slowest, the
 numbers to set the weights by.
 
+A prefill chunk is the unit of disk reads on every worker: each chunk makes a
+worker read a layer's experts again, so with workers the coordinator prefills
+the whole prompt in one chunk, up to 1024 tokens. On two SATA-SSD workers that
+took a 245-token prefill from 618 s to 454 s. Bigger chunks amortize the reads
+further but put up to 16 KiB per token row in flight each way on every worker,
+so the default stops there; `GLM53_PREFILL_CHUNK` still overrides, up to the
+65536-row cap of one worker request (8192 tokens at top-8).
+
 Nothing in a GLM-5.3 cluster waits forever. `GLM53_CLUSTER_TIMEOUT` (seconds,
 default 120) bounds connecting to a worker, every message in flight, and a
 worker's reply to a layer's request: a worker that does not answer in time
