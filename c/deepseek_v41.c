@@ -3047,9 +3047,19 @@ static int cluster_worker_run(const char *snap, int port) {
     st_init_multi(&m.S, snap, (extra_dirs && *extra_dirs) ? extra_dirs : NULL);
     mirror_setup(&m.S, snap, m.c.n_routed);                /* DUAL-SSD replicas, as model_load */
     int nr_layers = m.c.n_layers;
-    m.ecap = 1;
+    /* Cache depth: 1 slot/layer kept the worker honest but meant every routed read
+     * after the first was a cold SSD read; the coordinator runs a RAM-plan cache
+     * (48 slots/layer there), so a worker on the same class of box should be able
+     * to hold a working set too. CLUSTER_WORKER_CACHE=<slots/layer>, default 1. */
+    int ecap = 1;
+    const char *ce = getenv("CLUSTER_WORKER_CACHE");
+    if (ce && *ce) {
+        ecap = atoi(ce);
+        if (ecap < 1) { fprintf(stderr, "[CLUSTER] CLUSTER_WORKER_CACHE must be >= 1, not '%s'\n", ce); return 1; }
+    }
+    m.ecap = ecap;
     m.cache = xmalloc((size_t)nr_layers * sizeof(LCache), "expert caches");
-    for (int i = 0; i < nr_layers; i++) cache_init(&m, &m.cache[i], 1);
+    for (int i = 0; i < nr_layers; i++) cache_init(&m, &m.cache[i], ecap);
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { perror("cluster worker socket"); return 1; }
     int yes = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
@@ -3057,8 +3067,8 @@ static int cluster_worker_run(const char *snap, int port) {
     addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_ANY); addr.sin_port = htons((uint16_t)port);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) || listen(fd, 4)) {
         perror("cluster worker bind/listen"); return 1; }
-    fprintf(stderr, "[CLUSTER] expert worker listening on 0.0.0.0:%d (disk-backed, cache=1/layer, "
-                    "%d layers x %d experts)\n", port, nr_layers, m.c.n_routed);
+    fprintf(stderr, "[CLUSTER] expert worker listening on 0.0.0.0:%d (disk-backed, cache=%d/layer, "
+                    "%d layers x %d experts)\n", port, ecap, nr_layers, m.c.n_routed);
     for (;;) {
         int cfd = accept(fd, NULL, NULL);
         if (cfd < 0) { if (errno == EINTR) continue; break; }
