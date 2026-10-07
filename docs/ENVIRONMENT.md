@@ -426,7 +426,9 @@ These are for testing, benchmarking, or internal use — not part of the everyda
 
 Read **only** by `c/glm53.c`. Like the other siblings it has its own loader,
 cache and precision selection and shares none of the `colibri` knobs above.
-See `docs/glm53-flash.md`.
+See `docs/glm53-flash.md`. The expert-worker knobs shared with `colibri`
+(`CLUSTER_WORKERS`, `EXPERT_WORKER`, `CLUSTER_WORKER_PORT`, `CLUSTER_WORKER_BIND`,
+`COLI_CLUSTER_WEIGHTS`, `COLI_WORKER_WEIGHT`) are in `docs/cluster.md`.
 
 | Variable | Default | Effect |
 |---|---|---|
@@ -436,7 +438,8 @@ See `docs/glm53-flash.md`.
 | `GLM53_PREFILL_CHUNK` | `128` | Prefill chunk size in tokens. Smaller keeps the workspace smaller; too small re-reads experts once per chunk per layer instead of amortizing them. In serve mode, CANCEL is checked before each prefill chunk. Cancellation waits for any chunk already running to finish. |
 | `GLM53_REWIND` | `0` | Avoid reprocessing the prompt when a continue request trims cached trailing whitespace, by rewinding recurrent state with a snapshot (~149 MiB per slot, outside the `GLM53_EXPERT_GB` budget), allocated on first use, retained across slot resets, and copied once per generated whitespace run, whether or not the reply is ever continued. Off by default for that reason; exact-match continuations need no snapshot and reuse the cache either way. |
 | `GLM53_MAX_IMAGE_TOKENS` | checkpoint's (8000) | Ceiling on tokens per image. Each covers 28×28 pixels, so 256 keeps ordinary text legible and 64 keeps shapes and colours. The image is shrunk, not cropped. Lower it: 8000 is 2691 tokens for a 1080p photo, i.e. a prefill nobody will sit through. |
-| `GLM53_VERBOSE` | unset | Print the parsed geometry, the expert budget and the per-token cache cost to stderr. |
+| `GLM53_VERBOSE` | unset | `1` prints the parsed geometry, the expert budget and the per-token cache cost to stderr, and with expert workers each worker's request count, rows and mean reply time at exit. `2` adds one line per MoE layer with every worker's rows and reply time and the wait for the slowest, the numbers to set `COLI_CLUSTER_WEIGHTS` by. |
+| `GLM53_CLUSTER_TIMEOUT` | `120` | Seconds before a GLM-5.3 cluster gives up on a peer. On the coordinator it bounds connecting to a worker, every message in flight and each layer's reply: a worker that does not answer ends the run with `expert worker HOST:PORT did not answer in N s`. On a worker it is the time a new client has to complete the handshake before it is dropped; a coordinator that has completed it may idle between requests. Raise it for a worker whose disk needs more than two minutes per prefill chunk. |
 | `GLM53_DUMP_INDEX` | unset | Print the rows the sparse indexer selected. The first place to look when the engine diverges only at certain lengths. |
 | `COLI_MAP_EXPERTS` | `0` | Serve the routed-expert pieces as read-only views of a per-shard mapping instead of copying each miss into a slab. CPU runs only: with Metal active the slots keep owned slabs, because the batched Metal MoE cannot register a view that does not start on its mapping's base. Also read by `qwen38`. See [Weights from disk instead of RAM](#weights-from-disk-instead-of-ram). |
 | `COLI_VULKAN` | `0` | Open the shared Vulkan backend. Needs a `VK=1` build and the compiled shaders (`COLI_VK_SHADERS`). The streaming container's routed experts go to the shared expert tier (`COLI_VK_TIER*`, see the Vulkan section), which keeps the hot ones on the device instead of uploading each one as it arrives; it runs only when the checkpoint's `swiglu_limit` is above 0, the only clamp the device applies as the CPU does. The resident matrices follow `COLI_VK_DENSE`: unset, on the device, except on a device sharing the CPU's RAM while the tier runs. |

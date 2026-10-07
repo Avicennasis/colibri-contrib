@@ -36,7 +36,9 @@ To set the shares yourself, pass one weight per listed worker with
 worker. Requests for a layer go to every worker before any reply is read, so
 their disks read at the same time. Set `CLUSTER_WORKER_BIND` to a private
 address to keep a worker off other interfaces. `GLM53_VERBOSE=1` on the
-coordinator prints each worker's mean reply time at exit.
+coordinator prints each worker's mean reply time at exit; `GLM53_VERBOSE=2`
+prints every layer's per-worker reply time and the wait for the slowest, the
+numbers to set the weights by.
 
 Nothing in a GLM-5.3 cluster waits forever. `GLM53_CLUSTER_TIMEOUT` (seconds,
 default 120) bounds connecting to a worker, every message in flight, and a
