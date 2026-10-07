@@ -38,6 +38,18 @@ their disks read at the same time. Set `CLUSTER_WORKER_BIND` to a private
 address to keep a worker off other interfaces. `GLM53_VERBOSE=1` on the
 coordinator prints each worker's mean reply time at exit.
 
+Nothing in a GLM-5.3 cluster waits forever. `GLM53_CLUSTER_TIMEOUT` (seconds,
+default 120) bounds connecting to a worker, every message in flight, and a
+worker's reply to a layer's request: a worker that does not answer in time
+ends the coordinator with `expert worker HOST:PORT did not answer in N s`, and
+a client that connects to a worker without completing the handshake in time
+is dropped, so it cannot keep the port from the real coordinator. A
+coordinator that has completed the handshake may pause between requests for
+as long as it likes (a serve waiting for its next prompt); one that vanishes
+without closing is noticed by TCP keepalive in about two deadlines. Raise the
+deadline for a worker whose disk needs more than two minutes per prefill
+chunk.
+
 The transport is disabled unless workers are configured, so the existing
 single-machine path remains unchanged. Dense-layer sharding and browser/WebGPU
 workers are separate follow-up seams.

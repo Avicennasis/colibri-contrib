@@ -2207,6 +2207,7 @@ static void glm53_pick_prefix(GModel *m) {
 #include <sys/socket.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0                      /* macOS: SO_NOSIGPIPE on the socket */
 #endif
@@ -2235,13 +2236,35 @@ typedef struct {
 static Glm53Worker g_glm53_workers[GLM53_CLUSTER_MAX];
 static int g_glm53_cluster_n = 0;
 static int g_glm53_cluster_cut[GLM53_CLUSTER_MAX];
+static int g_glm53_net_timed_out = 0;       /* the last glm53_net_io failure was a deadline */
+
+/* GLM53_CLUSTER_TIMEOUT: the seconds a connection, a message or a layer's
+ * reply may take before that is an error (default 120, generous for a worker
+ * reading a prefill chunk's experts off a slow disk). Nothing in the cluster
+ * waits without one, except a worker between two requests of a coordinator
+ * that completed the handshake: a serve waits for its next prompt as long as
+ * it likes, and a dead coordinator is found by TCP keepalive instead. */
+#define GLM53_CLUSTER_TIMEOUT_DEFAULT 120
+static int glm53_cluster_timeout_s(void) {
+    static int seconds = 0;
+    if (!seconds) {
+        const char *env = getenv("GLM53_CLUSTER_TIMEOUT");
+        const int given = env && *env ? atoi(env) : 0;
+        seconds = given > 0 ? given : GLM53_CLUSTER_TIMEOUT_DEFAULT;
+    }
+    return seconds;
+}
 
 static int glm53_net_io(int fd, void *buf, size_t n, int write_mode) {
     char *p = buf;
     while (n) {
         ssize_t r = write_mode ? send(fd, p, n, MSG_NOSIGNAL) : recv(fd, p, n, MSG_WAITALL);
         if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) return -1;
+        if (r <= 0) {
+            /* SO_RCVTIMEO/SO_SNDTIMEO: the message stopped making progress */
+            g_glm53_net_timed_out = r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK);
+            return -1;
+        }
         p += r;
         n -= (size_t)r;
     }
@@ -2268,6 +2291,50 @@ static void glm53_net_socket_opts(int fd) {
 #ifdef SO_NOSIGPIPE
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
 #endif
+    /* A message that stalls for the deadline fails instead of hanging. */
+    const int seconds = glm53_cluster_timeout_s();
+    struct timeval tv = { seconds, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    /* A peer that vanished without closing (power, cable) is noticed in about
+     * two deadlines, so a worker gets its port back from a dead coordinator. */
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+    const int interval = seconds / 4 > 0 ? seconds / 4 : 1, count = 3;
+#ifdef TCP_KEEPIDLE
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &seconds, sizeof(seconds));
+#elif defined(TCP_KEEPALIVE)
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &seconds, sizeof(seconds));   /* macOS */
+#endif
+#ifdef TCP_KEEPINTVL
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+#endif
+#ifdef TCP_KEEPCNT
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+#endif
+}
+
+/* connect() within the deadline: non-blocking, then poll for the result. A
+ * host that drops SYNs would otherwise hold the coordinator for the kernel's
+ * retry schedule, minutes on Linux. */
+static int glm53_connect_within(int fd, const struct sockaddr *sa, socklen_t len) {
+    const int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK)) return -1;
+    int rc = connect(fd, sa, len);
+    if (rc && errno == EINPROGRESS) {
+        struct pollfd pf = { fd, POLLOUT, 0 };
+        do rc = poll(&pf, 1, 1000 * glm53_cluster_timeout_s()); while (rc < 0 && errno == EINTR);
+        if (rc == 0) { errno = ETIMEDOUT; rc = -1; }
+        else if (rc > 0) {
+            int err = 0;
+            socklen_t err_len = sizeof(err);
+            rc = getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &err_len);
+            if (!rc && err) { errno = err; rc = -1; }
+        }
+    }
+    const int saved = errno;
+    if (fcntl(fd, F_SETFL, flags)) return -1;
+    errno = saved;
+    return rc;
 }
 
 /* Which worker owns (layer, eid). The constants differ from the mirror's so
@@ -2309,16 +2376,17 @@ static int glm53_cluster_connect(const char *spec, Glm53Worker *w) {
     memset(&hint, 0, sizeof(hint));
     hint.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(host, service, &hint, &found)) return -1;
-    int fd = -1;
+    int fd = -1, err = 0;
     for (struct addrinfo *a = found; a; a = a->ai_next) {
         fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
         if (fd < 0) continue;
-        if (!connect(fd, a->ai_addr, a->ai_addrlen)) break;
+        if (!glm53_connect_within(fd, a->ai_addr, a->ai_addrlen)) break;
+        err = errno;
         close(fd);
         fd = -1;
     }
     freeaddrinfo(found);
-    if (fd < 0) return -1;
+    if (fd < 0) { errno = err; return -1; }
     glm53_net_socket_opts(fd);
     memset(w, 0, sizeof(*w));
     w->fd = fd;
@@ -2399,7 +2467,8 @@ static void glm53_cluster_init(GModel *m) {
         }
         Glm53Worker *w = &g_glm53_workers[g_glm53_cluster_n];
         if (glm53_cluster_connect(tok, w)) {
-            fprintf(stderr, "[CLUSTER] cannot connect to expert worker %s\n", tok);
+            fprintf(stderr, "[CLUSTER] cannot connect to expert worker %s (%s)\n", tok,
+                    errno ? strerror(errno) : "bad HOST:PORT");
             continue;
         }
         if (glm53_cluster_hello(m, w)) {
@@ -2440,7 +2509,15 @@ static float glm53_gate(const int *chosen, const float *weight, int topk, int t,
     return 0.0f;
 }
 
+static void glm53_cluster_no_answer(const Glm53Worker *w, int layer) {
+    fprintf(stderr, "[CLUSTER] expert worker %s:%d did not answer in %d s during layer %d "
+                    "(GLM53_CLUSTER_TIMEOUT)\n",
+            w->host, w->port, glm53_cluster_timeout_s(), layer);
+    exit(1);
+}
+
 static void glm53_cluster_fail(const Glm53Worker *w, int layer) {
+    if (g_glm53_net_timed_out) glm53_cluster_no_answer(w, layer);
     fprintf(stderr, "[CLUSTER] expert worker %s:%d failed during layer %d\n",
             w->host, w->port, layer);
     exit(1);
@@ -2452,6 +2529,7 @@ static void glm53_cluster_fail(const Glm53Worker *w, int layer) {
 static void glm53_cluster_moe(GModel *m, int layer, const float *x, int tokens,
                               const int *chosen, const float *weight,
                               const int *ids, int n_ids, float *out) {
+    if (n_ids < 1) return;                  /* nothing routed: also keeps the casts below non-negative */
     const Cfg *c = &m->c;
     const int D = c->hidden, topk = c->topk;
     int *owner = malloc((size_t)n_ids * sizeof(int));
@@ -2501,10 +2579,12 @@ static void glm53_cluster_moe(GModel *m, int layer, const float *x, int tokens,
                 pf[np].revents = 0;
                 who[np++] = w;
             }
-        if (poll(pf, (nfds_t)np, -1) < 0) {
+        const int ready = poll(pf, (nfds_t)np, 1000 * glm53_cluster_timeout_s());
+        if (ready < 0) {
             if (errno == EINTR) continue;
             glm53_cluster_fail(&g_glm53_workers[who[0]], layer);
         }
+        if (ready == 0) glm53_cluster_no_answer(&g_glm53_workers[who[0]], layer);
         for (int p = 0; p < np; p++) {
             if (!pf[p].revents) continue;
             const int w = who[p];
@@ -2548,12 +2628,26 @@ static void glm53_cluster_moe(GModel *m, int layer, const float *x, int tokens,
 }
 
 /* One request on an accepted connection. Returns 0 to keep serving, -1 to drop
- * the connection. */
-static int glm53_worker_serve_one(GModel *m, int fd, int weight) {
+ * the connection. *established is set once the client has completed the
+ * handshake: until then it has one deadline to send a message, so that a
+ * client that connects and says nothing cannot keep the port from the real
+ * coordinator; after it, the pause between two requests is the coordinator's
+ * business (a serve waiting for its next prompt). */
+static int glm53_worker_serve_one(GModel *m, int fd, int weight, int *established) {
     const Cfg *c = &m->c;
     const int D = c->hidden, I = c->moe_inter;
     char magic[8];
     uint32_t head[5];
+    for (;;) {
+        struct pollfd pf = { fd, POLLIN, 0 };
+        const int ready = poll(&pf, 1, *established ? -1 : 1000 * glm53_cluster_timeout_s());
+        if (ready > 0) break;
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready == 0)
+            fprintf(stderr, "[CLUSTER] dropping a client: no handshake in %d s\n",
+                    glm53_cluster_timeout_s());
+        return -1;
+    }
     if (glm53_net_io(fd, magic, 8, 0)) return -1;
     if (memcmp(magic, GLM53_CLUSTER_MAGIC, 8) || glm53_net_get(fd, head, 5) ||
         head[0] != GLM53_CLUSTER_VERSION || head[2] != (uint32_t)D || head[3] != (uint32_t)I) {
@@ -2569,6 +2663,7 @@ static int glm53_worker_serve_one(GModel *m, int fd, int weight) {
         if (glm53_net_io(fd, GLM53_CLUSTER_MAGIC, 8, 1) || glm53_net_put(fd, reply, 3) ||
             glm53_net_put(fd, shape, 5))
             return -1;
+        *established = 1;
         return 0;
     }
     if (layer < (uint32_t)c->first_dense || layer >= (uint32_t)c->n_layers ||
@@ -2723,7 +2818,8 @@ static int glm53_expert_worker(const char *dir, int port) {
         int fd = accept(listener, NULL, NULL);
         if (fd < 0) { if (errno == EINTR) continue; perror("accept"); break; }
         glm53_net_socket_opts(fd);
-        while (!glm53_worker_serve_one(&m, fd, weight)) {}
+        int established = 0;
+        while (!glm53_worker_serve_one(&m, fd, weight, &established)) {}
         close(fd);
         if (getenv("GLM53_VERBOSE"))
             fprintf(stderr, "[CLUSTER] coordinator left: %ld hits, %ld reads so far\n",

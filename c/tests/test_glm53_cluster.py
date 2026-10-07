@@ -22,6 +22,8 @@ import json
 import os
 import re
 import socket
+import struct
+import threading
 import subprocess
 import sys
 import time
@@ -109,6 +111,33 @@ def parse(stdout):
     return out
 
 
+def recv_exactly(sock, n):
+    """Up to n bytes; fewer only at EOF."""
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+MAGIC = b"COLIG53X"
+HELLO_REQUEST = 8 + 5 * 4          # magic, version, layer, hidden, moe_inter, n
+HELLO_REPLY = 8 + 3 * 4 + 5 * 4    # magic, version, status, n, shape[5]
+
+
+def black_hole_after_hello(listener, worker):
+    """A worker that answers the handshake and then nothing: the handshake is
+    relayed to a real worker, every later request is read and dropped."""
+    client, _ = listener.accept()
+    with client, socket.create_connection(worker, timeout=10) as up:
+        up.sendall(recv_exactly(client, HELLO_REQUEST))
+        client.sendall(recv_exactly(up, HELLO_REPLY))
+        while client.recv(65536):
+            pass
+
+
 @unittest.skipUnless(FIXTURE, "COLI_GLM53_FIXTURE not set to the int4 streaming fixture")
 class Glm53ClusterEngineTest(unittest.TestCase):
     @classmethod
@@ -124,7 +153,11 @@ class Glm53ClusterEngineTest(unittest.TestCase):
             grid = ref.get("grid", (0, 0))
             cls.args += ["--patches", str(patches), "--grid", f"{grid[0]}x{grid[1]}"]
         cls.env = {**os.environ, "GLM53_BITS": "32"}
-        for name in ("CLUSTER_WORKERS", "COLI_CLUSTER_WEIGHTS", "EXPERT_WORKER"):
+        cfg = json.loads((fixture / "config.json").read_text())
+        text = cfg.get("text_config", cfg)
+        cls.hidden, cls.moe_inter = text["hidden_size"], text["moe_intermediate_size"]
+        for name in ("CLUSTER_WORKERS", "COLI_CLUSTER_WEIGHTS", "EXPERT_WORKER",
+                     "GLM53_CLUSTER_TIMEOUT"):
             cls.env.pop(name, None)
         cls.local = cls.run_engine({})
 
@@ -236,6 +269,85 @@ class Glm53ClusterEngineTest(unittest.TestCase):
             except ConnectionResetError:
                 pass            # closed with our junk unread: the kernel sends RST
         self.assert_same_as_local(self.run_engine({"CLUSTER_WORKERS": spec}))
+
+    # ---- deadlines: GLM53_CLUSTER_TIMEOUT seconds (default 120) ----
+
+    def hello(self, sock):
+        """A valid handshake from a raw client; returns the worker's reply."""
+        sock.sendall(MAGIC + struct.pack("!5I", 1, 0xFFFFFFFF, self.hidden, self.moe_inter, 0))
+        return recv_exactly(sock, HELLO_REPLY)
+
+    def assert_closed_within(self, sock, seconds):
+        sock.settimeout(seconds + 5)
+        t0 = time.time()
+        try:
+            self.assertEqual(sock.recv(64), b"")
+        except ConnectionResetError:
+            pass
+        except socket.timeout:
+            self.fail(f"still connected after {seconds + 5:.0f} s")
+        self.assertLess(time.time() - t0, seconds + 4, "dropped, but not by the deadline")
+
+    def test_client_that_never_finishes_a_message_is_dropped(self):
+        """A client that connects and sends nothing, or stalls inside a
+        request, is dropped once GLM53_CLUSTER_TIMEOUT passes, and the worker
+        then serves the real coordinator exactly."""
+        _, spec = self.start_workers(1, {"GLM53_CLUSTER_TIMEOUT": "1"})
+        host, port = spec.rsplit(":", 1)
+        for name, junk in (("silent", b""), ("stalled", MAGIC + struct.pack("!2I", 1, 3))):
+            with self.subTest(client=name):
+                with socket.create_connection((host, int(port)), timeout=5) as s:
+                    if junk:
+                        s.sendall(junk)
+                    self.assert_closed_within(s, 1)
+        self.assert_same_as_local(self.run_engine({"CLUSTER_WORKERS": spec}))
+
+    def test_established_coordinator_may_idle(self):
+        """The deadline bounds a message, not the pause between requests: a
+        client that completed the handshake can stay quiet longer than
+        GLM53_CLUSTER_TIMEOUT (a serve waiting for its next prompt) and is
+        still served."""
+        _, spec = self.start_workers(1, {"GLM53_CLUSTER_TIMEOUT": "1"})
+        host, port = spec.rsplit(":", 1)
+        with socket.create_connection((host, int(port)), timeout=10) as s:
+            self.assertEqual(len(self.hello(s)), HELLO_REPLY)
+            time.sleep(3)
+            self.assertEqual(len(self.hello(s)), HELLO_REPLY, "dropped while idle")
+
+    def test_unreachable_worker_fails_within_the_deadline(self):
+        """A worker address that drops packets (TEST-NET-1, 192.0.2.1) is
+        given up within GLM53_CLUSTER_TIMEOUT, not the kernel's SYN retry
+        schedule, and the run ends with the usual named error."""
+        t0 = time.time()
+        result = self.run_engine({"CLUSTER_WORKERS": "192.0.2.1:9100",
+                                  "GLM53_CLUSTER_TIMEOUT": "2"}, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no expert workers reachable", result.stderr)
+        self.assertLess(time.time() - t0, 30, "waited for the kernel, not the deadline")
+
+    def test_worker_that_never_answers_is_a_named_error(self):
+        """A worker that completes the handshake and then never replies to a
+        layer request ends the coordinator with an error that names the
+        worker and the deadline, instead of a hang."""
+        _, spec = self.start_workers(1)
+        host, port = spec.rsplit(":", 1)
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        hole = f"127.0.0.1:{listener.getsockname()[1]}"
+        threading.Thread(target=black_hole_after_hello, args=(listener, (host, int(port))),
+                         daemon=True).start()
+        env = {**self.env, "CLUSTER_WORKERS": hole, "GLM53_CLUSTER_TIMEOUT": "2"}
+        coordinator = subprocess.Popen(self.args, env=env, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.stop, coordinator)
+        try:
+            _, err = coordinator.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            self.fail("the coordinator hung on a worker that never answered")
+        self.assertNotEqual(coordinator.returncode, 0)
+        self.assertRegex(err, rf"\[CLUSTER\] expert worker {re.escape(hole)} did not answer in 2 s")
 
 
 if __name__ == "__main__":

@@ -122,7 +122,8 @@ static Buf exchange(const uint8_t *data, size_t n) {
     pthread_t tf, td;
     pthread_create(&tf, NULL, feed_run, &f);
     pthread_create(&td, NULL, drain_run, &d);
-    while (!glm53_worker_serve_one(&g_model, sv[1], 7)) {}
+    int established = 0;
+    while (!glm53_worker_serve_one(&g_model, sv[1], 7, &established)) {}
     close(sv[1]);                       /* the drain sees EOF */
     pthread_join(tf, NULL);
     pthread_join(td, NULL);
