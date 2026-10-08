@@ -7374,8 +7374,12 @@ class APIHandler(BaseHTTPRequestHandler):
         for (qid, kind, _, _, levels), question, answer in zip(plan, record["questions"], got):
             probs = answer.get("probs") if isinstance(answer, dict) else None
             n = len(question["options"])
-            if (answer.get("id") != qid or not isinstance(probs, list) or len(probs) != n or
-                    not all(isinstance(p, (int, float)) and math.isfinite(p) for p in probs)):
+            if (not isinstance(answer, dict) or answer.get("id") != qid or
+                    not isinstance(probs, list) or len(probs) != n or
+                    not all(type(p) in (int, float) and math.isfinite(p) and 0 <= p <= 1
+                            for p in probs) or
+                    # decide_serve.h writes nine significant digits on the wire.
+                    not math.isclose(math.fsum(probs), 1.0, rel_tol=0.0, abs_tol=1e-6)):
                 raise APIError(502, f"The decision engine sent no usable probabilities for `{qid}`.",
                                None, "engine_error", "server_error")
             best = max(range(n), key=lambda i: (probs[i], -i))
