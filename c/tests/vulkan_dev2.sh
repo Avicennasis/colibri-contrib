@@ -63,12 +63,16 @@ d2_case() {
     fault) x=(COLI_VK_DEV2_FAULT=2) ;;
     # the devices short of the experts too (COLI_VK_EXPERTS2): with room for all of them,
     # everything routed after the prompt is on a device and the CPU reads nothing more.
-    # COLI_VK_TIER_BALANCE=0: which experts the CPU computes, and so which ones its RAM
-    # cache holds when it evicts, then follows the routing alone; balanced, it follows
-    # the joins' timings, and deepseek_v4 gave up no copy on some runs (#1987: 1 run in
-    # 20 on a desktop, 20 in 20 with it off)
-    excl)   D2_SMALL=1; x=(COLI_VK_EXPERTS2=${D2_E2:-8} COLI_VK_TIER_BALANCE=0) ;;
-    noexcl) D2_SMALL=1; x=(COLI_VK_EXPERTS2=${D2_E2:-8} COLI_VK_TIER_EXCLUSIVE=0 COLI_VK_TIER_BALANCE=0) ;;
+    # Which experts sit in the CPU's one- or two-slot RAM cache when it evicts must follow
+    # the routing alone, or whether one of them is a device expert to give up first
+    # changes from run to run (#1987: deepseek_v4 gave up none on some runs).
+    # COLI_VK_TIER_BALANCE=0: the CPU's share of a step stops following the joins'
+    # timings; V4_LOADER_LANES=1: deepseek_v4 loads one expert at a time, so the slots
+    # fill in one order (the other engines do not read it). Measured on a desktop with
+    # six busy loops beside it: balanced, 19 runs in 20 passed idle; balance off, 38 in 40
+    # under load; both, 40 in 40, 3 copies given up in every run.
+    excl)   D2_SMALL=1; x=(COLI_VK_EXPERTS2=${D2_E2:-8} COLI_VK_TIER_BALANCE=0 V4_LOADER_LANES=1) ;;
+    noexcl) D2_SMALL=1; x=(COLI_VK_EXPERTS2=${D2_E2:-8} COLI_VK_TIER_EXCLUSIVE=0 COLI_VK_TIER_BALANCE=0 V4_LOADER_LANES=1) ;;
   esac
   $run cpu.tok cpu.log "$@"
   local D2_HIST=0 D2_KEEP=0
@@ -298,7 +302,7 @@ family_dev2_sanitize() {
       run=${eng#*:}; eng=${eng%%:*}
       local D2_X=1 D2_SMALL=0
       case $k in big) x=COLI_VK_TIER_GEMM_ROWS=2; D2_X=4 ;; evict) x=COLI_VK_EXPERTS2=2 ;; fault) x=COLI_VK_DEV2_FAULT=2 ;;
-                  excl) x="COLI_VK_EXPERTS2=8 COLI_VK_TIER_BALANCE=0"; D2_SMALL=1 ;; *) x=D2=1 ;; esac   # balance off: #1987
+                  excl) x="COLI_VK_EXPERTS2=8 COLI_VK_TIER_BALANCE=0 V4_LOADER_LANES=1"; D2_SMALL=1 ;; *) x=D2=1 ;; esac   # see d2_case's excl (#1987)
       local A=(ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
                OMP_NUM_THREADS=2 $x COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 COLI_VK_DEV2=0)
       local D2_HIST=0
