@@ -4902,17 +4902,28 @@ def _engine_extension_args(engine_k):
     return {"logprobs": engine_k, "gbytes_before_ext": True}
 
 
+# An instruction the processor does not have: SIGILL on POSIX, STATUS_ILLEGAL_INSTRUCTION on
+# Windows. An engine built for x86-64-v3 dies this way on a processor without AVX2 (#1979).
+ILLEGAL_INSTRUCTION = "an instruction this processor does not have, such as AVX2"
+
+
 def engine_exit_status(status):
     """A child's exit status in words: a signal on POSIX (a SIGKILL is most often the
     out-of-memory killer), the NTSTATUS on Windows."""
     if status < 0:
-        name = {9: "SIGKILL, most often the out-of-memory killer", 11: "SIGSEGV", 6: "SIGABRT"}.get(-status)
+        name = {9: "SIGKILL, most often the out-of-memory killer", 11: "SIGSEGV", 6: "SIGABRT",
+                4: f"SIGILL, {ILLEGAL_INSTRUCTION}"}.get(-status)
         return f"killed by signal {-status}" + (f", {name}" if name else "")
     if status >= 0xC0000000:
         name = {0xC0000005: "access violation", 0xC0000017: "out of memory", 0xC00000FD: "stack overflow",
-                0xC0000409: "fail-fast or stack buffer overrun"}.get(status)
+                0xC0000409: "fail-fast or stack buffer overrun",
+                0xC000001D: f"illegal instruction, {ILLEGAL_INSTRUCTION}"}.get(status)
         return f"exit status 0x{status:08X}" + (f", {name}" if name else "")
     return f"exit status {status}"
+
+
+def engine_illegal_instruction(status):
+    return status == -4 or status == 0xC000001D
 
 
 class EngineLoadError(RuntimeError):
@@ -5534,10 +5545,25 @@ class Engine:
             del boot[:-4096]
         try:
             read_engine_turn(self.process.stdout, READY, keep, self.caps)
-        except RuntimeError:
+        except RuntimeError as error:
             failure = parse_load_fail(bytes(boot))
             if failure is not None:
                 raise EngineLoadError(*failure) from None
+            # No LOAD_FAIL: the exit status is the only cause left to name. An engine
+            # that predates the processor check (cpu_check.h) dies on the first
+            # instruction its processor lacks, right after its banner (#1979).
+            try:
+                status = self.process.wait(timeout=2)
+            except Exception:
+                status = None
+            if status is not None and engine_illegal_instruction(status):
+                raise EngineLoadError(
+                    "unsupported", f"the engine stopped on {ILLEGAL_INSTRUCTION} "
+                    f"({engine_exit_status(status)}): it was built for a newer processor; "
+                    "build the engines for this one with ARCH=x86-64-v2 "
+                    "(docs/quickstart.md, \"Old processors\")") from None
+            if status is not None:
+                raise RuntimeError(f"{error} ({engine_exit_status(status)})") from None
             raise
         # True/False when the engine said whether it loaded a vision tower; None when
         # it said nothing (an engine that predates CAPS, or a family without a tower).

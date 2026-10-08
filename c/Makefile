@@ -2044,6 +2044,9 @@ tests/test_serve_codec$(EXE): tests/test_serve_codec.c
 tests/test_serve_budget$(EXE): tests/test_serve_budget.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_cpu_check$(EXE): tests/test_cpu_check.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_segment_runtime$(EXE): tests/test_segment_runtime.c tests/segment_runtime.o
 	$(CC) $(CFLAGS) tests/test_segment_runtime.c tests/segment_runtime.o -o $@ $(LDFLAGS)
 # segment_runtime.c as its own object, compiled with the flags this test gave it on
