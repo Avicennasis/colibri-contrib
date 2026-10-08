@@ -1309,6 +1309,28 @@ class WholeSetup(HomeTestCase):
                                           {"backend": "cpu", "missing": []}, tc, out=lambda *_: None)
         self.assertIn("no prebuilt engine", str(caught.exception))
 
+    def test_a_processor_without_avx2_is_not_handed_the_prebuilt_engine(self):
+        # #1979: the prebuilt engines assume x86-64-v3 and stopped on their first AVX2
+        # instruction on a Xeon E3-1230 V2. Without a compiler setup says so, with what
+        # to install, instead of fetching an archive that cannot run.
+        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
+        os.remove(os.path.join(self.engines, "qwen36"))
+        old = {"arch": "x86_64", "name": "Intel Xeon E3-1230 V2", "features": []}
+        fetched = setup_flow.SetupError("fetched")
+        with modeled("linux"), mock.patch.object(setup_hw, "detect_cpu", return_value=old), \
+             mock.patch.object(setup_flow, "fetch_release_archive", side_effect=fetched) as fetch:
+            with self.assertRaises(setup_flow.SetupError) as caught:
+                setup_flow.resolve_engine(family_by_id("qwen36"), None,
+                                          {"backend": "cpu", "missing": []}, tc, out=lambda *_: None)
+            self.assertIn("no AVX2", str(caught.exception))
+            self.assertIn(setup_flow.package_hint(["build"]), str(caught.exception))
+            fetch.assert_not_called()
+            # COLI_CPU_CHECK=0 trusts the archive, as the engines do
+            with mock.patch.dict(os.environ, {"COLI_CPU_CHECK": "0"}):
+                with self.assertRaisesRegex(setup_flow.SetupError, "fetched"):
+                    setup_flow.resolve_engine(family_by_id("qwen36"), None,
+                                              {"backend": "cpu", "missing": []}, tc, out=lambda *_: None)
+
     def test_list_json(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):

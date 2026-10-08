@@ -945,6 +945,14 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
     if release_asset_suffix() is None:
         raise SetupError(f"no compiler here, and no prebuilt engine is published for "
                          f"{host_os()}/{host_machine()}: {package_hint(['build'])}")
+    # The prebuilt engines assume x86-64-v3: on an older processor they stop at their
+    # first AVX2 instruction (#1979). A compiler builds one for this processor instead.
+    # COLI_CPU_CHECK=0 trusts the archive anyway, as it does in the engines.
+    missing = setup_hw.missing_for_prebuilt(setup_hw.detect_cpu())
+    if missing and os.environ.get("COLI_CPU_CHECK") != "0":
+        raise SetupError(f"this processor has no {', '.join(f.upper() for f in missing)}, which "
+                         "the prebuilt engines need; with a compiler setup builds the engine for "
+                         f"this processor: {package_hint(['build'])}")
     out("  no compiler found: using the prebuilt engine from the GitHub release")
     runtime, tag = fetch_release_archive(version, out=out)
     if entry is not None and setup_catalog.version_tuple(tag) < setup_catalog.version_tuple(entry.prebuilt_since):

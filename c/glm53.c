@@ -66,6 +66,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 
+#include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
 #include "json.h"
 #include "stop_ids.h"
