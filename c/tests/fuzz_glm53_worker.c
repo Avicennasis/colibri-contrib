@@ -14,8 +14,8 @@
  * well-formed reply: magic, version, status 0, and every expert back in
  * request order with its row count.
  *
- * The expert cache is held at two slots per layer so batches span several
- * cache blocks, and slots are reused within one request.
+ * The expert cache is held at two slots per layer so every batch crosses the
+ * read-ahead path (the next block read while the current one computes).
  *
  * Seeded and bounded (FUZZ_ITERS, default 3000). Needs the int4 streaming
  * fixture:
@@ -211,7 +211,7 @@ static void mutate(Buf *b) {
 }
 
 static int setup(const char *fixture) {
-    g_cap_override = 2;             /* two slots: batches span several cache blocks */
+    g_cap_override = 2;             /* two slots: every batch crosses the read-ahead */
     return glm53_worker_open(&g_model, fixture);
 }
 
