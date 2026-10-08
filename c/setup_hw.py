@@ -155,6 +155,21 @@ def cpu_from_cpuinfo(text):
     return {"name": name, "features": features}
 
 
+#: What the prebuilt x86-64 engines are compiled to assume (ARCH=x86-64-v3): on a
+#: processor without it they stop at their first such instruction (#1979). AVX2 stands
+#: for the level: a processor without FMA or BMI2 has no AVX2 either.
+PREBUILT_X86_NEEDS = ("avx2",)
+
+
+def missing_for_prebuilt(cpu):
+    """The features the prebuilt engines need that this processor reports it lacks;
+    [] off x86-64, where the prebuilt engines assume nothing beyond the baseline."""
+    if ((cpu or {}).get("arch") or "") not in ("x86_64", "amd64", "x64"):
+        return []
+    features = set((cpu or {}).get("features") or [])
+    return [feature for feature in PREBUILT_X86_NEEDS if feature not in features]
+
+
 #: IsProcessorFeaturePresent codes (winnt.h).
 WINDOWS_PF = {"avx2": 40, "avx512f": 41, "asimd": 43}
 
@@ -880,6 +895,11 @@ def format_report(report):
                          ("avx2", "avx_vnni", "avx512f", "avx512_vnni", "avx512_bf16", "asimddp", "sve"))
     lines.append(f"  CPU     {cpu.get('name') or cpu.get('arch') or '?'}, {core_text}"
                  + (f", {features}" if features else ""))
+    missing = missing_for_prebuilt(cpu)
+    if missing:
+        lines.append(f"          note: no {', '.join(f.upper() for f in missing)}: the prebuilt "
+                     "engines need it, so the engine is built for this processor (a compiler "
+                     "is needed)")
     lines.append(f"  RAM     {fmt_gb(mem.get('total'))}"
                  + (f" ({fmt_gb(mem.get('available'))} free now)" if mem.get("available") else ""))
     disk = report.get("disk")
