@@ -58,25 +58,11 @@ PY=${PY:-python3}
 export COLI_LOOKUP=${COLI_LOOKUP:-0} Q38_MTP=${Q38_MTP:-0}
 
 fail() { echo "FAIL: $*"; exit 1; }
-# san_diag <log>: 0 when the log holds a sanitizer diagnostic that fails the case. One kind
-# does not: a SEGV inside Lavapipe's own queue thread, every frame of which is Mesa's,
-# the C library's or the sanitizer's, and nothing else in the log (#1988). It has come
-# once in a day of runs, at the end of a GLM-5.2 case, and not in 260 runs on a desktop;
-# it is reported as a warning. A frame of ours on that stack, or any other diagnostic
-# (a use after free inside Mesa included), still fails, and the case's other gates
-# (its tokens, its experts on the device) still hold the run to its output.
+# san_diag <log>: 0 when the log holds a sanitizer diagnostic, which fails the case.
+# (#1988, a SEGV in Lavapipe's queue thread, was ours: a batch whose wait had timed out
+# had its experts freed under it. backend_vulkan.c keeps them now, test_vk_tier checks.)
 san_diag() {
-  grep -qaE "ERROR: AddressSanitizer|runtime error:" "$1" || return 1
-  if [ "$(grep -caE 'ERROR: AddressSanitizer|runtime error:' "$1")" = 1 ] &&
-     grep -qa "ERROR: AddressSanitizer: SEGV on unknown address" "$1" &&
-     awk '/ERROR: AddressSanitizer: SEGV/ { on = 1; next }
-          on && /^ *#[0-9]+ / { n++; if ($0 !~ /libvulkan_lvp\.so|libc\.so|libsanitizer|asan_thread_start/) ours = 1; next }
-          on && n && /^[ \t]*$/ { exit }
-          END { exit !(n > 0 && !ours) }' "$1"; then
-    echo "::warning::a SEGV inside Lavapipe's own thread, no frame of ours (#1988): $(grep -a -m1 'ERROR: AddressSanitizer' "$1")"
-    return 1
-  fi
-  return 0
+  grep -qaE "ERROR: AddressSanitizer|runtime error:" "$1"
 }
 
 # Every sanitized run below sets ASAN_OPTIONS with detect_stack_use_after_return=0:

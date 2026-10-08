@@ -2567,9 +2567,9 @@ int coli_vk_expert_group_issue(ColiVkTensor *const *gates, ColiVkTensor *const *
 int coli_vk_expert_group_take(float *y) {
     if (!G.eg_inflight) return 0;
     G.eg_inflight = 0;
-    if (vk_fence_wait(G.dev, G.eg_fence) != VK_SUCCESS) {
+    if (vk_fence_wait(G.dev, G.eg_fence) != VK_SUCCESS) {   /* no async_end: the group may still run */
         fprintf(stderr, "[VK] expert-group fence wait failed — disabling GPU offload\n");
-        G.ready = 0; async_end(0); return 0;
+        G.ready = 0; return 0;
     }
     async_end(0);
     double t4 = G.eg_prof ? vk_now() : 0;
@@ -2957,9 +2957,9 @@ int coli_vk_expert_group_issue2(ColiVkTensor *const *gates, ColiVkTensor *const 
 int coli_vk_expert_group_take2(float *y) {
     if (!G2.inflight) return 0;
     G2.inflight = 0;
-    if (vk_fence_wait(G2.dev, G2.fence) != VK_SUCCESS) {
+    if (vk_fence_wait(G2.dev, G2.fence) != VK_SUCCESS) {   /* no async_end: the group may still run */
         fprintf(stderr, "[VK] dev2 expert-group fence wait failed — disabling dev2 offload\n");
-        G2.ready = 0; async_end(1); return 0;
+        G2.ready = 0; return 0;
     }
     async_end(1);
     memcpy(y, G2.y.ptr, G2.pending_yb);
@@ -3475,6 +3475,12 @@ static void tensor_reap(int dev) {
     pthread_mutex_unlock(&g_deferred_mx);
     while (mine) { ColiVkTensor *n = mine->next_free; tensor_release(mine); mine = n; }
 }
+/* A join whose wait fails does not call async_end. A wait that gives up (VK_TIMEOUT: a
+ * slow device, a loaded machine) does not stop the work, which may still be running and
+ * reading every tensor it names, so the device stays counted busy and its frees wait for
+ * the vkDeviceWaitIdle of the shutdown. #1988: a tier batch's wait timed out on Lavapipe,
+ * the tier's teardown at exit freed that batch's experts, and Lavapipe's queue thread,
+ * still running it, read freed memory. */
 static void async_end(int dev) {
     __atomic_sub_fetch(&g_async_inflight[dev], 1, __ATOMIC_ACQ_REL);
     tensor_reap(dev);
@@ -4052,7 +4058,18 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
     X->ready = 1;
     return 1;
 }
+/* COLI_VK_WAIT_FAULT=n (tests): the n-th batch joined on the primary device after
+ * coli_vk_xb_init gives up at once with VK_TIMEOUT, as a wait that runs out of time
+ * does: the batch may still be running. One stderr line says when it fired. */
+static long g_wait_fault_at, g_wait_fault_n;
+static int wait_fault(void) {
+    if (g_wait_fault_at <= 0 || ++g_wait_fault_n != g_wait_fault_at) return 0;
+    fprintf(stderr, "[VK] COLI_VK_WAIT_FAULT: the wait for batch #%ld gives up\n", g_wait_fault_at);
+    return 1;
+}
 int coli_vk_xb_init(int D, int I, int act, float limit, float a, float b) {
+    const char *e = getenv("COLI_VK_WAIT_FAULT");
+    g_wait_fault_at = e && *e ? atol(e) : 0; g_wait_fault_n = 0;
     return xb_init(&g_xb[0], 0, D, I, act, limit, a, b);
 }
 int coli_vk_xb_init_dev(int dev, int D, int I, int act, float limit, float a, float b) {
@@ -4100,12 +4117,14 @@ ColiVkExpert *coli_vk_xb_expert(ColiVkTensor *g, ColiVkTensor *u, ColiVkTensor *
 }
 
 /* The expert's sets and its three tensors. Not while a batch is in flight (the
- * batch may name it); the tier frees at its join. */
+ * batch may name it); the tier frees at its join. After a batch stopped the context
+ * (X->ready 0: a failed wait, and that batch may still be running) the sets stay
+ * until xb_shutdown destroys their pools, after the device's wait. */
 static void xb_expert_unlink(ColiVkExpert *e) {   /* its sets, not its tensors */
     XbCtx *X = e->X;
     if (e->prev) e->prev->next = e->next; else X->live = e->next;
     if (e->next) e->next->prev = e->prev;
-    if (xb_dev_ready(X) && e->dpool < X->ndpools) {
+    if (X->ready && xb_dev_ready(X) && e->dpool < X->ndpools) {
         VkDescriptorSet sets[4] = {e->s_gu, e->s_dn, e->s_g, e->s_u};
         vkFreeDescriptorSets(X->dev, X->dpools[e->dpool], 4, sets);
     }
@@ -4446,16 +4465,16 @@ static int dev2_fault(void) {
 static int xb_join(XbCtx *X, const float **yrows, double *device_ms) {
     if (!X->inflight) return 0;
     X->inflight = 0;
-    VkResult r = vk_fence_wait(X->dev, X->fence);
+    VkResult r = !X->d && wait_fault() ? VK_TIMEOUT : vk_fence_wait(X->dev, X->fence);
     if (r == VK_SUCCESS && X->d && dev2_fault()) r = VK_ERROR_DEVICE_LOST;
-    async_end(X->d);
-    if (r != VK_SUCCESS) {
+    if (r != VK_SUCCESS) {   /* no async_end: the batch may still run */
         fprintf(stderr, "[VK] %sexpert batch: fence wait failed (%d), %s\n", X->d ? "dev2 " : "", r,
                 X->d ? "the second device stops" : "the tier stops");
         X->ready = 0;
         if (X->d) __atomic_store_n(&G2.ready, 0, __ATOMIC_RELEASE);   /* lost: nothing else runs there */
         return 0;
     }
+    async_end(X->d);
     double ms = 0;
     if (X->has_ts) {
         uint64_t ts[2];
@@ -4626,12 +4645,12 @@ int coli_vk_xb_sub_join(int h, float *const *yout, double *device_ms) {
     if (device_ms) *device_ms = 0;
     if (h < 0 || h > 1 || !X->sub[h].inflight) return 0;
     X->sub[h].inflight = 0;
-    VkResult r = vk_fence_wait_gemm(X->dev, X->sub[h].fence);
-    async_end(X->d);
-    if (r != VK_SUCCESS) {
+    VkResult r = wait_fault() ? VK_TIMEOUT : vk_fence_wait_gemm(X->dev, X->sub[h].fence);
+    if (r != VK_SUCCESS) {   /* no async_end: the batch may still run */
         fprintf(stderr, "[VK] expert batch: fence wait failed (%d), the tier stops\n", r);
         X->ready = 0; return 0;
     }
+    async_end(X->d);
     double ms = 0;
     if (X->has_ts && X->sub[h].qp) {
         uint64_t ts[2];
@@ -4749,8 +4768,10 @@ const float *coli_vk_xb_step_sum(const float *w, const uint8_t *use, double *dev
     if (vkResetFences(X->dev, 1, &X->fence) != VK_SUCCESS || vk_submit(X->d, X->q, &si, X->fence) != VK_SUCCESS) return NULL;
     async_begin(X->d);
     VkResult r = vk_fence_wait_gemm(X->dev, X->fence);
+    if (r != VK_SUCCESS) {   /* no async_end: the sum may still run */
+        fprintf(stderr, "[VK] expert batch: the step's sum failed (%d)\n", r); X->ready = 0; return NULL;
+    }
     async_end(X->d);
-    if (r != VK_SUCCESS) { fprintf(stderr, "[VK] expert batch: the step's sum failed (%d)\n", r); X->ready = 0; return NULL; }
     double ms = 0;
     if (X->has_ts) {
         uint64_t ts[2];
