@@ -28,7 +28,9 @@
  *            slots, prefetch, experts cut into parts): every device row, resident or
  *            streamed, equals the reference, the sum the all-CPU sum, the cold experts
  *            below the rule's rows stay on the CPU, and the resident set is the warm
- *            start's before and after (streaming promotes nothing).
+ *            start's before and after (streaming promotes nothing);
+ *   timeout  a batch's wait gives up (COLI_VK_WAIT_FAULT): the tier stops and the experts
+ *            that batch names keep their device memory until the device is idle.
  *
  *   make tests/test_vk_tier VK=1 && VK_ICD_FILENAMES=.../lvp_icd.json ./tests/test_vk_tier */
 #include <stdio.h>
@@ -792,6 +794,46 @@ static void stream_commit_failure(const char *spv) {
     unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
 }
 
+/* COLI_VK_WAIT_FAULT=1: the first batch's wait gives up at once, as a wait that runs out
+ * of time does, and the batch may still be running (#1988). The tier stops; the experts
+ * that batch names, freed by the tier's shutdown, keep their device ranges until the
+ * device is idle (coli_vk_shutdown), not from the moment the wait gave up. */
+static void wait_timeout(const char *spv) {
+    setenv("COLI_VK_WAIT_FAULT", "1", 1);
+    int ready = coli_vk_init(spv);
+    CHECK(ready, "wait timeout: no device");
+    if (!ready) { unsetenv("COLI_VK_WAIT_FAULT"); return; }
+    VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    set_budget(L * E, f, f);
+    VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+    int on = vkt_init(&vc, NULL);
+    CHECK(on, "wait timeout: the tier did not start");
+    if (on) {
+        for (int e = 0; e < E; e++) { VktExpertSrc s = src_of(&ex[0][e]); vkt_put(0, e, &s); }
+        vkt_put_done();
+        enum { S = 4 };
+        int idx[S * K]; float w[S * K]; uint8_t taken[S * K]; const float *dev[S * K];
+        float x[S * HF_MAX];
+        route(S, 0, E, idx, w);
+        for (int i = 0; i < S * H; i++) x[i] = frnd();
+        int n = vkt_issue(0, x, S, K, idx, taken);
+        int joined = n ? vkt_join(dev) : -1;
+        CHECK(n > 0 && joined == 0, "wait timeout: %d rows issued, join %d (the device should take them and the join fail)", n, joined);
+        CHECK(vkt_devices() == 0, "wait timeout: the tier is still on");
+        ColiVkPoolStats before, after; coli_vk_pool_stats(1, &before);
+        vkt_shutdown();
+        coli_vk_pool_stats(1, &after);
+        CHECK(before.live > 0 && after.live == before.live && after.frees == before.frees,
+              "wait timeout: the tier's shutdown freed experts under the batch (%d live ranges and %llu frees "
+              "before it, %d and %llu after)", before.live, (unsigned long long)before.frees, after.live,
+              (unsigned long long)after.frees);
+        printf("  the wait gave up: tier stopped, %d expert ranges kept until the device is idle\n", after.live);
+    }
+    model_free(); coli_vk_shutdown();
+    unsetenv("COLI_VK_WAIT_FAULT");
+}
+
 /* The expert batch's grouped GEMM (qmatmul_grp.comp) and a big step's whole-step
  * buffers (coli_vk_xb_step_*): a hidden width of 256 (multiples of 128 take the grouped
  * route), every format it computes (device fmt 1, 2, 4).
@@ -924,6 +966,7 @@ int main(int argc, char **argv) {
     CHECK(ps.live == 0 && px.live == 0, "%d + %d tier ranges still live after every shutdown", ps.live, px.live);
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */
     stream_commit_failure(spv);
+    printf("wait timeout:\n"); wait_timeout(spv);
     printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
     return fails != 0;
 }
