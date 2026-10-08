@@ -62,9 +62,13 @@ d2_case() {
     evict) x=(COLI_VK_EXPERTS2=${D2_E2:-2}) ;;
     fault) x=(COLI_VK_DEV2_FAULT=2) ;;
     # the devices short of the experts too (COLI_VK_EXPERTS2): with room for all of them,
-    # everything routed after the prompt is on a device and the CPU reads nothing more
-    excl)   D2_SMALL=1; x=(COLI_VK_EXPERTS2=${D2_E2:-8}) ;;
-    noexcl) D2_SMALL=1; x=(COLI_VK_EXPERTS2=${D2_E2:-8} COLI_VK_TIER_EXCLUSIVE=0) ;;
+    # everything routed after the prompt is on a device and the CPU reads nothing more.
+    # COLI_VK_TIER_BALANCE=0: which experts the CPU computes, and so which ones its RAM
+    # cache holds when it evicts, then follows the routing alone; balanced, it follows
+    # the joins' timings, and deepseek_v4 gave up no copy on some runs (#1987: 1 run in
+    # 20 on a desktop, 20 in 20 with it off)
+    excl)   D2_SMALL=1; x=(COLI_VK_EXPERTS2=${D2_E2:-8} COLI_VK_TIER_BALANCE=0) ;;
+    noexcl) D2_SMALL=1; x=(COLI_VK_EXPERTS2=${D2_E2:-8} COLI_VK_TIER_EXCLUSIVE=0 COLI_VK_TIER_BALANCE=0) ;;
   esac
   $run cpu.tok cpu.log "$@"
   local D2_HIST=0 D2_KEEP=0
@@ -294,13 +298,13 @@ family_dev2_sanitize() {
       run=${eng#*:}; eng=${eng%%:*}
       local D2_X=1 D2_SMALL=0
       case $k in big) x=COLI_VK_TIER_GEMM_ROWS=2; D2_X=4 ;; evict) x=COLI_VK_EXPERTS2=2 ;; fault) x=COLI_VK_DEV2_FAULT=2 ;;
-                  excl) x=COLI_VK_EXPERTS2=8; D2_SMALL=1 ;; *) x=D2=1 ;; esac
+                  excl) x="COLI_VK_EXPERTS2=8 COLI_VK_TIER_BALANCE=0"; D2_SMALL=1 ;; *) x=D2=1 ;; esac   # balance off: #1987
       local A=(ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
                OMP_NUM_THREADS=2 $x COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 COLI_VK_DEV2=0)
       local D2_HIST=0
       [ $k = big ] && { D2_KEEP=1 $run san.tok san.log "${A[@]}"; D2_HIST=1; }   # the warm start's history
       $run san.tok san.log "${A[@]}"
-      if grep -qaE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan dev2 $eng $k: sanitizer diagnostic"; fi
+      if san_diag san.log; then cat san.log; fail "asan dev2 $eng $k: sanitizer diagnostic"; fi
       if [ $k = excl ]; then
         grep -qaE "^\[VK\] tier $eng run: .* \| exclusive: [1-9]" san.log || { grep -a '\[VK\] tier' san.log; fail "asan dev2 $eng excl: no RAM copy given up"; }
       elif [ $k = fault ]; then

@@ -402,7 +402,7 @@ ptl_mla_san() {  # <engine> <tag> <want N> <env and argv...>
   rm -f chain.usage
   env COLI_USAGE=chain.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} "$@" > san.log 2>&1 || true
   rm -f chain.usage
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
   grep -q "$eng chain: \([1-9][0-9]* forwards\|the device was lost\)" san.log || [ "$want" = 0 ] || { cat san.log; fail "$tag: the chain never ran"; }
   ptl_check_n "$eng" san.log "$want" "$tag"
   ptl_check_placed "$eng" san.log "$tag"
@@ -444,7 +444,7 @@ ptl_family_glm_sanitize() {
     # shellcheck disable=SC2086
     CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=$([ "${args%% *}" = ./colibri ] && echo colibri || echo numeric) \
       $PY tests/vulkan_chain_serve.py $args > san.log 2>&1 || { cat san.log; fail "asan partial serve $args"; }
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan partial serve $args: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan partial serve $args: sanitizer diagnostic"; fi
     echo "OK asan partial serve ${args%% *}: $(tail -1 san.log | cut -c1-120)"
   done
   rm -rf glm_tiny_shx glm53_l6 glm53_l6s-i4 glm53_l6_serve chain.usage
