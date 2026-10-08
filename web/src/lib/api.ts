@@ -335,13 +335,17 @@ export async function askSystemOne(
   state: string,
   question: string,
   options: string[],
+  pinState: boolean,
   signal?: AbortSignal,
 ): Promise<DecisionResponse> {
   const response = await fetch(endpoint(baseUrl, "systemone"), {
     method: "POST",
     headers: headers(apiKey),
     body: JSON.stringify({
-      model, state,
+      /* The page sends one question per request so each result can appear as it
+         arrives. A multi-question run asks the first request to photograph the
+         shared document; a one-question run preserves the server's heuristic. */
+      model, state, ...(pinState ? { pin_state: true } : {}),
       questions: { q: { type: "choice", instructions: question, criteria: Object.fromEntries(options.map((o) => [o, null])) } },
     }),
     signal,
