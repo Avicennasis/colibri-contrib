@@ -104,10 +104,17 @@ jobs:
   vulkan:
     name: Vulkan (Lavapipe, software)
     runs-on: ubuntu-latest
+    # 3 minutes when it works. Without a limit a stalled package mirror held a runner for
+    # the 6-hour default (#1978's run of 2026-10-07).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install the Vulkan toolchain and a software driver
         run: |
+          # A mirror that stops answering mid-file is given up after 30 s and retried,
+          # instead of holding the job until its time limit (archive.ubuntu.com, 2026-10-07).
+          printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\n' |
+            sudo tee /etc/apt/apt.conf.d/99colibri-ci > /dev/null
           sudo apt-get update
           # libvulkan-dev: headers + loader. glslc: compiles the .comp shaders to SPIR-V --
           # neither is present on the runner by default, which is half of why VK=1 was
@@ -461,6 +468,9 @@ jobs:
           cache-dependency-path: ${{ matrix.req }}
       - name: Install the Vulkan toolchain, Lavapipe and the fixture dependencies
         run: |
+          # see the vulkan job: a stalled mirror is given up and retried
+          printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\n' |
+            sudo tee /etc/apt/apt.conf.d/99colibri-ci > /dev/null
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libvulkan-dev glslc mesa-vulkan-drivers

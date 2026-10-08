@@ -1680,5 +1680,33 @@ class WindowsToolchainTests(unittest.TestCase):
         self.assertIn("mingw-w64-ucrt-x86_64-libgomp", setup_flow.PACKAGES["msys2"][1]["build"])
 
 
+
+class PortFreeTest(unittest.TestCase):
+    """A port is free when nothing answers on it AND a server could bind it now."""
+
+    def test_a_port_held_without_listening_is_not_free(self):
+        # test_foreign_http_health_does_not_prevent_starting_the_configured_server failed
+        # on a busy runner (#1977's run of 2026-10-07): the port after the occupied one
+        # had no listener, so it passed for free, yet a socket held it and the server
+        # could not bind it.
+        held = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        held.bind(("127.0.0.1", 0))
+        port = held.getsockname()[1]
+        try:
+            self.assertFalse(setup_flow.port_free("127.0.0.1", port))
+        finally:
+            held.close()
+
+    def test_a_listening_port_is_not_free_and_a_closed_one_is(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        try:
+            self.assertFalse(setup_flow.port_free("127.0.0.1", port))
+        finally:
+            server.close()
+        self.assertTrue(setup_flow.port_free("127.0.0.1", free_port()))
+
 if __name__ == "__main__":
     unittest.main()

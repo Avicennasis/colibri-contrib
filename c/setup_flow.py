@@ -1227,9 +1227,27 @@ def _get_json(url, timeout=2.0):
 
 
 def port_free(host, port):
+    """Nothing answers on `port`, and a server could bind it now. Connecting alone took
+    a port nobody listens on for a free one even when a socket held it -- in the
+    ephemeral range, the local end of some outgoing connection -- and the server then
+    failed with "Address already in use" (test_setup_flow on a busy CI runner)."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.5)
-        return sock.connect_ex(("127.0.0.1" if host in ("0.0.0.0", "") else host, port)) != 0
+        if sock.connect_ex(("127.0.0.1" if host in ("0.0.0.0", "") else host, port)) == 0:
+            return False
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            if os.name != "nt":
+                # as the server binds (socketserver's allow_reuse_address): a port in
+                # TIME_WAIT is free for it. On Windows the option would let the probe
+                # share a port that is in use, so it is left off there.
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host or "0.0.0.0", port))
+    except socket.gaierror:
+        return True               # not an IPv4 address: the connect above is all there is
+    except OSError:
+        return False
+    return True
 
 
 def pick_port(host, preferred, tries=20):
