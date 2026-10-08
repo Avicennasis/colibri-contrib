@@ -111,16 +111,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install the Vulkan toolchain and a software driver
         run: |
-          # A mirror that stops answering mid-file is given up after 30 s and retried,
-          # instead of holding the job until its time limit (archive.ubuntu.com, 2026-10-07).
-          printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\n' |
-            sudo tee /etc/apt/apt.conf.d/99colibri-ci > /dev/null
-          sudo apt-get update
           # libvulkan-dev: headers + loader. glslc: compiles the .comp shaders to SPIR-V --
           # neither is present on the runner by default, which is half of why VK=1 was
-          # never built here. mesa-vulkan-drivers carries Lavapipe (lvp).
-          sudo apt-get install -y --no-install-recommends \
-            libvulkan-dev glslc mesa-vulkan-drivers
+          # never built here. mesa-vulkan-drivers carries Lavapipe (lvp). The script puts
+          # hard limits around apt: a stalled mirror held these jobs for hours.
+          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
       - name: Build with VK=1
         run: |
           cd c
@@ -468,12 +463,8 @@ jobs:
           cache-dependency-path: ${{ matrix.req }}
       - name: Install the Vulkan toolchain, Lavapipe and the fixture dependencies
         run: |
-          # see the vulkan job: a stalled mirror is given up and retried
-          printf 'Acquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries "5";\n' |
-            sudo tee /etc/apt/apt.conf.d/99colibri-ci > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libvulkan-dev glslc mesa-vulkan-drivers
+          # hard limits around apt (.github/scripts/apt-install.sh): see the vulkan job
+          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
           pip install -r ${{ matrix.req }} ${{ matrix.extra }}
       - name: The pinned TypeScript SDK
         if: ${{ matrix.npm }}
