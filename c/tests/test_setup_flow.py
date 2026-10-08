@@ -1309,6 +1309,28 @@ class WholeSetup(HomeTestCase):
                                           {"backend": "cpu", "missing": []}, tc, out=lambda *_: None)
         self.assertIn("no prebuilt engine", str(caught.exception))
 
+    def test_a_processor_without_avx2_is_not_handed_the_prebuilt_engine(self):
+        # #1979: the prebuilt engines assume x86-64-v3 and stopped on their first AVX2
+        # instruction on a Xeon E3-1230 V2. Without a compiler setup says so, with what
+        # to install, instead of fetching an archive that cannot run.
+        tc = dict(TC_ALL, source_checkout=False, can_build=False, can_build_vulkan=False)
+        os.remove(os.path.join(self.engines, "qwen36"))
+        old = {"arch": "x86_64", "name": "Intel Xeon E3-1230 V2", "features": []}
+        fetched = setup_flow.SetupError("fetched")
+        with modeled("linux"), mock.patch.object(setup_hw, "detect_cpu", return_value=old), \
+             mock.patch.object(setup_flow, "fetch_release_archive", side_effect=fetched) as fetch:
+            with self.assertRaises(setup_flow.SetupError) as caught:
+                setup_flow.resolve_engine(family_by_id("qwen36"), None,
+                                          {"backend": "cpu", "missing": []}, tc, out=lambda *_: None)
+            self.assertIn("no AVX2", str(caught.exception))
+            self.assertIn(setup_flow.package_hint(["build"]), str(caught.exception))
+            fetch.assert_not_called()
+            # COLI_CPU_CHECK=0 trusts the archive, as the engines do
+            with mock.patch.dict(os.environ, {"COLI_CPU_CHECK": "0"}):
+                with self.assertRaisesRegex(setup_flow.SetupError, "fetched"):
+                    setup_flow.resolve_engine(family_by_id("qwen36"), None,
+                                              {"backend": "cpu", "missing": []}, tc, out=lambda *_: None)
+
     def test_list_json(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -1657,6 +1679,34 @@ class WindowsToolchainTests(unittest.TestCase):
     def test_msys2_build_packages_include_libgomp(self):
         self.assertIn("mingw-w64-ucrt-x86_64-libgomp", setup_flow.PACKAGES["msys2"][1]["build"])
 
+
+
+class PortFreeTest(unittest.TestCase):
+    """A port is free when nothing answers on it AND a server could bind it now."""
+
+    def test_a_port_held_without_listening_is_not_free(self):
+        # test_foreign_http_health_does_not_prevent_starting_the_configured_server failed
+        # on a busy runner (#1977's run of 2026-10-07): the port after the occupied one
+        # had no listener, so it passed for free, yet a socket held it and the server
+        # could not bind it.
+        held = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        held.bind(("127.0.0.1", 0))
+        port = held.getsockname()[1]
+        try:
+            self.assertFalse(setup_flow.port_free("127.0.0.1", port))
+        finally:
+            held.close()
+
+    def test_a_listening_port_is_not_free_and_a_closed_one_is(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        try:
+            self.assertFalse(setup_flow.port_free("127.0.0.1", port))
+        finally:
+            server.close()
+        self.assertTrue(setup_flow.port_free("127.0.0.1", free_port()))
 
 if __name__ == "__main__":
     unittest.main()
