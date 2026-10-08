@@ -945,6 +945,14 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
     if release_asset_suffix() is None:
         raise SetupError(f"no compiler here, and no prebuilt engine is published for "
                          f"{host_os()}/{host_machine()}: {package_hint(['build'])}")
+    # The prebuilt engines assume x86-64-v3: on an older processor they stop at their
+    # first AVX2 instruction (#1979). A compiler builds one for this processor instead.
+    # COLI_CPU_CHECK=0 trusts the archive anyway, as it does in the engines.
+    missing = setup_hw.missing_for_prebuilt(setup_hw.detect_cpu())
+    if missing and os.environ.get("COLI_CPU_CHECK") != "0":
+        raise SetupError(f"this processor has no {', '.join(f.upper() for f in missing)}, which "
+                         "the prebuilt engines need; with a compiler setup builds the engine for "
+                         f"this processor: {package_hint(['build'])}")
     out("  no compiler found: using the prebuilt engine from the GitHub release")
     runtime, tag = fetch_release_archive(version, out=out)
     if entry is not None and setup_catalog.version_tuple(tag) < setup_catalog.version_tuple(entry.prebuilt_since):
@@ -1219,9 +1227,27 @@ def _get_json(url, timeout=2.0):
 
 
 def port_free(host, port):
+    """Nothing answers on `port`, and a server could bind it now. Connecting alone took
+    a port nobody listens on for a free one even when a socket held it -- in the
+    ephemeral range, the local end of some outgoing connection -- and the server then
+    failed with "Address already in use" (test_setup_flow on a busy CI runner)."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.5)
-        return sock.connect_ex(("127.0.0.1" if host in ("0.0.0.0", "") else host, port)) != 0
+        if sock.connect_ex(("127.0.0.1" if host in ("0.0.0.0", "") else host, port)) == 0:
+            return False
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            if os.name != "nt":
+                # as the server binds (socketserver's allow_reuse_address): a port in
+                # TIME_WAIT is free for it. On Windows the option would let the probe
+                # share a port that is in use, so it is left off there.
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host or "0.0.0.0", port))
+    except socket.gaierror:
+        return True               # not an IPv4 address: the connect above is all there is
+    except OSError:
+        return False
+    return True
 
 
 def pick_port(host, preferred, tries=20):
