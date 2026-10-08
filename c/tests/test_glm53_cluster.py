@@ -169,14 +169,14 @@ class Glm53ClusterEngineTest(unittest.TestCase):
             raise AssertionError(result.stderr)
         return result
 
-    def start_workers(self, n, extra=None):
+    def start_workers(self, n, extra=None, args=()):
         workers, ports = [], []
         for _ in range(n):
             port = free_port()
             env = {**self.env, "EXPERT_WORKER": "1", "SNAP": FIXTURE,
                    "CLUSTER_WORKER_PORT": str(port), "CLUSTER_WORKER_BIND": "127.0.0.1",
                    **(extra or {})}
-            proc = subprocess.Popen([str(BINARY)], env=env, stdout=subprocess.DEVNULL,
+            proc = subprocess.Popen([str(BINARY), *args], env=env, stdout=subprocess.DEVNULL,
                                     stderr=subprocess.PIPE, text=True)
             self.addCleanup(self.stop, proc)
             workers.append(proc)
@@ -235,6 +235,23 @@ class Glm53ClusterEngineTest(unittest.TestCase):
         self.assertTrue(lines, result.stderr)
         for _, workers, waited in lines:
             self.assertGreaterEqual(int(waited), max(int(ms) for ms in re.findall(r"(\d+) ms", workers)))
+
+    def test_worker_readahead_at_every_cache_size(self):
+        """The worker computes one block while it reads the next into the
+        other half of the layer's slots. With 1 slot there is no overlap;
+        with 2, 3 and 4 every block boundary is crossed with reads in flight.
+        Whatever the size, the answer is the local run's, byte for byte, with
+        the prefill split into blocks of 1 and 3 tokens as well as whole."""
+        for cap in ("1", "2", "3", "4"):
+            for chunk in ("1", "3", "128"):
+                with self.subTest(slots=cap, chunk=chunk):
+                    _, spec = self.start_workers(2, args=(cap,))
+                    local = self.run_engine({"GLM53_PREFILL_CHUNK": chunk})
+                    result = self.run_engine({"CLUSTER_WORKERS": spec,
+                                              "GLM53_PREFILL_CHUNK": chunk})
+                    want, got = parse(local.stdout), parse(result.stdout)
+                    for key in COMPARED:
+                        self.assertEqual(got.get(key), want.get(key), f"{key} differs")
 
     def test_weights_override_and_route_everything_to_one_worker(self):
         """COLI_CLUSTER_WEIGHTS wins over the probes; a lopsided split still

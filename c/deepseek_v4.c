@@ -12703,6 +12703,7 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 
 #ifdef COLI_V4_UNIT_GENERATE_STATS
 /* ######## tools/deepseek_v4_generate_stats.c ######## */
+#include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979): in the unit with main only */
 #define COLI_V4_GENERATE_MAIN coli_v4_generate_stats_legacy_main
 #define COLI_V4_GENERATE_HELPERS_ONLY
 #define spec_print spec_print_diagnostic_legacy

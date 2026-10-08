@@ -80,11 +80,15 @@ export default function Brio({ baseUrl, apiKey, model, connected }: {
     const controller = new AbortController()
     abort.current = controller
     setRows((all) => all.map((row) => ({ ...row, result: undefined, error: undefined, seconds: undefined })))
+    /* Requests are deliberately one question at a time. When more follow, the
+       first one must photograph their shared document; a one-question run can
+       keep System One's cheaper no-photo heuristic. */
+    const pinState = asked.length > 1
     for (const row of asked) {
       setRunning(row.id)
       const started = performance.now()
       try {
-        const result = await askSystemOne(baseUrl, apiKey, model, state, row.text, lines(row.options), controller.signal)
+        const result = await askSystemOne(baseUrl, apiKey, model, state, row.text, lines(row.options), pinState, controller.signal)
         patch(row.id, { result, seconds: (performance.now() - started) / 1000 })
       } catch (cause) {
         if (controller.signal.aborted) break   /* fermato apposta: le domande dopo restano intatte */

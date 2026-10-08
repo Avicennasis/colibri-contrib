@@ -60,6 +60,7 @@ static int qwen38_max_ctx(void) {
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+#include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
 #include "st.h"
 #include "omp_tune.h"

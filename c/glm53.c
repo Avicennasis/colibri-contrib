@@ -66,6 +66,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 
+#include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
 #include "json.h"
 #include "stop_ids.h"
@@ -2007,12 +2008,16 @@ static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, M
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
 
-/* Un blocco di `here` esperti distinti del layer (here <= gli slot della cache):
+/* expert_block_reserve picks a slot for each of ids[0..here) (hits, then the
+ * least recently used victims, a slot the Vulkan tier already holds first) and
+ * lists in to_read the ones still to be read; expert_block_read also reads them.
+ *
+  * Un blocco di `here` esperti distinti del layer (here <= gli slot della cache):
  * ognuno riceve uno slot, quello dove sta gia' se c'e', altrimenti il meno usato di
  * recente, prenotato subito; poi i mancanti si leggono in parallelo. slot_of[i] e'
  * lo slot di ids[i]; to_read e' spazio di lavoro da `here` interi. */
-static void expert_block_read(GModel *m, int index, const int *ids, int here,
-                              int *slot_of, int *to_read) {
+static int expert_block_reserve(GModel *m, int index, const int *ids, int here,
+                                int *slot_of, int *to_read) {
     LCache *cache = &m->ecache[index];
     int reads = 0;
     for (int i = 0; i < here; i++) {
@@ -2038,6 +2043,13 @@ static void expert_block_read(GModel *m, int index, const int *ids, int here,
         slot_of[i] = (int)(victim - cache->s);
         to_read[reads++] = i;
     }
+    return reads;
+}
+
+static void expert_block_read(GModel *m, int index, const int *ids, int here,
+                              int *slot_of, int *to_read) {
+    LCache *cache = &m->ecache[index];
+    const int reads = expert_block_reserve(m, index, ids, here, slot_of, to_read);
     double t_batch0;
     t_batch0 = now_s();
 #ifdef _OPENMP
@@ -2652,6 +2664,48 @@ static void glm53_cluster_moe(GModel *m, int layer, const float *x, int tokens,
     free(y); free(rows); free(owner);
 }
 
+/* Read-ahead for the worker: the next block's experts are read by a few
+ * threads while the current block is computed, so the disk and the CPU work
+ * at the same time instead of in turn. The slots were reserved beforehand on
+ * the calling thread; these threads only fill them. */
+#define GLM53_READAHEAD_THREADS 4
+typedef struct {
+    GModel *m;
+    int layer, reads, next;
+    const int *ids, *slot_of, *to_read;
+    pthread_t thread[GLM53_READAHEAD_THREADS];
+    int started;
+    double t0;
+} Glm53Readahead;
+
+static void *glm53_readahead_run(void *arg) {
+    Glm53Readahead *r = arg;
+    LCache *cache = &r->m->ecache[r->layer];
+    for (;;) {
+        const int k = __atomic_fetch_add(&r->next, 1, __ATOMIC_RELAXED);
+        if (k >= r->reads) break;
+        const int i = r->to_read[k];
+        expert_read(r->m, r->layer, r->ids[i], &cache->s[r->slot_of[i]]);
+    }
+    return NULL;
+}
+
+static void glm53_readahead_start(Glm53Readahead *r) {
+    r->next = 0;
+    r->started = 0;
+    r->t0 = now_s();
+    const int n = r->reads < GLM53_READAHEAD_THREADS ? r->reads : GLM53_READAHEAD_THREADS;
+    for (int t = 0; t < n; t++)
+        if (!pthread_create(&r->thread[t], NULL, glm53_readahead_run, r)) r->started++;
+    if (!r->started) glm53_readahead_run(r);      /* no threads: read in place */
+}
+
+static void glm53_readahead_join(Glm53Readahead *r) {
+    for (int t = 0; t < r->started; t++) pthread_join(r->thread[t], NULL);
+    r->started = 0;
+    r->m->t_disk += now_s() - r->t0;
+}
+
 /* One request on an accepted connection. Returns 0 to keep serving, -1 to drop
  * the connection. *established is set once the client has completed the
  * handshake: until then it has one deadline to send a message, so that a
@@ -2722,24 +2776,55 @@ static int glm53_worker_serve_one(GModel *m, int fd, int weight, int *establishe
     if (!bad && (glm53_net_io(fd, GLM53_CLUSTER_MAGIC, 8, 1) || glm53_net_put(fd, reply, 3)))
         bad = 1;
 
-    /* the same cache-sized blocks as the local loop: never more experts in
-     * flight than the layer has slots */
+    /* Blocks of half the layer's slots: one block is computed while the next
+     * is read into the other half. The victims for the next block are the
+     * least recently used slots, which the block being computed (reserved
+     * just before, so most recently) never is. With one slot there is no
+     * second half and the blocks run in turn. */
     LCache *cache = &m->ecache[layer];
-    const int block = cache->cap;
-    int *slot_of = malloc((size_t)block * sizeof(int));
-    int *to_read = malloc((size_t)block * sizeof(int));
+    const int block = cache->cap >= 2 ? cache->cap / 2 : 1;
+    const int overlap = cache->cap >= 2;
+    int *slot_of = malloc((size_t)2 * block * sizeof(int));
+    int *to_read = malloc((size_t)2 * block * sizeof(int));
     int wide = I;
     float *sg = malloc((size_t)wide * sizeof(float)), *su = malloc((size_t)wide * sizeof(float));
     float *y = NULL;
     size_t y_cap = 0;
     if (!slot_of || !to_read || !sg || !su) bad = 1;
-    for (int base = 0; base < (int)n && !bad; base += block) {
+    Glm53Readahead ahead = { .m = m, .layer = (int)layer };
+    int in_flight = 0;                    /* a block's reads are running */
+    if (!bad && overlap) {
+        const int first = block <= (int)n ? block : (int)n;
+        ahead.ids = eid; ahead.slot_of = slot_of; ahead.to_read = to_read;
+        ahead.reads = expert_block_reserve(m, (int)layer, eid, first, slot_of, to_read);
+        glm53_readahead_start(&ahead);
+        in_flight = 1;
+    }
+    for (int base = 0, half = 0; base < (int)n && !bad; base += block, half ^= 1) {
         const int here = base + block <= (int)n ? block : (int)n - base;
-        expert_block_read(m, (int)layer, eid + base, here, slot_of, to_read);
+        int *mine = slot_of + (size_t)half * block;
+        if (overlap) {
+            glm53_readahead_join(&ahead);     /* this block is now in its slots */
+            in_flight = 0;
+            const int next = base + block;
+            if (next < (int)n) {
+                const int count = next + block <= (int)n ? block : (int)n - next;
+                int *theirs = slot_of + (size_t)(half ^ 1) * block;
+                int *reads = to_read + (size_t)(half ^ 1) * block;
+                ahead.ids = eid + next; ahead.slot_of = theirs; ahead.to_read = reads;
+                ahead.reads = expert_block_reserve(m, (int)layer, eid + next, count, theirs, reads);
+                glm53_readahead_start(&ahead);
+                in_flight = 1;
+            }
+        } else {
+            expert_block_read(m, (int)layer, eid + base, here, mine, to_read);
+        }
         for (int i = 0; i < here && !bad; i++) {
             const int j = base + i;
-            Slot *slot = &cache->s[slot_of[i]];
-            slot->used = ++m->clock;
+            Slot *slot = &cache->s[mine[i]];
+            /* No recency bump here: the reservation already stamped it, and
+             * stamping it again now would rank this block above the one
+             * being read, making that block the next victims. */
             Mat gate, up, down;
             expert_mats(m, slot, &gate, &up, &down);
             const size_t need = (size_t)nr[j] * D;
@@ -2757,6 +2842,7 @@ static int glm53_worker_serve_one(GModel *m, int fd, int weight, int *establishe
                 bad = 1;
         }
     }
+    if (in_flight) glm53_readahead_join(&ahead);   /* never free slots under a reader */
     free(y); free(su); free(sg); free(to_read); free(slot_of);
     for (uint32_t j = 0; in && j < n; j++) free(in[j]);
     free(in); free(nr); free(eid);
