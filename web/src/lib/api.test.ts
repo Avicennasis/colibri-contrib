@@ -154,7 +154,7 @@ describe("askSystemOne", () => {
      refactor that "helpfully" appended them to the text would be invisible in
      the answer. */
   it("asks one choice question on /v1/systemone and draws its probabilities", async () => {
-    const seen: { url?: string; body?: { state: string; questions: { q: { type: string; criteria: object } } } } = {}
+    const seen: { url?: string; body?: { state: string; pin_state?: boolean; questions: { q: { type: string; criteria: object } } } } = {}
     vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
       seen.url = url
       seen.body = JSON.parse(String(init.body))
@@ -164,9 +164,10 @@ describe("askSystemOne", () => {
         usage: { input_tokens: 40, output_tokens: 3, cost: 0 },
       }), { status: 200, headers: { "Content-Type": "application/json" } })
     }))
-    const out = await askSystemOne("http://x/v1", "", "laya", "state", "q?", ["a", "b"])
+    const out = await askSystemOne("http://x/v1", "", "laya", "state", "q?", ["a", "b"], true)
     expect(seen.url).toBe("http://x/v1/systemone")
     expect(seen.body?.state).toBe("state")
+    expect(seen.body?.pin_state).toBe(true)
     expect(seen.body?.questions.q).toEqual({ type: "choice", instructions: "q?", criteria: { a: null, b: null } })
     expect(out.answer).toBe("b")
     expect(out.choices.map((c) => c.option)).toEqual(["b", "a"])
@@ -178,7 +179,7 @@ describe("askSystemOne", () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(
       JSON.stringify({ error: { message: "`questions.q.criteria` must be a non-empty object" } }),
       { status: 422, headers: { "Content-Type": "application/json" } })))
-    await expect(askSystemOne("http://x/v1", "", "m", "s", "q", []))
+    await expect(askSystemOne("http://x/v1", "", "m", "s", "q", [], false))
       .rejects.toThrow("must be a non-empty object")
   })
 })
