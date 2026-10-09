@@ -337,7 +337,7 @@ static void test_hello_refuses_a_v1_worker_by_name(void)
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     pthread_t thread;
     assert(pthread_create(&thread, NULL, fake_v1_worker, &sockets[1]) == 0);
-    ClusterWorker w = {sockets[0], "mac-b", 9101};
+    ClusterWorker w = {sockets[0], "mac-b", 9101, 0};
     int saved, capture = stderr_capture_begin(&saved);
     int rc = cluster_hello(&w);
     char said[1024];
@@ -357,7 +357,7 @@ static void test_hello_accepts_a_v2_worker(void)
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     pthread_t thread;
     assert(pthread_create(&thread, NULL, fake_v2_hello_worker, &sockets[1]) == 0);
-    ClusterWorker w = {sockets[0], "mac-a", 9100};
+    ClusterWorker w = {sockets[0], "mac-a", 9100, 0};
     assert(cluster_hello(&w) == 0);
     void *failed;
     assert(pthread_join(thread, &failed) == 0 && failed == NULL);
@@ -453,6 +453,135 @@ static void test_shared_expert_rides_the_routed_batch(void)
         close(sockets[1]);
     }
 }
+
+/* ---- after a failure the link is dead until reconnect (ds4 f0962e3) ---- */
+
+/* A worker for one v1 request of layer 7 (D=3, I=5, one item: expert 42 over
+ * two rows) that answers it wrongly in one of two ways, then waits for a
+ * second request and counts whatever arrives:
+ *  FAIL_STALE: the reply's header claims two items for a one-item request (a
+ *              one-sided mix-up), nothing follows it, and a well-formed reply
+ *              to the same request is sent right behind it -- 52 bytes a
+ *              coordinator that kept reading would take as the answer to its
+ *              NEXT request;
+ *  FAIL_EOF:   the reply stops after the first of its two rows and the write
+ *              side is shut, so the coordinator sees EOF mid-reply while the
+ *              read side stays open. */
+enum { FAIL_STALE = 0, FAIL_EOF = 1 };
+typedef struct { int fd, mode, failed; ssize_t bytes_after; } FailingWorker;
+
+static int failing_worker_read_request(int fd, float *input /* 6 */)
+{
+    char magic[8];
+    uint32_t version, layer, D, I, n, eid, nr;
+    return cluster_io(fd, magic, 8, 0) || memcmp(magic, COLI_CLUSTER_MAGIC, 8) ||
+           cluster_u32(fd, &version, 0) || version != COLI_CLUSTER_VERSION ||
+           cluster_u32(fd, &layer, 0) || layer != 7 ||
+           cluster_u32(fd, &D, 0) || D != 3 || cluster_u32(fd, &I, 0) || I != 5 ||
+           cluster_u32(fd, &n, 0) || n != 1 ||
+           cluster_u32(fd, &eid, 0) || eid != 42 || cluster_u32(fd, &nr, 0) || nr != 2 ||
+           cluster_io(fd, input, 6 * sizeof(float), 0);
+}
+
+static int failing_worker_write_reply(int fd, uint32_t n, const float *output, size_t floats)
+{
+    uint32_t version = COLI_CLUSTER_VERSION, zero = 0, eid = 42, nr = 2;
+    if (cluster_io(fd, (void *)COLI_CLUSTER_MAGIC, 8, 1) || cluster_u32(fd, &version, 1) ||
+        cluster_u32(fd, &zero, 1) || cluster_u32(fd, &n, 1))
+        return -1;
+    if (floats == 0) return 0;            /* a header and nothing behind it */
+    return cluster_u32(fd, &eid, 1) || cluster_u32(fd, &nr, 1) ||
+           cluster_io(fd, (void *)output, floats * sizeof(float), 1);
+}
+
+static void *failing_worker(void *opaque)
+{
+    FailingWorker *w = opaque;
+    float input[6], output[6];
+    if (failing_worker_read_request(w->fd, input)) { w->failed = 1; return NULL; }
+    for (int i = 0; i < 6; i++) output[i] = input[i] * 2.0f;
+    if (w->mode == FAIL_STALE) {
+        if (failing_worker_write_reply(w->fd, 2, NULL, 0) ||
+            failing_worker_write_reply(w->fd, 1, output, 6)) { w->failed = 1; return NULL; }
+    } else {
+        if (failing_worker_write_reply(w->fd, 1, output, 3)) { w->failed = 1; return NULL; }
+        shutdown(w->fd, SHUT_WR);
+    }
+    /* Anything the coordinator sends now is a request it must not have made.
+     * The test closing its end is what ends this wait. */
+    char buf[256];
+    ssize_t got;
+    while ((got = recv(w->fd, buf, sizeof(buf), 0)) > 0) w->bytes_after += got;
+    return NULL;
+}
+
+static void test_failed_link_refuses_later_exchanges_without_io(void)
+{
+    static Model m;
+    memset(&m, 0, sizeof(m));
+    m.c.hidden = 3;
+    m.c.moe_inter = 5;
+    float x[6] = {1.0f, -2.0f, 0.5f, 3.0f, -4.0f, 0.25f};
+    int idxs[2] = {42, 42}, keff[2] = {1, 1};
+    float ws[2] = {0.5f, 0.25f};
+    assert(g_cluster_act == COLI_ACT_F32);
+    for (int mode = FAIL_STALE; mode <= FAIL_EOF; mode++) {
+        int sockets[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        ClusterWorker w = {sockets[0], "mac-a", 9100, 0};
+        FailingWorker fw = {sockets[1], mode, 0, 0};
+        pthread_t thread;
+        assert(pthread_create(&thread, NULL, failing_worker, &fw) == 0);
+
+        /* The first exchange fails on the worker's reply. */
+        ClusterItem items[1];
+        memset(items, 0, sizeof(items));
+        assert(cluster_item(idxs, ws, keff, 1, 2, 42, &items[0], 3, x) == 1);
+        float out[6] = {0};
+        assert(cluster_exchange(&w, COLI_CLUSTER_VERSION, 7, 3, 5, items, 1, out, NULL) == -1);
+        assert(w.failed == 1);
+        for (int z = 0; z < 6; z++) assert(out[z] == 0.0f);   /* nothing of a failed reply lands */
+
+        /* In FAIL_STALE the worker's well-formed 52-byte reply is queued on
+         * the link before the second exchange begins (wait for it, so the
+         * claim below is about bytes that were there to be read). */
+        char peek[256];
+        ssize_t pending = 0;
+        for (int tries = 0; mode == FAIL_STALE && pending < 52 && tries < 500; tries++) {
+            pending = recv(sockets[0], peek, sizeof(peek), MSG_PEEK | MSG_DONTWAIT);
+            if (pending < 52) usleep(10000);
+        }
+        if (mode == FAIL_STALE) assert(pending == 52);
+
+        /* The second exchange on the same link is refused before any I/O: it
+         * returns at once (the alarm turns a blocked read into a failure), it
+         * sends the worker nothing, and it reads nothing -- in FAIL_STALE the
+         * well-formed 52-byte reply the worker queued is still there, unread. */
+        memset(items, 0, sizeof(items));
+        assert(cluster_item(idxs, ws, keff, 1, 2, 42, &items[0], 3, x) == 1);
+        float out2[6] = {0};
+        alarm(5);
+        int rc = cluster_exchange(&w, COLI_CLUSTER_VERSION, 7, 3, 5, items, 1, out2, NULL);
+        alarm(0);
+        assert(rc == -1);
+        assert(w.failed == 1);
+        for (int z = 0; z < 6; z++) assert(out2[z] == 0.0f);
+        cluster_item_free(&items[0]);
+        pending = recv(sockets[0], peek, sizeof(peek), MSG_PEEK | MSG_DONTWAIT);
+        if (mode == FAIL_STALE) {
+            assert(pending == 52);                     /* magic 8 + 4 u32 + eid nr + 6 f32 */
+            assert(memcmp(peek, COLI_CLUSTER_MAGIC, 8) == 0);
+        } else {
+            assert(pending == 0);                      /* EOF: the worker shut its write side */
+        }
+
+        close(sockets[0]);                             /* ends the worker's wait */
+        assert(pthread_join(thread, NULL) == 0);
+        close(sockets[1]);
+        assert(fw.failed == 0);
+        assert(fw.bytes_after == 0);                   /* no second request reached it */
+    }
+}
 #endif
 
 int main(void)
@@ -466,6 +595,7 @@ int main(void)
     test_hello_refuses_a_v1_worker_by_name();
     test_hello_accepts_a_v2_worker();
     test_shared_expert_rides_the_routed_batch();
+    test_failed_link_refuses_later_exchanges_without_io();
     puts("cluster protocol tests: ok");
 #else
     puts("cluster protocol tests: skipped on Windows");

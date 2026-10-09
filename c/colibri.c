@@ -166,7 +166,7 @@ static const float *g_pre_sh;
  * moe() la usa e salta la FASE A. NULL = router su CPU. */
 static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pre_keff;
 #if !defined(_WIN32)
-typedef struct { int fd; char host[128]; int port; } ClusterWorker;
+typedef struct { int fd; char host[128]; int port; int failed; } ClusterWorker;
 static ClusterWorker g_cluster_workers[16];
 static int g_cluster_n;
 #endif
@@ -3450,7 +3450,7 @@ static int cluster_connect_one(const char *spec, ClusterWorker *out){
     out->fd=fd;
     size_t hostlen=strlen(copy); if(hostlen>=sizeof(out->host)) hostlen=sizeof(out->host)-1;
     memcpy(out->host,copy,hostlen); out->host[hostlen]=0;
-    out->port=port; return 0;
+    out->port=port; out->failed=0; return 0;
 }
 /* v2 hello: an empty request (layer, D, I and n all zero -- the coordinator has
  * no model loaded yet) in the act this coordinator will speak; sent only when
@@ -3465,18 +3465,18 @@ static int cluster_hello(ClusterWorker *w){
     if(v!=COLI_CLUSTER_VERSION_ACT){
         fprintf(stderr,"[CLUSTER] expert worker %s:%d answered the hello with protocol v%u, this coordinator needs v%u\n",
                 w->host,w->port,v,COLI_CLUSTER_VERSION_ACT);
-        return -1;
+        w->failed=1; return -1;
     }
     if(cluster_u32(w->fd,&v,0)||v!=g_cluster_act||cluster_u32(w->fd,&v,0)||v!=0||cluster_u32(w->fd,&v,0)||v!=0){
         fprintf(stderr,"[CLUSTER] expert worker %s:%d answered the hello with a non-empty response\n",w->host,w->port);
-        return -1;
+        w->failed=1; return -1;
     }
     return 0;
 closed:
     fprintf(stderr,"[CLUSTER] expert worker %s:%d closed on the COLIEX01 v%u hello: it runs an older engine (v%u); "
             "rebuild the worker, or run this coordinator without COLI_CLUSTER_ACT=q8 and CLUSTER_SHARED=1\n",
             w->host,w->port,COLI_CLUSTER_VERSION_ACT,COLI_CLUSTER_VERSION);
-    return -1;
+    w->failed=1; return -1;
 }
 static void cluster_close_all(void){
     if(g_cluster_n) fprintf(stderr,"[CLUSTER] transfer: %llu bytes sent, %llu bytes received (activations %s)\n",
@@ -3526,6 +3526,55 @@ static int cluster_item(const int *idxs,const float *ws,const int *keff,int K,in
     return 1;
 }
 static void cluster_item_free(ClusterItem *it){ free(it->rows); free(it->weights); free(it->inputs); memset(it,0,sizeof(*it)); }
+/* One request to one worker and its reply, on that worker's own link: the
+ * header, the n items, then the reply's header and items, each routed row
+ * weighted into out and the shared item's rows (if any) copied into sh_out.
+ * Returns 1 when sh_out was filled, 0 when the exchange completed without a
+ * shared item, -1 on any transport or protocol failure: a short read, EOF
+ * mid-reply, a magic, version, act, status, item id or row count that is not
+ * the one asked for. A failure marks the link failed, and every later
+ * exchange on that link returns -1 before touching the socket, so whatever
+ * the worker still sends after a failed exchange -- the rest of a reply the
+ * coordinator stopped reading, or a well-formed reply that followed it -- is
+ * never read as the answer to a later request. The link comes back only by
+ * reconnecting (ds4 f0962e3's rule after a one-sided transport failure). */
+static int cluster_exchange(ClusterWorker *w,uint32_t ver,int layer,int D,int I,
+                            ClusterItem *items,int n,float *out,float *sh_out){
+    char magic[8]; uint32_t v; int delivered=0;
+    if(w->failed) return -1;
+    if(cluster_io(w->fd,(void*)COLI_CLUSTER_MAGIC,8,1)) goto fail;
+    v=ver; if(cluster_u32(w->fd,&v,1)) goto fail;
+    if(ver==COLI_CLUSTER_VERSION_ACT){ v=g_cluster_act; if(cluster_u32(w->fd,&v,1)) goto fail; }
+    v=(uint32_t)layer; if(cluster_u32(w->fd,&v,1)) goto fail;
+    v=(uint32_t)D; if(cluster_u32(w->fd,&v,1)) goto fail;
+    v=(uint32_t)I; if(cluster_u32(w->fd,&v,1)) goto fail;
+    v=(uint32_t)n; if(cluster_u32(w->fd,&v,1)) goto fail;
+    for(int j=0;j<n;j++){
+        v=items[j].eid<0?COLI_CLUSTER_EID_SHARED:(uint32_t)items[j].eid; if(cluster_u32(w->fd,&v,1)) goto fail;
+        v=(uint32_t)items[j].nr; if(cluster_u32(w->fd,&v,1)) goto fail;
+        if(cluster_act_send(w->fd,g_cluster_act,items[j].inputs,(uint32_t)items[j].nr,(uint32_t)D)) goto fail;
+    }
+    if(cluster_io(w->fd,magic,8,0)||memcmp(magic,COLI_CLUSTER_MAGIC,8)) goto fail;
+    if(cluster_u32(w->fd,&v,0)||v!=ver) goto fail;
+    if(ver==COLI_CLUSTER_VERSION_ACT&&(cluster_u32(w->fd,&v,0)||v!=g_cluster_act)) goto fail;
+    if(cluster_u32(w->fd,&v,0)||v!=0) goto fail;
+    if(cluster_u32(w->fd,&v,0)||v!=(uint32_t)n) goto fail;
+    for(int j=0;j<n;j++){
+        uint32_t eid,nr, want=items[j].eid<0?COLI_CLUSTER_EID_SHARED:(uint32_t)items[j].eid;
+        if(cluster_u32(w->fd,&eid,0)||cluster_u32(w->fd,&nr,0) ||
+           eid!=want || nr!=(uint32_t)items[j].nr) goto fail;
+        float *y=falloc((int64_t)nr*D);
+        if(cluster_act_recv(w->fd,g_cluster_act,y,nr,(uint32_t)D)){ free(y); goto fail; }
+        if(items[j].eid<0){ if(sh_out){ memcpy(sh_out,y,(size_t)nr*D*sizeof(float)); delivered=1; } }
+        else for(uint32_t r=0;r<nr;r++){ float *dst=out+(int64_t)items[j].rows[r]*D;
+            float wt=items[j].weights[r]; for(int d=0;d<D;d++) dst[d]+=wt*y[(int64_t)r*D+d]; }
+        free(y);
+    }
+    return delivered;
+fail:
+    w->failed=1;
+    return -1;
+}
 /* One layer's routed batch-union to the workers. With sh_out (v2, CLUSTER_SHARED=1)
  * the first block (base==0) also carries the shared expert, as one item of S rows
  * on the worker layer%n picks; its unweighted output lands in sh_out, and the
@@ -3547,46 +3596,18 @@ static int cluster_moe_batch(Model *m,int layer,float *x,int S,float *out,
             it->inputs=falloc((int64_t)S*D); memcpy(it->inputs,x,(size_t)S*D*sizeof(float));
         }
         if(!n) continue;
-        ClusterWorker *w=&g_cluster_workers[wi]; char magic[8]; uint32_t v;
-        uint32_t ver=cluster_version_for(sh_out!=NULL);
-        if(cluster_io(w->fd,(void*)COLI_CLUSTER_MAGIC,8,1)) goto fail;
-        v=ver; if(cluster_u32(w->fd,&v,1)) goto fail;
-        if(ver==COLI_CLUSTER_VERSION_ACT){ v=g_cluster_act; if(cluster_u32(w->fd,&v,1)) goto fail; }
-        v=(uint32_t)layer; if(cluster_u32(w->fd,&v,1)) goto fail;
-        v=(uint32_t)D; if(cluster_u32(w->fd,&v,1)) goto fail;
-        v=(uint32_t)m->c.moe_inter; if(cluster_u32(w->fd,&v,1)) goto fail;
-        v=(uint32_t)n; if(cluster_u32(w->fd,&v,1)) goto fail;
-        for(int j=0;j<n;j++){
-            v=items[j].eid<0?COLI_CLUSTER_EID_SHARED:(uint32_t)items[j].eid; if(cluster_u32(w->fd,&v,1)) goto fail;
-            v=(uint32_t)items[j].nr; if(cluster_u32(w->fd,&v,1)) goto fail;
-            if(cluster_act_send(w->fd,g_cluster_act,items[j].inputs,(uint32_t)items[j].nr,(uint32_t)D)) goto fail;
-        }
-        if(cluster_io(w->fd,magic,8,0)||memcmp(magic,COLI_CLUSTER_MAGIC,8)) goto fail;
-        if(cluster_u32(w->fd,&v,0)||v!=ver) goto fail;
-        if(ver==COLI_CLUSTER_VERSION_ACT&&(cluster_u32(w->fd,&v,0)||v!=g_cluster_act)) goto fail;
-        if(cluster_u32(w->fd,&v,0)||v!=0) goto fail;
-        if(cluster_u32(w->fd,&v,0)||v!=(uint32_t)n) goto fail;
-        for(int j=0;j<n;j++){
-            uint32_t eid,nr, want=items[j].eid<0?COLI_CLUSTER_EID_SHARED:(uint32_t)items[j].eid;
-            if(cluster_u32(w->fd,&eid,0)||cluster_u32(w->fd,&nr,0) ||
-               eid!=want || nr!=(uint32_t)items[j].nr) goto fail;
-            float *y=falloc((int64_t)nr*D);
-            if(cluster_act_recv(w->fd,g_cluster_act,y,nr,(uint32_t)D)){ free(y); goto fail; }
-            if(items[j].eid<0){ memcpy(sh_out,y,(size_t)nr*D*sizeof(float)); delivered=1; }
-            else for(uint32_t r=0;r<nr;r++){ float *dst=out+(int64_t)items[j].rows[r]*D;
-                float wt=items[j].weights[r]; for(int d=0;d<D;d++) dst[d]+=wt*y[(int64_t)r*D+d]; }
-            free(y);
-        }
+        ClusterWorker *w=&g_cluster_workers[wi]; uint32_t ver=cluster_version_for(sh_out!=NULL);
+        int rc=cluster_exchange(w,ver,layer,D,m->c.moe_inter,items,n,out,sh_out);
         for(int j=0;j<n;j++) cluster_item_free(&items[j]);
-        continue;
-fail:
-        for(int j=0;j<n;j++) cluster_item_free(&items[j]);
-        fprintf(stderr,"[CLUSTER] expert worker %s:%d failed during layer %d batch (protocol v%u, activations %s)\n",
-                w->host,w->port,layer,ver,cluster_act_name(g_cluster_act));
-        if(ver!=COLI_CLUSTER_VERSION)
-            fprintf(stderr,"[CLUSTER] if the worker at %s:%d only speaks protocol v%u it refuses this v%u request by closing: "
-                    "rebuild it, or run this coordinator with COLI_CLUSTER_ACT=f32\n",w->host,w->port,COLI_CLUSTER_VERSION,ver);
-        exit(1);
+        if(rc<0){
+            fprintf(stderr,"[CLUSTER] expert worker %s:%d failed during layer %d batch (protocol v%u, activations %s)\n",
+                    w->host,w->port,layer,ver,cluster_act_name(g_cluster_act));
+            if(ver!=COLI_CLUSTER_VERSION)
+                fprintf(stderr,"[CLUSTER] if the worker at %s:%d only speaks protocol v%u it refuses this v%u request by closing: "
+                        "rebuild it, or run this coordinator with COLI_CLUSTER_ACT=f32\n",w->host,w->port,COLI_CLUSTER_VERSION,ver);
+            exit(1);
+        }
+        if(rc) delivered=1;
     }
     return delivered;
 }
