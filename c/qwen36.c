@@ -933,7 +933,8 @@ typedef struct {
  * g4/u4/d4 are then NULL. */
 typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used;
                  unsigned busy; /* callers computing from this slot (expert_hold): never evicted */
-                 uint8_t *gqe;  /* GGUF mode: the expert as the file stores it, [gate | up | down] rows of their own ggml types (GqExp) */ } Slot;
+                 uint8_t *gqe;  /* GGUF mode: the expert as the file stores it, [gate | up | down] rows of their own ggml types (GqExp) */
+                 int8_t *t8; float *t8s; int t8_eid;   /* GGUF mode, the Vulkan tier: gqe as int8 with one scale per 32 weights, for expert t8_eid - 1 (gq_slot_i8) */ } Slot;
 /* GGUF mode: where layer L's experts live. The three fused tensors hold
  * n_experts contiguous matrices each; expert e of gate is eb_g bytes at
  * e*eb_g. The types can differ per matrix and per layer (a Q4_K_M file keeps
@@ -3751,7 +3752,50 @@ static void route_footer(FILE *f, const Model *m) {
  * Every expert the CPU computed passes its RAM bytes to the tier (vkt_note), which
  * may promote it. */
 #define QWEN_VK_ROWS 64
-static VktExpertSrc vk_slot_src(Model *m, const Slot *e) {
+/* GGUF mode: one matrix of ggml rows as int8 with one f32 scale per 32 weights (the
+ * tier's VKT_SRC_I8_GS, fmt 13), the expert's ".scale" factor folded into the scales.
+ * Measured on Qwen3.6's unsloth levels (IQ1_M to Q8_0, layer 10): +0.4-0.55% relative
+ * error on top of each level's own 6-35% against Q8_0, and exactly the weights for
+ * Q8_0; int4 would add 7-10%. */
+static void gq_rows_i8(int t, const uint8_t *src, int rows, int cols, float mul, int8_t *dst, float *sc) {
+    const int64_t rb = gq_row_bytes(t, cols); const int ng = cols / 32;
+    #pragma omp parallel
+    {
+        float *row = falloc(cols);
+        #pragma omp for schedule(static)
+        for (int o = 0; o < rows; o++) {
+            gq_dequant_row(t, src + (int64_t)o * rb, row, cols);
+            for (int g = 0; g < ng; g++) {
+                const float *v = row + g * 32; float a = 0.f;
+                for (int i = 0; i < 32; i++) { float f = fabsf(v[i]); if (f > a) a = f; }
+                float scale = a / 127.f, inv = a > 0.f ? 127.f / a : 0.f;
+                int8_t *q = dst + (int64_t)o * cols + g * 32;
+                for (int i = 0; i < 32; i++) { long r = lrintf(v[i] * inv); q[i] = (int8_t)(r > 127 ? 127 : r < -127 ? -127 : r); }
+                sc[(int64_t)o * ng + g] = scale * mul;
+            }
+        }
+        free(row);
+    }
+}
+static void gq_slot_i8(Model *m, int layer, Slot *e) {
+    if (e->t8_eid == e->eid + 1) return;
+    const Cfg *c = &m->c; const GqExp *x = &m->gqx[layer];
+    const int D = c->hidden, I = c->inter; const int64_t n = (int64_t)I * D;
+    if (!e->t8) {
+        e->t8 = malloc((size_t)(3 * n)); e->t8s = malloc((size_t)(3 * (n / 32)) * sizeof(float));
+        if (!e->t8 || !e->t8s) { fprintf(stderr, "OOM gq_slot_i8\n"); exit(1); }
+    }
+    gq_rows_i8(x->tg, e->gqe, I, D, x->sg ? x->sg[e->eid] : 1.f, e->t8, e->t8s);
+    gq_rows_i8(x->tu, e->gqe + x->eb_g, I, D, x->su ? x->su[e->eid] : 1.f, e->t8 + n, e->t8s + n / 32);
+    gq_rows_i8(x->td, e->gqe + x->eb_g + x->eb_u, D, I, x->sd ? x->sd[e->eid] : 1.f, e->t8 + 2 * n, e->t8s + 2 * (n / 32));
+    e->t8_eid = e->eid + 1;
+}
+static VktExpertSrc vk_slot_src(Model *m, int layer, Slot *e) {
+    if (g_gguf) {
+        int64_t n = (int64_t)m->c.inter * m->c.hidden;
+        gq_slot_i8(m, layer, e);
+        return (VktExpertSrc){e->t8, e->t8 + n, e->t8 + 2 * n, e->t8s, e->t8s + n / 32, e->t8s + 2 * (n / 32)};
+    }
     if (e->pw) {
         int64_t gp = (int64_t)m->c.inter * m->c.hidden / 2;
         return (VktExpertSrc){e->pw, e->pw + gp, e->pw + 2 * gp, e->gs, e->us, e->ds};
@@ -3788,7 +3832,7 @@ static void moe_vk_xf_cpu(Model *m, int layer, const float *x, int S, const int 
                 int src = (s0 + s) * K + (k0 + k), dst = s * kper + k;
                 if (!held[dst]) continue;
                 memcpy(ctb + (int64_t)src * D, lctb + (int64_t)dst * D, (size_t)D * sizeof(float));
-                VktExpertSrc vs = vk_slot_src(m, held[dst]); vkt_note(layer, idx[src], &vs);
+                VktExpertSrc vs = vk_slot_src(m, layer, held[dst]); vkt_note(layer, idx[src], &vs);
                 slot_release(held[dst]);
             }
         }
@@ -3807,9 +3851,31 @@ static void moe_vk_i8_cpu(Model *m, int layer, const float *x, int S, const int 
         matmul_qe(u, xs, e->u, e->us, D, I);
         for (int j = 0; j < I; j++) { float gv = g[j]; g[j] = (gv / (1.f + expf(-gv))) * u[j]; }
         matmul_qd(ctb + (int64_t)i * D, g, e->d, e->ds, I, D);
-        VktExpertSrc vs = vk_slot_src(m, e); vkt_note(layer, idx[i], &vs);
+        VktExpertSrc vs = vk_slot_src(m, layer, e); vkt_note(layer, idx[i], &vs);
         slot_release(e);
     }
+}
+/* GGUF mode: the pairs the tier did not take, from the ggml rows as the CPU path reads
+ * them; an expert the tier would take now is converted for it (vkt_wants) and noted. */
+static void moe_vk_gq_cpu(Model *m, int layer, const float *x, int S, const int *idx,
+                          const uint8_t *want, float *ctb) {
+    Cfg *c = &m->c; int D = c->hidden, K = c->topk, I = c->inter;
+    const GqExp *gx = &m->gqx[layer];
+    float *G = falloc(I), *U = falloc(I);
+    for (int i = 0; i < S * K; i++) {
+        if (idx[i] < 0 || !want[i]) continue;
+        const float *xs = x + (int64_t)(i / K) * D; float *y = ctb + (int64_t)i * D;
+        Slot *e = expert_hold(m, layer, idx[i]);
+        gq_matmul(G, xs, e->gqe, gx->tg, 1, D, I);
+        gq_matmul(U, xs, e->gqe + gx->eb_g, gx->tu, 1, D, I);
+        float sg = gx->sg ? gx->sg[idx[i]] : 1.f, su = gx->su ? gx->su[idx[i]] : 1.f;
+        for (int j = 0; j < I; j++) { float gv = G[j] * sg; G[j] = (gv / (1.f + expf(-gv))) * (U[j] * su); }
+        gq_matmul(y, G, e->gqe + gx->eb_g + gx->eb_u, gx->td, 1, I, D);
+        if (gx->sd) for (int d = 0; d < D; d++) y[d] *= gx->sd[idx[i]];
+        if (vkt_wants(layer, idx[i])) { VktExpertSrc vs = vk_slot_src(m, layer, e); vkt_note(layer, idx[i], &vs); }
+        slot_release(e);
+    }
+    free(G); free(U);
 }
 static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, float *out,
                        const int *idx, const float *val, int routed_only) {
@@ -3826,12 +3892,14 @@ static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, flo
         const float *vb = val + (int64_t)s0 * K;
         int ndev = vkt_issue(layer, xb, rows, K, ib, taken);
         for (int i = 0; i < n; i++) { want[i] = !taken[i]; if (taken[i]) ehit_mark(m, layer, ib[i]); }
-        if (xf) moe_vk_xf_cpu(m, layer, xb, rows, ib, want, ctb);
+        if (g_gguf) moe_vk_gq_cpu(m, layer, xb, rows, ib, want, ctb);
+        else if (xf) moe_vk_xf_cpu(m, layer, xb, rows, ib, want, ctb);
         else    moe_vk_i8_cpu(m, layer, xb, rows, ib, want, ctb, g, u);
         if (shb) { memset(shb, 0, (size_t)rows * D * sizeof(float)); qwen_shared_experts_cpu(m, l, xb, rows, shb, g, u, hh); }
         const float *dsum = NULL;   /* a step wholly on the device: its routed rows summed there */
         if (ndev && !vkt_join_sum(dev, vb, &dsum)) {   /* the batch failed (the tier stops): those pairs here */
-            if (xf) moe_vk_xf_cpu(m, layer, xb, rows, ib, taken, ctb);
+            if (g_gguf) moe_vk_gq_cpu(m, layer, xb, rows, ib, taken, ctb);
+            else if (xf) moe_vk_xf_cpu(m, layer, xb, rows, ib, taken, ctb);
             else    moe_vk_i8_cpu(m, layer, xb, rows, ib, taken, ctb, g, u);
             memset(taken, 0, (size_t)n);
         }
@@ -3992,7 +4060,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
      * neither the CUDA tier nor the expert_ffn kernel is consulted.
      * Routing, shared expert, and the combine stay on the CPU below. */
     /* GGUF: the experts as the file stores them, ggml blocks no tier reads (moe_gq_run) */
-    int use_gq = g_gguf;
+    int use_gq = g_gguf && !vkt_ready();   /* the Vulkan tier takes GGUF experts as int8-g32 */
     int use_qq = !use_gq && qq_active();
     int use_qt = !use_gq && !use_qq && qt_ready();
     /* the Vulkan tier takes the routed experts of every format it was given
@@ -6681,8 +6749,8 @@ static int vk_load(void *ctx, int layer, int e, VktExpertSrc *src, void **h) {
     Model *m = ctx;
     Slot *s = expert_hold(m, layer, e);
     if (!s) return 0;
-    if (!xf_mode(m)) slot_ensure_int8(m, s);
-    *src = vk_slot_src(m, s); *h = s;
+    if (!xf_mode(m) && !g_gguf) slot_ensure_int8(m, s);
+    *src = vk_slot_src(m, layer, s); *h = s;
     return 1;
 }
 static void vk_release(void *ctx, void *h) { (void)ctx; slot_release((Slot *)h); }
@@ -6694,7 +6762,8 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
     if (on && *on == '0') return;
     int gs = c->expert_gs, dgs = down_gs_of(c);
     VktFmt gu, dn;
-    if (xf_mode(m)) { gu = (VktFmt){VKT_SRC_I4U_PLANAR64, 64}; dn = gu; }
+    if (g_gguf) { gu = (VktFmt){VKT_SRC_I8_GS, 32}; dn = gu; }
+    else if (xf_mode(m)) { gu = (VktFmt){VKT_SRC_I4U_PLANAR64, 64}; dn = gu; }
     else if (expert_mixed) {   /* int4 gate/up unpacked to int8 in the slot, int8 down */
         gu = (VktFmt){gs ? VKT_SRC_I8_AS_I4_GS : VKT_SRC_I8_AS_I4_ROW, gs};
         dn = (VktFmt){dgs ? VKT_SRC_I8_GS : VKT_SRC_I8_ROW, dgs};
@@ -6704,7 +6773,8 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
         gu = (VktFmt){gs ? VKT_SRC_I8_GS : VKT_SRC_I8_ROW, gs}; dn = gu;
     }
     int64_t ng = (int64_t)c->inter * c->hidden;
-    size_t slot = (size_t)(xf_mode(m) ? (2 * ng + ng) / 2 : 3 * ng) +
+    size_t slot = g_gguf ? (size_t)m->gqe_max
+                : (size_t)(xf_mode(m) ? (2 * ng + ng) / 2 : 3 * ng) +
                   (size_t)(2 * scale_count_gu(c) + scale_count_d(c)) * sizeof(float);
     VktConfig vc = {.engine = "qwen36", .layers = c->n_layers, .experts = c->n_experts,
                     .hidden = c->hidden, .inter = c->inter, .topk = c->topk,
@@ -6736,9 +6806,10 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
             Slot tmp; memset(&tmp, 0, sizeof tmp);
             slot_ensure_allocated(m, &tmp);
             load_expert_merged(m, pl[i], pe[i], &tmp);
-            VktExpertSrc src = vk_slot_src(m, &tmp);
+            VktExpertSrc src = vk_slot_src(m, pl[i], &tmp);
             vkt_put(pl[i], pe[i], &src);
             free(tmp.pw); free(tmp.g); free(tmp.gs); free(tmp.g4); free(tmp.u4); free(tmp.d4);
+            free(tmp.gqe); free(tmp.t8); free(tmp.t8s);
         }
         vkt_put_done();
         fprintf(stderr, "[VK] tier qwen36: warm start, %d experts from the history in %.1fs\n", n, now_s() - t0);
@@ -6918,6 +6989,10 @@ int main(int argc, char **argv) {
     /* measured on a Radeon 780M: decode and prefill both faster (docs/vulkan.md) */
     if (g_vk_ready && !qq_active())
         g_vk_chain = coli_vk_chain_decide("qwen36", vkt_wanted() && m.c.n_experts > 0, COLI_VK_CHAIN_ON);
+    if (g_vk_chain && g_gguf) {   /* the chain reads colibri's own dense formats, not ggml blocks */
+        fprintf(stderr, "[VK] qwen36: GGUF weights: the dense chain stays off, the expert tier takes the experts\n");
+        g_vk_chain = 0;
+    }
     if (g_vk_chain && g_q36_mux_slots > 1) {
         g_vk_chain = 0;
         fprintf(stderr, "[VK] qwen36: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
@@ -7039,7 +7114,7 @@ int main(int argc, char **argv) {
     /* Una riga, sempre: e' l'unico modo di verificare il probe dall'esterno
      * (CI sul container tiny int8, #1331) senza una scheda. */
     fprintf(stderr, "[qwen36] expert format on disk: %s\n",
-            g_gguf ? "GGUF native ggml types (CPU path, no VRAM tier)"
+            g_gguf ? "GGUF native ggml types (the Vulkan tier holds them as int8, one scale per 32)"
             : m.c.n_experts == 0 ? "none (dense model: every layer's MLP is resident)"
             : expert_mixed ? "int4 gate/up + int8 down (mixed; CPU path, no VRAM tier yet)"
                          : expert_is_int4 ? "int4 packed (tier fmt=4)" : "int8 (tier fmt=1)");
@@ -7337,7 +7412,7 @@ static void qwen36_segment_model_destroy(Qwen36SegmentEngine *engine) {
         for (int slot = 0; slot < cache->n; slot++) {
             free(cache->slots[slot].g);
             free(cache->slots[slot].pw);
-            free(cache->slots[slot].gqe);
+            free(cache->slots[slot].gqe); free(cache->slots[slot].t8); free(cache->slots[slot].t8s);
             free(cache->slots[slot].gs);
             free(cache->slots[slot].g4);
             free(cache->slots[slot].u4);
