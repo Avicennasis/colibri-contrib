@@ -1,0 +1,131 @@
+"""tools/convert_qwen38_experts_int4.py --int2: the int2-g32 sidecar's quantizer and layout.
+
+numpy only:
+  * pack_int2 puts element i's code where int2_g32.h reads it (byte (i/128)*32 + i%32,
+    bits 2*((i%128)/32)), checked with an independent decoder;
+  * quantize_int2_g32 gives codes 0..3, u8 group scales and an f32 per row, and on
+    Gaussian weights the error of the four-level Lloyd-Max grid; activation weights
+    move the error away from the heavy channels;
+  * the record: nine tensors back to back, the f32 row scales aligned, 1,397,760 bytes
+    on Qwen3.8-Flash-Next's geometry;
+  * CovStats: the factor it hands out is upper triangular and inverts the damped H;
+  * the error-carrying quantizer (GPTQ) lowers the output error under a correlated H.
+"""
+import math
+import os
+import struct
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+import convert_qwen38_experts_int4 as cv  # noqa: E402
+
+
+def decode_codes(packed, cols):
+    rows = packed.shape[0]
+    out = np.zeros((rows, cols), np.uint8)
+    for i in range(cols):
+        byte = packed[:, (i // 128) * 32 + i % 32]
+        out[:, i] = (byte >> (2 * ((i % 128) // 32))) & 3
+    return out
+
+
+def out_err(w, q, h):
+    dw = w - q
+    return math.sqrt(np.einsum("ij,jk,ik->", dw, h, dw) / np.einsum("ij,jk,ik->", w, h, w))
+
+
+class Int2Convert(unittest.TestCase):
+    def setUp(self):
+        self.rng = np.random.default_rng(7)
+
+    def test_pack_layout(self):
+        codes = self.rng.integers(0, 4, (5, 384), dtype=np.uint8)
+        packed = cv.pack_int2(codes)
+        self.assertEqual(packed.shape, (5, 96))
+        np.testing.assert_array_equal(decode_codes(packed, 384), codes)
+
+    def test_quantizer_ranges_and_error(self):
+        w = (self.rng.standard_normal((64, 512)) * 0.02).astype(np.float32)
+        codes, q, d = cv.quantize_int2_g32(w)
+        self.assertEqual((codes.dtype, q.dtype, d.dtype), (np.uint8, np.uint8, np.float32))
+        self.assertEqual((codes.shape, q.shape, d.shape), ((64, 512), (64, 16), (64,)))
+        self.assertLessEqual(int(codes.max()), 3)
+        self.assertEqual(int(q.max(axis=1).min()), 255)          # the row scale is its largest group's
+        err = cv.rel_l2(w, cv.dequantize_int2(codes, q, d))
+        # 4-level Lloyd-Max on a Gaussian: sqrt(0.1175) = 0.343; a scale per 32 does a bit better
+        self.assertTrue(0.30 < err < 0.35, err)
+
+    def test_weights_protect_heavy_channels(self):
+        w = (self.rng.standard_normal((64, 512)) * 0.02).astype(np.float32)
+        imp = np.ones(512, np.float32)
+        imp[::32] = 100.0                                          # one heavy channel per group
+        plain = cv.dequantize_int2(*cv.quantize_int2_g32(w))
+        weighted = cv.dequantize_int2(*cv.quantize_int2_g32(w, imp))
+        heavy = slice(0, 512, 32)
+        self.assertLess(np.abs(w[:, heavy] - weighted[:, heavy]).mean(), np.abs(w[:, heavy] - plain[:, heavy]).mean())
+        self.assertLess((imp * (w - weighted) ** 2).sum(), (imp * (w - plain) ** 2).sum())
+
+    def test_record_geometry(self):
+        g = cv.Geometry(48, 512, 2560, 640, bits=2)
+        self.assertEqual(g.record_bytes, 1397760)
+        off = 0
+        names = []
+        for name, dtype, shape, start, n in g.tensors("model.language_model", 3, 7):
+            self.assertEqual(start, off)
+            self.assertEqual(n, int(np.prod(shape)) * (4 if dtype == "F32" else 1))
+            if dtype == "F32":
+                self.assertEqual(start % 4, 0)
+            off += n
+            names.append(name.rsplit(".", 2)[-2:])
+        self.assertEqual(off, g.record_bytes)
+        self.assertEqual([n[-1] for n in names[:3]], ["weight"] * 3)
+        self.assertEqual([n[-1] for n in names[3:6]], ["q8"] * 3)
+        self.assertEqual([n[-1] for n in names[6:]], ["d"] * 3)
+        with self.assertRaises(ValueError):
+            cv.Geometry(2, 4, 192, 64, bits=2)
+
+    def _cov_file(self, tmp, mats):
+        path = os.path.join(tmp, "cov.bin")
+        layers, hidden = len(mats), mats[0].shape[0]
+        with open(path, "wb") as f:
+            f.write(b"Q38COV1\0" + struct.pack("<2i", layers, hidden) + np.full(layers, 1000, np.int64).tobytes())
+            for m in mats:
+                f.write(m.astype(np.float64).tobytes())
+        return path
+
+    def test_cov_factor(self):
+        a = self.rng.standard_normal((256, 64))
+        m = a @ a.T + np.eye(256)
+        with tempfile.TemporaryDirectory() as tmp:
+            cov = cv.CovStats(self._cov_file(tmp, [m, 2 * m]))
+            imp = self.rng.uniform(0.5, 2.0, 256)
+            u = cov.upper_inv(0, imp)
+            self.assertTrue(np.allclose(np.tril(u, -1), 0))
+            dg = np.sqrt(np.diag(m))
+            c = m / dg[:, None] / dg[None, :] + cov.damp * np.eye(256)
+            h = np.sqrt(imp)[:, None] * c * np.sqrt(imp)[None, :]
+            np.testing.assert_allclose(u.T @ u @ h, np.eye(256), atol=1e-6)
+            np.testing.assert_allclose(cov.upper_inv(1, imp), u)   # the scale of a layer's matrix does not matter
+
+    def test_gptq_lowers_output_error(self):
+        a = self.rng.standard_normal((256, 16))
+        m = a @ a.T + 0.5 * np.eye(256)
+        w = (self.rng.standard_normal((32, 256)) * 0.02).astype(np.float32)
+        imp = np.diag(m).astype(np.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            cov = cv.CovStats(self._cov_file(tmp, [m]))
+            u = cov.upper_inv(0, imp)
+            dg = np.sqrt(np.diag(m))
+            h = (m / dg[:, None] / dg[None, :] + cov.damp * np.eye(256)) * np.sqrt(imp)[:, None] * np.sqrt(imp)[None, :]
+            plain = cv.dequantize_int2(*cv.quantize_int2_g32(w, imp))
+            gptq = cv.dequantize_int2(*cv.quantize_int2_g32_gptq(w, imp, u))
+            self.assertLess(out_err(w.astype(np.float64), gptq, h), 0.8 * out_err(w.astype(np.float64), plain, h))
+
+
+if __name__ == "__main__":
+    unittest.main()

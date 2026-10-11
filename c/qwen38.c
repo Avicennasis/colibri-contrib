@@ -2401,6 +2401,7 @@ int main(int argc, char **argv) {
                         "(speculation follows one conversation)\n", g_q38_mux_slots);
     else q38_mtp_attach(&m, cap);       /* Q38_MTP=1: the checkpoint's MTP head drafts (qwen38_core.h) */
     q38_act_init(&m);                   /* Q38_ACT_STATS: the experts' input statistics, for a calibrated quantizer */
+    q38_cov_init(&m);                   /* Q38_ACT_COV: their input second moments, for the error-compensating one */
     if (g_q38_gguf) {   /* a tensor the files have and nothing loaded: a weight the engine would ignore */
         int unused = 0, head = 0; char hp[32]; snprintf(hp, sizeof hp, "blk.%d.", m.c.layers);
         const gguf_ctx *files[2] = { &g_q38gg, &g_q38gg_mtp };
@@ -2789,7 +2790,7 @@ static void q38_expert_report(Model *m, int cap) {
         per_expert = (uint64_t)m->x4->record_bytes;
         snprintf(extra, sizeof extra, " (the snapshot's %s: %llu bytes)", what,
                  (unsigned long long)snapshot_expert);
-        what = "int4-g64 from " Q38_INT4_DIR "/";   /* and no FP8 scale bank is built */
+        what = m->x4->bits == 2 ? "int2-g32 from " Q38_INT2_DIR "/" : "int4-g64 from " Q38_INT4_DIR "/";   /* and no FP8 scale bank is built */
     } else if (fixed) {
         snprintf(extra, sizeof extra, " + %.1f MiB resident scale bank", fixed / 1048576.0);
     }
@@ -2926,6 +2927,10 @@ static void q38_vk_tier_start(Model *m,int cap){
     }
     Cfg *c=&m->c;int H=c->hidden,F=c->inter;
     VktFmt f={VKT_SRC_NONE,0};size_t ram_expert=0;
+    if(m->x4&&m->x4->bits==2){
+        fprintf(stderr,"[VK] tier qwen38: the int2-g32 experts have no device kernel yet; they stay on the CPU\n");
+        return;
+    }
     if(m->x4){ f.kind=VKT_SRC_I4U_PLANAR64; f.gs=64; ram_expert=(size_t)m->x4->record_bytes; }
     else f=q38_vk_native_fmt(m,0,c->layers,&ram_expert);
     if(f.kind==VKT_SRC_NONE){

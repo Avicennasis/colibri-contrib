@@ -49,9 +49,25 @@ the engine refuses anything else. A layer is written to a .part file and
 renamed when it is whole, so an interrupted run resumes at the first layer
 the index does not list.
 
+--int2 writes int2_g32.h's format into <model>/experts-int2g32/ instead
+(qwen38 reads it with Q38_EXPERT_INT2=1): per row, groups of 32 inputs on the
+fixed levels -10, -3, 3, 10 times the group's scale, the scales stored as one
+u8 per group under one f32 per row; 1.40 MB per expert, 2.25 bits per weight.
+A group's scale and codes are fitted in turn (nearest level, then the least
+squares scale for those codes) against the activation-weighted error when
+--act-stats is given, then the u8 scales are refitted for the codes they
+end up with. The record:
+
+  gate codes U8 [I, H/4] | up codes | down codes U8 [H, I/4] |
+  gate q U8 [I, H/32] | up q | down q U8 [H, I/32] |
+  gate d F32 [I, 1] | up d | down d F32 [H, 1]
+
+named <...>.weight, <...>.weight.q8 and <...>.weight.d.
+
 Usage:
   python3 tools/convert_qwen38_experts_int4.py --model /path/to/qwen38-fp8 --plan
   python3 tools/convert_qwen38_experts_int4.py --model /path/to/qwen38-fp8 [--workers N]
+  python3 tools/convert_qwen38_experts_int4.py --model /path/to/qwen38-fp8 --int2 --act-stats act.bin
 
 Peak RAM does not grow with the model: each worker holds one expert in flight
 (about 0.11 GB with numpy), and the writer at most the records of one layer
@@ -84,6 +100,12 @@ CODES = "planar64-v8"
 SCALES = "f32-per-64"
 DATA_ALIGN = 4096
 PROJ = ("gate_proj", "up_proj", "down_proj")
+SIDECAR_DIR2 = "experts-int2g32"
+FORMAT2 = "colibri.qwen38.experts-int2g32"
+GS2 = 32
+CODES2 = "planar128-2bit-lv10"
+SCALES2 = "u8-per-32-f32-per-row"
+LEVELS2 = np.array([-10.0, -3.0, 3.0, 10.0])
 FP8_BLOCK = 128
 
 _FLOAT_DTYPES = {"BF16": 2, "F16": 2, "F32": 4}
@@ -221,6 +243,124 @@ def unpack_planar(packed, cols):
     return out
 
 
+def quantize_int2_g32(w, imp=None, iters=6):
+    """w f32 [R, C] (C % 128 == 0) -> (codes u8 [R, C] in 0..3, q u8 [R, C/32], d f32 [R]):
+    w ~ d[r] * q[r, g] * LEVELS2[code]. Per group of 32 the scale and the codes are
+    fitted in turn against sum_i imp_i * (w_i - s * level_i)^2 (imp uniform without
+    statistics), then the scales are stored as u8 under the row's largest and refitted,
+    with the codes, for what the u8 can hold."""
+    rows, cols = w.shape
+    ng = cols // GS2
+    g = w.reshape(rows, ng, GS2).astype(np.float64)
+    a = np.ones((1, ng, GS2)) if imp is None else imp.astype(np.float64).reshape(1, ng, GS2)
+    edges = (LEVELS2[1:] + LEVELS2[:-1]) / 2
+    tiny = 1e-30
+
+    def refit(scale):
+        code = np.searchsorted(edges, g / np.maximum(scale, tiny)[..., None])
+        lv = LEVELS2[code]
+        num, den = (a * g * lv).sum(axis=2), (a * lv * lv).sum(axis=2)
+        return np.where(den > 0, num / np.maximum(den, tiny), scale)
+
+    s = np.sqrt((a * g * g).sum(axis=2) / a.sum(axis=2)) / math.sqrt(float(np.mean(LEVELS2 ** 2)))
+    for _ in range(iters):
+        s = refit(s)
+    d = np.maximum(s.max(axis=1), tiny) / 255.0
+    d = d.astype(np.float32).astype(np.float64)          # the f32 the file stores
+    q = np.clip(np.rint(s / d[:, None]), 1, 255)
+    for _ in range(2):
+        q = np.clip(np.rint(refit(d[:, None] * q) / d[:, None]), 0, 255)
+    code = np.searchsorted(edges, g / np.maximum(d[:, None] * q, tiny)[..., None])
+    return code.reshape(rows, cols).astype(np.uint8), q.astype(np.uint8), d.astype(np.float32)
+
+
+def quantize_int2_g32_gptq(w, imp, U, iters=6, batch=128, margin=1.25):
+    """quantize_int2_g32 with the error of every quantized column carried into the columns
+    still to come (GPTQ's update, written from the paper): U is the upper Cholesky factor
+    of H^-1 for this matrix's inputs, so quantizing column i moves the rest of its row by
+    -(w_i - q_i) / U[i,i] * U[i, i+1:], which is the least-squares answer under H. Columns
+    go in order; a group's scale is fitted when its first column comes up, on the weights
+    as the earlier groups' errors left them. The row scale d is fixed first (the plain
+    fit's, times `margin` for the room the updates may need)."""
+    rows, cols = w.shape
+    W = w.astype(np.float64).copy()
+    a = np.ones(cols) if imp is None else imp.astype(np.float64)
+    _, _, d0 = quantize_int2_g32(w, imp)
+    d = (d0.astype(np.float64) * margin).astype(np.float32).astype(np.float64)
+    edges = (LEVELS2[1:] + LEVELS2[:-1]) / 2
+    codes = np.zeros((rows, cols), np.uint8)
+    qs = np.zeros((rows, cols // GS2), np.uint8)
+    tiny = 1e-30
+    s = np.ones(rows)
+    for b0 in range(0, cols, batch):
+        b1 = min(b0 + batch, cols)
+        W1 = W[:, b0:b1].copy()
+        E1 = np.zeros_like(W1)
+        U1 = U[b0:b1, b0:b1]
+        for i in range(b1 - b0):
+            col = b0 + i
+            if col % GS2 == 0:
+                g = W1[:, i:i + GS2]
+                ga = a[col:col + GS2][None, :]
+                s = np.sqrt((ga * g * g).sum(axis=1) / ga.sum()) / math.sqrt(float(np.mean(LEVELS2 ** 2)))
+                for _ in range(iters):
+                    lv = LEVELS2[np.searchsorted(edges, g / np.maximum(s, tiny)[:, None])]
+                    num, den = (ga * g * lv).sum(axis=1), (ga * lv * lv).sum(axis=1)
+                    s = np.where(den > 0, num / np.maximum(den, tiny), s)
+                u = np.clip(np.rint(s / d), 1, 255)
+                qs[:, col // GS2] = u
+                s = d * u
+            c = np.searchsorted(edges, W1[:, i] / np.maximum(s, tiny))
+            codes[:, col] = c
+            err = (W1[:, i] - LEVELS2[c] * s) / U1[i, i]
+            W1[:, i + 1:] -= np.outer(err, U1[i, i + 1:])
+            E1[:, i] = err
+        W[:, b1:] -= E1 @ U[b0:b1, b1:]
+    return codes, qs, d.astype(np.float32)
+
+
+class CovStats:
+    """The engine's Q38_ACT_COV file: per layer sum_t x x^T of the routed experts' input.
+    upper_inv(layer, imp) is the upper Cholesky factor of H^-1 for one expert, with
+    H = D^1/2 C D^1/2: C the layer's correlations (damped by `damp` on the diagonal, as
+    GPTQ damps H), D the expert's own mean squares (Q38_ACT_STATS); the factor of C^-1 is
+    computed once per layer and an expert only rescales its columns."""
+    def __init__(self, path, damp=0.01):
+        with open(path, "rb") as f:
+            if f.read(8) != b"Q38COV1\0":
+                raise ValueError(f"{path}: not a Q38_ACT_COV file")
+            self.layers, self.hidden = struct.unpack("<2i", f.read(8))
+            self.n = np.frombuffer(f.read(8 * self.layers), np.int64).copy()
+        self.mat = np.memmap(path, np.float64, "r", offset=16 + 8 * self.layers,
+                             shape=(self.layers, self.hidden, self.hidden))
+        self.damp, self._layer, self._u = damp, None, None
+
+    def _factor(self, layer):
+        if self._layer != layer:
+            m = np.array(self.mat[layer])
+            dg = np.sqrt(np.maximum(np.diag(m), 1e-30))
+            c = m / dg[:, None] / dg[None, :] + self.damp * np.eye(self.hidden)
+            self._u = np.linalg.cholesky(np.linalg.inv(c)).T     # C^-1 = U^T U, U upper
+            self._layer = layer
+        return self._u
+
+    def upper_inv(self, layer, imp):
+        return self._factor(layer) / np.sqrt(np.maximum(imp.astype(np.float64), 1e-30))[None, :]
+
+
+def pack_int2(codes):
+    """u8 codes [R, C] (0..3) -> u8 [R, C/4]: blocks of 128, byte k holding elements
+    k, k+32, k+64, k+96 in bits 0-1, 2-3, 4-5, 6-7 (int2_g32.h)."""
+    rows, cols = codes.shape
+    c = codes.reshape(rows, cols // 128, 4, 32)
+    return (c[:, :, 0] | (c[:, :, 1] << 2) | (c[:, :, 2] << 4) | (c[:, :, 3] << 6)).reshape(rows, cols // 4)
+
+
+def dequantize_int2(codes, q, d):
+    rows, cols = codes.shape
+    return (LEVELS2[codes].reshape(rows, cols // GS2, GS2) * (d[:, None] * q.astype(np.float64))[..., None]).reshape(rows, cols)
+
+
 def dequantize(codes, scales):
     """codes u8 [R, C], scales f32 [R, ceil(C/64)] -> f32 [R, C]."""
     cols = codes.shape[1]
@@ -240,13 +380,24 @@ def rel_l2(reference, approx):
 # ---------- the geometry of one record ----------
 
 class Geometry:
-    def __init__(self, layers, experts, hidden, inter):
+    def __init__(self, layers, experts, hidden, inter, bits=4):
         self.layers, self.experts, self.hidden, self.inter = layers, experts, hidden, inter
+        self.bits = bits
         self.shape = ((inter, hidden), (inter, hidden), (hidden, inter))
-        self.code_bytes = [r * row_bytes(c) for r, c in self.shape]
-        self.scale_count = [r * groups(c) for r, c in self.shape]
-        self.scale_off = sum(self.code_bytes)
-        self.record_bytes = self.scale_off + 4 * sum(self.scale_count)
+        if bits == 2:
+            if hidden % 128 or inter % 128:
+                raise ValueError(f"hidden={hidden}, moe_intermediate_size={inter}: int2-g32 needs "
+                                 f"widths that are multiples of 128")
+            self.code_bytes = [r * c // 4 for r, c in self.shape]
+            self.q_count = [r * c // GS2 for r, c in self.shape]
+            self.scale_count = [r for r, c in self.shape]
+            self.scale_off = sum(self.code_bytes) + sum(self.q_count)
+            self.record_bytes = self.scale_off + 4 * sum(self.scale_count)
+        else:
+            self.code_bytes = [r * row_bytes(c) for r, c in self.shape]
+            self.scale_count = [r * groups(c) for r, c in self.shape]
+            self.scale_off = sum(self.code_bytes)
+            self.record_bytes = self.scale_off + 4 * sum(self.scale_count)
         if self.scale_off % 4:
             raise ValueError(f"hidden={hidden}, moe_intermediate_size={inter}: the codes of an "
                              f"expert are {self.scale_off} bytes, not a multiple of 4, so its f32 "
@@ -256,6 +407,18 @@ class Geometry:
         """(name, dtype, shape, offset in the record, bytes) in record order."""
         base = f"{prefix}.layers.{layer}.mlp.experts.{expert}"
         out, off = [], 0
+        if self.bits == 2:
+            for k, (r, c) in enumerate(self.shape):
+                out.append((f"{base}.{PROJ[k]}.weight", "U8", [r, c // 4], off, self.code_bytes[k]))
+                off += self.code_bytes[k]
+            for k, (r, c) in enumerate(self.shape):
+                out.append((f"{base}.{PROJ[k]}.weight.q8", "U8", [r, c // GS2], off, self.q_count[k]))
+                off += self.q_count[k]
+            for k, (r, c) in enumerate(self.shape):
+                out.append((f"{base}.{PROJ[k]}.weight.d", "F32", [r, 1], off, 4 * r))
+                off += 4 * r
+            assert off == self.record_bytes
+            return out
         for k, (r, c) in enumerate(self.shape):
             out.append((f"{base}.{PROJ[k]}.weight", "U8", [r, row_bytes(c)], off, self.code_bytes[k]))
             off += self.code_bytes[k]
@@ -416,18 +579,40 @@ class Source:
 
 _SOURCE = None
 _ACT = None
+_BITS = 4
+_COV = None
 
 
-def _init_worker(model_dir, act_path=None):
-    global _SOURCE, _ACT
+def _init_worker(model_dir, act_path=None, bits=4, cov_path=None):
+    global _SOURCE, _ACT, _BITS, _COV
     _SOURCE = Source(model_dir)
     _ACT = ActStats(act_path) if act_path else None
+    _BITS = bits
+    _COV = CovStats(cov_path) if cov_path else None
+
+
+def convert_expert_int2(layer, expert):
+    codes, qs, ds, errors = [], [], [], []
+    for k in range(3):
+        w = _SOURCE.matrix(layer, expert, k)
+        imp = _ACT.importance(layer, expert, k) if _ACT else None
+        if _COV is not None and k < 2:   # gate and up read the layer's hidden row; down an expert's own
+            c, q, d = quantize_int2_g32_gptq(w, imp, _COV.upper_inv(layer, imp if imp is not None else np.ones(w.shape[1])))
+        else:
+            c, q, d = quantize_int2_g32(w, imp)
+        errors.append(rel_l2(w, dequantize_int2(c, q, d)))
+        codes.append(pack_int2(c).tobytes())
+        qs.append(q.tobytes())
+        ds.append(d.tobytes())
+    return b"".join(codes) + b"".join(qs) + b"".join(ds), errors, peak_rss_mb()
 
 
 def convert_expert(task):
     """(layer, expert) -> (the record's bytes, relative L2 error of gate, up,
     down, this process's peak RSS in MB)."""
     layer, expert = task
+    if _BITS == 2:
+        return convert_expert_int2(layer, expert)
     codes, scales, errors = [], [], []
     for k in range(3):
         w = _SOURCE.matrix(layer, expert, k)
@@ -444,7 +629,7 @@ def layer_file(layer):
 
 def layer_header(geometry, prefix, layer):
     """The layer file's header, padded so the data region starts on DATA_ALIGN."""
-    header, meta = {}, {"format": FORMAT, "version": str(VERSION), "layer": str(layer)}
+    header, meta = {}, {"format": FORMAT2 if geometry.bits == 2 else FORMAT, "version": str(VERSION), "layer": str(layer)}
     for expert in range(geometry.experts):
         base = expert * geometry.record_bytes
         for name, dtype, shape, off, n in geometry.tensors(prefix, layer, expert):
@@ -492,6 +677,21 @@ def write_index(out_dir, index):
 
 def new_index(src):
     g = src.geometry
+    if g.bits == 2:
+        return {
+            "format": FORMAT2, "version": VERSION, "complete": False,
+            "group_size": GS2, "codes": CODES2, "scales": SCALES2,
+            "layers": g.layers, "experts": g.experts,
+            "hidden_size": g.hidden, "moe_intermediate_size": g.inter,
+            "prefix": src.prefix, "record_bytes": g.record_bytes,
+            "record": ["gate codes", "up codes", "down codes", "gate q", "up q", "down q",
+                       "gate d", "up d", "down d"],
+            "quantizer": "per 32 inputs: levels -10 -3 3 10, scale and codes fitted in turn (uniform "
+                         "weights), scales as u8 under the row's largest and refitted",
+            "files": [layer_file(i) for i in range(g.layers)],
+            "done": [],
+            "source": src.fingerprint(),
+        }
     return {
         "format": FORMAT, "version": VERSION, "complete": False,
         "group_size": GS, "codes": CODES, "scales": SCALES,
@@ -556,20 +756,27 @@ def peak_rss_mb():
     return peak / (1 << 20) if sys.platform == "darwin" else peak / 1024
 
 
-def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_path=None):
+def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_path=None, bits=4, cov_path=None):
     """Write (or finish) model_dir's sidecar; returns its directory."""
     src = Source(model_dir)
+    if bits == 2:
+        geo = src.geometry
+        try:
+            src.geometry = Geometry(geo.layers, geo.experts, geo.hidden, geo.inter, bits=2)
+        except ValueError as exc:
+            sys.exit(f"{model_dir}: {exc}")
     act = ActStats(act_path) if act_path else None
     if act and (act.layers, act.experts, act.hidden, act.inter) != (src.geometry.layers, src.geometry.experts,
                                                                   src.geometry.hidden, src.geometry.inter):
         sys.exit(f"{act_path}: statistics of another geometry")
     g = src.geometry
-    out_dir = out_dir or os.path.join(model_dir, SIDECAR_DIR)
+    out_dir = out_dir or os.path.join(model_dir, SIDECAR_DIR2 if bits == 2 else SIDECAR_DIR)
+    label = "int2-g32" if bits == 2 else "int4-g64"
     total = sum(layer_file_bytes(g, src.prefix, i) for i in range(g.layers))
     fp8 = g.fp8_expert_bytes() * g.experts * g.layers
     print(f"{model_dir}: {g.layers} layers x {g.experts} experts, hidden {g.hidden}, "
           f"moe_intermediate {g.inter}, prefix {src.prefix}")
-    print(f"  per expert: FP8 {g.fp8_expert_bytes():,} bytes -> int4-g64 {g.record_bytes:,} bytes "
+    print(f"  per expert: FP8 {g.fp8_expert_bytes():,} bytes -> {label} {g.record_bytes:,} bytes "
           f"({100 * g.record_bytes / g.fp8_expert_bytes():.1f}%)")
     print(f"  sidecar {out_dir}: {total:,} bytes ({total / 2**30:.2f} GiB) "
           f"for {fp8:,} bytes of FP8 experts")
@@ -578,9 +785,23 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
 
     os.makedirs(out_dir, exist_ok=True)
     index = resume_index(out_dir, src)
-    quantizer = (f"weighted: per 64 inputs the scale among absmax/7 * {list(ALPHAS)} with the least "
-                 f"activation-weighted squared error (Q38_ACT_STATS {os.path.basename(act_path)}, "
-                 f"{act.rows} expert rows)") if act else None
+    if cov_path and bits != 2:
+        sys.exit("--cov is for --int2")
+    cov = CovStats(cov_path) if cov_path else None
+    if cov and (cov.layers, cov.hidden) != (g.layers, g.hidden):
+        sys.exit(f"{cov_path}: matrices of another geometry")
+    if bits == 2:
+        quantizer = (f"weighted: per 32 inputs levels -10 -3 3 10, scale and codes fitted in turn against the "
+                     f"activation-weighted squared error (Q38_ACT_STATS {os.path.basename(act_path)}, "
+                     f"{act.rows} expert rows), scales as u8 under the row's largest and refitted") if act else None
+        if cov:
+            quantizer = (quantizer or "uniform weights") + (
+                f"; gate and up with the error carried column by column (GPTQ) under H = D^1/2 C D^1/2 "
+                f"(Q38_ACT_COV {os.path.basename(cov_path)}, {int(cov.n[0])} tokens, damp {cov.damp})")
+    else:
+        quantizer = (f"weighted: per 64 inputs the scale among absmax/7 * {list(ALPHAS)} with the least "
+                     f"activation-weighted squared error (Q38_ACT_STATS {os.path.basename(act_path)}, "
+                     f"{act.rows} expert rows)") if act else None
     if quantizer and index["done"] and index.get("quantizer") != quantizer:
         sys.exit(f"{out_dir}: started with another quantizer; give a new --out")
     if quantizer:
@@ -594,9 +815,11 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
     pool = None
     if workers > 1 and todo:
         from multiprocessing import get_context
-        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir, act_path))
+        for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ.setdefault(var, "1")   # one BLAS thread per worker: the workers are the parallelism
+        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir, act_path, bits, cov_path))
     else:
-        _init_worker(model_dir, act_path)
+        _init_worker(model_dir, act_path, bits, cov_path)
     worst = 0.0
     try:
         for layer in todo:
@@ -630,8 +853,12 @@ def main():
     ap.add_argument("--plan", action="store_true", help="print sizes and exit without writing")
     ap.add_argument("--act-stats", help="the engine's Q38_ACT_STATS file: each group's scale chosen against "
                                         "activation-weighted error instead of absmax/7")
+    ap.add_argument("--int2", action="store_true", help=f"write int2-g32 (int2_g32.h) into <model>/{SIDECAR_DIR2}/ "
+                                                        "instead (qwen38: Q38_EXPERT_INT2=1)")
+    ap.add_argument("--cov", help="the engine's Q38_ACT_COV file (with --int2): gate and up quantized with the "
+                                  "error carried column by column under the layer's input correlations")
     a = ap.parse_args()
-    convert(a.model, a.out, a.workers, a.layers, a.plan, a.act_stats)
+    convert(a.model, a.out, a.workers, a.layers, a.plan, a.act_stats, 2 if a.int2 else 4, a.cov)
 
 
 if __name__ == "__main__":

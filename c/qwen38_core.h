@@ -14,6 +14,7 @@
 #include "kv_prefix.h"
 #include "spec_draft.h"   /* prompt-lookup drafts and the gate that decides when drafting pays */
 #include "expert_ffn.h"   /* the int4-g64 routed experts (experts-int4g64/ sidecar) run through its f32 kernel */
+#include "int2_g32.h"     /* the int2-g32 routed experts (experts-int2g32/ sidecar) */
 #include "gguf.h"         /* SNAP = a tools/gguf_import.py directory: llama.cpp's qwen4exp GGUF, read in place */
 #include <pthread.h>   /* q38_ehit_mark publishes the lazy HITS table under a lock */
 #ifdef COLI_VULKAN
@@ -62,7 +63,8 @@ typedef enum {
     Q38_WEIGHT_BF16,
     Q38_WEIGHT_FP8,
     Q38_WEIGHT_INT4G64,            /* routed experts from the experts-int4g64/ sidecar */
-    Q38_WEIGHT_GGML                /* GGUF mode: rows of ggml blocks of gq_type, as the file stores them */
+    Q38_WEIGHT_GGML,               /* GGUF mode: rows of ggml blocks of gq_type, as the file stores them */
+    Q38_WEIGHT_INT2G32             /* routed experts from the experts-int2g32/ sidecar: data codes, x2q group scales, scales row scales */
 } Q38WeightKind;
 
 /* GGUF mode (SNAP holds gguf.json, written by tools/gguf_import.py). llama.cpp's
@@ -108,6 +110,7 @@ typedef struct {
     char *vk_name;                 /* COLI_VULKAN=1: its tensor's name, to read it back from disk (q38_dho_reload) */
     int vk_fmt, vk_gone;           /* dense weights on the device only (COLI_VK_DENSE_HOST): the device copy's format, and 1 while no host copy is kept */
     int gq_type;                   /* Q38_WEIGHT_GGML: the ggml type of the rows */
+    const uint8_t *x2q;            /* Q38_WEIGHT_INT2G32: u8 scale per row and 32 inputs (borrowed, like data) */
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -178,6 +181,9 @@ typedef struct {
     int64_t *off;                  /* [layer*experts + expert] where the record starts */
     int64_t code_bytes[3], scale_count[3];   /* gate, up, down */
     int64_t scale_off, record_bytes;
+    int bits;                      /* 4: experts-int4g64/; 2: experts-int2g32/, whose record holds
+                                    * the u8 group scales at q_off and one f32 per row at scale_off */
+    int64_t q_off, q_bytes[3];
 } Q38Int4Experts;
 
 typedef enum {
@@ -395,6 +401,8 @@ static uint64_t q38_weight_bytes(const Q38Weight *weight) {
     if(weight->kind==Q38_WEIGHT_INT4G64)
         return (uint64_t)weight->rows*(uint64_t)q38_int4_row_bytes(weight->cols)+
                (uint64_t)weight->scale_count*sizeof(float);
+    if(weight->kind==Q38_WEIGHT_INT2G32)
+        return (uint64_t)weight->rows*(x2_code_bytes(weight->cols)+(uint64_t)x2_groups(weight->cols)+sizeof(float));
     uint64_t element_size=weight->kind==Q38_WEIGHT_F32?sizeof(float):
                           weight->kind==Q38_WEIGHT_BF16?sizeof(uint16_t):
                           weight->kind==Q38_WEIGHT_FP8?sizeof(uint8_t):0;
@@ -640,6 +648,13 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
         q38_matmul_fp8(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
     else if(weight->kind==Q38_WEIGHT_INT4G64&&weight->scales)
         q38_matmul_int4g64(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
+    else if(weight->kind==Q38_WEIGHT_INT2G32&&weight->scales&&weight->x2q){
+        /* int2_g32.h: int8 activations per 32 (the GGUF path's contract), exact integer
+         * dots per group, one fma per group; the same bits for a row whatever S is */
+        if(x2_matmul(y,x,(const uint8_t*)weight->data,weight->x2q,weight->scales,S,I,O)){
+            fprintf(stderr,"OOM int2-g32 activation\n");exit(1);
+        }
+    }
     else if(weight->kind==Q38_WEIGHT_GGML){
         if(gq_matmul(y,x,(const uint8_t*)weight->data,weight->gq_type,S,I,O)){
             fprintf(stderr,"qwen38: GGUF matrix of type %s is not supported\n",gq_type_name(weight->gq_type));exit(1);
@@ -1892,6 +1907,25 @@ static void q38_load_expert_slice(Model *m,const char *name,const st_tensor *ten
 #define Q38_INT4_DIR "experts-int4g64"
 #define Q38_INT4_FORMAT "colibri.qwen38.experts-int4g64"
 #define Q38_INT4_VERSION 1
+/* The int2-g32 sidecar (int2_g32.h's format), written by
+ * tools/convert_qwen38_experts_int4.py --int2 into <snap>/experts-int2g32/ and
+ * attached instead of the int4 one when Q38_EXPERT_INT2=1. A record is
+ *
+ *   gate codes [I][H/4] | up codes [I][H/4] | down codes [H][I/4] |
+ *   gate q [I][H/32] | up q | down q [H][I/32] | gate d [I] | up d [I] | down d [H]
+ *
+ * (U8 "...weight" [rows][cols/4], U8 "...weight.q8" [rows][cols/32], F32
+ * "...weight.d" [rows][1]): 1.40 MB an expert on the release, 51% of the
+ * int4 record and 28% of the FP8 one. */
+#define Q38_INT2_DIR "experts-int2g32"
+#define Q38_INT2_FORMAT "colibri.qwen38.experts-int2g32"
+#define Q38_INT2_VERSION 1
+static int q38_expert_int2_wanted(void) {
+    const char *value=getenv("Q38_EXPERT_INT2");
+    if(!value||!*value||(value[0]=='0'&&!value[1]))return 0;
+    if(value[0]=='1'&&!value[1])return 1;
+    fprintf(stderr,"Q38_EXPERT_INT2 must be exactly 0 or 1\n");exit(1);
+}
 
 /* Q38_EXPERT_INT4: unset = the sidecar when there is one, 0 = never (the
  * snapshot's FP8), 1 = refuse to start without it (a benchmark that must not
@@ -1924,16 +1958,22 @@ static int q38_int4_record_at(Model *m,Q38Int4Experts *x,int layer,int expert,
     Cfg *c=&m->c;const char *projection[3]={"gate_proj","up_proj","down_proj"};
     int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};
     char suffix[192],name[320];int64_t at=0;
-    for(int part=0;part<6;part++){
-        int k=part%3,is_scale=part>=3;
+    const int int2=x->bits==2,parts=int2?9:6;
+    for(int part=0;part<parts;part++){
+        /* int4: codes, f32 scales per 64; int2: codes, u8 scales per 32, f32 per row */
+        int k=part%3,kind=part/3;
+        const char *tail=!kind?"":int2?(kind==1?".q8":".d"):".qs";
         int length=snprintf(suffix,sizeof suffix,"mlp.experts.%d.%s.weight%s",
-                            expert,projection[k],is_scale?".qs":"");
+                            expert,projection[k],tail);
         if(length<0||(size_t)length>=sizeof suffix)return -1;
         q38_name(m,name,sizeof name,layer,suffix);
         st_tensor *t=st_find(&x->S,name);
-        int64_t width=is_scale?q38_int4_groups(cols[k]):q38_int4_row_bytes(cols[k]);
-        int64_t bytes=is_scale?x->scale_count[k]*(int64_t)sizeof(float):x->code_bytes[k];
-        if(!t||t->dtype!=(is_scale?2:3)||t->rank!=2||t->shape[0]!=rows[k]||
+        int is_f32=int2?kind==2:kind==1;
+        int64_t width=int2?(kind==0?(int64_t)x2_code_bytes(cols[k]):kind==1?x2_groups(cols[k]):1):
+                      kind?q38_int4_groups(cols[k]):q38_int4_row_bytes(cols[k]);
+        int64_t bytes=int2?(kind==0?x->code_bytes[k]:kind==1?x->q_bytes[k]:x->scale_count[k]*(int64_t)sizeof(float)):
+                      kind?x->scale_count[k]*(int64_t)sizeof(float):x->code_bytes[k];
+        if(!t||t->dtype!=(is_f32?2:3)||t->rank!=2||t->shape[0]!=rows[k]||
            t->shape[1]!=width||t->nbytes!=bytes)return -1;
         if(!part){
             if(t->off%(int64_t)sizeof(float))return -1;
@@ -1951,16 +1991,18 @@ static int q38_int4_record_at(Model *m,Q38Int4Experts *x,int layer,int expert,
  * with a line saying so (or refused under Q38_EXPERT_INT4=1). */
 static void q38_expert_int4_attach(Model *m,const char *snap) {
     if(g_q38_gguf)return;   /* GGUF: the experts are the file's ggml blocks */
-    int wanted=q38_expert_int4_wanted();
+    const int int2=q38_expert_int2_wanted();
+    int wanted=int2?1:q38_expert_int4_wanted();
     if(!wanted)return;
     Cfg *c=&m->c;char dir[2100],path[2200];
-    snprintf(dir,sizeof dir,"%s/%s",snap,Q38_INT4_DIR);
+    snprintf(dir,sizeof dir,"%s/%s",snap,int2?Q38_INT2_DIR:Q38_INT4_DIR);
     snprintf(path,sizeof path,"%s/index.json",dir);
     FILE *f=fopen(path,"rb");
     if(!f){
         if(wanted>0){
-            fprintf(stderr,"Q38_EXPERT_INT4=1 but %s cannot be opened "
-                           "(tools/convert_qwen38_experts_int4.py writes it)\n",path);exit(1);
+            fprintf(stderr,"%s=1 but %s cannot be opened "
+                           "(tools/convert_qwen38_experts_int4.py%s writes it)\n",
+                    int2?"Q38_EXPERT_INT2":"Q38_EXPERT_INT4",path,int2?" --int2":"");exit(1);
         }
         return;
     }
@@ -1974,7 +2016,14 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
     jval *root=json_parse(text,&arena);
     if(!root||root->t!=J_OBJ)q38_int4_refuse(dir,"index.json is not a JSON object");
     const char *format=jstr(root,"format"),*codes=jstr(root,"codes"),*scales=jstr(root,"scales");
-    if(!format||strcmp(format,Q38_INT4_FORMAT)||q38_json_int(root,"version")!=Q38_INT4_VERSION||
+    if(int2){
+        if(!format||strcmp(format,Q38_INT2_FORMAT)||q38_json_int(root,"version")!=Q38_INT2_VERSION||
+           !codes||strcmp(codes,"planar128-2bit-lv10")||!scales||strcmp(scales,"u8-per-32-f32-per-row")||
+           q38_json_int(root,"group_size")!=X2_GROUP)
+            q38_int4_refuse(dir,"index.json is not format " Q38_INT2_FORMAT " version 1, 2-bit codes "
+                                "on levels -10 -3 3 10 in planar blocks of 128 with u8 scales per 32 "
+                                "and f32 per row");
+    } else if(!format||strcmp(format,Q38_INT4_FORMAT)||q38_json_int(root,"version")!=Q38_INT4_VERSION||
        !codes||strcmp(codes,"planar64-v8")||!scales||strcmp(scales,"f32-per-64")||
        q38_json_int(root,"group_size")!=XF_BLOCK)
         q38_int4_refuse(dir,"index.json is not format " Q38_INT4_FORMAT " version 1, int4 codes v+8 "
@@ -1982,7 +2031,18 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
     Q38Int4Experts *x=(Q38Int4Experts*)calloc(1,sizeof(*x));
     if(!x){fprintf(stderr,"OOM int4 expert index\n");exit(1);}
     int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};
-    for(int k=0;k<3;k++){
+    x->bits=int2?2:4;
+    if(int2){
+        for(int k=0;k<3;k++)if(!x2_layout_ok(cols[k]))
+            q38_int4_refuse(dir,"int2-g32 needs widths that are multiples of 128");
+        for(int k=0;k<3;k++){
+            x->code_bytes[k]=(int64_t)rows[k]*(int64_t)x2_code_bytes(cols[k]);
+            x->q_bytes[k]=(int64_t)rows[k]*x2_groups(cols[k]);
+            x->scale_count[k]=rows[k];
+            x->q_off+=x->code_bytes[k];
+        }
+        x->scale_off=x->q_off+x->q_bytes[0]+x->q_bytes[1]+x->q_bytes[2];
+    } else for(int k=0;k<3;k++){
         x->code_bytes[k]=(int64_t)rows[k]*q38_int4_row_bytes(cols[k]);
         x->scale_count[k]=(int64_t)rows[k]*q38_int4_groups(cols[k]);
         x->scale_off+=x->code_bytes[k];
@@ -2021,8 +2081,8 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
             if(q38_int4_record_at(m,x,layer,expert,&fd,&start)||
                (x->fd[layer]>=0&&fd!=x->fd[layer])){
                 char why[160];
-                snprintf(why,sizeof why,"layer %d expert %d is missing or is not one int4-g64 "
-                         "record of %lld bytes",layer,expert,(long long)x->record_bytes);
+                snprintf(why,sizeof why,"layer %d expert %d is missing or is not one %s "
+                         "record of %lld bytes",layer,expert,int2?"int2-g32":"int4-g64",(long long)x->record_bytes);
                 q38_int4_refuse(dir,why);
             }
             x->fd[layer]=fd;x->off[(int64_t)layer*c->experts+expert]=start;
@@ -2036,6 +2096,17 @@ static void q38_bind_int4_record(Model *m,Slot *slot,uint8_t *record) {
     int rows[3]={c->inter,c->inter,c->hidden},cols[3]={c->hidden,c->hidden,c->inter};
     Q38Weight *dst[3]={&slot->gate,&slot->up,&slot->down};
     uint8_t *codes=record;float *scales=(float*)(record+x->scale_off);
+    if(x->bits==2){
+        const uint8_t *q=record+x->q_off;
+        for(int k=0;k<3;k++){
+            Q38Weight *weight=dst[k];q38_weight_free(weight);
+            weight->data=codes;weight->x2q=q;weight->scales=scales;weight->rows=rows[k];weight->cols=cols[k];
+            weight->elements=(int64_t)rows[k]*cols[k];weight->scale_count=x->scale_count[k];
+            weight->kind=Q38_WEIGHT_INT2G32;
+            codes+=x->code_bytes[k];q+=x->q_bytes[k];scales+=x->scale_count[k];
+        }
+        return;
+    }
     for(int k=0;k<3;k++){
         Q38Weight *weight=dst[k];q38_weight_free(weight);
         weight->data=codes;weight->scales=scales;weight->rows=rows[k];weight->cols=cols[k];
@@ -3069,8 +3140,9 @@ static void q38_tier_start(Model *m,int cap) {
     if(m->x4){
         /* The tier streams e4m3 bytes (fmt 8) and copies them at qt_note; its
          * int4 mode wants every expert resident in RAM. Neither is this. */
-        fprintf(stderr,"[qtier] qwen38: the expert tier streams native FP8 experts only; the int4-g64 "
-                       "experts stay on the CPU and the tier stays off (Q38_EXPERT_INT4=0 gives it the FP8 ones)\n");
+        fprintf(stderr,"[qtier] qwen38: the expert tier streams native FP8 experts only; the %s "
+                       "experts stay on the CPU and the tier stays off (Q38_EXPERT_INT4=0 gives it the FP8 ones)\n",
+                m->x4->bits==2?"int2-g32":"int4-g64");
         return;
     }
     if(!m->native_fp8){
@@ -3138,11 +3210,129 @@ static void q38_vk_note(int layer,int eid,Slot *ex) {
     if(g_q38_gguf&&!vkt_wants(layer,eid))return;
     VktExpertSrc src=q38_vk_src(ex); vkt_note(layer,eid,&src); q38_vk_src_done(ex);
 }
+/* Q38_ACT_STATS=<file>: calibration statistics of the routed experts' inputs, for a
+ * data-aware quantizer: per layer and expert, the rows seen and the sum of squares of
+ * every gate/up input channel (hidden wide) and every down input channel (the SwiGLU
+ * output, inter wide), as float64. Collected wherever the CPU computes a routed
+ * expert: the prefill's grouped loop and the decode rows (a teacher-forced PPL=1 run
+ * prefills only its prompt, then scores token by token). Experts a device tier runs
+ * are not seen. Added to the file at exit so that several runs add up. */
+static double *g_q38_act; static int64_t *g_q38_act_n; static int g_q38_act_dims[4]; static char g_q38_act_path[4096];
+static void q38_act_add(int layer,int e,const float *xin,const float *hid,int n) {
+    const int L=g_q38_act_dims[0],E=g_q38_act_dims[1],H=g_q38_act_dims[2],I=g_q38_act_dims[3];
+    if(!g_q38_act||layer<0||layer>=L||e<0||e>=E)return;
+    double *a=g_q38_act+((int64_t)layer*E+e)*(H+I);
+    for(int r=0;r<n;r++){
+        const float *x=xin+(int64_t)r*H,*h=hid+(int64_t)r*I;
+        for(int i=0;i<H;i++)a[i]+=(double)x[i]*x[i];
+        for(int j=0;j<I;j++)a[H+j]+=(double)h[j]*h[j];
+    }
+    g_q38_act_n[(int64_t)layer*E+e]+=n;
+}
+static void q38_act_write(void) {
+    const int64_t cells=(int64_t)g_q38_act_dims[0]*g_q38_act_dims[1],width=g_q38_act_dims[2]+g_q38_act_dims[3];
+    FILE *f=fopen(g_q38_act_path,"rb");
+    if(f){   /* an earlier run's statistics of the same geometry: add them */
+        int dims[4]; double *a=(double*)malloc((size_t)(cells*width)*sizeof(double)); int64_t *n=(int64_t*)malloc((size_t)cells*sizeof(int64_t));
+        char magic[8];
+        if(a&&n&&fread(magic,8,1,f)==1&&!memcmp(magic,"Q38ACT1\0",8)&&fread(dims,sizeof dims,1,f)==1&&!memcmp(dims,g_q38_act_dims,sizeof dims)&&
+           fread(n,sizeof(int64_t),(size_t)cells,f)==(size_t)cells&&fread(a,sizeof(double),(size_t)(cells*width),f)==(size_t)(cells*width)){
+            for(int64_t i=0;i<cells;i++)g_q38_act_n[i]+=n[i];
+            for(int64_t i=0;i<cells*width;i++)g_q38_act[i]+=a[i];
+        } else fprintf(stderr,"[act] %s: not statistics of this model, overwritten\n",g_q38_act_path);
+        free(a);free(n);fclose(f);
+    }
+    f=fopen(g_q38_act_path,"wb");
+    if(!f){perror(g_q38_act_path);return;}
+    int ok=fwrite("Q38ACT1\0",8,1,f)==1&&fwrite(g_q38_act_dims,sizeof g_q38_act_dims,1,f)==1&&
+           fwrite(g_q38_act_n,sizeof(int64_t),(size_t)cells,f)==(size_t)cells&&
+           fwrite(g_q38_act,sizeof(double),(size_t)(cells*width),f)==(size_t)(cells*width);
+    if(fclose(f)||!ok)fprintf(stderr,"[act] %s: write failed\n",g_q38_act_path);
+    else{ int64_t rows=0; for(int64_t i=0;i<cells;i++)rows+=g_q38_act_n[i];
+          fprintf(stderr,"[act] %s: %lld expert rows in total\n",g_q38_act_path,(long long)rows); }
+}
+static void q38_act_init(Model *m) {
+    const char *p=getenv("Q38_ACT_STATS");
+    if(!p||!*p||m->c.experts<1)return;
+    snprintf(g_q38_act_path,sizeof g_q38_act_path,"%s",p);
+    g_q38_act_dims[0]=m->c.layers;g_q38_act_dims[1]=m->c.experts;g_q38_act_dims[2]=m->c.hidden;g_q38_act_dims[3]=m->c.inter;
+    const int64_t cells=(int64_t)m->c.layers*m->c.experts;
+    g_q38_act=(double*)calloc((size_t)(cells*(m->c.hidden+m->c.inter)),sizeof(double));
+    g_q38_act_n=(int64_t*)calloc((size_t)cells,sizeof(int64_t));
+    if(!g_q38_act||!g_q38_act_n){fprintf(stderr,"Q38_ACT_STATS: out of memory\n");exit(1);}
+    atexit(q38_act_write);
+    fprintf(stderr,"[act] collecting the routed experts' input statistics into %s\n",p);
+}
+
+/* Q38_ACT_COV=<file>: per layer the second moment sum_t x x^T of the routed experts'
+ * input (the hidden row the router and every expert of the layer read), H x H float64,
+ * for the error-compensating quantizer (tools/convert_qwen38_experts_int4.py --cov).
+ * Once per token and layer, in decode rows and prefill chunks alike; added to the file
+ * at exit, like Q38_ACT_STATS. The file: "Q38COV1\0", int32 layers and hidden, int64
+ * tokens per layer, then each layer's full symmetric matrix. */
+static double *g_q38_cov; static int64_t *g_q38_cov_n; static int g_q38_cov_dims[2]; static char g_q38_cov_path[4096];
+static void q38_cov_add(int layer,const float *x,int n) {
+    const int L=g_q38_cov_dims[0],H=g_q38_cov_dims[1];
+    if(!g_q38_cov||layer<0||layer>=L||n<1)return;
+    double *A=g_q38_cov+(int64_t)layer*H*H;
+    double *xd=(double*)malloc((size_t)n*H*sizeof(double));
+    if(!xd){fprintf(stderr,"Q38_ACT_COV: out of memory\n");exit(1);}
+    for(int64_t i=0;i<(int64_t)n*H;i++)xd[i]=x[i];
+    /* the upper triangle, row i from column i: rows are independent */
+    #pragma omp parallel for schedule(dynamic,16)
+    for(int i=0;i<H;i++){
+        double *a=A+(int64_t)i*H;
+        for(int r=0;r<n;r++){
+            const double *v=xd+(int64_t)r*H;const double vi=v[i];
+            for(int j=i;j<H;j++)a[j]+=vi*v[j];
+        }
+    }
+    free(xd);
+    g_q38_cov_n[layer]+=n;
+}
+static void q38_cov_write(void) {
+    const int L=g_q38_cov_dims[0],H=g_q38_cov_dims[1];const int64_t per=(int64_t)H*H;
+    for(int l=0;l<L;l++){double *A=g_q38_cov+l*per;for(int i=0;i<H;i++)for(int j=0;j<i;j++)A[(int64_t)i*H+j]=A[(int64_t)j*H+i];}
+    FILE *f=fopen(g_q38_cov_path,"rb");
+    if(f){   /* an earlier run's matrices of the same geometry: add them, one layer at a time */
+        char magic[8];int dims[2];int64_t *n=(int64_t*)malloc((size_t)L*sizeof(int64_t));double *a=(double*)malloc((size_t)per*sizeof(double));
+        int ok=a&&n&&fread(magic,8,1,f)==1&&!memcmp(magic,"Q38COV1\0",8)&&fread(dims,sizeof dims,1,f)==1&&
+               !memcmp(dims,g_q38_cov_dims,sizeof dims)&&fread(n,sizeof(int64_t),(size_t)L,f)==(size_t)L;
+        for(int l=0;ok&&l<L;l++){
+            ok=fread(a,sizeof(double),(size_t)per,f)==(size_t)per;
+            if(ok)for(int64_t i=0;i<per;i++)g_q38_cov[l*per+i]+=a[i];
+        }
+        if(ok)for(int l=0;l<L;l++)g_q38_cov_n[l]+=n[l];
+        else fprintf(stderr,"[cov] %s: not matrices of this model, overwritten\n",g_q38_cov_path);
+        free(a);free(n);fclose(f);
+    }
+    f=fopen(g_q38_cov_path,"wb");
+    if(!f){perror(g_q38_cov_path);return;}
+    int ok=fwrite("Q38COV1\0",8,1,f)==1&&fwrite(g_q38_cov_dims,sizeof g_q38_cov_dims,1,f)==1&&
+           fwrite(g_q38_cov_n,sizeof(int64_t),(size_t)L,f)==(size_t)L&&
+           fwrite(g_q38_cov,sizeof(double),(size_t)(L*per),f)==(size_t)(L*per);
+    if(fclose(f)||!ok)fprintf(stderr,"[cov] %s: write failed\n",g_q38_cov_path);
+    else fprintf(stderr,"[cov] %s: %lld tokens in layer 0\n",g_q38_cov_path,(long long)g_q38_cov_n[0]);
+}
+static void q38_cov_init(Model *m) {
+    const char *p=getenv("Q38_ACT_COV");
+    if(!p||!*p||m->c.experts<1)return;
+    snprintf(g_q38_cov_path,sizeof g_q38_cov_path,"%s",p);
+    g_q38_cov_dims[0]=m->c.layers;g_q38_cov_dims[1]=m->c.hidden;
+    g_q38_cov=(double*)calloc((size_t)m->c.layers*m->c.hidden*m->c.hidden,sizeof(double));
+    g_q38_cov_n=(int64_t*)calloc((size_t)m->c.layers,sizeof(int64_t));
+    if(!g_q38_cov||!g_q38_cov_n){fprintf(stderr,"Q38_ACT_COV: out of memory\n");exit(1);}
+    atexit(q38_cov_write);
+    fprintf(stderr,"[cov] collecting the routed experts' input second moments into %s\n",p);
+}
+
 static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,float *eu,float *eh,float *eo) {
     Cfg *c=&m->c;int H=c->hidden,I=c->inter;
     Slot *ex=q38_expert_get(m,layer,eid);double started=now_s();
     q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
-    for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
+    for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];
+    if(g_q38_act)q38_act_add(layer,eid,xs,eh,1);
+    q38_weight_matmul(eo,eh,&ex->down,1,I,H);
     q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
 }
 
@@ -3159,6 +3349,7 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
     float *ebuf=vk?falloc((int64_t)K*H):NULL;
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*H;float *ys=out+(int64_t)s*H;memset(ys,0,(size_t)H*sizeof(float));
+        if(g_q38_cov)q38_cov_add(layer,xs,1);
         if(logits_in)memcpy(logits,logits_in+(int64_t)s*E,(size_t)E*sizeof(float));
         else q38_dense_matmul(m,logits,xs,&l->router,1,H,E);
         float mx=logits[0];for(int e=1;e<E;e++)if(logits[e]>mx)mx=logits[e];
@@ -3194,7 +3385,9 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
             int z=cpu_rank[i];
             Slot *ex=loaded_batch?selected[i]:q38_expert_get(m,layer,cpu_idx[i]);phase_started=now_s();
             q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
-            for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
+            for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];
+            if(g_q38_act)q38_act_add(layer,cpu_idx[i],xs,eh,1);
+            q38_weight_matmul(eo,eh,&ex->down,1,I,H);
             if(vk){
                 memcpy(ebuf+(int64_t)z*H,eo,(size_t)H*sizeof(float));
                 q38_vk_note(layer,cpu_idx[i],ex);
@@ -3261,58 +3454,6 @@ static int q38_moe_prefill_rows(const Cfg *c,int requested) {
  * grouped order, assignment ids in assign[]) gathered, run as one batch and their
  * outputs scattered to their places in routed_out, where the reduction reads them.
  * Row for row the same arithmetic as the grouped loop below. */
-/* Q38_ACT_STATS=<file>: calibration statistics of the routed experts' inputs, for a
- * data-aware quantizer: per layer and expert, the rows seen and the sum of squares of
- * every gate/up input channel (hidden wide) and every down input channel (the SwiGLU
- * output, inter wide), as float64. Collected in the prefill's expert loop (the
- * teacher-forced PPL=1 runs), added to the file at exit so that several runs add up. */
-static double *g_q38_act; static int64_t *g_q38_act_n; static int g_q38_act_dims[4]; static char g_q38_act_path[4096];
-static void q38_act_add(int layer,int e,const float *xin,const float *hid,int n) {
-    const int L=g_q38_act_dims[0],E=g_q38_act_dims[1],H=g_q38_act_dims[2],I=g_q38_act_dims[3];
-    if(!g_q38_act||layer<0||layer>=L||e<0||e>=E)return;
-    double *a=g_q38_act+((int64_t)layer*E+e)*(H+I);
-    for(int r=0;r<n;r++){
-        const float *x=xin+(int64_t)r*H,*h=hid+(int64_t)r*I;
-        for(int i=0;i<H;i++)a[i]+=(double)x[i]*x[i];
-        for(int j=0;j<I;j++)a[H+j]+=(double)h[j]*h[j];
-    }
-    g_q38_act_n[(int64_t)layer*E+e]+=n;
-}
-static void q38_act_write(void) {
-    const int64_t cells=(int64_t)g_q38_act_dims[0]*g_q38_act_dims[1],width=g_q38_act_dims[2]+g_q38_act_dims[3];
-    FILE *f=fopen(g_q38_act_path,"rb");
-    if(f){   /* an earlier run's statistics of the same geometry: add them */
-        int dims[4]; double *a=(double*)malloc((size_t)(cells*width)*sizeof(double)); int64_t *n=(int64_t*)malloc((size_t)cells*sizeof(int64_t));
-        char magic[8];
-        if(a&&n&&fread(magic,8,1,f)==1&&!memcmp(magic,"Q38ACT1\0",8)&&fread(dims,sizeof dims,1,f)==1&&!memcmp(dims,g_q38_act_dims,sizeof dims)&&
-           fread(n,sizeof(int64_t),(size_t)cells,f)==(size_t)cells&&fread(a,sizeof(double),(size_t)(cells*width),f)==(size_t)(cells*width)){
-            for(int64_t i=0;i<cells;i++)g_q38_act_n[i]+=n[i];
-            for(int64_t i=0;i<cells*width;i++)g_q38_act[i]+=a[i];
-        } else fprintf(stderr,"[act] %s: not statistics of this model, overwritten\n",g_q38_act_path);
-        free(a);free(n);fclose(f);
-    }
-    f=fopen(g_q38_act_path,"wb");
-    if(!f){perror(g_q38_act_path);return;}
-    int ok=fwrite("Q38ACT1\0",8,1,f)==1&&fwrite(g_q38_act_dims,sizeof g_q38_act_dims,1,f)==1&&
-           fwrite(g_q38_act_n,sizeof(int64_t),(size_t)cells,f)==(size_t)cells&&
-           fwrite(g_q38_act,sizeof(double),(size_t)(cells*width),f)==(size_t)(cells*width);
-    if(fclose(f)||!ok)fprintf(stderr,"[act] %s: write failed\n",g_q38_act_path);
-    else{ int64_t rows=0; for(int64_t i=0;i<cells;i++)rows+=g_q38_act_n[i];
-          fprintf(stderr,"[act] %s: %lld expert rows in total\n",g_q38_act_path,(long long)rows); }
-}
-static void q38_act_init(Model *m) {
-    const char *p=getenv("Q38_ACT_STATS");
-    if(!p||!*p||m->c.experts<1)return;
-    snprintf(g_q38_act_path,sizeof g_q38_act_path,"%s",p);
-    g_q38_act_dims[0]=m->c.layers;g_q38_act_dims[1]=m->c.experts;g_q38_act_dims[2]=m->c.hidden;g_q38_act_dims[3]=m->c.inter;
-    const int64_t cells=(int64_t)m->c.layers*m->c.experts;
-    g_q38_act=(double*)calloc((size_t)(cells*(m->c.hidden+m->c.inter)),sizeof(double));
-    g_q38_act_n=(int64_t*)calloc((size_t)cells,sizeof(int64_t));
-    if(!g_q38_act||!g_q38_act_n){fprintf(stderr,"Q38_ACT_STATS: out of memory\n");exit(1);}
-    atexit(q38_act_write);
-    fprintf(stderr,"[act] collecting the routed experts' input statistics into %s\n",p);
-}
-
 static void q38_prefill_expert_rows(Model *m,Slot *expert,const float *xc,int K,const int *assign,
                                     const int *pos,int n,float *in,float *gate,float *up,float *routed_out) {
     if(n<1)return;
@@ -3381,6 +3522,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
     for(int base=0;base<S;) {
         int rows=S-base<rows_capacity?S-base:rows_capacity;
         int assignment_count=rows*K;
+        if(g_q38_cov)q38_cov_add(layer,x+(int64_t)base*H,rows);
         memset(group_counts,0,(size_t)E*sizeof(*group_counts));
 
         /* Route the complete chunk with one resident router matmul.  Selection
@@ -4440,7 +4582,7 @@ static void q38_mtp_attach(Model *m,int cap) {
             found,m->mtp_wiring,how,(double)c->mtp_theta,
             (m->resident_weight_bytes-resident_before)/1048576.0,
             expert_kind,g_q38_gguf?(g_q38gg_mtp.t?" (its own GGUF)":" (the model's GGUF)"):
-            m->x4?" (the int4-g64 sidecar covers the model's layers)":"",
+            m->x4?(m->x4->bits==2?" (the int2-g32 sidecar covers the model's layers)":" (the int4-g64 sidecar covers the model's layers)"):"",
             mtp_cap,expert_bytes/1048576.0,expert_bytes*mtp_cap/1073741824.0);
     fprintf(stderr,"[qwen38] MTP norm weights, mean: embedding %.4f, hidden %.4f, mixer %.4f "
                    "(q38_rms0 scales by 1+w; a plain norm's weights would sit near 1)\n",
