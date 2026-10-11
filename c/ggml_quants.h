@@ -713,6 +713,19 @@ GQ_SB_FN __m256i gq_sbk_q6_k(const uint8_t *b, int ib, float *s, float *m) {
     const __m256i h = _mm256_and_si256(k == 0 ? q : k == 1 ? _mm256_srli_epi16(q, 2) : k == 2 ? _mm256_srli_epi16(q, 4) : _mm256_srli_epi16(q, 6), m3);
     return _mm256_sub_epi8(_mm256_or_si256(lo, _mm256_slli_epi16(h, 4)), _mm256_set1_epi8(32));
 }
+GQ_SB_FN __m256i gq_sbk_q3_k(const uint8_t *b, int ib, float *s, float *m) {
+    const uint8_t *hm = b, *qs = b + 32, *sc = b + 96; const float d = gq_f16(gq_rd16(b + 108));
+    for (int h = 0; h < 2; h++) {
+        int k = 2 * ib + h, l = k < 8 ? (sc[k] & 0x0F) : (sc[k - 8] >> 4), hh = (sc[8 + (k & 3)] >> (2 * (k >> 2))) & 3;
+        s[h] = d * (float)((l | (hh << 4)) - 32);
+    }
+    m[0] = m[1] = 0.f;
+    const int c = ib >> 2, sh = ib & 3;   /* element 32*ib + j: bits 2*sh of qs[32c + j], bit ib of hm[j] (clear: -4) */
+    const __m256i q = _mm256_loadu_si256((const __m256i *)(qs + 32 * c)), hv = _mm256_loadu_si256((const __m256i *)hm);
+    const __m256i bit = _mm256_set1_epi8((char)(1 << ib));
+    const __m256i sub = _mm256_andnot_si256(_mm256_cmpeq_epi8(_mm256_and_si256(hv, bit), bit), _mm256_set1_epi8(4));
+    return _mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(q, 2 * sh), _mm256_set1_epi8(3)), sub);
+}
 #define GQ_UNPACK_SBK(SB) { \
         for (int ib = 0; ib < 8; ib++) { float s2[2], m2[2]; _mm256_storeu_si256((__m256i *)(w + 32 * ib), SB(b, ib, s2, m2)); \
             sw[2 * ib] = s2[0]; sw[2 * ib + 1] = s2[1]; mw[2 * ib] = m2[0]; mw[2 * ib + 1] = m2[1]; } \
@@ -762,24 +775,7 @@ GQ_EXACT_FN static void gq_ublk(int t, const uint8_t *b, int8_t *w, float *sw, f
                 _mm256_storeu_si256((__m256i *)(w + 128 * c + 32 * sh), _mm256_and_si256(_mm256_srli_epi16(q, 2 * sh), m3));
         }
         return; }
-    case GQ_Q3_K: {
-        const uint8_t *hm = b, *qs = b + 32, *s = b + 96; const float d = gq_f16(gq_rd16(b + 108));
-        for (int k = 0; k < 16; k++) {
-            int l = k < 8 ? (s[k] & 0x0F) : (s[k - 8] >> 4), h = (s[8 + (k & 3)] >> (2 * (k >> 2))) & 3;
-            sw[k] = d * (float)((l | (h << 4)) - 32); mw[k] = 0.f;
-        }
-        const __m256i m3 = _mm256_set1_epi8(3), four = _mm256_set1_epi8(4), hv = _mm256_loadu_si256((const __m256i *)hm);
-        for (int c = 0; c < 2; c++) {
-            __m256i q = _mm256_loadu_si256((const __m256i *)(qs + 32 * c));
-            for (int sh = 0; sh < 4; sh++) {
-                int row = 4 * c + sh;                 /* element i = 32*row + j uses bit row of hm[j] */
-                __m256i bit = _mm256_set1_epi8((char)(1 << row));
-                __m256i set = _mm256_cmpeq_epi8(_mm256_and_si256(hv, bit), bit);            /* 0xFF where the bit is set */
-                __m256i sub = _mm256_andnot_si256(set, four);                               /* 4 where it is clear */
-                _mm256_storeu_si256((__m256i *)(w + 128 * c + 32 * sh), _mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(q, 2 * sh), m3), sub));
-            }
-        }
-        return; }
+    case GQ_Q3_K: GQ_UNPACK_SBK(gq_sbk_q3_k)
     case GQ_TQ2_0: {
         const float d = gq_f16(gq_rd16(b + 64)); const __m256i m3 = _mm256_set1_epi8(3), one = _mm256_set1_epi8(1);
         gq_set_g(sw, mw, 0, 16, d, 0.f);
@@ -1447,6 +1443,7 @@ GQ_EXACT_FN static void NAME(float *y, int ystride, const uint8_t *row, const in
 GQ_DOT_SBK(gq_dot_q4_k, 144, gq_sbk_q4_k, 1)
 GQ_DOT_SBK(gq_dot_q5_k, 176, gq_sbk_q5_k, 1)
 GQ_DOT_SBK(gq_dot_q6_k, 210, gq_sbk_q6_k, 0)
+GQ_DOT_SBK(gq_dot_q3_k, 110, gq_sbk_q3_k, 0)
 typedef void (*gq_fdot_fn)(float *, int, const uint8_t *, const int8_t *, const float *, int, int);
 static inline gq_fdot_fn gq_fdot_sb256(int t) {
     switch (t) {
@@ -1477,6 +1474,7 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
         if (t == GQ_Q2_0) { gq_dot_q2_0(y, ystride, row, a->q, a->d, I, a->S); return; }
         if (t == GQ_Q5_K) { gq_dot_q5_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
         if (t == GQ_Q6_K) { gq_dot_q6_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
+        if (t == GQ_Q3_K) { gq_dot_q3_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
     }
 #else
     if (t == GQ_Q8_0) {
