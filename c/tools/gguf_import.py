@@ -170,8 +170,14 @@ def qwen4exp_config(meta, tensors, overrides=None):
     vh, kh = int(need("ssm.time_step_rank")), int(need("ssm.group_count"))
     inner = int(need("ssm.inner_size"))
     emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
-    recurrent = list(need("attention.recurrent_layers"))[:layers]
     ratios = [int(r) for r in meta.get(p + "attention.compress_ratios", [])][:layers]
+    if p + "attention.recurrent_layers" in meta:
+        recurrent = [int(r) for r in meta[p + "attention.recurrent_layers"]][:layers]
+    else:   # files from before llama.cpp wrote recurrent_layers (unsloth's): every Nth layer attends
+        every = int(need("full_attention_interval"))
+        recurrent = [int((i + 1) % every != 0) for i in range(layers)]
+    if any(ratios) and [int(not r) for r in ratios] != recurrent:
+        sys.exit("GGUF metadata disagrees on the attention layers: compress_ratios vs the recurrent layers")
     ratio = int(overrides.get("indexer_compress_ratio") or max(ratios or [0]))
     if not ratio:
         sys.exit("GGUF metadata gives no indexer compress ratio (attention.compress_ratios is all 0): "

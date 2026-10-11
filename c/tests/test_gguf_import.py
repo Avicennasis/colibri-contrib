@@ -168,5 +168,42 @@ class GgufImport(unittest.TestCase):
         self.assertEqual(a["expert_count"], LAYERS * E)
 
 
+class Qwen4ExpLayers(unittest.TestCase):
+    """Which layers attend, from either way a qwen4exp GGUF says it: unsloth's Qwen3.8-Flash-Next
+    files give full_attention_interval (no attention.recurrent_layers), newer llama.cpp
+    writes recurrent_layers; compress_ratios, when not all 0, must agree."""
+    def meta(self, **extra):
+        p = "qwen4exp."
+        m = {p + k: v for k, v in {
+            "block_count": 8, "embedding_length": 2560, "attention.head_count": 24, "attention.head_count_kv": 2,
+            "attention.key_length": 256, "rope.dimension_count": 64, "expert_count": 512, "expert_used_count": 10,
+            "expert_feed_forward_length": 640, "ssm.conv_kernel": 4, "ssm.state_size": 128, "ssm.group_count": 16,
+            "ssm.time_step_rank": 48, "ssm.inner_size": 6144, "hyper_connection.count": 4,
+            "hyper_connection.low_rank": 320, "attention.indexer.head_count": 4, "attention.indexer.key_length": 128,
+            "attention.indexer.top_k": 2048, "ple.layers": [1], "ple.ngram_size": 3, "ple.heads_per_ngram": 8,
+            "ple.conv_kernel": 4, "embedding_length_per_layer_input": 160}.items()}
+        m.update({p + k: v for k, v in extra.items()})
+        return m
+
+    def config(self, meta):
+        import tools.gguf_import as gi
+        tensors = {"token_embd.weight": {"dims": [2560, 248320]},
+                   **{f"blk.{i}.indexer.k_proj.weight": {"dims": [2560, 128]} for i in range(8)}}
+        return gi.qwen4exp_config(meta, tensors)[0]
+
+    def test_interval_and_recurrent_layers_agree(self):
+        ratios = [0, 0, 0, 4, 0, 0, 0, 4]
+        old = self.config(self.meta(full_attention_interval=4, **{"attention.compress_ratios": ratios}))
+        new = self.config(self.meta(**{"attention.recurrent_layers": [1, 1, 1, 0, 1, 1, 1, 0],
+                                       "attention.compress_ratios": ratios}))
+        self.assertEqual(old["layer_types"], ["linear_attention"] * 3 + ["full_attention"] + ["linear_attention"] * 3 + ["full_attention"])
+        self.assertEqual(old, new)
+        self.assertEqual(old["indexer_compress_ratio"], 4)
+
+    def test_contradicting_metadata_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.config(self.meta(full_attention_interval=4, **{"attention.compress_ratios": [0, 0, 4, 0, 0, 0, 4, 0]}))
+
+
 if __name__ == "__main__":
     unittest.main()
