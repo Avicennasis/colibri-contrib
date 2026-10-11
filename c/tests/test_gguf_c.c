@@ -1,11 +1,18 @@
 /* Dumps what gguf.h reads, for tests/test_gguf_c.py:
  *   test_gguf_c FILE            -> "OK", kv lines, tensor lines (with a float checksum)
  *   test_gguf_c FILE TENSOR     -> the tensor as float32 on stdout */
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include "../gguf.h"
 
 int main(int argc, char **argv) {
+#ifdef _WIN32   /* the blocks and floats go through stdin/stdout: no CRLF translation */
+    _setmode(_fileno(stdin), _O_BINARY); _setmode(_fileno(stdout), _O_BINARY);
+#endif
     if (argc < 2) return 2;
     gguf_ctx g;
     if (gguf_open(&g, argv[1])) { printf("ERR %s\n", g.err); return 1; }

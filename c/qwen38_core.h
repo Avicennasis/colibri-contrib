@@ -1412,7 +1412,7 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     Cfg *c=&m->c; char nm[320];
     if(g_q38_gguf){   /* the checkpoint's names map onto the GGUF's (q38_gg_name) */
         snprintf(m->prefix,sizeof m->prefix,"model");
-        m->expert_prefetch=0; m->expert_parallel_reads=0;   /* both read safetensors ranges */
+        m->expert_prefetch=0;   /* it reads safetensors ranges; the parallel batch reads the GGUF's */
     } else {
         st_init(&m->S,snap);
         if(st_has(&m->S,"model.language_model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model.language_model");
@@ -1995,24 +1995,38 @@ static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
 
 /* GGUF mode: expert eid's three matrices, each a slice of its projection's 3D tensor
  * ([experts][rows][cols], the rows ggml blocks), read into the slot as they are. */
-static void q38_gg_load_expert(Model *m,int layer,int eid,Slot *s) {
+/* The layer's three expert tensors, checked: looked up (and marked used) on one
+ * thread, so the parallel batch below only reads. */
+static void q38_gg_expert_tensors(Model *m,int layer,const gguf_tensor *t[3]) {
     const Cfg *c=&m->c; const int H=c->hidden,I=c->inter;
     static const char *kn[3]={"ffn_gate_exps","ffn_up_exps","ffn_down_exps"};
-    Q38Weight *dst[3]={&s->gate,&s->up,&s->down}; const int os[3]={I,I,H},is[3]={H,H,I};
+    const int os[3]={I,I,H},is[3]={H,H,I};
     for(int k=0;k<3;k++){
         char nm[96]; snprintf(nm,sizeof nm,"blk.%d.%s.weight",layer,kn[k]);
-        const gguf_tensor *t=gguf_mark(&g_q38gg,nm);
-        if(!t||t->ne[0]!=is[k]||t->ne[1]!=os[k]||t->ne[2]!=c->experts||t->ne[3]!=1){fprintf(stderr,"GGUF: %s missing or not [%d][%d][%d]\n",nm,c->experts,os[k],is[k]);exit(1);}
-        int64_t rb=gq_row_bytes(t->type,is[k]),eb=rb*os[k];
-        if(rb<=0||(!gq_blk_decoder(t->type)&&t->type!=GQ_F32&&t->type!=GQ_F16&&t->type!=GQ_BF16)){fprintf(stderr,"GGUF %s: type %s is not supported\n",nm,gq_type_name(t->type));exit(1);}
+        t[k]=gguf_mark(&g_q38gg,nm);
+        if(!t[k]||t[k]->ne[0]!=is[k]||t[k]->ne[1]!=os[k]||t[k]->ne[2]!=c->experts||t[k]->ne[3]!=1){fprintf(stderr,"GGUF: %s missing or not [%d][%d][%d]\n",nm,c->experts,os[k],is[k]);exit(1);}
+        if(gq_row_bytes(t[k]->type,is[k])<=0||(!gq_blk_decoder(t[k]->type)&&t[k]->type!=GQ_F32&&t[k]->type!=GQ_F16&&t[k]->type!=GQ_BF16)){fprintf(stderr,"GGUF %s: type %s is not supported\n",nm,gq_type_name(t[k]->type));exit(1);}
+    }
+}
+
+/* Expert eid's rows of the three tensors into the slot: preads only, safe in parallel. */
+static void q38_gg_read_expert(Model *m,const gguf_tensor *const t[3],int eid,Slot *s) {
+    const Cfg *c=&m->c; const int H=c->hidden,I=c->inter;
+    Q38Weight *dst[3]={&s->gate,&s->up,&s->down}; const int os[3]={I,I,H},is[3]={H,H,I};
+    for(int k=0;k<3;k++){
+        int64_t rb=gq_row_bytes(t[k]->type,is[k]),eb=rb*os[k];
         Q38Weight *w=dst[k];
-        if(w->kind!=Q38_WEIGHT_GGML||w->gq_type!=t->type||w->rows!=os[k]||w->cols!=is[k]||!w->owns_data){
+        if(w->kind!=Q38_WEIGHT_GGML||w->gq_type!=t[k]->type||w->rows!=os[k]||w->cols!=is[k]||!w->owns_data){
             q38_weight_free(w);
             w->data=malloc((size_t)eb); if(!w->data){fprintf(stderr,"OOM GGUF expert\n");exit(1);}
-            w->kind=Q38_WEIGHT_GGML;w->gq_type=t->type;w->rows=os[k];w->cols=is[k];w->elements=(int64_t)os[k]*is[k];w->owns_data=1;
+            w->kind=Q38_WEIGHT_GGML;w->gq_type=t[k]->type;w->rows=os[k];w->cols=is[k];w->elements=(int64_t)os[k]*is[k];w->owns_data=1;
         }
-        q38_gg_read(t,w->data,(int64_t)eid*eb,eb);
+        q38_gg_read(t[k],w->data,(int64_t)eid*eb,eb);
     }
+}
+
+static void q38_gg_load_expert(Model *m,int layer,int eid,Slot *s) {
+    const gguf_tensor *t[3]; q38_gg_expert_tensors(m,layer,t); q38_gg_read_expert(m,t,eid,s);
 }
 
 static void q38_load_expert(Model *m,int layer,int eid,Slot *s) {
@@ -2150,8 +2164,10 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
     if(count>cache->cap)
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_CACHE_CAPACITY,
                                          layer,cache->cap,count);
-    int x4=q38_layer_int4(m,layer);
-    if(!x4&&!q38_prepare_expert_scale_bank(m,layer))
+    int x4=q38_layer_int4(m,layer),gg=g_q38_gguf;
+    const gguf_tensor *ggt[3]={0};
+    if(gg)q38_gg_expert_tensors(m,layer,ggt);
+    if(!x4&&!gg&&!q38_prepare_expert_scale_bank(m,layer))
         return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_SCALE_BANK,layer,0,0);
     /* The demand set is no longer bounded by the decode top-k: the MoE prefill
      * hands over the whole chunk union (up to the cache cap) so its loads run
@@ -2177,7 +2193,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
             continue;
         }
         st_tensor *weight[3];
-        if(!x4&&!q38_native_fp8_expert_tensors(m,layer,expert,weight)){
+        if(!x4&&!gg&&!q38_native_fp8_expert_tensors(m,layer,expert,weight)){
             free(jobs);
             return q38_expert_batch_fallback(m,Q38_EXPERT_BATCH_FALLBACK_LAYOUT,
                                              layer,expert,0);
@@ -2208,7 +2224,7 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
                 if(slot->eid>=0)cache->by_expert[slot->eid]=-1;
             }
             slot->eid=-1;jobs[job_count].expert=expert;jobs[job_count].slot=slot;
-            if(!x4&&!q38_native_fp8_expert_tensors(m,layer,expert,jobs[job_count].weight)){
+            if(!x4&&!gg&&!q38_native_fp8_expert_tensors(m,layer,expert,jobs[job_count].weight)){
                 fprintf(stderr,"Qwen3.8 expert layout changed during batch reservation\n");exit(1);
             }
             job_count++;
@@ -2227,13 +2243,14 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
         double started=now_s();
         #pragma omp parallel for schedule(static) num_threads(workers) if(job_count>1)
         for(int job=0;job<job_count;job++){
-            if(x4)q38_load_int4_record(m,layer,jobs[job].expert,jobs[job].slot);
+            if(gg)q38_gg_read_expert(m,ggt,jobs[job].expert,jobs[job].slot);
+            else if(x4)q38_load_int4_record(m,layer,jobs[job].expert,jobs[job].slot);
             else q38_load_native_fp8_ranges(m,layer,jobs[job].expert,jobs[job].slot,
                                             jobs[job].weight);
         }
         q38_tm_add(m,Q38_TM_EXPERT_READ,started);
-        m->expert_weight_reads+=(uint64_t)job_count*(x4?1:2);
-        if(!x4)m->expert_pair_reads+=(uint64_t)job_count;
+        m->expert_weight_reads+=(uint64_t)job_count*(gg?3:x4?1:2);
+        if(!x4&&!gg)m->expert_pair_reads+=(uint64_t)job_count;
         if(job_count>1)m->expert_parallel_batches++;
         for(int job=0;job<job_count;job++){
             Slot *slot=jobs[job].slot;slot->eid=jobs[job].expert;

@@ -3,11 +3,18 @@
  * AVX2 dot, the min term, the per-group scales) from the activation's own
  * rounding. Reads: int32 type, int32 O, int32 I, int32 S, W bytes, S*I floats.
  * Prints the max error relative to sum|w*x| over all outputs. */
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include "../ggml_quants.h"
 int main(void) {
+#ifdef _WIN32   /* the blocks and floats go through stdin/stdout: no CRLF translation */
+    _setmode(_fileno(stdin), _O_BINARY); _setmode(_fileno(stdout), _O_BINARY);
+#endif
     int32_t t, O, I, S;
     if (fread(&t, 4, 1, stdin) != 1 || fread(&O, 4, 1, stdin) != 1 || fread(&I, 4, 1, stdin) != 1 || fread(&S, 4, 1, stdin) != 1) return 2;
     int64_t rb = gq_row_bytes(t, I); if (rb < 0) return 3;

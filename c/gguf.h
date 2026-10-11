@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <io.h>
+#include <windows.h>
 #else
 #include <unistd.h>
 #endif
@@ -324,10 +325,14 @@ static int gguf_read(const gguf_ctx *g, const gguf_tensor *t, void *dst, int64_t
     if (off < 0 || n < 0 || off > t->nbytes || n > t->nbytes - off) return -1;
     uint8_t *p = (uint8_t *)dst; uint64_t pos = t->off + (uint64_t)off; int64_t left = n;
     while (left > 0) {
-#ifdef _WIN32
-        if (_lseeki64(g->fds[t->file], (long long)pos, SEEK_SET) < 0) return -1;
-        int chunk = left > (1 << 30) ? (1 << 30) : (int)left;
-        int r = _read(g->fds[t->file], p, (unsigned)chunk);
+#ifdef _WIN32   /* positional, as compat_pread: _lseeki64 + _read share the seek and race between threads */
+        HANDLE h = (HANDLE)_get_osfhandle(g->fds[t->file]);
+        if (h == INVALID_HANDLE_VALUE) return -1;
+        DWORD want = left > (1 << 30) ? (DWORD)(1 << 30) : (DWORD)left, got = 0;
+        OVERLAPPED ov; memset(&ov, 0, sizeof ov);
+        ov.Offset = (DWORD)(pos & 0xFFFFFFFFu); ov.OffsetHigh = (DWORD)(pos >> 32);
+        if (!ReadFile(h, p, want, &got, &ov)) return -1;
+        int64_t r = (int64_t)got;
 #else
         ssize_t r = pread(g->fds[t->file], p, (size_t)(left > (1 << 30) ? (1 << 30) : left), (off_t)pos);
 #endif
