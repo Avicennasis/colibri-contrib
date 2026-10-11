@@ -566,6 +566,98 @@ static inline __m256i gq_nib16_lut(const uint8_t *p, __m128i tab) {
     return _mm256_set_m128i(hi, lo);
 }
 #endif
+#if defined(__AVX2__)
+/* Sub-block decoders of the 256-element grid types: 32 elements of sub-block ib (0..7)
+ * of block b as 32 int8 in a register, and the scales of its two 16-element groups
+ * (s[0], s[1]), from the block scale d (gq_bd_*). gq_ublk stores them (the unpack),
+ * gq_dot_sb256 multiplies them at once: one decoder per format, so both paths hold the
+ * same integers and scales by construction. */
+#define GQ_SB_FN GQ_EXACT_FN static inline __attribute__((always_inline))
+GQ_SB_FN float gq_bd_f16(const uint8_t *b) { return gq_f16(gq_rd16(b)); }
+GQ_SB_FN float gq_bd_iq4_xs(const uint8_t *b) { return gq_f16(gq_rd16(b)); }
+GQ_SB_FN float gq_bd_iq1_m(const uint8_t *b) {
+    uint16_t sc[4]; for (int i = 0; i < 4; i++) sc[i] = gq_rd16(b + 48 + 2 * i);
+    return gq_f16((uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000)));
+}
+GQ_SB_FN __m256i gq_sb_iq4_xs(const uint8_t *b, float d, int ib, float *s) {
+    const uint16_t sh = gq_rd16(b + 2); const uint8_t *sl = b + 4, *qs = b + 8;
+    int ls = ((sl[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((sh >> (2 * ib)) & 3) << 4);
+    s[0] = s[1] = d * (float)(ls - 32);
+    return gq_nib16_lut(qs + 16 * ib, _mm_loadu_si128((const __m128i *)GGML_KVALUES_IQ4NL));
+}
+GQ_SB_FN __m256i gq_sb_iq2_xxs(const uint8_t *b, float d, int ib, float *s) {
+    const uint8_t *qs = b + 2;
+    uint32_t a0 = gq_rd32(qs + 8 * ib), a1 = gq_rd32(qs + 8 * ib + 4);
+    s[0] = s[1] = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
+    const uint8_t *G = GGML_IQ2XXS_GRID;
+    return gq_grid4(G + 8 * (a0 & 0xFF), G + 8 * ((a0 >> 8) & 0xFF), G + 8 * ((a0 >> 16) & 0xFF), G + 8 * (a0 >> 24),
+        GGML_KSIGNS_IQ2XS[a1 & 127], GGML_KSIGNS_IQ2XS[(a1 >> 7) & 127], GGML_KSIGNS_IQ2XS[(a1 >> 14) & 127], GGML_KSIGNS_IQ2XS[(a1 >> 21) & 127]);
+}
+GQ_SB_FN __m256i gq_sb_iq2_xs(const uint8_t *b, float d, int ib, float *s) {
+    const uint8_t *qs = b + 2, *sc = b + 66;
+    for (int h = 0; h < 2; h++) { int si = 2 * ib + h; int v = (sc[si >> 1] >> (4 * (si & 1))) & 0x0F; s[h] = d * (0.5f + (float)v) * 0.25f; }
+    uint16_t q0 = gq_rd16(qs + 8 * ib), q1 = gq_rd16(qs + 8 * ib + 2), q2 = gq_rd16(qs + 8 * ib + 4), q3 = gq_rd16(qs + 8 * ib + 6);
+    const uint8_t *G = GGML_IQ2XS_GRID;
+    return gq_grid4(G + 8 * (q0 & 511), G + 8 * (q1 & 511), G + 8 * (q2 & 511), G + 8 * (q3 & 511),
+        GGML_KSIGNS_IQ2XS[q0 >> 9], GGML_KSIGNS_IQ2XS[q1 >> 9], GGML_KSIGNS_IQ2XS[q2 >> 9], GGML_KSIGNS_IQ2XS[q3 >> 9]);
+}
+GQ_SB_FN __m256i gq_sb_iq2_s(const uint8_t *b, float d, int ib, float *s) {
+    const uint8_t *qs = b + 2, *sg = b + 34, *qh = b + 66, *sc = b + 74;
+    for (int h = 0; h < 2; h++) { int si = 2 * ib + h; int v = (sc[si >> 1] >> (4 * (si & 1))) & 0x0F; s[h] = d * (0.5f + (float)v) * 0.25f; }
+    int k = 4 * ib; const uint8_t *G = GGML_IQ2S_GRID;
+    #define IX(kk) (qs[kk] | (((qh[(kk) >> 2] >> (2 * ((kk) & 3))) & 3) << 8))
+    __m256i v = gq_grid4(G + 8 * IX(k), G + 8 * IX(k + 1), G + 8 * IX(k + 2), G + 8 * IX(k + 3), sg[k], sg[k + 1], sg[k + 2], sg[k + 3]);
+    #undef IX
+    return v;
+}
+GQ_SB_FN __m256i gq_sb_iq3_xxs(const uint8_t *b, float d, int ib, float *s) {
+    const uint8_t *qs = b + 2, *ss = b + 66;
+    uint32_t a = gq_rd32(ss + 4 * ib);
+    s[0] = s[1] = d * (0.5f + (float)(a >> 28)) * 0.5f;
+    uint8_t gb[32]; const uint8_t *q = qs + 8 * ib;
+    for (int j = 0; j < 8; j++) memcpy(gb + 4 * j, GGML_IQ3XXS_GRID + 4 * q[j], 4);
+    return gq_grid4(gb, gb + 8, gb + 16, gb + 24,
+        GGML_KSIGNS_IQ2XS[a & 127], GGML_KSIGNS_IQ2XS[(a >> 7) & 127], GGML_KSIGNS_IQ2XS[(a >> 14) & 127], GGML_KSIGNS_IQ2XS[(a >> 21) & 127]);
+}
+GQ_SB_FN __m256i gq_sb_iq3_s(const uint8_t *b, float d, int ib, float *s) {
+    const uint8_t *qs = b + 2, *qh = b + 66, *sg = b + 74, *sc = b + 106;
+    int v = (sc[ib >> 1] >> (4 * (ib & 1))) & 0x0F; s[0] = s[1] = d * (float)(1 + 2 * v);
+    uint8_t gb[32];
+    for (int j = 0; j < 8; j++) { int k = 8 * ib + j; int idx = qs[k] | (((qh[k >> 3] >> (k & 7)) & 1) << 8); memcpy(gb + 4 * j, GGML_IQ3S_GRID + 4 * idx, 4); }
+    return gq_grid4(gb, gb + 8, gb + 16, gb + 24, sg[4 * ib], sg[4 * ib + 1], sg[4 * ib + 2], sg[4 * ib + 3]);
+}
+GQ_SB_FN __m256i gq_sb_iq1_s(const uint8_t *b, float d, int ib, float *s) {
+    const uint8_t *qs = b + 2, *qhp = b + 34;
+    uint16_t qh = gq_rd16(qhp + 2 * ib);
+    s[0] = s[1] = d * (float)(2 * ((qh >> 12) & 7) + 1) * 0.125f;
+    uint64_t g[4];
+    for (int l = 0; l < 4; l++) memcpy(&g[l], GGML_IQ1S_GRID + 8 * (qs[4 * ib + l] | (((qh >> (3 * l)) & 7) << 8)), 8);
+    __m256i v = _mm256_set_epi64x((long long)g[3], (long long)g[2], (long long)g[1], (long long)g[0]);
+    v = _mm256_add_epi8(_mm256_add_epi8(v, v), _mm256_add_epi8(v, v));      /* 4x */
+    v = _mm256_add_epi8(v, v);                                               /* 8x */
+    return _mm256_add_epi8(v, _mm256_set1_epi8((qh & 0x8000) ? -1 : 1));
+}
+GQ_SB_FN __m256i gq_sb_iq1_m(const uint8_t *b, float d, int ib, float *s) {
+    const uint8_t *qs = b, *qh = b + 32, *scp = b + 48;
+    uint16_t sc[4]; for (int i = 0; i < 4; i++) sc[i] = gq_rd16(scp + 2 * i);
+    for (int h = 0; h < 2; h++) { int s16 = 2 * ib + h; int v = (sc[s16 >> 2] >> (3 * (s16 & 3))) & 7; s[h] = d * (float)(2 * v + 1) * 0.125f; }
+    uint64_t g[4]; int8_t ds[4];
+    for (int l = 0; l < 4; l++) {
+        int k = 4 * ib + l, hh = (qh[k >> 1] >> (4 * (k & 1))) & 0x0F;
+        memcpy(&g[l], GGML_IQ1S_GRID + 8 * (qs[k] | ((hh & 7) << 8)), 8); ds[l] = (hh & 8) ? -1 : 1;
+    }
+    __m256i v = _mm256_set_epi64x((long long)g[3], (long long)g[2], (long long)g[1], (long long)g[0]);
+    v = _mm256_add_epi8(v, v); v = _mm256_add_epi8(v, v); v = _mm256_add_epi8(v, v);   /* 8 * grid, byte-wise (a 16-bit shift would carry 0xFF into the neighbour) */
+    __m256i dl = _mm256_set_epi64x((long long)(0x0101010101010101ull * (uint8_t)ds[3]), (long long)(0x0101010101010101ull * (uint8_t)ds[2]),
+                                   (long long)(0x0101010101010101ull * (uint8_t)ds[1]), (long long)(0x0101010101010101ull * (uint8_t)ds[0]));
+    return _mm256_add_epi8(v, dl);
+}
+/* gq_ublk's case for a grid type: every sub-block through its decoder */
+#define GQ_UNPACK_SB(BD, SB) { const float d = BD(b); \
+        for (int ib = 0; ib < 8; ib++) { float s2[2]; _mm256_storeu_si256((__m256i *)(w + 32 * ib), SB(b, d, ib, s2)); \
+            sw[2 * ib] = s2[0]; sw[2 * ib + 1] = s2[1]; mw[2 * ib] = mw[2 * ib + 1] = 0.f; } \
+        return; }
+#endif
 GQ_EXACT_FN static void gq_ublk(int t, const uint8_t *b, int8_t *w, float *sw, float *mw) {
     GQ_EXACT_BEGIN
 #if defined(__AVX2__)
@@ -618,98 +710,14 @@ GQ_EXACT_FN static void gq_ublk(int t, const uint8_t *b, int8_t *w, float *sw, f
         const __m128i tab = _mm_loadu_si128((const __m128i *)(nl ? GGML_KVALUES_IQ4NL : GGML_KVALUES_MXFP4));
         _mm256_storeu_si256((__m256i *)w, gq_nib16_lut(b + (nl ? 2 : 1), tab));
         gq_set_g(sw, mw, 0, 2, d, 0.f); return; }
-    case GQ_IQ4_XS: {
-        const float d = gq_f16(gq_rd16(b)); const uint16_t sh = gq_rd16(b + 2); const uint8_t *sl = b + 4, *qs = b + 8;
-        const __m128i tab = _mm_loadu_si128((const __m128i *)GGML_KVALUES_IQ4NL);
-        for (int ib = 0; ib < 8; ib++) {
-            int ls = ((sl[ib >> 1] >> (4 * (ib & 1))) & 0x0F) | (((sh >> (2 * ib)) & 3) << 4);
-            gq_set_g(sw, mw, 2 * ib, 2, d * (float)(ls - 32), 0.f);
-            _mm256_storeu_si256((__m256i *)(w + 32 * ib), gq_nib16_lut(qs + 16 * ib, tab));
-        }
-        return; }
-    case GQ_IQ2_XXS: {
-        gq_sign8_init(); const float d = gq_f16(gq_rd16(b)); const uint8_t *qs = b + 2;
-        for (int ib = 0; ib < 8; ib++) {
-            uint32_t a0 = gq_rd32(qs + 8 * ib), a1 = gq_rd32(qs + 8 * ib + 4);
-            gq_set_g(sw, mw, 2 * ib, 2, d * (0.5f + (float)(a1 >> 28)) * 0.25f, 0.f);
-            const uint8_t *G = GGML_IQ2XXS_GRID;
-            _mm256_storeu_si256((__m256i *)(w + 32 * ib), gq_grid4(G + 8 * (a0 & 0xFF), G + 8 * ((a0 >> 8) & 0xFF), G + 8 * ((a0 >> 16) & 0xFF), G + 8 * (a0 >> 24),
-                GGML_KSIGNS_IQ2XS[a1 & 127], GGML_KSIGNS_IQ2XS[(a1 >> 7) & 127], GGML_KSIGNS_IQ2XS[(a1 >> 14) & 127], GGML_KSIGNS_IQ2XS[(a1 >> 21) & 127]));
-        }
-        return; }
-    case GQ_IQ2_XS: {
-        gq_sign8_init(); const float d = gq_f16(gq_rd16(b)); const uint8_t *qs = b + 2, *sc = b + 66;
-        for (int ib = 0; ib < 8; ib++) {
-            for (int h = 0; h < 2; h++) { int si = 2 * ib + h; int s = (sc[si >> 1] >> (4 * (si & 1))) & 0x0F; sw[si] = d * (0.5f + (float)s) * 0.25f; mw[si] = 0.f; }
-            uint16_t q0 = gq_rd16(qs + 8 * ib), q1 = gq_rd16(qs + 8 * ib + 2), q2 = gq_rd16(qs + 8 * ib + 4), q3 = gq_rd16(qs + 8 * ib + 6);
-            const uint8_t *G = GGML_IQ2XS_GRID;
-            _mm256_storeu_si256((__m256i *)(w + 32 * ib), gq_grid4(G + 8 * (q0 & 511), G + 8 * (q1 & 511), G + 8 * (q2 & 511), G + 8 * (q3 & 511),
-                GGML_KSIGNS_IQ2XS[q0 >> 9], GGML_KSIGNS_IQ2XS[q1 >> 9], GGML_KSIGNS_IQ2XS[q2 >> 9], GGML_KSIGNS_IQ2XS[q3 >> 9]));
-        }
-        return; }
-    case GQ_IQ2_S: {
-        gq_sign8_init(); const float d = gq_f16(gq_rd16(b)); const uint8_t *qs = b + 2, *sg = b + 34, *qh = b + 66, *sc = b + 74;
-        for (int ib = 0; ib < 8; ib++) {
-            for (int h = 0; h < 2; h++) { int si = 2 * ib + h; int s = (sc[si >> 1] >> (4 * (si & 1))) & 0x0F; sw[si] = d * (0.5f + (float)s) * 0.25f; mw[si] = 0.f; }
-            int k = 4 * ib; const uint8_t *G = GGML_IQ2S_GRID;
-            #define IX(kk) (qs[kk] | (((qh[(kk) >> 2] >> (2 * ((kk) & 3))) & 3) << 8))
-            _mm256_storeu_si256((__m256i *)(w + 32 * ib), gq_grid4(G + 8 * IX(k), G + 8 * IX(k + 1), G + 8 * IX(k + 2), G + 8 * IX(k + 3),
-                sg[k], sg[k + 1], sg[k + 2], sg[k + 3]));
-            #undef IX
-        }
-        return; }
-    case GQ_IQ3_XXS: {
-        gq_sign8_init(); const float d = gq_f16(gq_rd16(b)); const uint8_t *qs = b + 2, *ss = b + 66;
-        for (int ib = 0; ib < 8; ib++) {
-            uint32_t a = gq_rd32(ss + 4 * ib);
-            gq_set_g(sw, mw, 2 * ib, 2, d * (0.5f + (float)(a >> 28)) * 0.5f, 0.f);
-            uint8_t gb[32]; const uint8_t *q = qs + 8 * ib;
-            for (int j = 0; j < 8; j++) memcpy(gb + 4 * j, GGML_IQ3XXS_GRID + 4 * q[j], 4);
-            _mm256_storeu_si256((__m256i *)(w + 32 * ib), gq_grid4(gb, gb + 8, gb + 16, gb + 24,
-                GGML_KSIGNS_IQ2XS[a & 127], GGML_KSIGNS_IQ2XS[(a >> 7) & 127], GGML_KSIGNS_IQ2XS[(a >> 14) & 127], GGML_KSIGNS_IQ2XS[(a >> 21) & 127]));
-        }
-        return; }
-    case GQ_IQ3_S: {
-        gq_sign8_init(); const float d = gq_f16(gq_rd16(b)); const uint8_t *qs = b + 2, *qh = b + 66, *sg = b + 74, *sc = b + 106;
-        for (int ib = 0; ib < 8; ib++) {
-            int s = (sc[ib >> 1] >> (4 * (ib & 1))) & 0x0F; gq_set_g(sw, mw, 2 * ib, 2, d * (float)(1 + 2 * s), 0.f);
-            uint8_t gb[32];
-            for (int j = 0; j < 8; j++) { int k = 8 * ib + j; int idx = qs[k] | (((qh[k >> 3] >> (k & 7)) & 1) << 8); memcpy(gb + 4 * j, GGML_IQ3S_GRID + 4 * idx, 4); }
-            _mm256_storeu_si256((__m256i *)(w + 32 * ib), gq_grid4(gb, gb + 8, gb + 16, gb + 24, sg[4 * ib], sg[4 * ib + 1], sg[4 * ib + 2], sg[4 * ib + 3]));
-        }
-        return; }
-    case GQ_IQ1_S: {
-        const float d = gq_f16(gq_rd16(b)); const uint8_t *qs = b + 2, *qhp = b + 34;
-        for (int ib = 0; ib < 8; ib++) {
-            uint16_t qh = gq_rd16(qhp + 2 * ib);
-            gq_set_g(sw, mw, 2 * ib, 2, d * (float)(2 * ((qh >> 12) & 7) + 1) * 0.125f, 0.f);
-            uint64_t g[4];
-            for (int l = 0; l < 4; l++) memcpy(&g[l], GGML_IQ1S_GRID + 8 * (qs[4 * ib + l] | (((qh >> (3 * l)) & 7) << 8)), 8);
-            __m256i v = _mm256_set_epi64x((long long)g[3], (long long)g[2], (long long)g[1], (long long)g[0]);
-            v = _mm256_add_epi8(_mm256_add_epi8(v, v), _mm256_add_epi8(v, v));      /* 4x */
-            v = _mm256_add_epi8(v, v);                                               /* 8x */
-            v = _mm256_add_epi8(v, _mm256_set1_epi8((qh & 0x8000) ? -1 : 1));
-            _mm256_storeu_si256((__m256i *)(w + 32 * ib), v);
-        }
-        return; }
-    case GQ_IQ1_M: {
-        const uint8_t *qs = b, *qh = b + 32, *scp = b + 48;
-        uint16_t sc[4]; for (int i = 0; i < 4; i++) sc[i] = gq_rd16(scp + 2 * i);
-        const float d = gq_f16((uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000)));
-        for (int ib = 0; ib < 8; ib++) {
-            for (int h = 0; h < 2; h++) { int s16 = 2 * ib + h; int s = (sc[s16 >> 2] >> (3 * (s16 & 3))) & 7; sw[s16] = d * (float)(2 * s + 1) * 0.125f; mw[s16] = 0.f; }
-            uint64_t g[4]; int8_t ds[4];
-            for (int l = 0; l < 4; l++) {
-                int k = 4 * ib + l, hh = (qh[k >> 1] >> (4 * (k & 1))) & 0x0F;
-                memcpy(&g[l], GGML_IQ1S_GRID + 8 * (qs[k] | ((hh & 7) << 8)), 8); ds[l] = (hh & 8) ? -1 : 1;
-            }
-            __m256i v = _mm256_set_epi64x((long long)g[3], (long long)g[2], (long long)g[1], (long long)g[0]);
-            v = _mm256_add_epi8(v, v); v = _mm256_add_epi8(v, v); v = _mm256_add_epi8(v, v);   /* 8 * grid, byte-wise (a 16-bit shift would carry 0xFF into the neighbour) */
-            __m256i dl = _mm256_set_epi64x((long long)(0x0101010101010101ull * (uint8_t)ds[3]), (long long)(0x0101010101010101ull * (uint8_t)ds[2]),
-                                           (long long)(0x0101010101010101ull * (uint8_t)ds[1]), (long long)(0x0101010101010101ull * (uint8_t)ds[0]));
-            _mm256_storeu_si256((__m256i *)(w + 32 * ib), _mm256_add_epi8(v, dl));
-        }
-        return; }
+    case GQ_IQ4_XS: GQ_UNPACK_SB(gq_bd_iq4_xs, gq_sb_iq4_xs)
+    case GQ_IQ2_XXS: GQ_UNPACK_SB(gq_bd_f16, gq_sb_iq2_xxs)
+    case GQ_IQ2_XS: GQ_UNPACK_SB(gq_bd_f16, gq_sb_iq2_xs)
+    case GQ_IQ2_S: GQ_UNPACK_SB(gq_bd_f16, gq_sb_iq2_s)
+    case GQ_IQ3_XXS: GQ_UNPACK_SB(gq_bd_f16, gq_sb_iq3_xxs)
+    case GQ_IQ3_S: GQ_UNPACK_SB(gq_bd_f16, gq_sb_iq3_s)
+    case GQ_IQ1_S: GQ_UNPACK_SB(gq_bd_f16, gq_sb_iq1_s)
+    case GQ_IQ1_M: GQ_UNPACK_SB(gq_bd_iq1_m, gq_sb_iq1_m)
     case GQ_Q2_K: {
         const uint8_t *sc = b, *qs = b + 16; const float d = gq_f16(gq_rd16(b + 80)), dmin = gq_f16(gq_rd16(b + 82));
         for (int g = 0; g < 16; g++) { sw[g] = d * (float)(sc[g] & 0xF); mw[g] = dmin * (float)(sc[g] >> 4); }
@@ -1245,6 +1253,45 @@ static inline float gq_dot_b32(int t, const uint8_t *row, const int8_t *xq, cons
     }
     return acc;
 }
+/* The 256-element grid types without the unpack: each sub-block from its decoder
+ * (gq_sb_*, the unpack's own), multiplied at once as gq_dot_i8 does it (the same
+ * lanes, group scales times dx, fma and reduction), so the result is the unpack
+ * path's bit for bit, without storing and reloading the row. */
+#define GQ_DOT_SB256(NAME, BYTES, BD, SB) \
+GQ_EXACT_FN static float NAME(const uint8_t *row, const int8_t *xq, const float *dx, int64_t n) { \
+    __m256 vacc = _mm256_setzero_ps(); const __m256i ones = _mm256_set1_epi16(1); \
+    for (int64_t blk = 0; blk < n / 256; blk++) { \
+        const uint8_t *b = row + blk * (BYTES); const float d = BD(b); \
+        for (int ib = 0; ib < 8; ib++) { \
+            float s2[2]; const __m256i w = SB(b, d, ib, s2); const int64_t xb = blk * 8 + ib; \
+            const __m256i x = _mm256_loadu_si256((const __m256i *)(xq + xb * 32)); \
+            const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(x, w)), ones); \
+            const float dd = dx[xb]; \
+            vacc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set_m128(_mm_set1_ps(s2[1] * dd), _mm_set1_ps(s2[0] * dd)), vacc); \
+        } \
+    } \
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(vacc), _mm256_extractf128_ps(vacc, 1)); \
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h)); h = _mm_add_ss(h, _mm_movehdup_ps(h)); \
+    return _mm_cvtss_f32(h); \
+}
+GQ_DOT_SB256(gq_dot_iq4_xs, 136, gq_bd_iq4_xs, gq_sb_iq4_xs)
+GQ_DOT_SB256(gq_dot_iq2_xxs, 66, gq_bd_f16, gq_sb_iq2_xxs)
+GQ_DOT_SB256(gq_dot_iq2_xs, 74, gq_bd_f16, gq_sb_iq2_xs)
+GQ_DOT_SB256(gq_dot_iq2_s, 82, gq_bd_f16, gq_sb_iq2_s)
+GQ_DOT_SB256(gq_dot_iq3_xxs, 98, gq_bd_f16, gq_sb_iq3_xxs)
+GQ_DOT_SB256(gq_dot_iq3_s, 110, gq_bd_f16, gq_sb_iq3_s)
+GQ_DOT_SB256(gq_dot_iq1_s, 50, gq_bd_f16, gq_sb_iq1_s)
+GQ_DOT_SB256(gq_dot_iq1_m, 56, gq_bd_iq1_m, gq_sb_iq1_m)
+typedef float (*gq_fdot_fn)(const uint8_t *, const int8_t *, const float *, int64_t);
+static inline gq_fdot_fn gq_fdot_sb256(int t) {
+    switch (t) {
+    case GQ_IQ4_XS: return gq_dot_iq4_xs;   case GQ_IQ2_XXS: return gq_dot_iq2_xxs;
+    case GQ_IQ2_XS: return gq_dot_iq2_xs;   case GQ_IQ2_S: return gq_dot_iq2_s;
+    case GQ_IQ3_XXS: return gq_dot_iq3_xxs; case GQ_IQ3_S: return gq_dot_iq3_s;
+    case GQ_IQ1_S: return gq_dot_iq1_s;     case GQ_IQ1_M: return gq_dot_iq1_m;
+    default: return NULL;
+    }
+}
 #define GQ_FUSED_ROWS 4   /* from this many activation rows, one unpack shared by all is cheaper */
 #endif
 static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint8_t *row, int t, int I) {
@@ -1256,6 +1303,11 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
     if ((t == GQ_Q4_0 || t == GQ_Q4_1 || t == GQ_Q5_0 || t == GQ_Q5_1 || t == GQ_IQ4_NL || t == GQ_MXFP4) && a->S <= GQ_FUSED_ROWS) {
         for (int s = 0; s < a->S; s++)
             y[(int64_t)s * ystride] = gq_dot_b32(t, row, a->q + (int64_t)s * I, a->d + (int64_t)s * (I / 32), a->s + (int64_t)s * (I / 16), I);
+        return;
+    }
+    const gq_fdot_fn f = a->S <= GQ_FUSED_ROWS ? gq_fdot_sb256(t) : NULL;
+    if (f) {
+        for (int s = 0; s < a->S; s++) y[(int64_t)s * ystride] = f(row, a->q + (int64_t)s * I, a->d + (int64_t)s * (I / 32), I);
         return;
     }
 #endif
