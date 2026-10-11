@@ -266,7 +266,8 @@ static void gguf_close(gguf_ctx *g) {
     free(g->kv);
     for (int i = 0; i < g->n_tensors; i++) free(g->t[i].name);
     free(g->t); free(g->idx);
-    memset(g, 0, sizeof *g);
+    char err[sizeof g->err]; memcpy(err, g->err, sizeof err);   /* gguf_open's reason outlives the close */
+    memset(g, 0, sizeof *g); memcpy(g->err, err, sizeof err);
 }
 
 /* 1 if path names a GGUF file (by magic), 0 otherwise. */

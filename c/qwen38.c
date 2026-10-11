@@ -785,7 +785,7 @@ static int decode_range_alloc(const int *arr,int from,int to,
         free(chunk);free(token);
     }
     unsigned char tail[3];int tail_n=0;
-    if(utf8_finish(carry,&carry_n,tail,sizeof tail,&tail_n)||
+    if(utf8_finish(carry,&carry_n,tail,sizeof tail,&tail_n)<0||
        q38_bytes_append(&all,&length,&capacity,tail,(size_t)tail_n)||
        q38_bytes_append(&all,&length,&capacity,(const unsigned char*)"",1u)){
         free(all);return -1;
@@ -2250,6 +2250,25 @@ int main(int argc, char **argv) {
     coli_omp_tune_threads("qwen38");
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    {   /* a model directory made by tools/gguf_import.py: gguf.json names llama.cpp's
+         * qwen4exp GGUF, read in place (qwen38_core.h, "GGUF mode") */
+        char gj[4096]; snprintf(gj, sizeof gj, "%s/gguf.json", snap);
+        FILE *f = fopen(gj, "rb");
+        if (f) {
+            char buf[8192], gp[4096]; size_t n = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[n] = 0;
+            char *arena = NULL; jval *r = json_parse(buf, &arena);
+            const char *g = r ? jstr(r, "gguf") : NULL;
+            if (!g || !*g) { fprintf(stderr, "%s: no \"gguf\" path\n", gj); return 1; }
+            if (g[0] == '/') snprintf(gp, sizeof gp, "%s", g); else snprintf(gp, sizeof gp, "%s/%s", snap, g);
+            free(arena);
+            if (gguf_open(&g_q38gg, gp)) { fprintf(stderr, "GGUF: %s\n", g_q38gg.err); return 1; }
+            const char *arch = gguf_get_str(&g_q38gg, "general.architecture");
+            if (!arch || strcmp(arch, "qwen4exp")) { fprintf(stderr, "GGUF %s: architecture %s, not qwen4exp\n", gp, arch ? arch : "(none)"); return 1; }
+            g_q38_gguf = 1; g_q38_a_direct = 1; g_q38_dn_tiled = 1;
+            fprintf(stderr, "[gguf] %s: %d file(s), %d tensors, read in place (native ggml types, no conversion)\n",
+                    gp, g_q38gg.n_files, g_q38gg.n_tensors);
+        }
+    }
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
     const char *mv = getenv("MODEL");
     if (mv && *mv) snprintf(g_model, sizeof g_model, "%s", mv);
@@ -2355,6 +2374,15 @@ int main(int argc, char **argv) {
     }
 
     Model m; model_init(&m, snap, cap, bits);
+    if (g_q38_gguf) {   /* a tensor the file has and nothing loaded: a weight the engine would ignore */
+        int unused = 0;
+        for (int i = 0; i < g_q38gg.n_tensors; i++) {
+            const gguf_tensor *t = &g_q38gg.t[i];
+            if (t->used || strstr(t->name, "_exps.weight")) continue;   /* the experts load on demand */
+            fprintf(stderr, "[gguf] not used by the engine: %s\n", t->name); unused++;
+        }
+        if (unused && getenv("GGUF_STRICT") && getenv("GGUF_STRICT")[0] == '1') return 3;
+    }
     q38_expert_int4_attach(&m, snap);   /* <snap>/experts-int4g64/ when present (Q38_EXPERT_INT4) */
     if (serve_mode) {   /* KV_SLOTS: how many conversations the serve decodes at once */
         const char *ks=getenv("KV_SLOTS");
@@ -2379,7 +2407,9 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
     /* After the trunk is int8: those rows upload at their first matmul. No
      * device (or COLI_VULKAN unset) leaves g_vk_ready 0, the CPU path. */
-    g_vk_ready=coli_vk_init_env_tier("qwen38",vkt_wanted()&&m.c.experts>0&&!qt_ready());
+    g_vk_ready=g_q38_gguf?0:coli_vk_init_env_tier("qwen38",vkt_wanted()&&m.c.experts>0&&!qt_ready());
+    if(g_q38_gguf&&getenv("COLI_VULKAN")&&getenv("COLI_VULKAN")[0]=='1')
+        fprintf(stderr,"[VK] qwen38: GGUF weights stay on the CPU for now\n");
     g_vk_dense=coli_vk_dense();   /* COLI_VK_DENSE; unset, off on a device sharing the CPU's RAM with the tier on */
     /* COLI_VK_CHAIN: every layer's dense chain on the device (qwen38_chain.h); the CUDA
      * tier keeps its priority */
@@ -2709,6 +2739,19 @@ static int q38_segment_expert_layout(Model *m,uint32_t begin,uint32_t end,
 static void q38_expert_report(Model *m, int cap) {
     Cfg *c = &m->c;
     int layers = m->range_end - m->range_begin;
+    if (g_q38_gguf) {
+        char nm[3][64]; const char *kn[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
+        uint64_t bytes = 0; const gguf_tensor *t[3];
+        for (int k = 0; k < 3; k++) {
+            snprintf(nm[k], sizeof nm[k], "blk.%d.%s.weight", m->range_begin, kn[k]);
+            t[k] = gguf_find(&g_q38gg, nm[k]);
+            if (t[k]) bytes += (uint64_t)(t[k]->nbytes / c->experts);
+        }
+        fprintf(stderr, "[qwen38] routed experts: GGUF %s/%s/%s (layer %d), %.2f MiB per expert; cache %d/layer\n",
+                t[0] ? gq_type_name(t[0]->type) : "?", t[1] ? gq_type_name(t[1]->type) : "?",
+                t[2] ? gq_type_name(t[2]->type) : "?", m->range_begin, bytes / 1048576.0, cap);
+        return;
+    }
     uint64_t per_capacity = 0, fixed = 0, snapshot_expert = 0;
     unsigned kinds = 0;
     if (layers < 1) return;

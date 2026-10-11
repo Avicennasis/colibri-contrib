@@ -14,6 +14,7 @@
 #include "kv_prefix.h"
 #include "spec_draft.h"   /* prompt-lookup drafts and the gate that decides when drafting pays */
 #include "expert_ffn.h"   /* the int4-g64 routed experts (experts-int4g64/ sidecar) run through its f32 kernel */
+#include "gguf.h"         /* SNAP = a tools/gguf_import.py directory: llama.cpp's qwen4exp GGUF, read in place */
 #include <pthread.h>   /* q38_ehit_mark publishes the lazy HITS table under a lock */
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h" /* COLI_VULKAN=1: the int8 trunk on a Vulkan device */
@@ -60,8 +61,26 @@ typedef enum {
     Q38_WEIGHT_F32,
     Q38_WEIGHT_BF16,
     Q38_WEIGHT_FP8,
-    Q38_WEIGHT_INT4G64             /* routed experts from the experts-int4g64/ sidecar */
+    Q38_WEIGHT_INT4G64,            /* routed experts from the experts-int4g64/ sidecar */
+    Q38_WEIGHT_GGML                /* GGUF mode: rows of ggml blocks of gq_type, as the file stores them */
 } Q38WeightKind;
+
+/* GGUF mode (SNAP holds gguf.json, written by tools/gguf_import.py). llama.cpp's
+ * conversion of the same checkpoint changes what the forward pass reads, and each
+ * change is taken as the file stores it, measured tensor by tensor on the tiny model
+ * (its F32 GGUF against its safetensors):
+ *  - every RMSNorm weight but the DeltaNet's is stored as 1 + w: the loader takes the
+ *    1 off (exact in f32 for a bf16 w);
+ *  - A_log is stored as A = -exp(A_log) (g_q38_a_direct);
+ *  - the DeltaNet's value heads are "tiled": value head h reads key head h % kheads,
+ *    not h / rep (g_q38_dn_tiled), in qkv, z, a, b, the convolution, dt_bias, A and
+ *    out_proj's columns alike; undoing it would mean permuting columns inside
+ *    quantized blocks, which is not lossless;
+ *  - the indexer's q and k projections are two tensors (rows concatenated here), the
+ *    experts one 3D tensor per projection, the PLE table one tensor
+ *    (per_layer_token_embd) and its hash constants metadata. */
+static gguf_ctx g_q38gg;
+static int g_q38_gguf, g_q38_a_direct, g_q38_dn_tiled;
 
 /* int4-g64 rows: ceil(cols/2) bytes of codes and one f32 scale per 64 inputs */
 static inline int64_t q38_int4_row_bytes(int cols){ return ((int64_t)cols+1)/2; }
@@ -80,6 +99,7 @@ typedef struct {
     int vk_res;                    /* COLI_VULKAN=1: a resident matrix (q38_load_weight), never an expert slot that is refilled in place */
     char *vk_name;                 /* COLI_VULKAN=1: its tensor's name, to read it back from disk (q38_dho_reload) */
     int vk_fmt, vk_gone;           /* dense weights on the device only (COLI_VK_DENSE_HOST): the device copy's format, and 1 while no host copy is kept */
+    int gq_type;                   /* Q38_WEIGHT_GGML: the ggml type of the rows */
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -202,6 +222,7 @@ typedef struct {
     st_tensor *ple_parts[Q38_MAX_PLE_PARTS];
     char ple_part_names[Q38_MAX_PLE_PARTS][320];
     int64_t ple_part_start[Q38_MAX_PLE_PARTS + 1];
+    const gguf_tensor *ple_gg;      /* GGUF mode: per_layer_token_embd, the whole table */
     int ple_part_count;
     float ple_weight_scale;
     int64_t ple_multipliers[3], ple_head_vocab[64], ple_head_offset[64];
@@ -360,6 +381,8 @@ static void q38_weight_reserve(Q38Weight *weight,Q38WeightKind kind,int rows,int
 }
 
 static uint64_t q38_weight_bytes(const Q38Weight *weight) {
+    if(weight->kind==Q38_WEIGHT_GGML)
+        return (uint64_t)weight->rows*(uint64_t)gq_row_bytes(weight->gq_type,weight->cols);
     if(weight->kind==Q38_WEIGHT_INT4G64)
         return (uint64_t)weight->rows*(uint64_t)q38_int4_row_bytes(weight->cols)+
                (uint64_t)weight->scale_count*sizeof(float);
@@ -608,6 +631,11 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
         q38_matmul_fp8(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
     else if(weight->kind==Q38_WEIGHT_INT4G64&&weight->scales)
         q38_matmul_int4g64(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
+    else if(weight->kind==Q38_WEIGHT_GGML){
+        if(gq_matmul(y,x,(const uint8_t*)weight->data,weight->gq_type,S,I,O)){
+            fprintf(stderr,"qwen38: GGUF matrix of type %s is not supported\n",gq_type_name(weight->gq_type));exit(1);
+        }
+    }
     else {fprintf(stderr,"unsupported matmul weight kind %d\n",(int)weight->kind);exit(1);}
 }
 
@@ -621,6 +649,11 @@ static void q38_weight_row(const Q38Weight *weight,int row,float *out) {
     else if(weight->kind==Q38_WEIGHT_BF16){
         const uint16_t *src=(const uint16_t*)weight->data+(int64_t)row*weight->cols;
         for(int i=0;i<weight->cols;i++)out[i]=bf16_to_f32(src[i]);
+    } else if(weight->kind==Q38_WEIGHT_GGML){
+        int64_t rb=gq_row_bytes(weight->gq_type,weight->cols);
+        if(rb<0||gq_dequant_row(weight->gq_type,(const uint8_t*)weight->data+(int64_t)row*rb,out,weight->cols)){
+            fprintf(stderr,"qwen38: GGUF row of type %s is not supported\n",gq_type_name(weight->gq_type));exit(1);
+        }
     } else {fprintf(stderr,"weight kind %d has no dense row view\n",(int)weight->kind);exit(1);}
 }
 
@@ -929,7 +962,132 @@ static void q38_validate_cfg(const Cfg *c) {
     Q38_NEED(c->ple_layer>=0&&c->ple_layer<c->layers,"PLE layer=%d",c->ple_layer);
 }
 
+/* GGUF mode: the tensor a checkpoint name is in the file, by llama.cpp's qwen4exp names;
+ * *norm: a norm the file stores as 1 + w. The routed experts and the indexer's fused
+ * projection have loaders of their own. */
+static const char *q38_gg_name(const char *hf,char *out,size_t cap,int *norm) {
+    static const struct { const char *hf,*gg; int norm; } top[]={
+        {"model.embed_tokens.weight","token_embd.weight",0},
+        {"lm_head.weight","output.weight",0},
+        {"model.hyper_connection_mixer.hc_norm.weight","output_hc_norm.weight",1},
+        {"model.hyper_connection_mixer.input_mix_weight_down.weight","output_hc_down.weight",0},
+        {"model.hyper_connection_mixer.input_mix_weight_up.weight","output_hc_up.weight",0},
+    };
+    static const struct { const char *hf,*gg; int norm; } lay[]={
+        {"attn_hyper_connection.block_inject_weight.weight","hc_attn_inject.weight",0},
+        {"attn_hyper_connection.hc_norm.weight","hc_attn_norm.weight",1},
+        {"attn_hyper_connection.input_mix_weight_down.weight","hc_attn_down.weight",0},
+        {"attn_hyper_connection.input_mix_weight_up.weight","hc_attn_up.weight",0},
+        {"mlp_hyper_connection.block_inject_weight.weight","hc_ffn_inject.weight",0},
+        {"mlp_hyper_connection.hc_norm.weight","hc_ffn_norm.weight",1},
+        {"mlp_hyper_connection.input_mix_weight_down.weight","hc_ffn_down.weight",0},
+        {"mlp_hyper_connection.input_mix_weight_up.weight","hc_ffn_up.weight",0},
+        {"linear_attn.A_log","ssm_a",0},
+        {"linear_attn.conv1d.weight","ssm_conv1d.weight",0},
+        {"linear_attn.dt_bias","ssm_dt.bias",0},
+        {"linear_attn.in_proj_a.weight","ssm_alpha.weight",0},
+        {"linear_attn.in_proj_b.weight","ssm_beta.weight",0},
+        {"linear_attn.in_proj_qkv.weight","attn_qkv.weight",0},
+        {"linear_attn.in_proj_z.weight","attn_gate.weight",0},
+        {"linear_attn.norm.weight","ssm_norm.weight",0},
+        {"linear_attn.out_proj.weight","ssm_out.weight",0},
+        {"mlp.gate.weight","ffn_gate_inp.weight",0},
+        {"mlp.shared_expert.gate_proj.weight","ffn_gate_shexp.weight",0},
+        {"mlp.shared_expert.up_proj.weight","ffn_up_shexp.weight",0},
+        {"mlp.shared_expert.down_proj.weight","ffn_down_shexp.weight",0},
+        {"mlp.shared_expert_gate.weight","ffn_gate_inp_shexp.weight",0},
+        {"ple.conv1d.weight","ple_conv1d.weight",0},
+        {"ple.key_proj.weight","ple_key.weight",0},
+        {"ple.value_proj.weight","ple_value.weight",0},
+        {"ple.norm_conv.weight","ple_norm_conv.weight",1},
+        {"ple.norm_key.weight","ple_norm_key.weight",1},
+        {"ple.norm_query.weight","ple_norm_query.weight",1},
+        {"self_attn.indexer.k_layernorm.weight","indexer.k_norm.weight",1},
+        {"self_attn.indexer.q_layernorm.weight","indexer.q_norm.weight",1},
+        {"self_attn.k_norm.weight","attn_k_norm.weight",1},
+        {"self_attn.q_norm.weight","attn_q_norm.weight",1},
+        {"self_attn.q_proj.weight","attn_q.weight",0},
+        {"self_attn.k_proj.weight","attn_k.weight",0},
+        {"self_attn.v_proj.weight","attn_v.weight",0},
+        {"self_attn.o_proj.weight","attn_output.weight",0},
+    };
+    *norm=0;
+    for(size_t i=0;i<sizeof top/sizeof *top;i++)
+        if(!strcmp(hf,top[i].hf)){*norm=top[i].norm;snprintf(out,cap,"%s",top[i].gg);return out;}
+    int L=-1,off=0;
+    if(sscanf(hf,"model.layers.%d.%n",&L,&off)!=1||L<0||!off)return NULL;
+    if(!strcmp(hf+off,"ple.ple_embedding.ngram_embedding.weight")){snprintf(out,cap,"per_layer_token_embd.weight");return out;}
+    for(size_t i=0;i<sizeof lay/sizeof *lay;i++)
+        if(!strcmp(hf+off,lay[i].hf)){*norm=lay[i].norm;snprintf(out,cap,"blk.%d.%s",L,lay[i].gg);return out;}
+    return NULL;
+}
+static const gguf_tensor *q38_gg(const char *hf,int *norm) {
+    char nm[256]; int dummy; const char *g=q38_gg_name(hf,nm,sizeof nm,norm?norm:&dummy);
+    return g?gguf_mark(&g_q38gg,g):NULL;
+}
+static int64_t q38_gg_numel(const gguf_tensor *t) { return t->ne[0]*t->ne[1]*t->ne[2]*t->ne[3]; }
+static void q38_gg_read(const gguf_tensor *t,void *dst,int64_t off,int64_t n) {
+    if(gguf_read(&g_q38gg,t,dst,off,n)){fprintf(stderr,"GGUF %s: read failed\n",t->name);exit(1);}
+}
+/* A matrix [rows][cols] from the GGUF: f32/f16 as f32, bf16 as bf16, any other ggml
+ * type as its blocks (Q38_WEIGHT_GGML). `parts` tensors of the same type are stacked
+ * by rows (the indexer's q and k projections). */
+static Q38Weight q38_gg_weight_parts(Model *m,const gguf_tensor *const *parts,int n,int rows,int cols) {
+    Q38Weight w={0}; int64_t have=0; int type=parts[0]->type;
+    for(int i=0;i<n;i++){
+        const gguf_tensor *t=parts[i];
+        if(t->type!=type||t->ne[0]!=cols||t->ne[2]*t->ne[3]!=1){
+            fprintf(stderr,"GGUF %s: [%lld x %lld] %s, expected rows of %d of %s\n",t->name,(long long)t->ne[1],
+                    (long long)t->ne[0],gq_type_name(t->type),cols,gq_type_name(type));exit(1);
+        }
+        have+=t->ne[1];
+    }
+    if(have!=rows){fprintf(stderr,"GGUF %s: %lld rows, expected %d\n",parts[0]->name,(long long)have,rows);exit(1);}
+    if(type==GQ_F32||type==GQ_F16||(type==GQ_BF16&&!m->native_bf16)){
+        q38_weight_reserve(&w,Q38_WEIGHT_F32,rows,cols);
+        float *p=(float*)w.data;
+        for(int i=0;i<n;i++){
+            if(gguf_read_f32(&g_q38gg,parts[i],p)){fprintf(stderr,"GGUF %s: read failed\n",parts[i]->name);exit(1);}
+            p+=parts[i]->ne[1]*cols;
+        }
+    } else if(type==GQ_BF16){
+        q38_weight_reserve(&w,Q38_WEIGHT_BF16,rows,cols);
+        uint8_t *p=(uint8_t*)w.data;
+        for(int i=0;i<n;i++){q38_gg_read(parts[i],p,0,parts[i]->nbytes);p+=parts[i]->nbytes;}
+    } else if(gq_blk_decoder(type)){
+        int64_t rb=gq_row_bytes(type,cols);
+        w.data=malloc((size_t)(rb*rows)); if(!w.data){fprintf(stderr,"OOM GGUF weight\n");exit(1);}
+        uint8_t *p=(uint8_t*)w.data;
+        for(int i=0;i<n;i++){q38_gg_read(parts[i],p,0,parts[i]->nbytes);p+=parts[i]->nbytes;}
+        w.kind=Q38_WEIGHT_GGML;w.gq_type=type;w.rows=rows;w.cols=cols;w.elements=(int64_t)rows*cols;w.owns_data=1;
+    } else {fprintf(stderr,"GGUF %s: type %s is not supported\n",parts[0]->name,gq_type_name(type));exit(1);}
+    m->resident_weight_bytes+=q38_weight_bytes(&w);
+    return w;
+}
+static Q38Weight q38_gg_weight(Model *m,const char *name,int rows,int cols) {
+    const gguf_tensor *parts[2]; int n=1;
+    int L=-1,off=0;
+    if(sscanf(name,"model.layers.%d.%n",&L,&off)==1&&off&&!strcmp(name+off,"self_attn.indexer.index_qk_proj.weight")){
+        char a[96],b[96]; snprintf(a,sizeof a,"blk.%d.indexer.q_proj.weight",L); snprintf(b,sizeof b,"blk.%d.indexer.k_proj.weight",L);
+        parts[0]=gguf_mark(&g_q38gg,a); parts[1]=gguf_mark(&g_q38gg,b); n=2;
+        if(!parts[0]||!parts[1]){fprintf(stderr,"GGUF: missing %s or %s\n",a,b);exit(1);}
+    } else {
+        parts[0]=q38_gg(name,NULL);
+        if(!parts[0]){fprintf(stderr,"GGUF: no tensor for %s\n",name);exit(1);}
+    }
+    return q38_gg_weight_parts(m,parts,n,rows,cols);
+}
+
 static float *q38_load_tensor(Model *m,const char *name,int64_t want) {
+    if(g_q38_gguf){
+        int norm=0; const gguf_tensor *t=q38_gg(name,&norm);
+        if(!t){fprintf(stderr,"GGUF: no tensor for %s\n",name);exit(1);}
+        if(q38_gg_numel(t)!=want){fprintf(stderr,"GGUF %s: %lld elements, expected %lld\n",t->name,(long long)q38_gg_numel(t),(long long)want);exit(1);}
+        float *p=falloc(want);
+        if(gguf_read_f32(&g_q38gg,t,p)){fprintf(stderr,"GGUF %s: read failed (type %s)\n",t->name,gq_type_name(t->type));exit(1);}
+        if(norm)for(int64_t i=0;i<want;i++)p[i]-=1.f;
+        return p;
+    }
     st_tensor *t=st_find(&m->S,name);
     if(!t){fprintf(stderr,"missing %s\n",name);exit(1);}
     if(t->numel!=want){fprintf(stderr,"%s: %lld elements, expected %lld\n",name,(long long)t->numel,(long long)want);exit(1);}
@@ -944,6 +1102,7 @@ static int q38_env_bool(const char *name,int default_value) {
 }
 
 static Q38Weight q38_load_weight(Model *m,const char *name,int rows,int cols) {
+    if(g_q38_gguf)return q38_gg_weight(m,name,rows,cols);
     st_tensor *tensor=st_find(&m->S,name);Q38Weight weight={0};
     if(!tensor){fprintf(stderr,"missing %s\n",name);exit(1);}
     if(tensor->rank!=2||tensor->shape[0]!=rows||tensor->shape[1]!=cols||
@@ -1004,6 +1163,22 @@ static void q38_load_ple(Model *m,Layer *l) {
     const char *bufs[]={"layer_multipliers","ngram_heads_vocab_sizes","ngram_heads_offsets"};
     int64_t *dsts[]={m->ple_multipliers,m->ple_head_vocab,m->ple_head_offset};
     int counts[]={c->ngram_size,c->ngram_heads,c->ngram_heads};
+    if(g_q38_gguf){   /* the hash constants are metadata, the table one tensor */
+        const char *keys[]={"qwen4exp.ple.layer_multipliers","qwen4exp.ple.head_vocab_sizes","qwen4exp.ple.head_offsets"};
+        for(int b=0;b<3;b++){
+            const gguf_kv *kv=gguf_get(&g_q38gg,keys[b]);
+            Q38_NEED(kv&&kv->type==GGUF_T_ARRAY&&(int64_t)kv->n==counts[b]&&
+                     (kv->atype==GGUF_T_I64||kv->atype==GGUF_T_U64),"GGUF: %s missing or not %d 64-bit integers",keys[b],counts[b]);
+            memcpy(dsts[b],kv->arr,(size_t)counts[b]*8);
+        }
+        const gguf_tensor *t=gguf_mark(&g_q38gg,"per_layer_token_embd.weight");
+        Q38_NEED(t&&t->ne[0]==c->ngram_head_dim&&t->ne[2]*t->ne[3]==1,"GGUF: per_layer_token_embd missing or not rows of %d",c->ngram_head_dim);
+        m->ple_gg=t; m->ple_part_count=1; m->ple_part_start[0]=0; m->ple_part_start[1]=t->ne[1];
+        m->ple_weight_scale=1.f;
+        int64_t need=0; for(int h=0;h<c->ngram_heads;h++) if(m->ple_head_offset[h]+m->ple_head_vocab[h]>need) need=m->ple_head_offset[h]+m->ple_head_vocab[h];
+        Q38_NEED(t->ne[1]>=need,"PLE table rows %lld < required %lld",(long long)t->ne[1],(long long)need);
+        return;
+    }
     for(int b=0;b<3;b++){
         q38_name(m,nm,sizeof nm,i,"ple.ple_embedding."); strncat(nm,bufs[b],sizeof(nm)-strlen(nm)-1);
         st_tensor *t=st_find(&m->S,nm); if(!t||t->dtype!=6||t->numel!=counts[b]){fprintf(stderr,"invalid %s\n",nm);exit(1);}
@@ -1233,11 +1408,17 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     m->expert_prefetch=q38_env_bool("Q38_EXPERT_PREFETCH",1);
     m->expert_parallel_reads=q38_env_bool("Q38_EXPERT_PARALLEL_READS",1);
     m->prefill_batch=q38_env_bool("Q38_PREFILL_BATCH",1);
-    q38_load_cfg(&m->c,snap); q38_validate_cfg(&m->c); st_init(&m->S,snap);
+    q38_load_cfg(&m->c,snap); q38_validate_cfg(&m->c);
     Cfg *c=&m->c; char nm[320];
-    if(st_has(&m->S,"model.language_model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model.language_model");
-    else if(st_has(&m->S,"model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model");
-    else {fprintf(stderr,"checkpoint has no Qwen4-Exp text embedding\n");exit(1);}
+    if(g_q38_gguf){   /* the checkpoint's names map onto the GGUF's (q38_gg_name) */
+        snprintf(m->prefix,sizeof m->prefix,"model");
+        m->expert_prefetch=0; m->expert_parallel_reads=0;   /* both read safetensors ranges */
+    } else {
+        st_init(&m->S,snap);
+        if(st_has(&m->S,"model.language_model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model.language_model");
+        else if(st_has(&m->S,"model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model");
+        else {fprintf(stderr,"checkpoint has no Qwen4-Exp text embedding\n");exit(1);}
+    }
     if(layer_end==0) layer_end=c->layers;
     if(layer_begin<0||layer_begin>=layer_end||layer_end>c->layers){fprintf(stderr,"invalid Qwen3.8 layer range [%d,%d)\n",layer_begin,layer_end);exit(1);}
     m->range_begin=layer_begin; m->range_end=layer_end;
@@ -1257,7 +1438,7 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     /* La torre solo quando il motore possiede la sequenza intera: uno shard che
      * ospita solo alcuni layer non ha da fare niente con le immagini, e
      * caricarla la' sarebbe mezzo giga per nulla. */
-    if(load_boundaries&&q38_env_bool("Q38_VISION",1)) q38_load_vision(m);
+    if(load_boundaries&&!g_q38_gguf&&q38_env_bool("Q38_VISION",1)) q38_load_vision(m);   /* GGUF: the tower is a separate mmproj file */
     if(allocate_state) q38_alloc_state(m);
     m->dense_load_s=now_s()-t0;
     fprintf(stderr,"[qwen38] native text weights: prefix=%s, %d layers, PLE=%d, cache=%d/layer, "
@@ -1695,6 +1876,7 @@ static int q38_int4_record_at(Model *m,Q38Int4Experts *x,int layer,int expert,
  * index, is refused rather than ignored; one still being written is skipped
  * with a line saying so (or refused under Q38_EXPERT_INT4=1). */
 static void q38_expert_int4_attach(Model *m,const char *snap) {
+    if(g_q38_gguf)return;   /* GGUF: the experts are the file's ggml blocks */
     int wanted=q38_expert_int4_wanted();
     if(!wanted)return;
     Cfg *c=&m->c;char dir[2100],path[2200];
@@ -1811,8 +1993,36 @@ static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
                           slot->int4_slab_bytes,1,"pread Qwen3.8 int4 expert");
 }
 
+/* GGUF mode: expert eid's three matrices, each a slice of its projection's 3D tensor
+ * ([experts][rows][cols], the rows ggml blocks), read into the slot as they are. */
+static void q38_gg_load_expert(Model *m,int layer,int eid,Slot *s) {
+    const Cfg *c=&m->c; const int H=c->hidden,I=c->inter;
+    static const char *kn[3]={"ffn_gate_exps","ffn_up_exps","ffn_down_exps"};
+    Q38Weight *dst[3]={&s->gate,&s->up,&s->down}; const int os[3]={I,I,H},is[3]={H,H,I};
+    for(int k=0;k<3;k++){
+        char nm[96]; snprintf(nm,sizeof nm,"blk.%d.%s.weight",layer,kn[k]);
+        const gguf_tensor *t=gguf_mark(&g_q38gg,nm);
+        if(!t||t->ne[0]!=is[k]||t->ne[1]!=os[k]||t->ne[2]!=c->experts||t->ne[3]!=1){fprintf(stderr,"GGUF: %s missing or not [%d][%d][%d]\n",nm,c->experts,os[k],is[k]);exit(1);}
+        int64_t rb=gq_row_bytes(t->type,is[k]),eb=rb*os[k];
+        if(rb<=0||(!gq_blk_decoder(t->type)&&t->type!=GQ_F32&&t->type!=GQ_F16&&t->type!=GQ_BF16)){fprintf(stderr,"GGUF %s: type %s is not supported\n",nm,gq_type_name(t->type));exit(1);}
+        Q38Weight *w=dst[k];
+        if(w->kind!=Q38_WEIGHT_GGML||w->gq_type!=t->type||w->rows!=os[k]||w->cols!=is[k]||!w->owns_data){
+            q38_weight_free(w);
+            w->data=malloc((size_t)eb); if(!w->data){fprintf(stderr,"OOM GGUF expert\n");exit(1);}
+            w->kind=Q38_WEIGHT_GGML;w->gq_type=t->type;w->rows=os[k];w->cols=is[k];w->elements=(int64_t)os[k]*is[k];w->owns_data=1;
+        }
+        q38_gg_read(t,w->data,(int64_t)eid*eb,eb);
+    }
+}
+
 static void q38_load_expert(Model *m,int layer,int eid,Slot *s) {
     Cfg *c=&m->c; int H=c->hidden,I=c->inter; char nm[320],sn[340];
+    if(g_q38_gguf){
+        double started=now_s();
+        q38_gg_load_expert(m,layer,eid,s);
+        q38_tm_add(m,Q38_TM_EXPERT_READ,started);m->expert_weight_reads++;
+        return;
+    }
     if(q38_layer_int4(m,layer)){
         double started=now_s();
         q38_load_int4_record(m,layer,eid,s);
@@ -2036,6 +2246,14 @@ static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
 
 static void q38_ple_row(Model *m,int64_t row,float *out) {
     Cfg *c=&m->c; int p=0;
+    if(m->ple_gg){   /* GGUF: one row of the table's ggml blocks */
+        const gguf_tensor *t=m->ple_gg; int64_t rb=gq_row_bytes(t->type,c->ngram_head_dim);
+        Q38_NEED(row>=0&&row<t->ne[1]&&rb>0,"PLE row out of range: %lld",(long long)row);
+        uint8_t raw[1024]; Q38_NEED(rb<=(int64_t)sizeof raw,"PLE row too wide");
+        q38_gg_read(t,raw,row*rb,rb);
+        if(gq_dequant_row(t->type,raw,out,c->ngram_head_dim)){fprintf(stderr,"GGUF %s: type %s\n",t->name,gq_type_name(t->type));exit(1);}
+        return;
+    }
     while(p+1<m->ple_part_count&&row>=m->ple_part_start[p+1])p++;
     if(p>=m->ple_part_count||row<m->ple_part_start[p]){fprintf(stderr,"PLE row out of range: %lld\n",(long long)row);exit(1);}
     int64_t local=row-m->ple_part_start[p]; st_tensor *t=m->ple_parts[p]; const char *nm=m->ple_part_names[p];
@@ -2313,7 +2531,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
         q38_dense_matmul(m,aa,x,&l->dn_a,1,H,VH);
         float egh[64],beta[64];
         for(int h=0;h<VH&&h<64;h++){
-            egh[h]=expf(-expf(l->dn_alog[h])*q38_softplus(aa[h]+l->dn_dtbias[h]));
+            egh[h]=expf((g_q38_a_direct?l->dn_alog[h]:-expf(l->dn_alog[h]))*q38_softplus(aa[h]+l->dn_dtbias[h]));
             beta[h]=q38_sigmoid(bb[h]);
         }
         q38_dn_gpu_push(m,layer);
@@ -2352,8 +2570,9 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
             const float *qi=conv,*ki=conv+K,*vi=conv+2*K;
             for(int h=0;h<VH;h++) {
                 float *qh=q+(int64_t)h*KD,*kh=k+(int64_t)h*KD;
-                memcpy(qh,qi+(int64_t)(h/rep)*KD,(size_t)KD*sizeof(float));
-                memcpy(kh,ki+(int64_t)(h/rep)*KD,(size_t)KD*sizeof(float));
+                int kh_of=g_q38_dn_tiled?h%KH:h/rep;   /* GGUF: value heads tiled over the key heads */
+                memcpy(qh,qi+(int64_t)kh_of*KD,(size_t)KD*sizeof(float));
+                memcpy(kh,ki+(int64_t)kh_of*KD,(size_t)KD*sizeof(float));
                 double qsum=1e-6,ksum=1e-6;
                 for(int d=0;d<KD;d++) {
                     qsum+=(double)qh[d]*qh[d];
@@ -2369,7 +2588,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                 const float *qh=q+(int64_t)h*KD;
                 const float *kh=k+(int64_t)h*KD;
                 const float *vh=vi+(int64_t)h*VD;
-                float alpha=expf(-expf(l->dn_alog[h])*
+                float alpha=expf((g_q38_a_direct?l->dn_alog[h]:-expf(l->dn_alog[h]))*
                                  q38_softplus(a_row[h]+l->dn_dtbias[h]));
                 float beta=q38_sigmoid(b_row[h]);
                 float delta[512];
@@ -2754,6 +2973,7 @@ static void q38_trunk_place_all(Model *m) {
 static void q38_tier_start(Model *m,int cap) {
     const char *on=getenv("COLI_CUDA");
     if(!on||on[0]!='1'||on[1])return;
+    if(g_q38_gguf){fprintf(stderr,"[qtier] qwen38: COLI_CUDA=1 ignored: the VRAM tier does not take GGUF weights yet\n");return;}
     Cfg *c=&m->c;
     if(m->x4){
         /* The tier streams e4m3 bytes (fmt 8) and copies them at qt_note; its
@@ -3975,6 +4195,10 @@ static void q38_mtp_attach(Model *m,int cap) {
     const char *asked=getenv("Q38_MTP");
     int forced=asked&&*asked;
     if(!q38_env_bool("Q38_MTP",1))return;
+    if(g_q38_gguf){   /* the MTP head ships as a GGUF of its own (mtp-*.gguf), not read yet */
+        if(forced){fprintf(stderr,"Q38_MTP=1: a GGUF model carries no MTP head here\n");exit(1);}
+        return;
+    }
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width;
     if(!forced&&(m->range_begin!=0||m->range_end!=c->layers||!m->lm_head.rows||c->mtp_layers!=1)){
         fprintf(stderr,"[qwen38] speculative decoding with the MTP head: off (%s; Q38_MTP=0 silences this)\n",

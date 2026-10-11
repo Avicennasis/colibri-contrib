@@ -17,7 +17,8 @@ Two modes, both lossless (the ggml blocks are used or copied as they are):
 Either way the directory is an ordinary colibri model: `coli chat`, `coli
 serve`, `coli web` and the planner treat it like any other.
 
-Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine).
+Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine),
+qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine).
 
 Usage:
   python3 tools/gguf_import.py MODEL.gguf OUT_DIR [--mode link|copy]
@@ -112,7 +113,7 @@ def kv_section(path):
 
 
 # --------------------------------------------------------- architecture
-def qwen35moe_config(meta, tensors):
+def qwen35moe_config(meta, tensors, overrides=None):
     p = "qwen35moe."
     need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
     n_mtp = int(meta.get(p + "nextn_predict_layers", 0))
@@ -155,7 +156,82 @@ def qwen35moe_config(meta, tensors):
     return cfg, layers
 
 
-ARCHES = {"qwen35moe": qwen35moe_config}
+def qwen4exp_config(meta, tensors, overrides=None):
+    """Qwen3.8-Flash-Next (llama.cpp's qwen4exp) as the qwen38 engine's config.json. The
+    PLE table is one tensor here (per_layer_token_embd), so split_ngram_parts is 1; its
+    hash constants stay in the GGUF metadata, where the engine reads them."""
+    p = "qwen4exp."
+    overrides = overrides or {}
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    n_mtp = int(meta.get(p + "nextn_predict_layers", 0))
+    layers = int(need("block_count")) - n_mtp
+    head_dim = int(need("attention.key_length"))
+    rope_n = int(meta.get(p + "rope.dimension_count", head_dim))
+    vh, kh = int(need("ssm.time_step_rank")), int(need("ssm.group_count"))
+    inner = int(need("ssm.inner_size"))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    recurrent = list(need("attention.recurrent_layers"))[:layers]
+    ratios = [int(r) for r in meta.get(p + "attention.compress_ratios", [])][:layers]
+    ratio = int(overrides.get("indexer_compress_ratio") or max(ratios or [0]))
+    if not ratio:
+        sys.exit("GGUF metadata gives no indexer compress ratio (attention.compress_ratios is all 0): "
+                 "pass --indexer-compress-ratio")
+    attn = [i for i in range(layers) if not recurrent[i]]
+    idx_dim = int(need("attention.indexer.key_length"))
+    kproj = tensors.get(f"blk.{attn[0]}.indexer.k_proj.weight") if attn else None
+    if kproj is None:
+        sys.exit("GGUF has no indexer k_proj")
+    ple_layers = list(meta.get(p + "ple.layers", []))
+    ngram, per = int(need("ple.ngram_size")), int(need("ple.heads_per_ngram"))
+    row = int(need("embedding_length_per_layer_input"))
+    theta = float(meta.get(p + "rope.freq_base", 10000000.0))
+    cfg = {
+        "model_type": "qwen4_exp_text",
+        "architectures": ["Qwen4ExpForCausalLM"],
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "vocab_size": int(emb["dims"][1]),
+        "max_position_embeddings": int(meta.get(p + "context_length", 262144)),
+        "eos_token_id": int(meta.get(p + "ple.eos_token_id", meta.get("tokenizer.ggml.eos_token_id", -1))),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-6)),
+        "rope_parameters": {"rope_type": "default", "rope_theta": theta, "partial_rotary_factor": rope_n / head_dim},
+        "partial_rotary_factor": rope_n / head_dim,
+        "hc_count": int(need("hyper_connection.count")),
+        "hc_lowrank": int(need("hyper_connection.low_rank")),
+        "num_attention_heads": int(need("attention.head_count")),
+        "num_key_value_heads": int(need("attention.head_count_kv")),
+        "head_dim": head_dim,
+        "indexer_n_heads": int(need("attention.indexer.head_count")),
+        "indexer_kv_heads": int(kproj["dims"][1]) // idx_dim,
+        "indexer_head_dim": idx_dim,
+        "indexer_budget": int(need("attention.indexer.top_k")),
+        "indexer_compress_ratio": ratio,
+        "num_experts": int(need("expert_count")),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "shared_expert_intermediate_size": int(meta.get(p + "expert_shared_feed_forward_length", need("expert_feed_forward_length"))),
+        "norm_topk_prob": True,
+        "linear_num_key_heads": kh,
+        "linear_num_value_heads": vh,
+        "linear_key_head_dim": int(need("ssm.state_size")),
+        "linear_value_head_dim": inner // vh,
+        "linear_conv_kernel_dim": int(need("ssm.conv_kernel")),
+        "layer_types": ["linear_attention" if r else "full_attention" for r in recurrent],
+        "ple_layer_ids": [int(i) + 1 for i in ple_layers],
+        "ngram_size": ngram,
+        "heads_per_ngram": per,
+        "ple_conv_kernel_size": int(need("ple.conv_kernel")),
+        "ple_embed_dim": row * (ngram - 1) * per,
+        "split_ngram_parts": 1,
+        "hidden_act": "silu",
+        "output_gate_type": "sigmoid",
+        "attention_bias": False,
+        "tie_word_embeddings": False,
+    }
+    return cfg, layers
+
+
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen4exp": qwen4exp_config}
 
 
 # ------------------------------------------------------------- tokenizer
@@ -295,13 +371,16 @@ def main():
     ap.add_argument("gguf", type=Path)
     ap.add_argument("out", type=Path)
     ap.add_argument("--mode", choices=("link", "copy"), default="link")
+    ap.add_argument("--indexer-compress-ratio", type=int, default=0,
+                    help="qwen4exp: when the GGUF's attention.compress_ratios are all 0 (a converter "
+                         "that read the layers as qwen_sparse_attention)")
     args = ap.parse_args()
     src = args.gguf.resolve()
     parts, readers, meta, tensors = open_model(src)
     arch = meta.get("general.architecture")
     if arch not in ARCHES:
         sys.exit(f"architecture {arch!r} is not supported yet (supported: {', '.join(ARCHES)})")
-    cfg, layers = ARCHES[arch](meta, tensors)
+    cfg, layers = ARCHES[arch](meta, tensors, {"indexer_compress_ratio": args.indexer_compress_ratio})
     tok, tcfg, gen = tokenizer_files(meta)
     args.out.mkdir(parents=True, exist_ok=True)
     cfg["colibri_gguf"] = {"arch": arch, "mode": args.mode, "source": str(src)}
