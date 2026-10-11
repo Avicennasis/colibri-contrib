@@ -2400,6 +2400,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[qwen38] KV_SLOTS=%d: the MTP head stays unloaded and nothing drafts "
                         "(speculation follows one conversation)\n", g_q38_mux_slots);
     else q38_mtp_attach(&m, cap);       /* Q38_MTP=1: the checkpoint's MTP head drafts (qwen38_core.h) */
+    q38_act_init(&m);                   /* Q38_ACT_STATS: the experts' input statistics, for a calibrated quantizer */
     if (g_q38_gguf) {   /* a tensor the files have and nothing loaded: a weight the engine would ignore */
         int unused = 0, head = 0; char hp[32]; snprintf(hp, sizeof hp, "blk.%d.", m.c.layers);
         const gguf_ctx *files[2] = { &g_q38gg, &g_q38gg_mtp };

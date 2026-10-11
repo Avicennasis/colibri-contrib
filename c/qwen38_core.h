@@ -3261,6 +3261,58 @@ static int q38_moe_prefill_rows(const Cfg *c,int requested) {
  * grouped order, assignment ids in assign[]) gathered, run as one batch and their
  * outputs scattered to their places in routed_out, where the reduction reads them.
  * Row for row the same arithmetic as the grouped loop below. */
+/* Q38_ACT_STATS=<file>: calibration statistics of the routed experts' inputs, for a
+ * data-aware quantizer: per layer and expert, the rows seen and the sum of squares of
+ * every gate/up input channel (hidden wide) and every down input channel (the SwiGLU
+ * output, inter wide), as float64. Collected in the prefill's expert loop (the
+ * teacher-forced PPL=1 runs), added to the file at exit so that several runs add up. */
+static double *g_q38_act; static int64_t *g_q38_act_n; static int g_q38_act_dims[4]; static char g_q38_act_path[4096];
+static void q38_act_add(int layer,int e,const float *xin,const float *hid,int n) {
+    const int L=g_q38_act_dims[0],E=g_q38_act_dims[1],H=g_q38_act_dims[2],I=g_q38_act_dims[3];
+    if(!g_q38_act||layer<0||layer>=L||e<0||e>=E)return;
+    double *a=g_q38_act+((int64_t)layer*E+e)*(H+I);
+    for(int r=0;r<n;r++){
+        const float *x=xin+(int64_t)r*H,*h=hid+(int64_t)r*I;
+        for(int i=0;i<H;i++)a[i]+=(double)x[i]*x[i];
+        for(int j=0;j<I;j++)a[H+j]+=(double)h[j]*h[j];
+    }
+    g_q38_act_n[(int64_t)layer*E+e]+=n;
+}
+static void q38_act_write(void) {
+    const int64_t cells=(int64_t)g_q38_act_dims[0]*g_q38_act_dims[1],width=g_q38_act_dims[2]+g_q38_act_dims[3];
+    FILE *f=fopen(g_q38_act_path,"rb");
+    if(f){   /* an earlier run's statistics of the same geometry: add them */
+        int dims[4]; double *a=(double*)malloc((size_t)(cells*width)*sizeof(double)); int64_t *n=(int64_t*)malloc((size_t)cells*sizeof(int64_t));
+        char magic[8];
+        if(a&&n&&fread(magic,8,1,f)==1&&!memcmp(magic,"Q38ACT1\0",8)&&fread(dims,sizeof dims,1,f)==1&&!memcmp(dims,g_q38_act_dims,sizeof dims)&&
+           fread(n,sizeof(int64_t),(size_t)cells,f)==(size_t)cells&&fread(a,sizeof(double),(size_t)(cells*width),f)==(size_t)(cells*width)){
+            for(int64_t i=0;i<cells;i++)g_q38_act_n[i]+=n[i];
+            for(int64_t i=0;i<cells*width;i++)g_q38_act[i]+=a[i];
+        } else fprintf(stderr,"[act] %s: not statistics of this model, overwritten\n",g_q38_act_path);
+        free(a);free(n);fclose(f);
+    }
+    f=fopen(g_q38_act_path,"wb");
+    if(!f){perror(g_q38_act_path);return;}
+    int ok=fwrite("Q38ACT1\0",8,1,f)==1&&fwrite(g_q38_act_dims,sizeof g_q38_act_dims,1,f)==1&&
+           fwrite(g_q38_act_n,sizeof(int64_t),(size_t)cells,f)==(size_t)cells&&
+           fwrite(g_q38_act,sizeof(double),(size_t)(cells*width),f)==(size_t)(cells*width);
+    if(fclose(f)||!ok)fprintf(stderr,"[act] %s: write failed\n",g_q38_act_path);
+    else{ int64_t rows=0; for(int64_t i=0;i<cells;i++)rows+=g_q38_act_n[i];
+          fprintf(stderr,"[act] %s: %lld expert rows in total\n",g_q38_act_path,(long long)rows); }
+}
+static void q38_act_init(Model *m) {
+    const char *p=getenv("Q38_ACT_STATS");
+    if(!p||!*p||m->c.experts<1)return;
+    snprintf(g_q38_act_path,sizeof g_q38_act_path,"%s",p);
+    g_q38_act_dims[0]=m->c.layers;g_q38_act_dims[1]=m->c.experts;g_q38_act_dims[2]=m->c.hidden;g_q38_act_dims[3]=m->c.inter;
+    const int64_t cells=(int64_t)m->c.layers*m->c.experts;
+    g_q38_act=(double*)calloc((size_t)(cells*(m->c.hidden+m->c.inter)),sizeof(double));
+    g_q38_act_n=(int64_t*)calloc((size_t)cells,sizeof(int64_t));
+    if(!g_q38_act||!g_q38_act_n){fprintf(stderr,"Q38_ACT_STATS: out of memory\n");exit(1);}
+    atexit(q38_act_write);
+    fprintf(stderr,"[act] collecting the routed experts' input statistics into %s\n",p);
+}
+
 static void q38_prefill_expert_rows(Model *m,Slot *expert,const float *xc,int K,const int *assign,
                                     const int *pos,int n,float *in,float *gate,float *up,float *routed_out) {
     if(n<1)return;
@@ -3479,6 +3531,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
                     expert_gate[(int64_t)a*I+j]=
                         q38_silu(expert_gate[(int64_t)a*I+j])*
                         expert_up[(int64_t)a*I+j];
+                if(g_q38_act)q38_act_add(layer,e,expert_input,expert_gate,count);
                 q38_weight_matmul(routed_out+(int64_t)first*H,expert_gate,
                                   &expert->down,count,I,H);
                 q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);

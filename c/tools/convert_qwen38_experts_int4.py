@@ -133,6 +133,63 @@ def quantize_g64(w):
     return codes.reshape(rows, ng * GS)[:, :cols].astype(np.uint8), scales.reshape(rows, ng)
 
 
+ALPHAS = (1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6)
+
+
+def quantize_g64_weighted(w, imp, alphas=ALPHAS):
+    """quantize_g64 with the scale of every group of 64 chosen among absmax/7 * alpha
+    (alphas holds 1.0, so it is never worse than quantize_g64 by this measure) to
+    minimise sum_i imp_i * (w_i - s * code_i)^2: imp is the mean square of each input
+    channel's activations over calibration text (Q38_ACT_STATS), so an error counts as
+    much as the product it spoils. Same codes and scales layout as quantize_g64."""
+    rows, cols = w.shape
+    ng = groups(cols)
+    pad = ng * GS - cols
+    padded = np.pad(w, ((0, 0), (0, pad))) if pad else w
+    g = padded.reshape(rows, ng, GS)
+    wimp = (np.pad(imp, (0, pad)) if pad else imp).reshape(1, ng, GS).astype(np.float32)
+    base = np.maximum(np.abs(g).max(axis=2, keepdims=True), np.float32(1e-12)) / np.float32(7.0)
+    best_err = best_q = best_s = None
+    for a in alphas:
+        s = (base * np.float32(a)).astype(np.float32)
+        q = np.clip(np.rint(g / s), -8, 7)
+        err = (np.square(g - q * s) * wimp).sum(axis=2, keepdims=True)
+        if best_err is None:
+            best_err, best_q, best_s = err, q, s
+        else:
+            better = err < best_err
+            best_err = np.where(better, err, best_err)
+            best_q = np.where(better, q, best_q)
+            best_s = np.where(better, s, best_s)
+    codes = (best_q.astype(np.int16) + 8).reshape(rows, ng * GS)[:, :cols].astype(np.uint8)
+    return codes, best_s.reshape(rows, ng).astype(np.float32)
+
+
+class ActStats:
+    """The engine's Q38_ACT_STATS file: per layer and expert the rows seen and the sum
+    of squares of each gate/up input channel (hidden) and down input channel (inter)."""
+    def __init__(self, path):
+        with open(path, "rb") as f:
+            if f.read(8) != b"Q38ACT1\0":
+                raise ValueError(f"{path}: not a Q38_ACT_STATS file")
+            self.layers, self.experts, self.hidden, self.inter = struct.unpack("<4i", f.read(16))
+        cells = self.layers * self.experts
+        self.n = np.memmap(path, np.int64, "r", offset=24, shape=(cells,))
+        self.sums = np.memmap(path, np.float64, "r", offset=24 + 8 * cells, shape=(cells, self.hidden + self.inter))
+        self.path, self.rows = path, int(np.asarray(self.n).sum())
+
+    def importance(self, layer, expert, k):
+        """mean square per input channel for matrix k (0 gate, 1 up: hidden; 2 down: inter);
+        uniform where calibration never routed the expert"""
+        i = layer * self.experts + expert
+        n = int(self.n[i])
+        width = self.hidden if k < 2 else self.inter
+        if n == 0:
+            return np.ones(width, np.float32)
+        part = self.sums[i, :self.hidden] if k < 2 else self.sums[i, self.hidden:]
+        return (np.asarray(part) / n).astype(np.float32) + np.float32(1e-12)
+
+
 def pack_planar(codes):
     """u8 codes [R, C] (0..15) -> u8 [R, ceil(C/2)]: planar blocks of 64, tail in pairs."""
     rows, cols = codes.shape
@@ -358,11 +415,13 @@ class Source:
 # ---------- one expert, one layer ----------
 
 _SOURCE = None
+_ACT = None
 
 
-def _init_worker(model_dir):
-    global _SOURCE
+def _init_worker(model_dir, act_path=None):
+    global _SOURCE, _ACT
     _SOURCE = Source(model_dir)
+    _ACT = ActStats(act_path) if act_path else None
 
 
 def convert_expert(task):
@@ -372,7 +431,7 @@ def convert_expert(task):
     codes, scales, errors = [], [], []
     for k in range(3):
         w = _SOURCE.matrix(layer, expert, k)
-        q, s = quantize_g64(w)
+        q, s = quantize_g64_weighted(w, _ACT.importance(layer, expert, k)) if _ACT else quantize_g64(w)
         errors.append(rel_l2(w, dequantize(q, s)))
         codes.append(pack_planar(q).tobytes())
         scales.append(s.astype(np.float32).tobytes())
@@ -497,9 +556,13 @@ def peak_rss_mb():
     return peak / (1 << 20) if sys.platform == "darwin" else peak / 1024
 
 
-def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False):
+def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_path=None):
     """Write (or finish) model_dir's sidecar; returns its directory."""
     src = Source(model_dir)
+    act = ActStats(act_path) if act_path else None
+    if act and (act.layers, act.experts, act.hidden, act.inter) != (src.geometry.layers, src.geometry.experts,
+                                                                  src.geometry.hidden, src.geometry.inter):
+        sys.exit(f"{act_path}: statistics of another geometry")
     g = src.geometry
     out_dir = out_dir or os.path.join(model_dir, SIDECAR_DIR)
     total = sum(layer_file_bytes(g, src.prefix, i) for i in range(g.layers))
@@ -515,6 +578,13 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False):
 
     os.makedirs(out_dir, exist_ok=True)
     index = resume_index(out_dir, src)
+    quantizer = (f"weighted: per 64 inputs the scale among absmax/7 * {list(ALPHAS)} with the least "
+                 f"activation-weighted squared error (Q38_ACT_STATS {os.path.basename(act_path)}, "
+                 f"{act.rows} expert rows)") if act else None
+    if quantizer and index["done"] and index.get("quantizer") != quantizer:
+        sys.exit(f"{out_dir}: started with another quantizer; give a new --out")
+    if quantizer:
+        index["quantizer"] = quantizer
     wanted = parse_layers(layers, g.layers)
     todo = [i for i in wanted if i not in index["done"]]
     if len(wanted) > len(todo):
@@ -524,9 +594,9 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False):
     pool = None
     if workers > 1 and todo:
         from multiprocessing import get_context
-        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir,))
+        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir, act_path))
     else:
-        _init_worker(model_dir)
+        _init_worker(model_dir, act_path)
     worst = 0.0
     try:
         for layer in todo:
@@ -558,8 +628,10 @@ def main():
                     help="processes converting experts in parallel (default: every CPU)")
     ap.add_argument("--layers", help="only these layers, e.g. 0-3,7 (the index stays incomplete)")
     ap.add_argument("--plan", action="store_true", help="print sizes and exit without writing")
+    ap.add_argument("--act-stats", help="the engine's Q38_ACT_STATS file: each group's scale chosen against "
+                                        "activation-weighted error instead of absmax/7")
     a = ap.parse_args()
-    convert(a.model, a.out, a.workers, a.layers, a.plan)
+    convert(a.model, a.out, a.workers, a.layers, a.plan, a.act_stats)
 
 
 if __name__ == "__main__":
