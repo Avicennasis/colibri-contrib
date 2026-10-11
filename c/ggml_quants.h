@@ -470,6 +470,32 @@ static inline gq_blk_fn gq_blk_decoder(int t) {
 
 /* Decode n elements (a whole number of blocks) of type t into dst.
  * Returns 0, or -1 for an unsupported type or a partial block. */
+static int gq_dequant_row(int t, const uint8_t *src, float *dst, int64_t n);
+/* One matrix of ggml rows as int8 with one f32 scale per 32 weights (the Vulkan tier's
+ * VKT_SRC_I8_GS, fmt 13), times mul (an expert's ".scale" factor, else 1). Measured on
+ * Qwen3.6's unsloth levels (IQ1_M to Q8_0): +0.4-0.55% relative error on top of each
+ * level's own against Q8_0, and exactly the weights for Q8_0; int4 would add 7-10%. */
+static void gq_rows_i8(int t, const uint8_t *src, int rows, int cols, float mul, int8_t *dst, float *sc) {
+    const int64_t rb = gq_row_bytes(t, cols); const int ng = cols / 32;
+    #pragma omp parallel
+    {
+        float *row = (float *)malloc((size_t)cols * sizeof(float));
+        #pragma omp for schedule(static)
+        for (int o = 0; o < rows; o++) {
+            if (!row) continue;
+            gq_dequant_row(t, src + (int64_t)o * rb, row, cols);
+            for (int g = 0; g < ng; g++) {
+                const float *v = row + g * 32; float a = 0.f;
+                for (int i = 0; i < 32; i++) { float f = fabsf(v[i]); if (f > a) a = f; }
+                float scale = a / 127.f, inv = a > 0.f ? 127.f / a : 0.f;
+                int8_t *q = dst + (int64_t)o * cols + g * 32;
+                for (int i = 0; i < 32; i++) { long r = lrintf(v[i] * inv); q[i] = (int8_t)(r > 127 ? 127 : r < -127 ? -127 : r); }
+                sc[(int64_t)o * ng + g] = scale * mul;
+            }
+        }
+        free(row);
+    }
+}
 static int gq_dequant_row(int t, const uint8_t *src, float *dst, int64_t n) {
     if (t == GQ_F32) { memcpy(dst, src, (size_t)n * 4); return 0; }
     if (t == GQ_F16) { for (int64_t i = 0; i < n; i++) dst[i] = gq_f16(gq_rd16(src + 2 * i)); return 0; }

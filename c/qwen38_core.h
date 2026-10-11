@@ -160,6 +160,7 @@ typedef struct {
     int64_t fp8_slab_bytes;
     void *int4_slab;               /* one experts-int4g64/ record: codes, then scales */
     int64_t int4_slab_bytes;
+    int8_t *t8; float *t8s;        /* GGUF mode, for the Vulkan tier: the expert as int8-g32 (fmt 13), only while the tier reads it */
 } Slot;
 typedef struct { Slot *slots; int *by_expert, n, cap; } LCache;
 
@@ -3115,9 +3116,27 @@ static void q38_tier_start(Model *m,int cap) {
  * resident. The MTP head's layer too (index c.layers, the tier's extra layer), with
  * the experts the snapshot keeps (FP8 beside the sidecar's int4). A slot's bytes are
  * what the tier reads when it promotes the expert: codes and scales of each matrix. */
-static VktExpertSrc q38_vk_src(const Slot *ex) {
+/* GGUF mode: the tier takes int8 with a scale per 32 (gq_rows_i8, +0.4-0.55% on the ggml
+ * types, exact for Q8_0); converted only for an expert it takes (vkt_wants), and given
+ * back once it has copied it (q38_vk_src_done): no second copy stays in RAM. */
+static VktExpertSrc q38_vk_src(Slot *ex) {
+    if(g_q38_gguf&&ex->gate.kind==Q38_WEIGHT_GGML){
+        const Q38Weight *w[3]={&ex->gate,&ex->up,&ex->down}; const int64_t n=(int64_t)ex->gate.rows*ex->gate.cols;
+        if(!ex->t8){
+            ex->t8=(int8_t*)malloc((size_t)(3*n)); ex->t8s=(float*)malloc((size_t)(3*(n/32))*sizeof(float));
+            if(!ex->t8||!ex->t8s){fprintf(stderr,"OOM GGUF expert for the Vulkan tier\n");exit(1);}
+        }
+        for(int k=0;k<3;k++)gq_rows_i8(w[k]->gq_type,(const uint8_t*)w[k]->data,w[k]->rows,w[k]->cols,1.f,ex->t8+k*n,ex->t8s+k*(n/32));
+        return (VktExpertSrc){ex->t8,ex->t8+n,ex->t8+2*n,ex->t8s,ex->t8s+n/32,ex->t8s+2*(n/32)};
+    }
     VktExpertSrc s={ex->gate.data,ex->up.data,ex->down.data,ex->gate.scales,ex->up.scales,ex->down.scales};
     return s;
+}
+static void q38_vk_src_done(Slot *ex) { free(ex->t8); free(ex->t8s); ex->t8=NULL; ex->t8s=NULL; }
+/* vkt_note for an expert the CPU computed: GGUF converts only one the tier takes now */
+static void q38_vk_note(int layer,int eid,Slot *ex) {
+    if(g_q38_gguf&&!vkt_wants(layer,eid))return;
+    VktExpertSrc src=q38_vk_src(ex); vkt_note(layer,eid,&src); q38_vk_src_done(ex);
 }
 static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,float *eu,float *eh,float *eo) {
     Cfg *c=&m->c;int H=c->hidden,I=c->inter;
@@ -3178,7 +3197,7 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
             for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
             if(vk){
                 memcpy(ebuf+(int64_t)z*H,eo,(size_t)H*sizeof(float));
-                VktExpertSrc src=q38_vk_src(ex); vkt_note(layer,cpu_idx[i],&src);
+                q38_vk_note(layer,cpu_idx[i],ex);
             }
             else for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
@@ -3443,7 +3462,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
                     for(int a=0;a<count;a++)if(!vk_taken[assignments[first+a]])vk_sub[n++]=first+a;
                     q38_prefill_expert_rows(m,expert,x+(int64_t)base*H,K,assignments,vk_sub,n,
                                             expert_input,expert_gate,expert_up,routed_out);
-                    VktExpertSrc src=q38_vk_src(expert); vkt_note(layer,e,&src);
+                    q38_vk_note(layer,e,expert);
                     continue;
                 }
                 for(int a=0;a<count;a++) {

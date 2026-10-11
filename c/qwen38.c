@@ -2425,9 +2425,7 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
     /* After the trunk is int8: those rows upload at their first matmul. No
      * device (or COLI_VULKAN unset) leaves g_vk_ready 0, the CPU path. */
-    g_vk_ready=g_q38_gguf?0:coli_vk_init_env_tier("qwen38",vkt_wanted()&&m.c.experts>0&&!qt_ready());
-    if(g_q38_gguf&&getenv("COLI_VULKAN")&&getenv("COLI_VULKAN")[0]=='1')
-        fprintf(stderr,"[VK] qwen38: GGUF weights stay on the CPU for now\n");
+    g_vk_ready=coli_vk_init_env_tier("qwen38",vkt_wanted()&&m.c.experts>0&&!qt_ready());
     g_vk_dense=coli_vk_dense();   /* COLI_VK_DENSE; unset, off on a device sharing the CPU's RAM with the tier on */
     /* COLI_VK_CHAIN: every layer's dense chain on the device (qwen38_chain.h); the CUDA
      * tier keeps its priority */
@@ -2435,6 +2433,10 @@ int main(int argc, char **argv) {
      * on an integrated GPU (docs/vulkan.md, "The dense chain") */
     if(g_vk_ready&&!qt_ready())
         g_vk_chain=coli_vk_chain_decide("qwen38",vkt_wanted()&&m.c.experts>0,COLI_VK_CHAIN_OFF);
+    if(g_vk_chain&&g_q38_gguf){   /* the chain uploads the dense matrices in its own formats; a GGUF's are ggml blocks */
+        g_vk_chain=0;
+        fprintf(stderr,"[VK] qwen38: the dense chain is off for a GGUF (its dense matrices are ggml blocks, kept on the CPU); the expert tier runs\n");
+    }
     if(g_vk_chain&&g_q38_mux_slots>1){
         g_vk_chain=0;
         fprintf(stderr,"[VK] qwen38: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
@@ -2883,7 +2885,7 @@ static int q38_vk_load(void *ctx,int layer,int e,VktExpertSrc *src,void **h){
     if(!s)return 0;
     *src=q38_vk_src(s);*h=s;return 1;
 }
-static void q38_vk_release(void *ctx,void *h){(void)ctx;(void)h;}
+static void q38_vk_release(void *ctx,void *h){(void)ctx;q38_vk_src_done((Slot*)h);}   /* GGUF: the int8-g32 copy the tier read */
 static int q38_vk_load_batch(void *ctx,int layer,const int *e,int n,VktExpertSrc *srcs,void **h){
     Model *m=(Model*)ctx;Slot *sl[64];
     if(n>m->cache[layer].cap)n=m->cache[layer].cap;
@@ -2898,6 +2900,12 @@ static VktFmt q38_vk_native_fmt(Model *m,int begin,int end,size_t *ram_expert){
     Cfg *c=&m->c;int H=c->hidden,F=c->inter;
     uint64_t per_capacity=0,fixed=0;unsigned kinds=0;
     VktFmt f={VKT_SRC_NONE,0};
+    if(g_q38_gguf){   /* the ggml blocks go to the device as int8 per 32 (q38_vk_src); in RAM, what the file holds */
+        if(begin>=c->layers&&g_q38_gg_mtp_layer<0)return f;
+        const gguf_tensor *t[3]; q38_gg_expert_tensors(m,begin,t);
+        *ram_expert=0; for(int k=0;k<3;k++)*ram_expert+=(size_t)(t[k]->nbytes/c->experts);
+        f.kind=VKT_SRC_I8_GS; f.gs=32; (void)H; (void)F; return f;
+    }
     if(q38_segment_expert_layout(m,(uint32_t)begin,(uint32_t)end,&per_capacity,&fixed,&kinds))return f;
     if(kinds==Q38_EXPERT_FP8_BLOCK&&m->native_fp8){
         for(int l=begin;l<end;l++)
@@ -2972,7 +2980,7 @@ static void q38_vk_tier_start(Model *m,int cap){
             for(int i=0;i<n;i++){
                 Slot tmp; memset(&tmp,0,sizeof tmp);
                 q38_load_expert(m,pl[i],pe[i],&tmp);
-                VktExpertSrc src=q38_vk_src(&tmp); vkt_put(pl[i],pe[i],&src);
+                VktExpertSrc src=q38_vk_src(&tmp); vkt_put(pl[i],pe[i],&src); q38_vk_src_done(&tmp);
                 q38_weight_free(&tmp.gate);q38_weight_free(&tmp.up);q38_weight_free(&tmp.down);
                 free(tmp.fp8_slab);free(tmp.int4_slab);
             }

@@ -3752,31 +3752,6 @@ static void route_footer(FILE *f, const Model *m) {
  * Every expert the CPU computed passes its RAM bytes to the tier (vkt_note), which
  * may promote it. */
 #define QWEN_VK_ROWS 64
-/* GGUF mode: one matrix of ggml rows as int8 with one f32 scale per 32 weights (the
- * tier's VKT_SRC_I8_GS, fmt 13), the expert's ".scale" factor folded into the scales.
- * Measured on Qwen3.6's unsloth levels (IQ1_M to Q8_0, layer 10): +0.4-0.55% relative
- * error on top of each level's own 6-35% against Q8_0, and exactly the weights for
- * Q8_0; int4 would add 7-10%. */
-static void gq_rows_i8(int t, const uint8_t *src, int rows, int cols, float mul, int8_t *dst, float *sc) {
-    const int64_t rb = gq_row_bytes(t, cols); const int ng = cols / 32;
-    #pragma omp parallel
-    {
-        float *row = falloc(cols);
-        #pragma omp for schedule(static)
-        for (int o = 0; o < rows; o++) {
-            gq_dequant_row(t, src + (int64_t)o * rb, row, cols);
-            for (int g = 0; g < ng; g++) {
-                const float *v = row + g * 32; float a = 0.f;
-                for (int i = 0; i < 32; i++) { float f = fabsf(v[i]); if (f > a) a = f; }
-                float scale = a / 127.f, inv = a > 0.f ? 127.f / a : 0.f;
-                int8_t *q = dst + (int64_t)o * cols + g * 32;
-                for (int i = 0; i < 32; i++) { long r = lrintf(v[i] * inv); q[i] = (int8_t)(r > 127 ? 127 : r < -127 ? -127 : r); }
-                sc[(int64_t)o * ng + g] = scale * mul;
-            }
-        }
-        free(row);
-    }
-}
 static void gq_slot_i8(Model *m, int layer, Slot *e) {
     if (e->t8_eid == e->eid + 1) return;
     const Cfg *c = &m->c; const GqExp *x = &m->gqx[layer];
