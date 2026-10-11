@@ -1220,14 +1220,22 @@ static inline __m256i gq_bits32(uint32_t bits) {   /* byte i: 0xFF when bit i is
     __m256i v = _mm256_shuffle_epi8(_mm256_set1_epi32((int)bits), pick);
     return _mm256_cmpeq_epi8(_mm256_and_si256(v, bit), bit);
 }
-static inline float gq_dot_b32(int t, const uint8_t *row, const int8_t *xq, const float *dx, const int32_t *xs, int64_t n) {
+#define GQ_HSUM8(v) ({ __m128 h_ = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1)); \
+    h_ = _mm_add_ps(h_, _mm_movehl_ps(h_, h_)); h_ = _mm_add_ss(h_, _mm_movehdup_ps(h_)); _mm_cvtss_f32(h_); })
+#define GQ_FUSED_ROWS 4   /* activation rows a fused kernel takes at once; from there one unpack shared by all is cheaper */
+/* S (1..GQ_FUSED_ROWS) activation rows of one weight row: y[s * ystride]. A block is
+ * decoded once and multiplied into every row, each row with its own accumulator and
+ * the operations it has alone, so a row's bits do not depend on S. */
+static inline __attribute__((always_inline)) void gq_dot_b32_body(int t, float *y, int ystride, const uint8_t *row, const int8_t *xq,
+                                                                 const float *dx, const int32_t *xs, int I, const int S) {
     const int mx = t == GQ_MXFP4, nl = t == GQ_IQ4_NL, q5 = t == GQ_Q5_0 || t == GQ_Q5_1, hasmin = t == GQ_Q4_1 || t == GQ_Q5_1;
     const int bs = GQ_TYPES[t].bytes, off = mx ? 1 : t == GQ_Q4_0 || nl ? 2 : t == GQ_Q4_1 || t == GQ_Q5_0 ? (t == GQ_Q4_1 ? 4 : 6) : 8;
     const __m128i tab = _mm_loadu_si128((const __m128i *)(mx ? GGML_KVALUES_MXFP4 : GGML_KVALUES_IQ4NL));
     const __m128i m4 = _mm_set1_epi8(0x0F);
     const __m256i bias = _mm256_set1_epi8(t == GQ_Q4_0 ? 8 : t == GQ_Q5_0 ? 16 : 0), b16 = _mm256_set1_epi8(16);
-    __m256 vacc = _mm256_setzero_ps(); const __m256i ones = _mm256_set1_epi16(1);
-    for (int64_t b = 0; b < n / 32; b++) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 vacc[GQ_FUSED_ROWS]; for (int s = 0; s < S; s++) vacc[s] = _mm256_setzero_ps();
+    for (int64_t b = 0; b < I / 32; b++) {
         const uint8_t *blk = row + b * bs;
         const float d = mx ? gq_e8m0_half(blk[0]) : gq_f16(gq_rd16(blk));
         const __m128i v = _mm_loadu_si128((const __m128i *)(blk + off));
@@ -1236,43 +1244,88 @@ static inline float gq_dot_b32(int t, const uint8_t *row, const int8_t *xq, cons
         __m256i w = _mm256_set_m128i(hi, lo);
         if (q5) w = _mm256_or_si256(w, _mm256_and_si256(gq_bits32(gq_rd32(blk + (t == GQ_Q5_0 ? 2 : 4))), b16));
         w = _mm256_sub_epi8(w, bias);
-        const __m256i x = _mm256_loadu_si256((const __m256i *)(xq + b * 32));
-        const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(x, w)), ones);
-        vacc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d * dx[b]), vacc);
-    }
-    __m128 h = _mm_add_ps(_mm256_castps256_ps128(vacc), _mm256_extractf128_ps(vacc, 1));
-    h = _mm_add_ps(h, _mm_movehl_ps(h, h)); h = _mm_add_ss(h, _mm_movehdup_ps(h));
-    float acc = _mm_cvtss_f32(h);
-    if (hasmin) {   /* gq_dot_i8's min term, mw = -m for both halves of a block */
-        float m = 0.f;
-        for (int64_t b = 0; b < n / 32; b++) {
-            const float mw = -gq_f16(gq_rd16(row + b * bs + 2));
-            m = fmaf(dx[b], fmaf(mw, (float)xs[2 * b], mw * (float)xs[2 * b + 1]), m);
+        const __m256i aw = _mm256_sign_epi8(w, w);
+        for (int s = 0; s < S; s++) {
+            const __m256i x = _mm256_loadu_si256((const __m256i *)(xq + (int64_t)s * I + b * 32));
+            const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, _mm256_sign_epi8(x, w)), ones);
+            vacc[s] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d * dx[(int64_t)s * (I / 32) + b]), vacc[s]);
         }
-        acc -= m;
     }
-    return acc;
+    for (int s = 0; s < S; s++) {
+        float acc = GQ_HSUM8(vacc[s]);
+        if (hasmin) {   /* gq_dot_i8's min term, mw = -m for both halves of a block */
+            const float *dxs = dx + (int64_t)s * (I / 32); const int32_t *xss = xs + (int64_t)s * (I / 16);
+            float m = 0.f;
+            for (int64_t b = 0; b < I / 32; b++) {
+                const float mw = -gq_f16(gq_rd16(row + b * bs + 2));
+                m = fmaf(dxs[b], fmaf(mw, (float)xss[2 * b], mw * (float)xss[2 * b + 1]), m);
+            }
+            acc -= m;
+        }
+        y[(int64_t)s * ystride] = acc;
+    }
+}
+/* S constant in each call below: the accumulators stay in registers and S=1 is the one-row kernel */
+static void gq_dot_b32(int t, float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, const int32_t *xs, int I, int S) {
+    switch (S) {
+    case 1: gq_dot_b32_body(t, y, ystride, row, xq, dx, xs, I, 1); break;
+    case 2: gq_dot_b32_body(t, y, ystride, row, xq, dx, xs, I, 2); break;
+    case 3: gq_dot_b32_body(t, y, ystride, row, xq, dx, xs, I, 3); break;
+    default: gq_dot_b32_body(t, y, ystride, row, xq, dx, xs, I, 4); break;
+    }
+}
+/* Q8_0, S rows at once: the block's codes loaded and made positive once */
+static inline __attribute__((always_inline)) void gq_dot_q8_0_body(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, int I, const int S) {
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256 vacc[GQ_FUSED_ROWS]; for (int s = 0; s < S; s++) vacc[s] = _mm256_setzero_ps();
+    for (int64_t b = 0; b < I / 32; b++) {
+        const uint8_t *blk = row + b * 34; const float d = gq_f16(gq_rd16(blk));
+        const __m256i w = _mm256_loadu_si256((const __m256i *)(blk + 2)), aw = _mm256_sign_epi8(w, w);
+        for (int s = 0; s < S; s++) {
+            const __m256i x = _mm256_loadu_si256((const __m256i *)(xq + (int64_t)s * I + b * 32));
+            const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, _mm256_sign_epi8(x, w)), ones);
+            vacc[s] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d * dx[(int64_t)s * (I / 32) + b]), vacc[s]);
+        }
+    }
+    for (int s = 0; s < S; s++) y[(int64_t)s * ystride] = GQ_HSUM8(vacc[s]);
+}
+static void gq_dot_q8_0_rows(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, int I, int S) {
+    switch (S) {
+    case 1: gq_dot_q8_0_body(y, ystride, row, xq, dx, I, 1); break;
+    case 2: gq_dot_q8_0_body(y, ystride, row, xq, dx, I, 2); break;
+    case 3: gq_dot_q8_0_body(y, ystride, row, xq, dx, I, 3); break;
+    default: gq_dot_q8_0_body(y, ystride, row, xq, dx, I, 4); break;
+    }
 }
 /* The 256-element grid types without the unpack: each sub-block from its decoder
  * (gq_sb_*, the unpack's own), multiplied at once as gq_dot_i8 does it (the same
  * lanes, group scales times dx, fma and reduction), so the result is the unpack
  * path's bit for bit, without storing and reloading the row. */
 #define GQ_DOT_SB256(NAME, BYTES, BD, SB) \
-GQ_EXACT_FN static float NAME(const uint8_t *row, const int8_t *xq, const float *dx, int64_t n) { \
-    __m256 vacc = _mm256_setzero_ps(); const __m256i ones = _mm256_set1_epi16(1); \
-    for (int64_t blk = 0; blk < n / 256; blk++) { \
+GQ_SB_FN void NAME##_body(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, int I, const int S) { \
+    __m256 vacc[GQ_FUSED_ROWS]; for (int s = 0; s < S; s++) vacc[s] = _mm256_setzero_ps(); \
+    const __m256i ones = _mm256_set1_epi16(1); \
+    for (int64_t blk = 0; blk < I / 256; blk++) { \
         const uint8_t *b = row + blk * (BYTES); const float d = BD(b); \
         for (int ib = 0; ib < 8; ib++) { \
-            float s2[2]; const __m256i w = SB(b, d, ib, s2); const int64_t xb = blk * 8 + ib; \
-            const __m256i x = _mm256_loadu_si256((const __m256i *)(xq + xb * 32)); \
-            const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(x, w)), ones); \
-            const float dd = dx[xb]; \
-            vacc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set_m128(_mm_set1_ps(s2[1] * dd), _mm_set1_ps(s2[0] * dd)), vacc); \
+            float s2[2]; const __m256i w = SB(b, d, ib, s2), aw = _mm256_sign_epi8(w, w); const int64_t xb = blk * 8 + ib; \
+            for (int s = 0; s < S; s++) { \
+                const __m256i x = _mm256_loadu_si256((const __m256i *)(xq + (int64_t)s * I + xb * 32)); \
+                const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, _mm256_sign_epi8(x, w)), ones); \
+                const float dd = dx[(int64_t)s * (I / 32) + xb]; \
+                vacc[s] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set_m128(_mm_set1_ps(s2[1] * dd), _mm_set1_ps(s2[0] * dd)), vacc[s]); \
+            } \
         } \
     } \
-    __m128 h = _mm_add_ps(_mm256_castps256_ps128(vacc), _mm256_extractf128_ps(vacc, 1)); \
-    h = _mm_add_ps(h, _mm_movehl_ps(h, h)); h = _mm_add_ss(h, _mm_movehdup_ps(h)); \
-    return _mm_cvtss_f32(h); \
+    for (int s = 0; s < S; s++) y[(int64_t)s * ystride] = GQ_HSUM8(vacc[s]); \
+} \
+GQ_EXACT_FN static void NAME(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, int I, int S) { \
+    switch (S) { \
+    case 1: NAME##_body(y, ystride, row, xq, dx, I, 1); break; \
+    case 2: NAME##_body(y, ystride, row, xq, dx, I, 2); break; \
+    case 3: NAME##_body(y, ystride, row, xq, dx, I, 3); break; \
+    default: NAME##_body(y, ystride, row, xq, dx, I, 4); break; \
+    } \
 }
 GQ_DOT_SB256(gq_dot_iq4_xs, 136, gq_bd_iq4_xs, gq_sb_iq4_xs)
 GQ_DOT_SB256(gq_dot_iq2_xxs, 66, gq_bd_f16, gq_sb_iq2_xxs)
@@ -1282,7 +1335,7 @@ GQ_DOT_SB256(gq_dot_iq3_xxs, 98, gq_bd_f16, gq_sb_iq3_xxs)
 GQ_DOT_SB256(gq_dot_iq3_s, 110, gq_bd_f16, gq_sb_iq3_s)
 GQ_DOT_SB256(gq_dot_iq1_s, 50, gq_bd_f16, gq_sb_iq1_s)
 GQ_DOT_SB256(gq_dot_iq1_m, 56, gq_bd_iq1_m, gq_sb_iq1_m)
-typedef float (*gq_fdot_fn)(const uint8_t *, const int8_t *, const float *, int64_t);
+typedef void (*gq_fdot_fn)(float *, int, const uint8_t *, const int8_t *, const float *, int, int);
 static inline gq_fdot_fn gq_fdot_sb256(int t) {
     switch (t) {
     case GQ_IQ4_XS: return gq_dot_iq4_xs;   case GQ_IQ2_XXS: return gq_dot_iq2_xxs;
@@ -1292,22 +1345,26 @@ static inline gq_fdot_fn gq_fdot_sb256(int t) {
     default: return NULL;
     }
 }
-#define GQ_FUSED_ROWS 4   /* from this many activation rows, one unpack shared by all is cheaper */
 #endif
 static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint8_t *row, int t, int I) {
+#if defined(__AVX2__) && defined(__FMA__)
+    if (t == GQ_Q8_0) {   /* no unpack to share: rows in groups of GQ_FUSED_ROWS */
+        for (int s0 = 0; s0 < a->S; s0 += GQ_FUSED_ROWS) {
+            const int n = a->S - s0 < GQ_FUSED_ROWS ? a->S - s0 : GQ_FUSED_ROWS;
+            gq_dot_q8_0_rows(y + (int64_t)s0 * ystride, ystride, row, a->q + (int64_t)s0 * I, a->d + (int64_t)s0 * (I / 32), I, n);
+        }
+        return;
+    }
+    if (a->S <= GQ_FUSED_ROWS) {
+        if (t == GQ_Q4_0 || t == GQ_Q4_1 || t == GQ_Q5_0 || t == GQ_Q5_1 || t == GQ_IQ4_NL || t == GQ_MXFP4) {
+            gq_dot_b32(t, y, ystride, row, a->q, a->d, a->s, I, a->S); return;
+        }
+        const gq_fdot_fn f = gq_fdot_sb256(t);
+        if (f) { f(y, ystride, row, a->q, a->d, I, a->S); return; }
+    }
+#else
     if (t == GQ_Q8_0) {
         for (int s = 0; s < a->S; s++) y[(int64_t)s * ystride] = gq_dot_q8_0(row, a->q + (int64_t)s * I, a->d + (int64_t)s * (I / 32), I);
-        return;
-    }
-#if defined(__AVX2__) && defined(__FMA__)
-    if ((t == GQ_Q4_0 || t == GQ_Q4_1 || t == GQ_Q5_0 || t == GQ_Q5_1 || t == GQ_IQ4_NL || t == GQ_MXFP4) && a->S <= GQ_FUSED_ROWS) {
-        for (int s = 0; s < a->S; s++)
-            y[(int64_t)s * ystride] = gq_dot_b32(t, row, a->q + (int64_t)s * I, a->d + (int64_t)s * (I / 32), a->s + (int64_t)s * (I / 16), I);
-        return;
-    }
-    const gq_fdot_fn f = a->S <= GQ_FUSED_ROWS ? gq_fdot_sb256(t) : NULL;
-    if (f) {
-        for (int s = 0; s < a->S; s++) y[(int64_t)s * ystride] = f(row, a->q + (int64_t)s * I, a->d + (int64_t)s * (I / 32), I);
         return;
     }
 #endif
