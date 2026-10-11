@@ -2260,8 +2260,21 @@ int main(int argc, char **argv) {
             const char *g = r ? jstr(r, "gguf") : NULL;
             if (!g || !*g) { fprintf(stderr, "%s: no \"gguf\" path\n", gj); return 1; }
             if (g[0] == '/') snprintf(gp, sizeof gp, "%s", g); else snprintf(gp, sizeof gp, "%s/%s", snap, g);
+            const char *mt = jstr(r, "mtp");   /* the MTP head's own GGUF (unsloth's mtp-*.gguf), optional */
+            char mp[4096] = "";
+            if (mt && *mt) { if (mt[0] == '/') snprintf(mp, sizeof mp, "%s", mt); else snprintf(mp, sizeof mp, "%s/%s", snap, mt); }
             free(arena);
             if (gguf_open(&g_q38gg, gp)) { fprintf(stderr, "GGUF: %s\n", g_q38gg.err); return 1; }
+            if (mp[0]) {
+                if (gguf_open(&g_q38gg_mtp, mp)) { fprintf(stderr, "GGUF (MTP head): %s\n", g_q38gg_mtp.err); return 1; }
+                const char *ma = gguf_get_str(&g_q38gg_mtp, "general.architecture");
+                const gguf_kv *nx = gguf_get(&g_q38gg_mtp, "qwen4exp.nextn_predict_layers");
+                if (!ma || strcmp(ma, "qwen4exp") || !nx) {
+                    fprintf(stderr, "GGUF %s: not a qwen4exp MTP head (architecture %s, nextn_predict_layers %s)\n",
+                            mp, ma ? ma : "(none)", nx ? "present" : "missing"); return 1;
+                }
+                fprintf(stderr, "[gguf] MTP head %s: %d tensors\n", mp, g_q38gg_mtp.n_tensors);
+            }
             const char *arch = gguf_get_str(&g_q38gg, "general.architecture");
             if (!arch || strcmp(arch, "qwen4exp")) { fprintf(stderr, "GGUF %s: architecture %s, not qwen4exp\n", gp, arch ? arch : "(none)"); return 1; }
             g_q38_gguf = 1; g_q38_a_direct = 1; g_q38_dn_tiled = 1;
@@ -2374,15 +2387,6 @@ int main(int argc, char **argv) {
     }
 
     Model m; model_init(&m, snap, cap, bits);
-    if (g_q38_gguf) {   /* a tensor the file has and nothing loaded: a weight the engine would ignore */
-        int unused = 0;
-        for (int i = 0; i < g_q38gg.n_tensors; i++) {
-            const gguf_tensor *t = &g_q38gg.t[i];
-            if (t->used || strstr(t->name, "_exps.weight")) continue;   /* the experts load on demand */
-            fprintf(stderr, "[gguf] not used by the engine: %s\n", t->name); unused++;
-        }
-        if (unused && getenv("GGUF_STRICT") && getenv("GGUF_STRICT")[0] == '1') return 3;
-    }
     q38_expert_int4_attach(&m, snap);   /* <snap>/experts-int4g64/ when present (Q38_EXPERT_INT4) */
     if (serve_mode) {   /* KV_SLOTS: how many conversations the serve decodes at once */
         const char *ks=getenv("KV_SLOTS");
@@ -2396,6 +2400,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[qwen38] KV_SLOTS=%d: the MTP head stays unloaded and nothing drafts "
                         "(speculation follows one conversation)\n", g_q38_mux_slots);
     else q38_mtp_attach(&m, cap);       /* Q38_MTP=1: the checkpoint's MTP head drafts (qwen38_core.h) */
+    if (g_q38_gguf) {   /* a tensor the files have and nothing loaded: a weight the engine would ignore */
+        int unused = 0, head = 0; char hp[32]; snprintf(hp, sizeof hp, "blk.%d.", m.c.layers);
+        const gguf_ctx *files[2] = { &g_q38gg, &g_q38gg_mtp };
+        for (int f = 0; f < 2; f++)
+            for (int i = 0; i < files[f]->n_tensors; i++) {
+                const gguf_tensor *t = &files[f]->t[i];
+                if (t->used || strstr(t->name, "_exps.weight")) continue;   /* the experts load on demand */
+                if (f == 1 && (!strcmp(t->name, "token_embd.weight") || !strcmp(t->name, "output.weight"))) continue;   /* the model's own are used */
+                if (g_q38_gg_mtp_layer < 0 && !strncmp(t->name, hp, strlen(hp))) { head++; continue; }   /* the head, not attached */
+                fprintf(stderr, "[gguf] not used by the engine: %s\n", t->name); unused++;
+            }
+        if (head) fprintf(stderr, "[gguf] the MTP head's %d tensors (%s*) stay unread: it is not attached\n", head, hp);
+        if (unused && getenv("GGUF_STRICT") && getenv("GGUF_STRICT")[0] == '1') return 3;
+    }
     q38_tier_start(&m, cap);   /* COLI_CUDA=1: hot experts stream to VRAM (qwen36_tier.c) */
     if (g_q38_mux_slots>1 && m.dn_dev) {
         m.dn_dev=0;

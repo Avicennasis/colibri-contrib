@@ -239,6 +239,46 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 ARCHES = {"qwen35moe": qwen35moe_config, "qwen4exp": qwen4exp_config}
 
+# unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
+# shared-* borrow token_embd and output from the model (the engine always does), the
+# others carry copies. Their README recommends shared-Q8_0.
+MTP_PREFERENCE = ("shared-Q8_0", "Q8_0", "shared-Q4_K_M", "Q4_K_M", "shared-BF16", "BF16")
+
+
+def mtp_candidates(src):
+    """mtp-*.gguf next to the model: its folder, the parent, an MTP/ folder in either; best first."""
+    seen, found = set(), []
+    for d in (src.parent, src.parent / "MTP", src.parent.parent, src.parent.parent / "MTP"):
+        for f in sorted(d.glob("mtp-*.gguf")) if d.is_dir() else ():
+            if f.resolve() not in seen:
+                seen.add(f.resolve()); found.append(f)
+    rank = lambda f: next((i for i, tag in enumerate(MTP_PREFERENCE) if f.name.endswith(f"-{tag}.gguf")), len(MTP_PREFERENCE))
+    return sorted(found, key=rank)
+
+
+def mtp_head_ok(path, meta, layers):
+    """'' when path is a qwen4exp MTP head for this model (one nextn layer at blk.<layers>), else why not."""
+    p = "qwen4exp."
+    try:
+        r = GGUFReader(str(path))
+    except (GGUFError, OSError) as e:
+        return str(e)
+    try:
+        hm, names = r.metadata, {t["name"] for t in r.tensors}
+        if hm.get("general.architecture") != "qwen4exp":
+            return f"architecture {hm.get('general.architecture')!r}, not qwen4exp"
+        if int(hm.get(p + "nextn_predict_layers", 0)) != 1:
+            return "not one MTP layer (nextn_predict_layers)"
+        for k in ("block_count", "embedding_length", "expert_count", "expert_feed_forward_length"):
+            want = int(meta[p + k]) + (1 if k == "block_count" else 0)
+            if int(hm.get(p + k, -1)) != want:
+                return f"{k} {hm.get(p + k)} does not match the model ({want})"
+        if f"blk.{layers}.nextn.eh_proj.weight" not in names:
+            return f"no blk.{layers}.nextn.eh_proj.weight"
+        return ""
+    finally:
+        r.close()
+
 
 # ------------------------------------------------------------- tokenizer
 def tokenizer_files(meta):
@@ -377,6 +417,10 @@ def main():
     ap.add_argument("gguf", type=Path)
     ap.add_argument("out", type=Path)
     ap.add_argument("--mode", choices=("link", "copy"), default="link")
+    ap.add_argument("--mtp", type=Path, default=None,
+                    help="qwen4exp: the MTP head's GGUF (unsloth's mtp-*.gguf); unset, one next to the model "
+                         "is used (its folder, the parent, an MTP/ folder in either; shared-Q8_0 first)")
+    ap.add_argument("--no-mtp", action="store_true", help="qwen4exp: no MTP head, plain decoding")
     ap.add_argument("--indexer-compress-ratio", type=int, default=0,
                     help="qwen4exp: when the GGUF's attention.compress_ratios are all 0 (a converter "
                          "that read the layers as qwen_sparse_attention)")
@@ -387,6 +431,22 @@ def main():
     if arch not in ARCHES:
         sys.exit(f"architecture {arch!r} is not supported yet (supported: {', '.join(ARCHES)})")
     cfg, layers = ARCHES[arch](meta, tensors, {"indexer_compress_ratio": args.indexer_compress_ratio})
+    mtp_file, mtp_where = None, None
+    if arch == "qwen4exp" and not args.no_mtp:
+        if f"blk.{layers}.nextn.eh_proj.weight" in tensors:
+            mtp_where = "in the model's GGUF"
+        else:
+            for cand in ([args.mtp] if args.mtp else mtp_candidates(src)):
+                why = mtp_head_ok(cand, meta, layers)
+                if not why:
+                    mtp_file = cand.resolve(); mtp_where = str(mtp_file); break
+                if args.mtp:
+                    sys.exit(f"--mtp {cand}: {why}")
+                print(f"  {cand.name}: not this model's MTP head ({why})")
+        if mtp_where:   # the head drafts; the engine reads the rest of it from the GGUF
+            cfg["mtp_num_hidden_layers"] = 1
+            cfg["mtp"] = {"layer_types": ["full_attention"], "rope_theta": cfg["rope_parameters"]["rope_theta"]}
+            cfg["mtp_use_dedicated_embeddings"] = False
     tok, tcfg, gen = tokenizer_files(meta)
     args.out.mkdir(parents=True, exist_ok=True)
     cfg["colibri_gguf"] = {"arch": arch, "mode": args.mode, "source": str(src)}
@@ -401,10 +461,14 @@ def main():
     link = {"format": "colibri-gguf-v1", "gguf": str(target) if args.mode == "link" else target.name,
             "mode": args.mode, "arch": arch, "parts": len(parts),
             "size": sum(p.stat().st_size for p in parts) if args.mode == "link" else target.stat().st_size}
+    if mtp_file:
+        link["mtp"] = str(mtp_file)
     (args.out / "gguf.json").write_text(json.dumps(link, indent=1))
     for r in readers:
         r.close()
     print(f"colibri model directory ready: {args.out}  ({arch}, {layers} layers, mode {args.mode})")
+    if arch == "qwen4exp":
+        print(f"  MTP head: {mtp_where or ('off (--no-mtp)' if args.no_mtp else 'none found: decoding without drafts (--mtp names one)')}")
 
 
 if __name__ == "__main__":

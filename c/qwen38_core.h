@@ -78,9 +78,17 @@ typedef enum {
  *    quantized blocks, which is not lossless;
  *  - the indexer's q and k projections are two tensors (rows concatenated here), the
  *    experts one 3D tensor per projection, the PLE table one tensor
- *    (per_layer_token_embd) and its hash constants metadata. */
-static gguf_ctx g_q38gg;
+ *    (per_layer_token_embd) and its hash constants metadata.
+ * The MTP head is llama.cpp's nextn layer, blk.<layers>: in the model's GGUF when its
+ * converter kept it there, or in a GGUF of its own (unsloth's mtp-*.gguf, named by
+ * gguf.json "mtp", g_q38gg_mtp). A tensor is looked up in the model's file first, so a
+ * self-contained head's own copies of token_embd and output stay unread: the head
+ * drafts through the model's embedding and lm_head, as the checkpoint's does. Its
+ * fc_embedding and fc_hidden are the two column halves of nextn.eh_proj, its norms
+ * (enorm, hnorm, hc_head_norm) stored as 1 + w like the model's. */
+static gguf_ctx g_q38gg, g_q38gg_mtp;
 static int g_q38_gguf, g_q38_a_direct, g_q38_dn_tiled;
+static int g_q38_gg_mtp_layer=-1;   /* blk.<this> is the head, once q38_mtp_attach found it */
 
 /* int4-g64 rows: ceil(cols/2) bytes of codes and one f32 scale per 64 inputs */
 static inline int64_t q38_int4_row_bytes(int cols){ return ((int64_t)cols+1)/2; }
@@ -962,6 +970,15 @@ static void q38_validate_cfg(const Cfg *c) {
     Q38_NEED(c->ple_layer>=0&&c->ple_layer<c->layers,"PLE layer=%d",c->ple_layer);
 }
 
+/* GGUF mode: the GGUF layer of a checkpoint layer name, *off where its suffix starts:
+ * model.layers.N. is blk.N, the MTP head's mtp.layers.0. is blk.<layers>; -1 otherwise. */
+static int q38_gg_layer(const char *hf,int *off) {
+    int L=-1,n=0;
+    if(sscanf(hf,"model.layers.%d.%n",&L,&n)==1&&L>=0&&n){*off=n;return L;}
+    if(g_q38_gg_mtp_layer>=0&&!strncmp(hf,"mtp.layers.0.",13)){*off=13;return g_q38_gg_mtp_layer;}
+    return -1;
+}
+
 /* GGUF mode: the tensor a checkpoint name is in the file, by llama.cpp's qwen4exp names;
  * *norm: a norm the file stores as 1 + w. The routed experts and the indexer's fused
  * projection have loaders of their own. */
@@ -1011,23 +1028,47 @@ static const char *q38_gg_name(const char *hf,char *out,size_t cap,int *norm) {
         {"self_attn.v_proj.weight","attn_v.weight",0},
         {"self_attn.o_proj.weight","attn_output.weight",0},
     };
+    static const struct { const char *hf,*gg; int norm; } head[]={   /* the MTP head, around its layer */
+        {"mtp.pre_fc_norm_embedding.weight","nextn.enorm.weight",1},
+        {"mtp.pre_fc_norm_hidden.weight","nextn.hnorm.weight",1},
+        {"mtp.hyper_connection_mixer.hc_norm.weight","nextn.hc_head_norm.weight",1},
+        {"mtp.hyper_connection_mixer.input_mix_weight_down.weight","nextn.hc_head_down.weight",0},
+        {"mtp.hyper_connection_mixer.input_mix_weight_up.weight","nextn.hc_head_up.weight",0},
+    };
     *norm=0;
     for(size_t i=0;i<sizeof top/sizeof *top;i++)
         if(!strcmp(hf,top[i].hf)){*norm=top[i].norm;snprintf(out,cap,"%s",top[i].gg);return out;}
-    int L=-1,off=0;
-    if(sscanf(hf,"model.layers.%d.%n",&L,&off)!=1||L<0||!off)return NULL;
+    if(g_q38_gg_mtp_layer>=0)
+        for(size_t i=0;i<sizeof head/sizeof *head;i++)
+            if(!strcmp(hf,head[i].hf)){*norm=head[i].norm;snprintf(out,cap,"blk.%d.%s",g_q38_gg_mtp_layer,head[i].gg);return out;}
+    int off=0,L=q38_gg_layer(hf,&off);
+    if(L<0)return NULL;
     if(!strcmp(hf+off,"ple.ple_embedding.ngram_embedding.weight")){snprintf(out,cap,"per_layer_token_embd.weight");return out;}
     for(size_t i=0;i<sizeof lay/sizeof *lay;i++)
         if(!strcmp(hf+off,lay[i].hf)){*norm=lay[i].norm;snprintf(out,cap,"blk.%d.%s",L,lay[i].gg);return out;}
     return NULL;
 }
+/* the file a tensor was read from: the model's GGUF or the MTP head's */
+static const gguf_ctx *q38_gg_ctx_of(const gguf_tensor *t) {
+    if(g_q38gg_mtp.t&&t>=g_q38gg_mtp.t&&t<g_q38gg_mtp.t+g_q38gg_mtp.n_tensors)return &g_q38gg_mtp;
+    return &g_q38gg;
+}
+/* a GGUF name, marked used: the model's file first, then the MTP head's */
+static const gguf_tensor *q38_gg_find(const char *gg) {
+    const gguf_tensor *t=gguf_mark(&g_q38gg,gg);
+    if(!t&&g_q38gg_mtp.t)t=gguf_mark(&g_q38gg_mtp,gg);
+    return t;
+}
 static const gguf_tensor *q38_gg(const char *hf,int *norm) {
     char nm[256]; int dummy; const char *g=q38_gg_name(hf,nm,sizeof nm,norm?norm:&dummy);
-    return g?gguf_mark(&g_q38gg,g):NULL;
+    return g?q38_gg_find(g):NULL;
 }
 static int64_t q38_gg_numel(const gguf_tensor *t) { return t->ne[0]*t->ne[1]*t->ne[2]*t->ne[3]; }
 static void q38_gg_read(const gguf_tensor *t,void *dst,int64_t off,int64_t n) {
-    if(gguf_read(&g_q38gg,t,dst,off,n)){fprintf(stderr,"GGUF %s: read failed\n",t->name);exit(1);}
+    if(gguf_read(q38_gg_ctx_of(t),t,dst,off,n)){fprintf(stderr,"GGUF %s: read failed\n",t->name);exit(1);}
+}
+static void q38_gg_read_f32(const gguf_tensor *t,float *dst) {
+    if(gguf_read_f32(q38_gg_ctx_of(t),t,dst)){fprintf(stderr,"GGUF %s: read failed (type %s)\n",t->name,gq_type_name(t->type));exit(1);}
 }
 /* A matrix [rows][cols] from the GGUF: f32/f16 as f32, bf16 as bf16, any other ggml
  * type as its blocks (Q38_WEIGHT_GGML). `parts` tensors of the same type are stacked
@@ -1047,7 +1088,7 @@ static Q38Weight q38_gg_weight_parts(Model *m,const gguf_tensor *const *parts,in
         q38_weight_reserve(&w,Q38_WEIGHT_F32,rows,cols);
         float *p=(float*)w.data;
         for(int i=0;i<n;i++){
-            if(gguf_read_f32(&g_q38gg,parts[i],p)){fprintf(stderr,"GGUF %s: read failed\n",parts[i]->name);exit(1);}
+            q38_gg_read_f32(parts[i],p);
             p+=parts[i]->ne[1]*cols;
         }
     } else if(type==GQ_BF16){
@@ -1064,12 +1105,44 @@ static Q38Weight q38_gg_weight_parts(Model *m,const gguf_tensor *const *parts,in
     m->resident_weight_bytes+=q38_weight_bytes(&w);
     return w;
 }
+/* Columns [col0, col0+cols) of every row of t (rows x 2*cols): the MTP head's fc_embedding
+ * and fc_hidden, the two halves of nextn.eh_proj. A block type splits on a block boundary
+ * (cols a multiple of its block); f32/f16/bf16 are kept as f32. */
+static Q38Weight q38_gg_weight_cols(Model *m,const gguf_tensor *t,int rows,int cols,int col0) {
+    Q38Weight w={0}; int type=t->type; int64_t full=t->ne[0];
+    if(full!=2*(int64_t)cols||t->ne[1]!=rows||t->ne[2]*t->ne[3]!=1||(col0!=0&&col0!=cols)){
+        fprintf(stderr,"GGUF %s: [%lld x %lld], expected [%d x %d]\n",t->name,(long long)t->ne[1],(long long)full,rows,2*cols);exit(1);
+    }
+    if(type==GQ_F32||type==GQ_F16||type==GQ_BF16){
+        float *all=falloc((int64_t)rows*full); q38_gg_read_f32(t,all);
+        q38_weight_reserve(&w,Q38_WEIGHT_F32,rows,cols);
+        for(int r=0;r<rows;r++)memcpy((float*)w.data+(int64_t)r*cols,all+(int64_t)r*full+col0,(size_t)cols*sizeof(float));
+        free(all);
+    } else if(gq_blk_decoder(type)){
+        int64_t rbf=gq_row_bytes(type,full),rbh=gq_row_bytes(type,cols);
+        if(rbh<=0||rbf!=2*rbh){fprintf(stderr,"GGUF %s: %s does not split at column %d\n",t->name,gq_type_name(type),cols);exit(1);}
+        uint8_t *all=(uint8_t*)malloc((size_t)(rbf*rows)); w.data=malloc((size_t)(rbh*rows));
+        if(!all||!w.data){fprintf(stderr,"OOM GGUF weight\n");exit(1);}
+        q38_gg_read(t,all,0,rbf*rows);
+        for(int r=0;r<rows;r++)memcpy((uint8_t*)w.data+(int64_t)r*rbh,all+(int64_t)r*rbf+(col0?rbh:0),(size_t)rbh);
+        free(all);
+        w.kind=Q38_WEIGHT_GGML;w.gq_type=type;w.rows=rows;w.cols=cols;w.elements=(int64_t)rows*cols;w.owns_data=1;
+    } else {fprintf(stderr,"GGUF %s: type %s is not supported\n",t->name,gq_type_name(type));exit(1);}
+    m->resident_weight_bytes+=q38_weight_bytes(&w);
+    return w;
+}
 static Q38Weight q38_gg_weight(Model *m,const char *name,int rows,int cols) {
     const gguf_tensor *parts[2]; int n=1;
-    int L=-1,off=0;
-    if(sscanf(name,"model.layers.%d.%n",&L,&off)==1&&off&&!strcmp(name+off,"self_attn.indexer.index_qk_proj.weight")){
+    int off=0,L=q38_gg_layer(name,&off);
+    if(g_q38_gg_mtp_layer>=0&&(!strcmp(name,"mtp.fc_embedding.weight")||!strcmp(name,"mtp.fc_hidden.weight"))){
+        char eh[96]; snprintf(eh,sizeof eh,"blk.%d.nextn.eh_proj.weight",g_q38_gg_mtp_layer);
+        const gguf_tensor *t=q38_gg_find(eh);
+        if(!t){fprintf(stderr,"GGUF: no %s for %s\n",eh,name);exit(1);}
+        return q38_gg_weight_cols(m,t,rows,cols,strcmp(name,"mtp.fc_hidden.weight")?0:cols);   /* [embedding | hidden] */
+    }
+    if(L>=0&&!strcmp(name+off,"self_attn.indexer.index_qk_proj.weight")){
         char a[96],b[96]; snprintf(a,sizeof a,"blk.%d.indexer.q_proj.weight",L); snprintf(b,sizeof b,"blk.%d.indexer.k_proj.weight",L);
-        parts[0]=gguf_mark(&g_q38gg,a); parts[1]=gguf_mark(&g_q38gg,b); n=2;
+        parts[0]=q38_gg_find(a); parts[1]=q38_gg_find(b); n=2;
         if(!parts[0]||!parts[1]){fprintf(stderr,"GGUF: missing %s or %s\n",a,b);exit(1);}
     } else {
         parts[0]=q38_gg(name,NULL);
@@ -1084,7 +1157,7 @@ static float *q38_load_tensor(Model *m,const char *name,int64_t want) {
         if(!t){fprintf(stderr,"GGUF: no tensor for %s\n",name);exit(1);}
         if(q38_gg_numel(t)!=want){fprintf(stderr,"GGUF %s: %lld elements, expected %lld\n",t->name,(long long)q38_gg_numel(t),(long long)want);exit(1);}
         float *p=falloc(want);
-        if(gguf_read_f32(&g_q38gg,t,p)){fprintf(stderr,"GGUF %s: read failed (type %s)\n",t->name,gq_type_name(t->type));exit(1);}
+        q38_gg_read_f32(t,p);
         if(norm)for(int64_t i=0;i<want;i++)p[i]-=1.f;
         return p;
     }
@@ -2003,7 +2076,7 @@ static void q38_gg_expert_tensors(Model *m,int layer,const gguf_tensor *t[3]) {
     const int os[3]={I,I,H},is[3]={H,H,I};
     for(int k=0;k<3;k++){
         char nm[96]; snprintf(nm,sizeof nm,"blk.%d.%s.weight",layer,kn[k]);
-        t[k]=gguf_mark(&g_q38gg,nm);
+        t[k]=q38_gg_find(nm);
         if(!t[k]||t[k]->ne[0]!=is[k]||t[k]->ne[1]!=os[k]||t[k]->ne[2]!=c->experts||t[k]->ne[3]!=1){fprintf(stderr,"GGUF: %s missing or not [%d][%d][%d]\n",nm,c->experts,os[k],is[k]);exit(1);}
         if(gq_row_bytes(t[k]->type,is[k])<=0||(!gq_blk_decoder(t[k]->type)&&t[k]->type!=GQ_F32&&t[k]->type!=GQ_F16&&t[k]->type!=GQ_BF16)){fprintf(stderr,"GGUF %s: type %s is not supported\n",nm,gq_type_name(t[k]->type));exit(1);}
     }
@@ -4212,11 +4285,17 @@ static void q38_mtp_attach(Model *m,int cap) {
     const char *asked=getenv("Q38_MTP");
     int forced=asked&&*asked;
     if(!q38_env_bool("Q38_MTP",1))return;
-    if(g_q38_gguf){   /* the MTP head ships as a GGUF of its own (mtp-*.gguf), not read yet */
-        if(forced){fprintf(stderr,"Q38_MTP=1: a GGUF model carries no MTP head here\n");exit(1);}
-        return;
-    }
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width;
+    if(g_q38_gguf){   /* the head is blk.<layers>, in the model's GGUF or in gguf.json's "mtp" */
+        char eh[96]; snprintf(eh,sizeof eh,"blk.%d.nextn.eh_proj.weight",c->layers);
+        if(!gguf_find(&g_q38gg,eh)&&!(g_q38gg_mtp.t&&gguf_find(&g_q38gg_mtp,eh))){
+            if(forced){fprintf(stderr,"Q38_MTP=1 but the GGUF has no MTP head (%s) and gguf.json names no "
+                                      "mtp-*.gguf (tools/gguf_import.py --mtp) -- refusing\n",eh);exit(1);}
+            fprintf(stderr,"[qwen38] speculative decoding with the MTP head: off (the GGUF has none; "
+                           "tools/gguf_import.py --mtp names an mtp-*.gguf; Q38_MTP=0 silences this)\n");
+            return;
+        }
+    }
     if(!forced&&(m->range_begin!=0||m->range_end!=c->layers||!m->lm_head.rows||c->mtp_layers!=1)){
         fprintf(stderr,"[qwen38] speculative decoding with the MTP head: off (%s; Q38_MTP=0 silences this)\n",
                 c->mtp_layers==0?"the checkpoint has no MTP head":c->mtp_layers!=1?"an MTP head this engine does not run":
@@ -4245,6 +4324,7 @@ static void q38_mtp_attach(Model *m,int cap) {
     char probe[96];const char *found=NULL;
     const char *bases[3]={"mtp","model.mtp",NULL};
     char nested[48];snprintf(nested,sizeof nested,"%s.mtp",m->prefix);bases[2]=nested;
+    if(g_q38_gguf){found="mtp";g_q38_gg_mtp_layer=c->layers;}   /* the checkpoint's names, mapped onto the GGUF's (q38_gg_name) */
     for(int i=0;i<3&&!found;i++){
         snprintf(probe,sizeof probe,"%s.fc_embedding.weight",bases[i]);
         if(st_has(&m->S,probe))found=bases[i];
@@ -4273,15 +4353,22 @@ static void q38_mtp_attach(Model *m,int cap) {
     /* the verify's first rollback copy (q38_spec_rollback); deeper verifies add theirs */
     if(!q38_spec_alloc(m,1)){fprintf(stderr,"OOM MTP rollback state\n");exit(1);}
     snprintf(nm,sizeof nm,"%s.layers.0.mlp.experts.0.gate_proj.weight",found);
-    st_tensor *expert=st_find(&m->S,nm);
+    st_tensor *expert=g_q38_gguf?NULL:st_find(&m->S,nm);
     double expert_bytes=expert?3.0*(double)expert->nbytes:0.0;   /* gate, up and down are the same size */
+    const char *expert_kind=expert?st_dtype_name(expert->dtype):"(fused)";
+    if(g_q38_gguf){
+        const gguf_tensor *t[3]; q38_gg_expert_tensors(m,c->layers,t);
+        expert_bytes=0; for(int k=0;k<3;k++)expert_bytes+=(double)t[k]->nbytes/c->experts;
+        expert_kind=gq_type_name(t[0]->type);
+    }
     const char *how=m->mtp_wiring==Q38_MTP_STREAM_NORM?"a norm per stream, fc_hidden per stream":
                     "one norm over the four streams, fc_hidden per stream (diagnostic; b is the default)";
     fprintf(stderr,"[qwen38] MTP head %s.*: wiring %c (%s), RoPE base %g, %.2f MiB resident; "
                    "routed experts %s from the snapshot%s, cache %d (Q38_MTP_CAP) x %.2f MiB = %.2f GiB full\n",
             found,m->mtp_wiring,how,(double)c->mtp_theta,
             (m->resident_weight_bytes-resident_before)/1048576.0,
-            expert?st_dtype_name(expert->dtype):"(fused)",m->x4?" (the int4-g64 sidecar covers the model's layers)":"",
+            expert_kind,g_q38_gguf?(g_q38gg_mtp.t?" (its own GGUF)":" (the model's GGUF)"):
+            m->x4?" (the int4-g64 sidecar covers the model's layers)":"",
             mtp_cap,expert_bytes/1048576.0,expert_bytes*mtp_cap/1073741824.0);
     fprintf(stderr,"[qwen38] MTP norm weights, mean: embedding %.4f, hidden %.4f, mixer %.4f "
                    "(q38_rms0 scales by 1+w; a plain norm's weights would sit near 1)\n",

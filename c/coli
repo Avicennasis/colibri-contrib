@@ -3414,7 +3414,8 @@ def cmd_import(a):
         out = os.path.join(os.path.dirname(src), stem + ".colibri")
     out = os.path.abspath(os.path.expanduser(out))
     tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "gguf_import.py")
-    rc = subprocess.call([sys.executable, tool, src, out, "--mode", a.mode])
+    extra = ["--no-mtp"] if a.no_mtp else (["--mtp", os.path.abspath(os.path.expanduser(a.mtp))] if a.mtp else [])
+    rc = subprocess.call([sys.executable, tool, src, out, "--mode", a.mode] + extra)
     if rc:
         sys.exit(rc)
     print(f"\n  {C.grn}ready{C.r}: coli chat --model {out}   (or coli serve / coli web)")
@@ -3714,6 +3715,10 @@ def main():
     pim.add_argument("--out", default=None, help="model directory to write (default: next to the GGUF, NAME.colibri)")
     pim.add_argument("--mode", choices=("link", "copy"), default="link",
                      help="link: read the GGUF in place (default); copy: write the colibri container too")
+    pim.add_argument("--mtp", default=None,
+                     help="Qwen3.8: the MTP head's GGUF (mtp-*.gguf); unset, one next to the model is found "
+                          "(its folder, the parent, an MTP/ folder)")
+    pim.add_argument("--no-mtp", action="store_true", help="Qwen3.8: decode without the MTP head")
     pc=sub.add_parser("convert", parents=[common])
     pc.add_argument("--repo",default=None,
                     help="HF repo to download and convert (default zai-org/GLM-5.2-FP8). "

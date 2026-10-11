@@ -226,7 +226,7 @@ MTP_SEED_OFFSET = 0x4D5450      # "MTP": the head's weights come from their own 
 MTP_ROPE_THETA = 50000.0        # not the model's 10000, so a head on the wrong base shows
 
 
-def _add_mtp(out: Path, config, seed, fp8_experts=False, expert_gain=1.0):
+def _add_mtp(out: Path, config, seed, fp8_experts=False, expert_gain=1.0, model_base=False):
     """Add an MTP head with the release's tensor names to the saved fixture.
 
     Transformers has no MTP module (it ignores ``mtp.*`` on load), so the head
@@ -277,7 +277,10 @@ def _add_mtp(out: Path, config, seed, fp8_experts=False, expert_gain=1.0):
     cfg_path = out / "config.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     cfg["mtp_num_hidden_layers"] = 1
-    cfg["mtp"] = {"layer_types": ["full_attention"], "rope_theta": MTP_ROPE_THETA, "hybrid": True}
+    # model_base (--geometry): a GGUF stores one RoPE base for the model and its head, as
+    # the release has (both 1e7), so the head takes the model's
+    theta = cfg.get("rope_parameters", {}).get("rope_theta", 10000.0) if model_base else MTP_ROPE_THETA
+    cfg["mtp"] = {"layer_types": ["full_attention"], "rope_theta": theta, "hybrid": True}
     cfg["mtp_use_dedicated_embeddings"] = False
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     print(f"mtp head: {len(head)} tensors (decoder layer shaped like {source}*)")
@@ -452,7 +455,7 @@ def build(out: Path, prompt_ids=None, max_new=8, seed=SEED, emit_ref=True, fp8_e
                                    for t in cfg_json["layer_types"]]
         cfg_path.write_text(json.dumps(cfg_json, indent=2) + "\n")
     if mtp:
-        _add_mtp(out, config, seed, fp8_experts=fp8_experts, expert_gain=expert_gain)
+        _add_mtp(out, config, seed, fp8_experts=fp8_experts, expert_gain=expert_gain, model_base=bool(geometry))
     if packed:
         _rewrite_shard_fp8(out, packed)
 
