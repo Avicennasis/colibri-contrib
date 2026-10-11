@@ -104,16 +104,18 @@ jobs:
   vulkan:
     name: Vulkan (Lavapipe, software)
     runs-on: ubuntu-latest
+    # 3 minutes when it works. Without a limit a stalled package mirror held a runner for
+    # the 6-hour default (#1978's run of 2026-10-07).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install the Vulkan toolchain and a software driver
         run: |
-          sudo apt-get update
           # libvulkan-dev: headers + loader. glslc: compiles the .comp shaders to SPIR-V --
           # neither is present on the runner by default, which is half of why VK=1 was
-          # never built here. mesa-vulkan-drivers carries Lavapipe (lvp).
-          sudo apt-get install -y --no-install-recommends \
-            libvulkan-dev glslc mesa-vulkan-drivers
+          # never built here. mesa-vulkan-drivers carries Lavapipe (lvp). The script puts
+          # hard limits around apt: a stalled mirror held these jobs for hours.
+          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
       - name: Build with VK=1
         run: |
           cd c
@@ -461,9 +463,8 @@ jobs:
           cache-dependency-path: ${{ matrix.req }}
       - name: Install the Vulkan toolchain, Lavapipe and the fixture dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libvulkan-dev glslc mesa-vulkan-drivers
+          # hard limits around apt (.github/scripts/apt-install.sh): see the vulkan job
+          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
           pip install -r ${{ matrix.req }} ${{ matrix.extra }}
       - name: The pinned TypeScript SDK
         if: ${{ matrix.npm }}

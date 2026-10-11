@@ -485,6 +485,23 @@ class Report(unittest.TestCase):
                       "driver 580.178.04)", lines)
         self.assertIn("  GPU     Tesla V100-SXM2-16GB (NVIDIA, 17.2 GB VRAM, driver 580.178.04)", lines)
 
+    def test_a_processor_without_avx2_is_named_for_the_prebuilt_engines(self):
+        # #1979: the prebuilt x86-64 engines are built for x86-64-v3
+        missing = setup_hw.missing_for_prebuilt
+        self.assertEqual(missing({"arch": "x86_64", "features": []}), ["avx2"])
+        self.assertEqual(missing({"arch": "amd64", "features": ["avx2", "fma"]}), [])
+        self.assertEqual(missing({"arch": "arm64", "features": []}), [])
+        self.assertEqual(missing({"features": []}), [])
+        report = {"os": {"platform": "win32", "pretty_name": "Windows 10"},
+                  "cpu": {"name": "Intel Xeon E3-1230 V2", "arch": "amd64", "features": [],
+                          "physical_cores": 4, "logical_cores": 8},
+                  "memory": {"total": 16e9, "available": 12e9}, "disk": None,
+                  "vulkan": {"devices": []}, "nvidia": [], "windows_video": [],
+                  "gpu": setup_hw.gpu_summary({"devices": []}, [])}
+        self.assertIn("no AVX2: the prebuilt engines need it", setup_hw.format_report(report))
+        report["cpu"]["features"] = ["avx2"]
+        self.assertNotIn("no AVX2", setup_hw.format_report(report))
+
     def test_detect_without_gpu_probe_is_plain_data(self):
         import json
         with tempfile.TemporaryDirectory() as tmp:

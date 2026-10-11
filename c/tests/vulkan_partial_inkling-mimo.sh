@@ -446,7 +446,7 @@ ptl_family_inkling_mimo_sanitize() {
     local eng=$1 tag=$2 k=$3; shift 3
     rm -f chain.usage
     env COLI_USAGE=chain.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan $tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan $tag: sanitizer diagnostic"; fi
     ptl_check_n "$eng" san.log "$k" "asan $tag"
     ptl_check_placed "$eng" san.log "asan $tag"
     echo "OK asan $tag: sanitizers clean, N = $k, $(chain_count "$eng" san.log) chain forwards"

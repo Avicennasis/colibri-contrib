@@ -358,7 +358,7 @@ ptl_family_qwen36_olmoe_sanitize() {
     rm -f chain.usage
     env COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
     rm -f chain.usage
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     ptl_check_n "$eng" san.log "$n" "$tag"
     [ "$n" = 0 ] || [ "$(chain_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: the chain never ran"; }
     echo "OK $tag: sanitizers clean, $n of $(ptl_L "$eng" san.log) layers on the device, $(chain_count "$eng" san.log) chain forwards"
@@ -394,7 +394,7 @@ ptl_family_qwen36_olmoe_sanitize() {
     snap=qwen36_tiny_c; n=4; [ $eng = olmoe ] && { snap=olmoe_tiny_c; n=2; }
     CHAIN_SERVE_EXPECT="$eng chain: $n of [0-9]+ layers on the device" \
       $PY tests/vulkan_chain_serve.py ./$eng $snap COLI_DENSE_I8=0 COLI_VK_CHAIN_LAYERS=$n > san.log 2>&1 || { cat san.log; fail "asan partial $eng serve"; }
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan partial $eng serve: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan partial $eng serve: sanitizer diagnostic"; fi
     echo "OK asan partial $eng serve: $(tail -1 san.log)"
   done
   rm -f chain.usage chain-serve.usage

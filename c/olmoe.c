@@ -39,6 +39,7 @@
 #if defined(__GLIBC__)
 #include <malloc.h>   /* malloc_trim: kv_room_fit gives the slots it frees back to the system */
 #endif
+#include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
 #include "st.h"
 #ifdef _OPENMP

@@ -70,6 +70,10 @@ const de: Record<string, string> = {
 
   // Chat
   "chat.you": "Du",
+  "chat.toBottom": "Zur neuesten Nachricht",
+  "chat.image": "Bild",
+  "ui.exportMarkdown": "Markdown (.md)",
+  "ui.exportJson": "JSON (.json)",
   "chat.colibri": "colibrì",
   "chat.placeholder": "Nachricht an colibrì…",
   "chat.inputHint": "Eingabetaste zum Senden · Umschalt+Eingabetaste für Zeilenumbruch",

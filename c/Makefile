@@ -17,6 +17,19 @@ DARWIN := $(findstring darwin,$(TRIPLET))
 LINUX  := $(findstring linux,$(TRIPLET))
 IS_WIN := $(MINGW)$(CYGWIN)
 
+# A gcc that targets the MSYS or Cygwin runtime (MSYS2's "MSYS" shell, or its plain
+# `gcc` package) is not a native Windows compiler: it does not define _WIN32, so
+# compat.h's Windows layer is skipped and the build dies on a POSIX call it cannot
+# find (getrusage in qwen36.c, #1979). Stop before compiling and say which compiler
+# to use. `make clean` still runs; ALLOW_MSYS_GCC=1 builds anyway.
+ifneq ($(CYGWIN)$(findstring msys,$(TRIPLET)),)
+ifneq ($(ALLOW_MSYS_GCC),1)
+ifneq ($(filter-out clean%,$(or $(MAKECMDGOALS),all)),)
+$(error $(DETECT_CC) builds for $(TRIPLET), the MSYS/Cygwin runtime, not for Windows itself. Open the "MSYS2 UCRT64" shell (not "MSYS2 MSYS"), install its MinGW compiler with `pacman -S --needed make mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgomp`, and check that `gcc -dumpmachine` says x86_64-w64-mingw32 (docs/windows.md))
+endif
+endif
+endif
+
 # Appended to every platform's flags, so a caller can add to the build without
 # replacing it. Overriding CFLAGS= on the command line would drop that
 # platform's OpenMP and -march flags, which is how a sanitizer run ends up
@@ -2056,6 +2069,9 @@ tests/test_serve_codec$(EXE): tests/test_serve_codec.c
 tests/test_serve_budget$(EXE): tests/test_serve_budget.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_cpu_check$(EXE): tests/test_cpu_check.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_segment_runtime$(EXE): tests/test_segment_runtime.c tests/segment_runtime.o
 	$(CC) $(CFLAGS) tests/test_segment_runtime.c tests/segment_runtime.o -o $@ $(LDFLAGS)
 # segment_runtime.c as its own object, compiled with the flags this test gave it on
@@ -2223,6 +2239,19 @@ fuzz-rans: tests/fuzz_rans.c rans.h
 	  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
 	  tests/fuzz_rans.c -o tests/fuzz_rans -lm
 	./tests/fuzz_rans
+
+# Structured-mutation fuzz for the GLM-5.3 expert worker's wire parser under
+# ASan+UBSan: glm53_worker_serve_one() over a socketpair with the int4 tiny
+# fixture loaded, well-formed traffic mutated at the byte and field level,
+# well-formed requests checked for a well-formed reply. Seeded and bounded
+# (FUZZ_ITERS, default 3000). NOT a test gate; build+run on demand:
+#   make fuzz-glm53-worker GLM53_FUZZ_FIXTURE=/tmp/glm53_stream-i4
+fuzz-glm53-worker: tests/fuzz_glm53_worker.c glm53.c
+	$(CC) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+	  -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+	  -Wno-misleading-indentation -Wno-format-truncation \
+	  tests/fuzz_glm53_worker.c -o tests/fuzz_glm53_worker -lm
+	ASAN_OPTIONS=detect_leaks=0 ./tests/fuzz_glm53_worker $(GLM53_FUZZ_FIXTURE)
 
 tests/test_int3$(EXE): tests/test_int3.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)

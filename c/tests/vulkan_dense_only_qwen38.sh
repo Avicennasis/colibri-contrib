@@ -59,14 +59,14 @@ dho_family_qwen38_sanitize() {
     esac
     rm -f chain.usage
     env COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DENSE_HOST=0 "${args[@]}" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan dense-only qwen38 $tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan dense-only qwen38 $tag: sanitizer diagnostic"; fi
     [ "$(dho_dropped san.log)" -gt 0 ] || { cat san.log; fail "asan dense-only qwen38 $tag: nothing on the device only"; }
     if [ "$tag" = "device lost" ]; then [ "$(dho_reloaded san.log)" -gt 0 ] || { cat san.log; fail "asan dense-only qwen38 $tag: nothing read back"; }; fi
     echo "OK asan dense-only qwen38 $tag: sanitizers clean, $(dho_dropped san.log) matrices on the device only, $(dho_reloaded san.log) read back"
   done
   CHAIN_SERVE_EXPECT='dense matrices on the device only' COLI_VK_DENSE_HOST=0 \
     $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp Q38_MTP=1 > san.log 2>&1 || { cat san.log; fail "asan dense-only qwen38 serve"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan dense-only qwen38 serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan dense-only qwen38 serve: sanitizer diagnostic"; fi
   echo "OK asan dense-only qwen38 serve: $(tail -1 san.log)"
   rm -f chain.usage
   unset OMP_NUM_THREADS

@@ -87,8 +87,8 @@ jobs:
       # Lavapipe, which the verify step runs the packaged engine on.
       - if: matrix.os == 'ubuntu-latest'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libvulkan-dev glslc mesa-vulkan-drivers
+          # hard limits around apt: a stalled mirror held CI jobs for hours (2026-10-07)
+          bash .github/scripts/apt-install.sh libvulkan-dev glslc mesa-vulkan-drivers
 
       # Every portable sibling engine, not just GLM. CI's all-platform engine
       # matrix proves the same list builds before these archives are assembled.

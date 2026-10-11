@@ -2748,6 +2748,37 @@ class CapSentinelShimTest(unittest.TestCase):
                                                 context=8192, gpu_indices=[])
                 self.assertEqual(popen.call_args[0][0], ["deepseek_v41", "96"])
 
+    def test_qwen_ram_plan_reaches_engine_argv(self):
+        # Qwen3.6 and Qwen3.8 read only their argv cap. Without --cap, a tune
+        # profile or --auto-tier they started on the registry's implicit cap
+        # (8 and 1 slots a layer) while the plan for the same RAM held 100+.
+        for executable, model_type in (("qwen36", "qwen3_5_moe_text"),
+                                       ("qwen38", "qwen4_exp_text")):
+            with self.subTest(engine=executable):
+                model = self._model(model_type)
+                process = FakeProcess(lambda _process, _frame: None)
+                with patch("resource_plan.build_plan", return_value={
+                        "tiers": {"ram": {"cache_slots_per_layer": 153}}}) as planner, \
+                        patch("openai_server.subprocess.Popen", return_value=process) as popen:
+                    engine = Engine(executable, model, env={})
+                    engine.close()
+                planner.assert_called_once()
+                self.assertEqual(popen.call_args[0][0][:2], [executable, "153"])
+
+    def test_qwen_without_a_plan_keeps_the_implicit_cap(self):
+        for arch, implicit in (("qwen36", 8), ("qwen38", 1)):
+            with self.subTest(arch=arch):
+                with patch("resource_plan.build_plan", side_effect=ValueError("no safetensors shards")):
+                    self.assertEqual(cap_for_arch(arch, None, {}, model="model"), implicit)
+                with patch("resource_plan.build_plan", return_value={
+                        "tiers": {"ram": {"cache_slots_per_layer": 0}}}):
+                    self.assertEqual(cap_for_arch(arch, None, {}, model="model"), implicit)
+                with patch("resource_plan.build_plan") as planner:
+                    self.assertEqual(cap_for_arch(arch, 5, {}, model="model"), 5)
+                    self.assertEqual(cap_for_arch(arch, None, {"COLI_PROFILE_CAP": "105"},
+                                                  model="model"), 105)
+                    planner.assert_not_called()
+
     def test_v41_explicit_and_calibrated_caps_bypass_planning(self):
         for cap, env, expected in ((7, {}, 7), (0, {}, 0),
                                    (None, {"COLI_PROFILE_CAP": "12"}, 12),
@@ -2836,6 +2867,19 @@ class HTTPTest(unittest.TestCase):
             self.request("/v1/models", key="wrong")
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
+
+    def test_models_report_the_context(self):
+        """Agents size their own compaction from the listed context (#1973's limit)."""
+        def entry():
+            with self.request("/v1/models") as response:
+                return json.load(response)["data"][0]
+        self.assertNotIn("context_length", entry())
+        self.server.context_limit = 65536
+        self.addCleanup(setattr, self.server, "context_limit", None)
+        listed = entry()
+        self.assertEqual((listed["context_length"], listed["max_model_len"]), (65536, 65536))
+        with self.request("/v1/models/test-model") as response:
+            self.assertEqual(json.load(response)["context_length"], 65536)
 
     def test_unsupported_modalities_fail_before_engine_work(self):
         cases = (
@@ -7599,10 +7643,11 @@ class EngineLoadFailTest(unittest.TestCase):
     """An engine that cannot load says `LOAD_FAIL kind=<kind> <detail>` and exits
     before READY; the gateway raises the kind, not "exited unexpectedly"."""
 
-    def _engine(self, stdout_bytes):
+    def _engine(self, stdout_bytes, returncode=None):
         process = FakeProcess(lambda _process, _frame: None)
         process.stdout = BlockingStream(stdout_bytes)
         process.stdout.close()   # the engine is gone: EOF right after what it said
+        process.returncode = returncode
         with patch("openai_server.ARCH", "glm53"), \
              patch("openai_server.subprocess.Popen", return_value=process):
             return Engine("glm53", "model")
@@ -7622,6 +7667,38 @@ class EngineLoadFailTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exited unexpectedly") as caught:
             self._engine(b"")
         self.assertNotIsInstance(caught.exception, openai_server.EngineLoadError)
+
+    def test_an_engine_that_dies_at_start_names_its_exit_status(self):
+        with self.assertRaisesRegex(RuntimeError, r"exited unexpectedly \(exit status 3\)") as caught:
+            self._engine(b"", returncode=3)
+        self.assertNotIsInstance(caught.exception, openai_server.EngineLoadError)
+
+    def test_an_illegal_instruction_at_start_names_the_processor(self):
+        # #1979: a 2.0.0 engine (x86-64-v3) on a Xeon E3-1230 V2, no AVX2: the banner,
+        # then STATUS_ILLEGAL_INSTRUCTION; SIGILL on Linux. Said as a load failure, with
+        # the way forward, instead of "exited unexpectedly" and a traceback.
+        for status in (0xC000001D, -4):
+            with self.subTest(status=status):
+                with self.assertRaises(openai_server.EngineLoadError) as caught:
+                    self._engine(b"", returncode=status)
+                self.assertEqual(caught.exception.kind, "unsupported")
+                self.assertIn("instruction this processor does not have", caught.exception.detail)
+                self.assertIn("ARCH=x86-64-v2", caught.exception.detail)
+
+    def test_the_processor_check_is_a_load_failure(self):
+        detail = ("this processor has no avx2 fma, which this engine build needs; build the "
+                  "engines for it with ARCH=x86-64-v2 (docs/quickstart.md, \"Old processors\")")
+        with self.assertRaises(openai_server.EngineLoadError) as caught:
+            self._engine(f"LOAD_FAIL kind=unsupported {detail}\n".encode(), returncode=1)
+        self.assertEqual((caught.exception.kind, caught.exception.detail), ("unsupported", detail))
+
+    def test_exit_statuses_in_words(self):
+        status = openai_server.engine_exit_status
+        self.assertIn("illegal instruction", status(0xC000001D))
+        self.assertIn("SIGILL", status(-4))
+        self.assertTrue(openai_server.engine_illegal_instruction(0xC000001D))
+        self.assertTrue(openai_server.engine_illegal_instruction(-4))
+        self.assertFalse(openai_server.engine_illegal_instruction(-9))
 
     def test_parse_load_fail_takes_the_last_line_and_keeps_the_detail_whole(self):
         parse = openai_server.parse_load_fail

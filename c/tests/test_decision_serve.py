@@ -368,6 +368,23 @@ class DecisionGateway(unittest.TestCase):
         self.assertEqual(status, 422)
         self.assertIn("only 3 of its 30", error["error"]["message"])
 
+    def test_malformed_engine_probabilities_are_a_502(self):
+        engine = FakeDecisionEngine({})
+        engine.answer = None
+        engine.decide = lambda *args, **kwargs: ({"answers": [engine.answer]}, {})
+        self.serve(engine)
+        body = {"state": "x", "questions": {"q": {"type": "noul"}}}
+        malformed = (None,
+                     {"id": "q", "probs": [-0.1, 1.1]},
+                     {"id": "q", "probs": [0.8, 0.8]},
+                     {"id": "q", "probs": [True, False]})
+        for answer in malformed:
+            with self.subTest(answer=answer):
+                engine.answer = answer
+                status, error = self.post_error("/v1/systemone", body)
+                self.assertEqual(status, 502)
+                self.assertEqual(error["error"]["code"], "engine_error")
+
 
 class DecisionRegistryAndLauncher(unittest.TestCase):
     """A Laya checkpoint has no root config.json: the registry knows it by its

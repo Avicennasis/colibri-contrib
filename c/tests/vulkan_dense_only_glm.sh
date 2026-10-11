@@ -232,7 +232,7 @@ dho_family_glm_sanitize() {
     rm -f chain.usage
     env COLI_USAGE=chain.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} COLI_VK_DENSE_HOST=0 "$@" > san.log 2>&1 || true
     rm -f chain.usage
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(dho_dropped san.log)" -gt 0 ] || { cat san.log; fail "$tag: nothing on the device only"; }
     if [ "$lost" = 1 ]; then [ "$(dho_reloaded san.log)" -gt 0 ] || { cat san.log; fail "$tag: nothing read back"; }; fi
     echo "OK $tag: sanitizers clean, $(dho_dropped san.log) matrices on the device only, $(dho_reloaded san.log) read back"
@@ -254,7 +254,7 @@ dho_family_glm_sanitize() {
     # shellcheck disable=SC2086
     COLI_VK_DENSE_HOST=0 CHAIN_SERVE_EXPECT='dense matrices on the device only' CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=$dialect \
       $PY tests/vulkan_chain_serve.py $args > san.log 2>&1 || { cat san.log; fail "asan dense-only serve ${args%% *}"; }
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan dense-only serve ${args%% *}: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan dense-only serve ${args%% *}: sanitizer diagnostic"; fi
     echo "OK asan dense-only serve ${args%% *}: $(tail -1 san.log)"
   done
   unset OMP_NUM_THREADS CAP_RAISE

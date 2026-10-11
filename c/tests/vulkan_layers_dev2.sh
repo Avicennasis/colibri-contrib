@@ -600,7 +600,7 @@ ld2_san() {
   env OMP_NUM_THREADS=2 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DEV2=0 COLI_VK_TIER_BALANCE=0 \
     "$@" > san.log 2>&1 || true
   rm -f chain.usage
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
   if [ "${LD2_SAN_LOST:-0}" = 1 ]; then
     grep -q "COLI_VK_CHAIN_FAULT2" san.log && grep -q "the device was lost" san.log || { cat san.log; fail "$tag: the loss was not taken over"; }
     echo "OK $tag: sanitizers clean, the second device's loss taken over"

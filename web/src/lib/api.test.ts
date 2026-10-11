@@ -59,7 +59,7 @@ describe("chat request extensions", () => {
     headers: { "content-type": "text/event-stream" },
   })
 
-  async function requestBody(cacheSlot?: number) {
+  async function requestBody(cacheSlot?: number, compact?: boolean) {
     const fetchMock = vi.fn().mockResolvedValue(completedStream())
     vi.stubGlobal("fetch", fetchMock)
     await streamChat({
@@ -71,6 +71,7 @@ describe("chat request extensions", () => {
       maxTokens: 8,
       enableThinking: false,
       cacheSlot,
+      compact,
       signal: new AbortController().signal,
       onDelta: () => undefined,
     })
@@ -83,6 +84,34 @@ describe("chat request extensions", () => {
 
   it("sends cache_slot zero when colibrì advertises KV slots", async () => {
     expect(await requestBody(0)).toMatchObject({ cache_slot: 0 })
+  })
+
+  it("asks a colibrì server for context compaction, and only a colibrì server", async () => {
+    expect(await requestBody(undefined, true)).toMatchObject({ context_compaction: "auto" })
+    expect(await requestBody()).not.toHaveProperty("context_compaction")
+  })
+})
+
+describe("context compaction", () => {
+  /* The gateway says, in a chunk before the text, that the turn ran on a summary of
+     the conversation's first messages; the page tells the user why. */
+  it("returns the compaction the stream reported", async () => {
+    const compaction = { summarized_messages: 6, summary: "the user listed topics" }
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+      'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}\n\n'
+      + `data: ${JSON.stringify({ choices: [], compaction })}\n\n`
+      + 'data: {"choices":[{"delta":{"content":"answer"}}]}\n\n'
+      + "data: [DONE]\n\n",
+      { headers: { "content-type": "text/event-stream" } },
+    )))
+    const content: string[] = []
+    const result = await streamChat({
+      baseUrl: "http://localhost:8000/v1", apiKey: "", model: "test-model", messages: [],
+      temperature: 0, maxTokens: 8, enableThinking: false,
+      signal: new AbortController().signal, onDelta: (text) => content.push(text),
+    })
+    expect(result.compaction).toEqual(compaction)
+    expect(content).toEqual(["answer"])
   })
 })
 
@@ -125,7 +154,7 @@ describe("askSystemOne", () => {
      refactor that "helpfully" appended them to the text would be invisible in
      the answer. */
   it("asks one choice question on /v1/systemone and draws its probabilities", async () => {
-    const seen: { url?: string; body?: { state: string; questions: { q: { type: string; criteria: object } } } } = {}
+    const seen: { url?: string; body?: { state: string; pin_state?: boolean; questions: { q: { type: string; criteria: object } } } } = {}
     vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
       seen.url = url
       seen.body = JSON.parse(String(init.body))
@@ -135,9 +164,10 @@ describe("askSystemOne", () => {
         usage: { input_tokens: 40, output_tokens: 3, cost: 0 },
       }), { status: 200, headers: { "Content-Type": "application/json" } })
     }))
-    const out = await askSystemOne("http://x/v1", "", "laya", "state", "q?", ["a", "b"])
+    const out = await askSystemOne("http://x/v1", "", "laya", "state", "q?", ["a", "b"], true)
     expect(seen.url).toBe("http://x/v1/systemone")
     expect(seen.body?.state).toBe("state")
+    expect(seen.body?.pin_state).toBe(true)
     expect(seen.body?.questions.q).toEqual({ type: "choice", instructions: "q?", criteria: { a: null, b: null } })
     expect(out.answer).toBe("b")
     expect(out.choices.map((c) => c.option)).toEqual(["b", "a"])
@@ -149,7 +179,7 @@ describe("askSystemOne", () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(
       JSON.stringify({ error: { message: "`questions.q.criteria` must be a non-empty object" } }),
       { status: 422, headers: { "Content-Type": "application/json" } })))
-    await expect(askSystemOne("http://x/v1", "", "m", "s", "q", []))
+    await expect(askSystemOne("http://x/v1", "", "m", "s", "q", [], false))
       .rejects.toThrow("must be a non-empty object")
   })
 })
