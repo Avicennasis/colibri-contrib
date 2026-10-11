@@ -1057,6 +1057,10 @@ def _qwen38_expert_inventory(name, size, config, dtype=None):
     inventory because the native loader shares their normalized bank.
     """
     match = _QWEN38_EXPERT.fullmatch(name)
+    if match and isinstance(dtype, str) and dtype.startswith("GGUF_"):
+        # a tools/gguf_import.py directory: the engine keeps each expert's ggml
+        # blocks as the file has them (q38_gg_read_expert), so a slot costs their bytes
+        return ((int(match.group(1)), int(match.group(2)), size),)
     if match:
         hidden = _required_int(config, "hidden_size", "qwen38")
         intermediate = _required_int(config, "moe_intermediate_size", "qwen38")
@@ -1200,6 +1204,13 @@ def _qwen38_resident_inventory(name, size, _config, dtype=None):
     rank-two matrices stay in that two-byte representation; the comparatively
     small norms, gates and convolution vectors still expand through st_read_f32.
     """
+    if isinstance(dtype, str) and dtype.startswith("GGUF_"):
+        # a tools/gguf_import.py directory, GGUF names: the PLE table is read a
+        # row at a time like the checkpoint's shards; every other tensor is
+        # held as the file has it, F16 widened to f32 (q38_gg_weight)
+        if name == "per_layer_token_embd.weight":
+            return 0
+        return size * 2 if dtype == "GGUF_F16" else size
     if _QWEN38_EXPERT_SCALE.fullmatch(name):
         # Expert scales belong to the fixed normalized bank, not dense
         # residency. The dedicated inventory hook accounts them once.

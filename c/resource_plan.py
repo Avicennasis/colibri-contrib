@@ -76,7 +76,7 @@ class _CgroupMount:
 # sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
 # straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
 _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
-_ANALYSIS_CACHE_VERSION = 11
+_ANALYSIS_CACHE_VERSION = 12
 
 
 def _dense_in_ram(descriptor, on_disk_bytes):

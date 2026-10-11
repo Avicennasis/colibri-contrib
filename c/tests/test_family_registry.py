@@ -286,6 +286,25 @@ class FamilyRegistryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "max_position_embeddings"):
             planner_geometry(bad, 32)
 
+    def test_qwen38_gguf_directory_is_sized_as_the_file_holds_it(self):
+        # tools/gguf_import.py: resource_plan names each expert's slice of the
+        # fused ggml tensor like a checkpoint expert, dtype "GGUF_<type>"; the
+        # engine keeps the blocks as they are and reads the PLE table by rows.
+        family = next(family for family in FAMILIES if family.id == "qwen38")
+        resolved = type("R", (), {"descriptor": family,
+                                   "family_config": {"num_experts": 512, "hidden_size": 2560,
+                                                     "moe_intermediate_size": 640},
+                                   "model_dir": "."})()
+        self.assertEqual(expert_contributions(
+            resolved, "model.layers.0.mlp.experts.5.down_proj.weight", 921600, "GGUF_IQ4_NL"),
+            ((0, 5, 921600),))
+        self.assertEqual(resident_contribution(
+            resolved, "per_layer_token_embd.weight", 28800138240, "GGUF_IQ4_NL"), 0)
+        self.assertEqual(resident_contribution(
+            resolved, "blk.3.attn_q.weight", 1000, "GGUF_Q8_0"), 1000)
+        self.assertEqual(resident_contribution(
+            resolved, "blk.3.attn_q.weight", 1000, "GGUF_F16"), 2000)
+
     def test_qwen38_inventory_aggregates_per_expert_and_fused_tensor_sizes(self):
         family = next(family for family in FAMILIES if family.id == "qwen38")
         resolved = type("R", (), {"descriptor": family,
