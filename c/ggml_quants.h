@@ -1199,11 +1199,45 @@ static inline int gq_tbuf(int I) {
     return gq_tcap >= I;
 }
 /* one output row of W against every activation row */
+#if defined(__AVX2__) && defined(__FMA__)
+/* Q4_0, IQ4_NL and MXFP4 without the unpack: a block is a scale and 16 bytes of
+ * nibbles (low nibbles are elements 0..15, high ones 16..31), made 32 int8 in a
+ * register and multiplied as gq_dot_i8 does it: the same int32 lanes, the same
+ * scale product and fma, the same reduction, so the result is the unpack path's
+ * bit for bit. The unpack cost a call and a switch per 32-element block. */
+static inline float gq_dot_nib32(int t, const uint8_t *row, const int8_t *xq, const float *dx, int64_t n) {
+    const int mx = t == GQ_MXFP4, bs = GQ_TYPES[t].bytes, off = mx ? 1 : 2;
+    const __m128i tab = _mm_loadu_si128((const __m128i *)(mx ? GGML_KVALUES_MXFP4 : GGML_KVALUES_IQ4NL));
+    const __m128i m4 = _mm_set1_epi8(0x0F), e8 = _mm_set1_epi8(8);
+    __m256 vacc = _mm256_setzero_ps(); const __m256i ones = _mm256_set1_epi16(1);
+    for (int64_t b = 0; b < n / 32; b++) {
+        const uint8_t *blk = row + b * bs;
+        const float d = mx ? gq_e8m0_half(blk[0]) : gq_f16(gq_rd16(blk));
+        const __m128i v = _mm_loadu_si128((const __m128i *)(blk + off));
+        __m128i lo = _mm_and_si128(v, m4), hi = _mm_and_si128(_mm_srli_epi16(v, 4), m4);
+        if (t == GQ_Q4_0) { lo = _mm_sub_epi8(lo, e8); hi = _mm_sub_epi8(hi, e8); }
+        else { lo = _mm_shuffle_epi8(tab, lo); hi = _mm_shuffle_epi8(tab, hi); }
+        const __m256i w = _mm256_set_m128i(hi, lo), x = _mm256_loadu_si256((const __m256i *)(xq + b * 32));
+        const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(x, w)), ones);
+        vacc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d * dx[b]), vacc);
+    }
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(vacc), _mm256_extractf128_ps(vacc, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h)); h = _mm_add_ss(h, _mm_movehdup_ps(h));
+    return _mm_cvtss_f32(h);
+}
+#define GQ_FUSED_ROWS 4   /* from this many activation rows, one unpack shared by all is cheaper */
+#endif
 static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint8_t *row, int t, int I) {
     if (t == GQ_Q8_0) {
         for (int s = 0; s < a->S; s++) y[(int64_t)s * ystride] = gq_dot_q8_0(row, a->q + (int64_t)s * I, a->d + (int64_t)s * (I / 32), I);
         return;
     }
+#if defined(__AVX2__) && defined(__FMA__)
+    if ((t == GQ_Q4_0 || t == GQ_IQ4_NL || t == GQ_MXFP4) && a->S <= GQ_FUSED_ROWS) {
+        for (int s = 0; s < a->S; s++) y[(int64_t)s * ystride] = gq_dot_nib32(t, row, a->q + (int64_t)s * I, a->d + (int64_t)s * (I / 32), I);
+        return;
+    }
+#endif
     if (!gq_tbuf(I)) return;
     gq_unpack_row(t, row, I, gq_tw8, gq_tsw, gq_tmw);
     const int hm = gq_has_min(t);
