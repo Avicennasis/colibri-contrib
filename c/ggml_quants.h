@@ -574,11 +574,17 @@ static inline void gq_sign8_init(void) {}
 /* four 8-byte groups (grid rows g0..g3, sign bytes s0..s3) -> 32 signed int8 */
 static inline __m256i gq_grid4(const uint8_t *g0, const uint8_t *g1, const uint8_t *g2, const uint8_t *g3,
                                int s0, int s1, int s2, int s3) {
-    uint64_t a, b, c, d, e, f, h, i;
+    uint64_t a, b, c, d;
     memcpy(&a, g0, 8); memcpy(&b, g1, 8); memcpy(&c, g2, 8); memcpy(&d, g3, 8);
-    memcpy(&e, GQ_SIGN8(s0), 8); memcpy(&f, GQ_SIGN8(s1), 8); memcpy(&h, GQ_SIGN8(s2), 8); memcpy(&i, GQ_SIGN8(s3), 8);
-    return _mm256_sign_epi8(_mm256_set_epi64x((long long)d, (long long)c, (long long)b, (long long)a),
-                            _mm256_set_epi64x((long long)i, (long long)h, (long long)f, (long long)e));
+    const __m256i v = _mm256_set_epi64x((long long)d, (long long)c, (long long)b, (long long)a);
+    /* the four sign bytes to a byte mask (bit j of byte k: element 8k+j negative) and a
+     * conditional negation, (v ^ m) - m: the values of _mm256_sign_epi8 against the
+     * GQ_SIGN8 rows, without reading four of them (the grids hold no -128) */
+    const uint32_t bits = (uint32_t)(s0 & 0xFF) | (uint32_t)(s1 & 0xFF) << 8 | (uint32_t)(s2 & 0xFF) << 16 | (uint32_t)(s3 & 0xFF) << 24;
+    const __m256i pick = _mm256_set_epi64x(0x0303030303030303LL, 0x0202020202020202LL, 0x0101010101010101LL, 0);
+    const __m256i bit = _mm256_set1_epi64x((long long)0x8040201008040201ULL);
+    const __m256i m = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int)bits), pick), bit), bit);
+    return _mm256_sub_epi8(_mm256_xor_si256(v, m), m);
 }
 /* 32 bytes -> low nibbles and high nibbles as two 32-byte vectors */
 static inline void gq_nib32(const uint8_t *p, __m256i *lo, __m256i *hi) {
@@ -1293,6 +1299,50 @@ static inline __attribute__((always_inline)) void gq_dot_b32_body(int t, float *
         y[(int64_t)s * ystride] = acc;
     }
 }
+/* Q2_0 (64 elements in 18 bytes: an f16 scale, then four 2-bit codes a byte, element
+ * 4k+r in bits 2r of byte k, value (code - 1) * d): the 16 code bytes become 64 int8 in
+ * two registers (each byte copied to the four lanes of its elements, the lane's two bits
+ * picked with a shift and a mask) and are multiplied as gq_dot_i8 does it, two 32-element
+ * halves with the block's scale each, so the result is the unpack path's bit for bit. */
+static inline __attribute__((always_inline)) void gq_dot_q2_0_body(float *y, int ystride, const uint8_t *row, const int8_t *xq,
+                                                                  const float *dx, int I, const int S) {
+    const __m256i lo_pick = _mm256_set_epi64x(0x0707070706060606LL, 0x0505050504040404LL, 0x0303030302020202LL, 0x0101010100000000LL);
+    const __m256i hi_pick = _mm256_set_epi64x(0x0F0F0F0F0E0E0E0ELL, 0x0D0D0D0D0C0C0C0CLL, 0x0B0B0B0B0A0A0A0ALL, 0x0909090908080808LL);
+    const __m256i m3 = _mm256_set1_epi8(3), one = _mm256_set1_epi8(1), ones = _mm256_set1_epi16(1);
+    const __m256i r1 = _mm256_set1_epi32(0x0000FF00), r2 = _mm256_set1_epi32(0x00FF0000), r3 = _mm256_set1_epi32((int)0xFF000000u);
+    __m256 vacc[GQ_FUSED_ROWS]; for (int s = 0; s < S; s++) vacc[s] = _mm256_setzero_ps();
+    for (int64_t b = 0; b < I / 64; b++) {
+        const uint8_t *blk = row + b * 18; const float d = gq_f16(gq_rd16(blk));
+        const __m128i q = _mm_loadu_si128((const __m128i *)(blk + 2));
+        const __m256i qq = _mm256_set_m128i(q, q);
+        __m256i w2[2];
+        for (int h = 0; h < 2; h++) {
+            const __m256i v = _mm256_shuffle_epi8(qq, h ? hi_pick : lo_pick);   /* byte i holds the codes of element i */
+            __m256i w = _mm256_and_si256(v, m3);                                 /* lanes 4k: bits 0-1 */
+            w = _mm256_blendv_epi8(w, _mm256_and_si256(_mm256_srli_epi16(v, 2), m3), r1);
+            w = _mm256_blendv_epi8(w, _mm256_and_si256(_mm256_srli_epi16(v, 4), m3), r2);
+            w = _mm256_blendv_epi8(w, _mm256_and_si256(_mm256_srli_epi16(v, 6), m3), r3);
+            w2[h] = _mm256_sub_epi8(w, one);
+        }
+        for (int h = 0; h < 2; h++) {
+            const __m256i w = w2[h], aw = _mm256_sign_epi8(w, w); const int64_t xb = 2 * b + h;
+            for (int s = 0; s < S; s++) {
+                const __m256i x = _mm256_loadu_si256((const __m256i *)(xq + (int64_t)s * I + xb * 32));
+                const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(aw, _mm256_sign_epi8(x, w)), ones);
+                vacc[s] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d * dx[(int64_t)s * (I / 32) + xb]), vacc[s]);
+            }
+        }
+    }
+    for (int s = 0; s < S; s++) y[(int64_t)s * ystride] = GQ_HSUM8(vacc[s]);
+}
+static void gq_dot_q2_0(float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, int I, int S) {
+    switch (S) {
+    case 1: gq_dot_q2_0_body(y, ystride, row, xq, dx, I, 1); break;
+    case 2: gq_dot_q2_0_body(y, ystride, row, xq, dx, I, 2); break;
+    case 3: gq_dot_q2_0_body(y, ystride, row, xq, dx, I, 3); break;
+    default: gq_dot_q2_0_body(y, ystride, row, xq, dx, I, 4); break;
+    }
+}
 /* S constant in each call below: the accumulators stay in registers and S=1 is the one-row kernel */
 static void gq_dot_b32(int t, float *y, int ystride, const uint8_t *row, const int8_t *xq, const float *dx, const int32_t *xs, int I, int S) {
     switch (S) {
@@ -1424,6 +1474,7 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
         const gq_fdot_fn f = gq_fdot_sb256(t);
         if (f) { f(y, ystride, row, a->q, a->d, I, a->S); return; }
         if (t == GQ_Q4_K) { gq_dot_q4_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
+        if (t == GQ_Q2_0) { gq_dot_q2_0(y, ystride, row, a->q, a->d, I, a->S); return; }
         if (t == GQ_Q5_K) { gq_dot_q5_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
         if (t == GQ_Q6_K) { gq_dot_q6_k(y, ystride, row, a->q, a->d, a->s, I, a->S); return; }
     }
