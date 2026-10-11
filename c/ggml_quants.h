@@ -1123,9 +1123,9 @@ static float gq_dot_i8(const int8_t *w8, const float *sw, const float *mw, int h
         acc += dx[b] * (sw[2 * b] * (float)s0 + sw[2 * b + 1] * (float)s1);
     }
 #endif
-    if (has_min) {
+    if (has_min) {   /* explicit fmaf: the same bits in gq_dot_b32, whatever the compiler contracts */
         float m = 0.f;
-        for (int64_t b = 0; b < n / 32; b++) m += dx[b] * (mw[2 * b] * (float)xs[2 * b] + mw[2 * b + 1] * (float)xs[2 * b + 1]);
+        for (int64_t b = 0; b < n / 32; b++) m = fmaf(dx[b], fmaf(mw[2 * b], (float)xs[2 * b], mw[2 * b + 1] * (float)xs[2 * b + 1]), m);
         acc -= m;
     }
     return acc;
@@ -1200,30 +1200,50 @@ static inline int gq_tbuf(int I) {
 }
 /* one output row of W against every activation row */
 #if defined(__AVX2__) && defined(__FMA__)
-/* Q4_0, IQ4_NL and MXFP4 without the unpack: a block is a scale and 16 bytes of
- * nibbles (low nibbles are elements 0..15, high ones 16..31), made 32 int8 in a
- * register and multiplied as gq_dot_i8 does it: the same int32 lanes, the same
- * scale product and fma, the same reduction, so the result is the unpack path's
- * bit for bit. The unpack cost a call and a switch per 32-element block. */
-static inline float gq_dot_nib32(int t, const uint8_t *row, const int8_t *xq, const float *dx, int64_t n) {
-    const int mx = t == GQ_MXFP4, bs = GQ_TYPES[t].bytes, off = mx ? 1 : 2;
+/* The 32-element block types without the unpack (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL,
+ * MXFP4): a block's nibbles (low ones are elements 0..15, high ones 16..31), the
+ * fifth bit of Q5_x, made 32 int8 in a register and multiplied as gq_dot_i8 does:
+ * the same int32 lanes, the same scale product and fma, the same reduction, and for
+ * Q4_1/Q5_1 the same min term, so the result is the unpack path's bit for bit. The
+ * unpack cost a call and a type switch per block, 64 per 2048-wide row. */
+static inline __m256i gq_bits32(uint32_t bits) {   /* byte i: 0xFF when bit i is set */
+    const __m256i pick = _mm256_set_epi64x(0x0303030303030303LL, 0x0202020202020202LL, 0x0101010101010101LL, 0);
+    const __m256i bit = _mm256_set1_epi64x((long long)0x8040201008040201ULL);
+    __m256i v = _mm256_shuffle_epi8(_mm256_set1_epi32((int)bits), pick);
+    return _mm256_cmpeq_epi8(_mm256_and_si256(v, bit), bit);
+}
+static inline float gq_dot_b32(int t, const uint8_t *row, const int8_t *xq, const float *dx, const int32_t *xs, int64_t n) {
+    const int mx = t == GQ_MXFP4, nl = t == GQ_IQ4_NL, q5 = t == GQ_Q5_0 || t == GQ_Q5_1, hasmin = t == GQ_Q4_1 || t == GQ_Q5_1;
+    const int bs = GQ_TYPES[t].bytes, off = mx ? 1 : t == GQ_Q4_0 || nl ? 2 : t == GQ_Q4_1 || t == GQ_Q5_0 ? (t == GQ_Q4_1 ? 4 : 6) : 8;
     const __m128i tab = _mm_loadu_si128((const __m128i *)(mx ? GGML_KVALUES_MXFP4 : GGML_KVALUES_IQ4NL));
-    const __m128i m4 = _mm_set1_epi8(0x0F), e8 = _mm_set1_epi8(8);
+    const __m128i m4 = _mm_set1_epi8(0x0F);
+    const __m256i bias = _mm256_set1_epi8(t == GQ_Q4_0 ? 8 : t == GQ_Q5_0 ? 16 : 0), b16 = _mm256_set1_epi8(16);
     __m256 vacc = _mm256_setzero_ps(); const __m256i ones = _mm256_set1_epi16(1);
     for (int64_t b = 0; b < n / 32; b++) {
         const uint8_t *blk = row + b * bs;
         const float d = mx ? gq_e8m0_half(blk[0]) : gq_f16(gq_rd16(blk));
         const __m128i v = _mm_loadu_si128((const __m128i *)(blk + off));
         __m128i lo = _mm_and_si128(v, m4), hi = _mm_and_si128(_mm_srli_epi16(v, 4), m4);
-        if (t == GQ_Q4_0) { lo = _mm_sub_epi8(lo, e8); hi = _mm_sub_epi8(hi, e8); }
-        else { lo = _mm_shuffle_epi8(tab, lo); hi = _mm_shuffle_epi8(tab, hi); }
-        const __m256i w = _mm256_set_m128i(hi, lo), x = _mm256_loadu_si256((const __m256i *)(xq + b * 32));
+        if (nl || mx) { lo = _mm_shuffle_epi8(tab, lo); hi = _mm_shuffle_epi8(tab, hi); }
+        __m256i w = _mm256_set_m128i(hi, lo);
+        if (q5) w = _mm256_or_si256(w, _mm256_and_si256(gq_bits32(gq_rd32(blk + (t == GQ_Q5_0 ? 2 : 4))), b16));
+        w = _mm256_sub_epi8(w, bias);
+        const __m256i x = _mm256_loadu_si256((const __m256i *)(xq + b * 32));
         const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(x, w)), ones);
         vacc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(d * dx[b]), vacc);
     }
     __m128 h = _mm_add_ps(_mm256_castps256_ps128(vacc), _mm256_extractf128_ps(vacc, 1));
     h = _mm_add_ps(h, _mm_movehl_ps(h, h)); h = _mm_add_ss(h, _mm_movehdup_ps(h));
-    return _mm_cvtss_f32(h);
+    float acc = _mm_cvtss_f32(h);
+    if (hasmin) {   /* gq_dot_i8's min term, mw = -m for both halves of a block */
+        float m = 0.f;
+        for (int64_t b = 0; b < n / 32; b++) {
+            const float mw = -gq_f16(gq_rd16(row + b * bs + 2));
+            m = fmaf(dx[b], fmaf(mw, (float)xs[2 * b], mw * (float)xs[2 * b + 1]), m);
+        }
+        acc -= m;
+    }
+    return acc;
 }
 #define GQ_FUSED_ROWS 4   /* from this many activation rows, one unpack shared by all is cheaper */
 #endif
@@ -1233,8 +1253,9 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
         return;
     }
 #if defined(__AVX2__) && defined(__FMA__)
-    if ((t == GQ_Q4_0 || t == GQ_IQ4_NL || t == GQ_MXFP4) && a->S <= GQ_FUSED_ROWS) {
-        for (int s = 0; s < a->S; s++) y[(int64_t)s * ystride] = gq_dot_nib32(t, row, a->q + (int64_t)s * I, a->d + (int64_t)s * (I / 32), I);
+    if ((t == GQ_Q4_0 || t == GQ_Q4_1 || t == GQ_Q5_0 || t == GQ_Q5_1 || t == GQ_IQ4_NL || t == GQ_MXFP4) && a->S <= GQ_FUSED_ROWS) {
+        for (int s = 0; s < a->S; s++)
+            y[(int64_t)s * ystride] = gq_dot_b32(t, row, a->q + (int64_t)s * I, a->d + (int64_t)s * (I / 32), a->s + (int64_t)s * (I / 16), I);
         return;
     }
 #endif
