@@ -245,6 +245,9 @@ def main():
     ap.add_argument("--engine", default=str(HERE / "qwen36"))
     ap.add_argument("--types", default=",".join(BLOCKS) + ",F16,BF16")
     ap.add_argument("--mixed", action="store_true", help="also a UD-style mixed variant")
+    ap.add_argument("--ud", action="store_true",
+                    help="also a variant typed by layer as published files are (gate and up one type in a layer, "
+                         "a few layers bigger ones): the expert tier's per-layer forms")
     ap.add_argument("--caps", default="1,8")
     ap.add_argument("--workdir", default=None)
     ap.add_argument("--max-new", type=int, default=16)
@@ -297,6 +300,13 @@ def main():
                                    "output.weight": "Q6_K", "*": "Q8_0",
                                    "blk.0.ffn_gate_exps.weight": "IQ2_XXS", "blk.1.ffn_down_exps.weight": "IQ3_S",
                                    "blk.2.ffn_up_exps.weight": "MXFP4", "blk.3.attn_output.weight": "Q5_K"}))
+    if args.ud:
+        variants.append(("UD", {"ffn_gate_exps.weight": "Q4_K", "ffn_up_exps.weight": "Q4_K",
+                                "ffn_down_exps.weight": "Q5_K", "*": "Q8_0",
+                                "blk.0.ffn_gate_exps.weight": "Q5_K", "blk.0.ffn_up_exps.weight": "Q5_K",
+                                "blk.0.ffn_down_exps.weight": "Q6_K",
+                                "blk.1.ffn_gate_exps.weight": "IQ3_XXS", "blk.1.ffn_up_exps.weight": "IQ3_XXS",
+                                "blk.1.ffn_down_exps.weight": "IQ4_XS", "blk.5.ffn_down_exps.weight": "Q6_K"}))
     results = []
     if args.scales:
         variants = [(l + "+S", m) for l, m in variants]

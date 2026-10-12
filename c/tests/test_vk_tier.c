@@ -29,6 +29,11 @@
  *            streamed, equals the reference, the sum the all-CPU sum, the cold experts
  *            below the rule's rows stay on the CPU, and the resident set is the warm
  *            start's before and after (streaming promotes nothing);
+ *   layers   formats that change by layer (VktConfig.layer_gate_up/layer_down, a GGUF typed
+ *            by layer): every device row equals the reference with the model resident,
+ *            with a budget of four (experts of one form evicted for the other's, no
+ *            upload refused), and streamed through slots that change format between
+ *            the layers' steps;
  *   timeout  a batch's wait gives up (COLI_VK_WAIT_FAULT): the tier stops and the experts
  *            that batch names keep their device memory until the device is idle.
  *
@@ -849,6 +854,78 @@ static void stream(void) {
     }
 }
 
+/* formats by layer: layer 0 Q4_K gate/up and Q5_K down (the main form), layer 1 the
+ * bigger Q5_K and Q6_K, as a published GGUF gives a few layers */
+static void layers(void) {
+    const int H0 = H, F0 = F;
+    H = 512; F = 256;
+    VktFmt lgu[L], ldn[L];
+    lgu[0] = (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}; ldn[0] = (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q5_K), 0};
+    lgu[1] = (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q5_K), 0}; ldn[1] = (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0};
+    for (int mode = 0; mode < 3; mode++) {   /* resident, evicting, streaming */
+        for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) {
+            mat_make_block(&ex[l][e].g, lgu[l], H, F); mat_make_block(&ex[l][e].u, lgu[l], H, F);
+            mat_make_block(&ex[l][e].d, ldn[l], F, H);
+        }
+        g_act = VKT_ACT_SWIGLU; g_limit = 0;
+        set_budget(mode == 0 ? L * E : 4, lgu[1], ldn[1]);   /* counted in the biggest form */
+        setenv("COLI_VK_TIER_RATE", mode == 2 ? "0" : "64", 1);
+        setenv("COLI_VK_TIER_SYNC", "1", 1);
+        if (mode == 2) { setenv("COLI_VK_TIER_STREAM_SLOTS", "4", 1); setenv("COLI_VK_TIER_STREAM_ROWS", "3", 1);
+                         setenv("COLI_VK_TIER_STREAM_HALF", "40", 1); }
+        VktConfig vc = cfg_of(lgu[0], ldn[0], VKT_ACT_SWIGLU, 0);
+        vc.layer_gate_up = lgu; vc.layer_down = ldn;
+        if (mode == 2) { vc.load = load_cb; vc.release = release_cb; }
+        uint32_t hist[L][E], *hr[L];
+        for (int l = 0; l < L; l++) { hr[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = l == 0 && e < 4 ? 100 - e : 0; }
+        int on = vkt_init(&vc, mode == 2 ? hr : NULL);
+        unsetenv("COLI_VK_TIER_SYNC"); unsetenv("COLI_VK_TIER_STREAM_HALF");
+        CHECK(on, "layers: the tier did not start");
+        if (!on) { model_free(); break; }
+        if (mode == 2) {   /* the warm start: layer 0's four, the slots then stream layer 1's experts */
+            int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+            for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+            vkt_put_done();
+        }
+        Books bk = {0, 0}; double worst = 0; unsigned long long streamed = 0, kept = 0;
+        int res1 = 0;
+        static const int Ss[2][6] = {{1, 3, 20, 1, 2, 24}, {48, 33, 1, 64, 2, 40}};
+        if (mode == 1)   /* layer 0's experts settle, then layer 1's take their room (LFRU: a few hundred steps) */
+            for (int t = 0; t < 360; t++) {
+                int lay = t < 60 ? 0 : 1, idx[4 * K]; float w[4 * K];
+                route(4, 0, 5, idx, w);
+                vkt_begin_forward();
+                double r = step(lay, 4, idx, w, &bk);
+                if (!(r <= worst)) worst = r;
+            }
+        else
+            for (int t = 0; t < 6; t++)
+                for (int l = 0; l < L; l++) {
+                    int S = Ss[mode / 2][t], idx[64 * K]; float w[64 * K];
+                    route(S, 0, E, idx, w);
+                    vkt_begin_forward();
+                    double r = mode == 2 ? stream_step(l, S, idx, w, 0, &bk, &streamed, &kept, 0) : step(l, S, idx, w, &bk);
+                    if (!(r <= worst)) worst = r;
+                }
+        for (int e = 0; e < E; e++) res1 += vkt_resident(1, e);
+        static const char *mn[3] = {"resident", "budget of four", "streaming"};
+        printf("  Q4_K/Q5_K and Q5_K/Q6_K layers, %-15s device %3llu of %3llu (%llu streamed), %d of layer 1 resident, worst %.2e\n",
+               mn[mode], bk.dev, bk.routed, streamed, res1, worst);
+        unsigned long long ev, failed;
+        report_counts(&ev, &failed);
+        int counted = failed != ~0ull;   /* the report read back (not where stderr cannot be redirected: mingw) */
+        CHECK(bk.dev > 0, "layers %s: nothing ran on the device", mn[mode]);
+        CHECK(!counted || failed == 0, "layers %s: %llu uploads refused", mn[mode], failed);
+        CHECK(worst < 2e-3, "layers %s: device rows off the reference (%.3g)", mn[mode], worst);
+        if (mode == 1) CHECK(res1 > 0 && (!counted || ev > 0), "layers: no expert of the bigger form took a freed one's room "
+                                                "(%d resident, %llu evictions)", res1, ev);
+        if (mode == 2) CHECK(streamed > 0, "layers: nothing streamed");
+        vkt_shutdown(); model_free();
+        unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
+    }
+    H = H0; F = F0;
+}
+
 /* A large requested step under a deliberately tiny scratch budget: reserve a
  * smaller batch before allocating, then keep the backend usable for the format
  * and streaming reference checks below. Reusing those buffers needs no growth. */
@@ -1075,6 +1152,7 @@ int main(int argc, char **argv) {
     printf("extra:\n"); extra();
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
+    printf("layers:\n"); layers();
     ColiVkPoolStats ps, px; coli_vk_pool_stats(1, &ps); coli_vk_pool_stats(4, &px);
     CHECK(ps.live == 0 && px.live == 0, "%d + %d tier ranges still live after every shutdown", ps.live, px.live);
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */

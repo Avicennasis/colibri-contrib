@@ -9,12 +9,16 @@
 //   BD_P      a prefix for the function names (one instance per weight buffer)
 //   BD_W(i)   uint word i of that buffer
 //   BD_X(i)   the activation at element i of the current row
+//   BD_G(i)   uint word i of the table buffer (blockdec_table.h), which the backend binds
+//             in the scales' place for a block format (they have none)
 // and calls BD_P##unit(fmt, row byte offset, unit index, row width) for unit u
-// (elements 32u..32u+31). Every block size here is a multiple of 32.
+// (elements 32u..32u+31). Every block size here is a multiple of 32. No constant array
+// is indexed at run time: tables come from the buffer, the low-bit levels and powers of
+// three from bytes packed in a word.
 #ifndef BD_P
-#error "define BD_P, BD_W and BD_X before including blockdec.glsl"
+#error "define BD_P, BD_W, BD_X and BD_G before including blockdec.glsl"
 #endif
-#include "blockdec_grids.glsl"
+#include "blockdec_table.h"
 
 #ifndef BD_CAT
 #define BD_CAT2(a, b) a##b
@@ -38,11 +42,9 @@ float bd_ue4m3_half(uint x) {
     uint e = (x >> 3) & 15u, m = x & 7u;
     return e == 0u ? ldexp(float(m), -10) : ldexp(float(8u + m), int(e) - 11);
 }
-const uint BD_BLK[43] = uint[43](1u,1u,32u,32u,0u,0u,32u,32u,32u,0u,256u,256u,256u,256u,256u,0u,
-    256u,256u,256u,256u,32u,256u,256u,256u,0u,0u,0u,0u,0u,256u,0u,0u,0u,0u,256u,256u,0u,0u,0u,32u,64u,128u,64u);
-const uint BD_BYTES[43] = uint[43](4u,2u,18u,20u,0u,0u,22u,24u,34u,0u,84u,110u,144u,176u,210u,0u,
-    66u,74u,98u,50u,18u,110u,82u,136u,0u,0u,0u,0u,0u,56u,0u,0u,0u,0u,54u,66u,0u,0u,0u,17u,36u,18u,18u);
+int bd_sb(uint word, uint k) { return bitfieldExtract(int(word), int(8u * k), 8); }   // signed byte k
 #endif
+uvec2 BDN(g2)(uint base, uint i) { return uvec2(BD_G(base + 2u * i), BD_G(base + 2u * i + 1u)); }
 
 // sum over the unit's 32 weights of weight * x; I is the row's width (low-bit formats)
 float BDN(unit)(int fmt, uint rb, uint u, uint I) {
@@ -63,11 +65,12 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
         for (uint j = 0u; j < 32u; j++) {
             uint c = (BDN(u8)(boff + j) >> (2u * h)) & 3u;
             if (bits == 3) { uint k = h * 32u + j; c |= ((BDN(u8)(boff + 32u + (k & 15u)) >> (k >> 4u)) & 1u) << 2u; }
-            wv[j] = bits == 3 ? int[8](-26, -16, -9, -3, 3, 9, 16, 26)[c] : int[4](-10, -3, 3, 10)[c];
+            // levels -26 -16 -9 -3 3 9 16 26 and -10 -3 3 10 as signed bytes
+            wv[j] = bits == 3 ? bd_sb(c < 4u ? 0xfdf7f0e6u : 0x1a100903u, c & 3u) : bd_sb(0x0a03fdf6u, c);
         }
     } else {
         int t = fmt - 100;
-        uint B = BD_BLK[t], T = BD_BYTES[t];
+        uint B = BD_G(BDT_BLK + uint(t)), T = BD_G(BDT_BYTES + uint(t));
         uint e0 = xb % B, off = rb + (xb / B) * T;
         uint g0 = e0 / 16u;   // the unit's first group of 16 within the block
         if (t == 2 || t == 3 || t == 6 || t == 7) {        // Q4_0, Q4_1, Q5_0, Q5_1
@@ -92,8 +95,8 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
             uint qs = off + (t == 20 ? 2u : 1u);
             for (uint j = 0u; j < 16u; j++) {
                 uint b = BDN(u8)(qs + j);
-                wv[j] = t == 20 ? BD_KV_IQ4NL[b & 15u] : BD_KV_MXFP4[b & 15u];
-                wv[j + 16u] = t == 20 ? BD_KV_IQ4NL[b >> 4] : BD_KV_MXFP4[b >> 4];
+                uint kv = t == 20 ? BDT_IQ4NL : BDT_MXFP4;
+                wv[j] = int(BD_G(kv + (b & 15u))); wv[j + 16u] = int(BD_G(kv + (b >> 4)));
             }
             sA = sB = d;
         } else if (t == 42) {                                // Q2_0: element 4k+r in bits 2r of byte k
@@ -112,7 +115,7 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
                 if (hh == 0u) sA = s; else sB = s;
                 for (uint j = 0u; j < 8u; j++) {
                     uint b = BDN(u8)(qs + 8u * sb + j);
-                    wv[16u * hh + j] = BD_KV_MXFP4[b & 15u]; wv[16u * hh + 8u + j] = BD_KV_MXFP4[b >> 4];
+                    wv[16u * hh + j] = int(BD_G(BDT_MXFP4 + (b & 15u))); wv[16u * hh + 8u + j] = int(BD_G(BDT_MXFP4 + (b >> 4)));
                 }
             }
         } else if (t == 10) {                                // Q2_K
@@ -169,7 +172,7 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
             uint a0 = BDN(u32)(qs), a1 = BDN(u32)(qs + 4u);
             sA = sB = d * (0.5 + float(a1 >> 28)) * 0.25;
             for (uint l = 0u; l < 4u; l++) {
-                uvec2 gr = BD_IQ2XXS[(a0 >> (8u * l)) & 255u]; uint sg = BD_KSIGNS[(a1 >> (7u * l)) & 127u];
+                uvec2 gr = BDN(g2)(BDT_IQ2XXS, (a0 >> (8u * l)) & 255u); uint sg = BD_G(BDT_KSIGNS + ((a1 >> (7u * l)) & 127u));
                 for (uint j = 0u; j < 8u; j++) { int v = int(bd_byte(gr, j)); wv[l * 8u + j] = ((sg >> j) & 1u) != 0u ? -v : v; }
             }
         } else if (t == 17 || t == 22) {                     // IQ2_XS, IQ2_S
@@ -183,10 +186,10 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
             for (uint l = 0u; l < 4u; l++) {
                 uint k = (e0 >> 3) + l;   // the 8-weight chunk within the block
                 uvec2 gr; uint sg;
-                if (t == 17) { uint q = BDN(u16)(off + 2u + 2u * k); gr = BD_IQ2XS[q & 511u]; sg = BD_KSIGNS[q >> 9]; }
+                if (t == 17) { uint q = BDN(u16)(off + 2u + 2u * k); gr = BDN(g2)(BDT_IQ2XS, q & 511u); sg = BD_G(BDT_KSIGNS + (q >> 9)); }
                 else {
                     uint idx = BDN(u8)(off + 2u + k) | (((BDN(u8)(off + 66u + (k >> 2)) >> (2u * (k & 3u))) & 3u) << 8);
-                    gr = BD_IQ2S[idx]; sg = BDN(u8)(off + 34u + k);
+                    gr = BDN(g2)(BDT_IQ2S, idx); sg = BDN(u8)(off + 34u + k);
                 }
                 for (uint j = 0u; j < 8u; j++) { int v = int(bd_byte(gr, j)); wv[l * 8u + j] = ((sg >> j) & 1u) != 0u ? -v : v; }
             }
@@ -196,8 +199,8 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
             uint a = BDN(u32)(off + 66u + 4u * ib);
             sA = sB = d * (0.5 + float(a >> 28)) * 0.5;
             for (uint l = 0u; l < 4u; l++) {
-                uint sg = BD_KSIGNS[(a >> (7u * l)) & 127u];
-                uint g1 = BD_IQ3XXS[BDN(u8)(qs + 8u * ib + 2u * l)], g2 = BD_IQ3XXS[BDN(u8)(qs + 8u * ib + 2u * l + 1u)];
+                uint sg = BD_G(BDT_KSIGNS + ((a >> (7u * l)) & 127u));
+                uint g1 = BD_G(BDT_IQ3XXS + BDN(u8)(qs + 8u * ib + 2u * l)), g2 = BD_G(BDT_IQ3XXS + BDN(u8)(qs + 8u * ib + 2u * l + 1u));
                 for (uint j = 0u; j < 4u; j++) {
                     int v1 = int((g1 >> (8u * j)) & 255u), v2 = int((g2 >> (8u * j)) & 255u);
                     wv[l * 8u + j] = ((sg >> j) & 1u) != 0u ? -v1 : v1;
@@ -211,7 +214,7 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
             for (uint l = 0u; l < 8u; l++) {
                 uint k = (e0 >> 2) + l;   // the 4-weight chunk within the block
                 uint idx = BDN(u8)(off + 2u + k) | (((BDN(u8)(off + 66u + (k >> 3)) >> (k & 7u)) & 1u) << 8);
-                uint gr = BD_IQ3S[idx];
+                uint gr = BD_G(BDT_IQ3S + idx);
                 for (uint j = 0u; j < 4u; j++) {
                     uint e = k * 4u + j; int v = int((gr >> (8u * j)) & 255u);
                     wv[l * 4u + j] = ((BDN(u8)(off + 74u + (e >> 3)) >> (e & 7u)) & 1u) != 0u ? -v : v;
@@ -225,22 +228,21 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
             int dsign = (qh & 0x8000u) != 0u ? -1 : 1;
             sA = sB = dl * 0.125;
             for (uint l = 0u; l < 4u; l++) {
-                uvec2 gr = BD_IQ1S[BDN(u8)(off + 2u + 4u * ib + l) | (((qh >> (3u * l)) & 7u) << 8)];
+                uvec2 gr = BDN(g2)(BDT_IQ1S, BDN(u8)(off + 2u + 4u * ib + l) | (((qh >> (3u * l)) & 7u) << 8));
                 for (uint j = 0u; j < 8u; j++) wv[l * 8u + j] = 8 * bd_sbyte(gr, j) + dsign;
             }
         } else if (t == 29) {                                // IQ1_M
             uint s0 = BDN(u16)(off + 48u), s1 = BDN(u16)(off + 50u), s2 = BDN(u16)(off + 52u), s3 = BDN(u16)(off + 54u);
             float d = unpackHalf2x16((s0 >> 12) | ((s1 >> 8) & 0xf0u) | ((s2 >> 4) & 0xf00u) | (s3 & 0xf000u)).x;
-            uint sc[4] = uint[4](s0, s1, s2, s3);
             for (uint hh = 0u; hh < 2u; hh++) {
-                uint s16 = g0 + hh;
-                float s = d * float(2u * ((sc[s16 >> 2] >> (3u * (s16 & 3u))) & 7u) + 1u) * 0.125;
+                uint s16 = g0 + hh, q = s16 >> 2, sw = q == 0u ? s0 : q == 1u ? s1 : q == 2u ? s2 : s3;
+                float s = d * float(2u * ((sw >> (3u * (s16 & 3u))) & 7u) + 1u) * 0.125;
                 if (hh == 0u) sA = s; else sB = s;
             }
             for (uint l = 0u; l < 4u; l++) {
                 uint k = (e0 >> 3) + l;
                 uint h = (BDN(u8)(off + 32u + (k >> 1)) >> (4u * (k & 1u))) & 15u;
-                uvec2 gr = BD_IQ1S[BDN(u8)(off + k) | ((h & 7u) << 8)];
+                uvec2 gr = BDN(g2)(BDT_IQ1S, BDN(u8)(off + k) | ((h & 7u) << 8));
                 int dsign = (h & 8u) != 0u ? -1 : 1;
                 for (uint j = 0u; j < 8u; j++) wv[l * 8u + j] = 8 * bd_sbyte(gr, j) + dsign;
             }
@@ -250,7 +252,7 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
             uint ls = ((BDN(u8)(off + 4u + (ib >> 1)) >> (4u * (ib & 1u))) & 15u) | (((sh >> (2u * ib)) & 3u) << 4);
             sA = sB = d * float(int(ls) - 32);
             uint q = off + 8u + 16u * ib;
-            for (uint j = 0u; j < 16u; j++) { uint b = BDN(u8)(q + j); wv[j] = BD_KV_IQ4NL[b & 15u]; wv[j + 16u] = BD_KV_IQ4NL[b >> 4]; }
+            for (uint j = 0u; j < 16u; j++) { uint b = BDN(u8)(q + j); wv[j] = int(BD_G(BDT_IQ4NL + (b & 15u))); wv[j + 16u] = int(BD_G(BDT_IQ4NL + (b >> 4))); }
         } else if (t == 35) {                                // TQ2_0
             float d = BDN(f16)(off + 64u);
             for (uint j = 0u; j < 32u; j++) {
@@ -260,13 +262,12 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
             sA = sB = d;
         } else if (t == 34) {                                // TQ1_0: base-3 digits
             float d = BDN(f16)(off + 52u);
-            const uint pow3[5] = uint[5](1u, 3u, 9u, 27u, 81u);
             for (uint j = 0u; j < 32u; j++) {
                 uint e = e0 + j, byte, n;
                 if (e < 160u) { n = e >> 5; byte = BDN(u8)(off + (e & 31u)); }
                 else if (e < 240u) { uint f = e - 160u; n = f >> 4; byte = BDN(u8)(off + 32u + (f & 15u)); }
                 else { uint f = e - 240u; n = f >> 2; byte = BDN(u8)(off + 48u + (f & 3u)); }
-                uint v = (byte * pow3[n]) & 255u;
+                uint v = (byte * (n < 4u ? uint(bd_sb(0x1b090301u, n)) : 81u)) & 255u;   // 3^n
                 wv[j] = int((v * 3u) >> 8) - 1;
             }
             sA = sB = d;

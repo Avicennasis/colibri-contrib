@@ -211,7 +211,14 @@ typedef struct {
      * main layers only). 0: none. */
     int extra_layers;
     VktFmt extra_gate_up, extra_down;
+    /* Optional: the main layers' forms when they differ by layer (a GGUF whose layers mix
+     * block types, as published ones do): layer_gate_up[l], layer_down[l] for l < layers,
+     * at most VKT_FORMS - 1 distinct pairs, gate_up/down among them or not; NULL = every
+     * layer gate_up/down. The arrays are read during vkt_init only. */
+    const VktFmt *layer_gate_up, *layer_down;
 } VktConfig;
+#define VKT_FORMS 8
+#define VKT_MAX_LAYERS 512
 
 
 #ifdef COLI_VULKAN

@@ -910,7 +910,7 @@ shaders/qmatmul_grp_gemv_gate_up.spv: shaders/qmatmul_grp_gemv.comp
 vk_chain.o: vk_chain.c .build-config
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@
 # the block formats' decoders (fmt >= 100), included by the two GEMV shaders
-shaders/qmatmul.spv shaders/qmatmul_gate_up.spv: shaders/blockdec.glsl shaders/blockdec_grids.glsl
+shaders/qmatmul.spv shaders/qmatmul_gate_up.spv: shaders/blockdec.glsl shaders/blockdec_table.h
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@

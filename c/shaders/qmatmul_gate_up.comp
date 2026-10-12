@@ -25,6 +25,7 @@ layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer X  { float x[]; };
 layout(std430, binding = 1) readonly buffer WG { uint  wg[]; };   // gate weights
 layout(std430, binding = 2) readonly buffer SG { float gscale[]; };
+layout(std430, binding = 2) readonly buffer SGT { uint bdtab[]; };   // a block format: blockdec_table.h's table (gate and up alike)
 layout(std430, binding = 3) readonly buffer WU { uint  wu[]; };   // up weights
 layout(std430, binding = 4) readonly buffer SU { float uscale[]; };
 layout(std430, binding = 5) writeonly buffer H { float hid[]; };
@@ -48,6 +49,7 @@ float xv(int i) { return staged ? xsh[i] : x[xoff + i]; }
 // block formats (fmt >= 100: ggml types, colibri's low-bit experts), shaders/blockdec.glsl:
 // one instance per weight buffer
 #define BD_X(i) xv(int(i))
+#define BD_G(i) bdtab[i]
 #define BD_P gg_
 #define BD_W(i) wg[i]
 #include "blockdec.glsl"

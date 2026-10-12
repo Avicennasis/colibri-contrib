@@ -3765,7 +3765,12 @@ static void gq_slot_i8(Model *m, int layer, Slot *e) {
     gq_rows_i8(x->td, e->gqe + x->eb_g + x->eb_u, D, I, x->sd ? x->sd[e->eid] : 1.f, e->t8 + 2 * n, e->t8s + 2 * (n / 32));
     e->t8_eid = e->eid + 1;
 }
+static int g_vk_gguf_raw;   /* the tier holds the GGUF experts' blocks as the file has them (blockdec.glsl) */
 static VktExpertSrc vk_slot_src(Model *m, int layer, Slot *e) {
+    if (g_gguf && g_vk_gguf_raw) {
+        const GqExp *x = &m->gqx[layer];
+        return (VktExpertSrc){e->gqe, e->gqe + x->eb_g, e->gqe + x->eb_g + x->eb_u, NULL, NULL, NULL};
+    }
     if (g_gguf) {
         int64_t n = (int64_t)m->c.inter * m->c.hidden;
         gq_slot_i8(m, layer, e);
@@ -6737,7 +6742,40 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
     if (on && *on == '0') return;
     int gs = c->expert_gs, dgs = down_gs_of(c);
     VktFmt gu, dn;
-    if (g_gguf) { gu = (VktFmt){VKT_SRC_I8_GS, 32}; dn = gu; }
+    VktFmt *lgu = NULL, *ldn = NULL;   /* the GGUF's types by layer, when they differ */
+    if (g_gguf) {
+        /* the blocks as the file has them when every layer has one type for gate and up,
+         * no per-expert scale and whole blocks in both widths, the types free to change
+         * from layer to layer (published files give a few layers bigger ones); else int8
+         * per 32 (COLI_VK_GGUF_RAW=0 too) */
+        const char *re = getenv("COLI_VK_GGUF_RAW");
+        int raw = !(re && re[0] == '0'), L = c->n_layers, best = 0, bestn = 0, mixed = 0;
+        for (int l = 0; raw && l < L; l++) {
+            const GqExp *x = &m->gqx[l];
+            int bg = coli_vk_block_elems(100 + x->tg), bd = coli_vk_block_elems(100 + x->td);
+            if (x->tu != x->tg || x->sg || x->su || x->sd || !bg || !bd || c->hidden % bg || c->inter % bd) raw = 0;
+            if (x->tg != m->gqx[0].tg || x->td != m->gqx[0].td) mixed = 1;
+        }
+        for (int l = 0; raw && l < L; l++) {   /* the commonest pair is the tier's main form */
+            int n = 0;
+            for (int j = 0; j < L; j++) n += m->gqx[j].tg == m->gqx[l].tg && m->gqx[j].td == m->gqx[l].td;
+            if (n > bestn) { bestn = n; best = l; }
+        }
+        if (raw && mixed && (!(lgu = malloc((size_t)L * sizeof *lgu)) || !(ldn = malloc((size_t)L * sizeof *ldn)))) raw = 0;
+        if (raw) {
+            const int tg = m->gqx[best].tg, td = m->gqx[best].td;
+            gu = (VktFmt){(VktSrc)(VKT_SRC_GGML + tg), 0}; dn = (VktFmt){(VktSrc)(VKT_SRC_GGML + td), 0};
+            for (int l = 0; mixed && l < L; l++) {
+                lgu[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + m->gqx[l].tg), 0};
+                ldn[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + m->gqx[l].td), 0};
+            }
+            g_vk_gguf_raw = 1;
+            fprintf(stderr, "[VK] tier qwen36: the GGUF experts' blocks go to the device as the file has them "
+                            "(%s gate/up, %s down", gq_type_name(tg), gq_type_name(td));
+            if (mixed) fprintf(stderr, " on %d of %d layers, the others their own types", bestn, L);
+            fprintf(stderr, "; COLI_VK_GGUF_RAW=0: int8 per 32)\n");
+        } else { free(lgu); free(ldn); lgu = ldn = NULL; gu = (VktFmt){VKT_SRC_I8_GS, 32}; dn = gu; }
+    }
     else if (xf_mode(m)) { gu = (VktFmt){VKT_SRC_I4U_PLANAR64, 64}; dn = gu; }
     else if (expert_mixed) {   /* int4 gate/up unpacked to int8 in the slot, int8 down */
         gu = (VktFmt){gs ? VKT_SRC_I8_AS_I4_GS : VKT_SRC_I8_AS_I4_ROW, gs};
@@ -6758,7 +6796,8 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
                     .ram_reserve = slot * (size_t)cap * (size_t)c->n_layers,
                     .dense_bytes = vk_dense_bytes(m),
                     .in_ram = vk_in_ram, .ram_ctx = m,
-                    .load = vk_load, .release = vk_release, .load_ctx = m};
+                    .load = vk_load, .release = vk_release, .load_ctx = m,
+                    .layer_gate_up = lgu, .layer_down = ldn};
     rt_init("qwen36", c->n_layers, c->n_experts);
     rt_drop_row(c->n_layers);   /* no MTP row */
     const char *up = getenv("COLI_USAGE");
@@ -6767,7 +6806,9 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
     int64_t h = rt_load(g_vk_usage);
     if (h > 0) fprintf(stderr, "[USAGE] expert history: %lld selections (%s)\n", (long long)h, g_vk_usage);
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
-    if (!vkt_init(&vc, rt_counts_all())) { rt_destroy(); return; }
+    int tier_on = vkt_init(&vc, rt_counts_all());
+    free(lgu); free(ldn);   /* read during vkt_init only */
+    if (!tier_on) { rt_destroy(); return; }
     m->vk_hist = 1;
     atexit(vkt_shutdown);
     int all = c->n_layers * c->n_experts;

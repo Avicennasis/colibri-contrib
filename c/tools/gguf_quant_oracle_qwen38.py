@@ -31,6 +31,7 @@ format and maps every tensor right, which only the float path answers token for 
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -165,6 +166,22 @@ def model_dir(link_template, variant, work, label):
     return d
 
 
+def ud_type(name):
+    """--ud: the types by layer of a published file (gate and up alike in a layer, the
+    commonest pair Q4_K/Q5_K, three layers in other forms), the rest Q8_0"""
+    m = re.match(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$", name)
+    if not m:
+        return "Q8_0"
+    l, role = int(m.group(1)), m.group(2)
+    if l == 0:
+        return "Q6_K" if role == "down" else "Q5_K"
+    if l == 1:
+        return "IQ4_XS" if role == "down" else "IQ3_XXS"
+    if l == 3 and role == "down":
+        return "Q6_K"
+    return "Q5_K" if role == "down" else "Q4_K"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hf", required=True)
@@ -178,6 +195,9 @@ def main():
     ap.add_argument("--max-new", type=int, default=12)
     ap.add_argument("--seed", type=int, default=1, help="the synthetic blocks' seed")
     ap.add_argument("--only", default="", help="comma-separated substrings: quantize only the tensors whose name has one")
+    ap.add_argument("--ud", action="store_true",
+                    help="also a variant typed by layer as published files are (gate and up one type in a layer, "
+                         "a few layers bigger ones): the expert tier's per-layer forms")
     args = ap.parse_args()
     gguf, quants = base.load_gguf_modules(args.llama)
     import torch
@@ -202,8 +222,11 @@ def main():
     prompt = [1, 3, 4, 5, 6]
     rng = np.random.default_rng(args.seed)
     results = []
-    for label in [x for x in args.types.split(",") if x]:
-        if label in ("F16", "BF16"):
+    labels = [x for x in args.types.split(",") if x] + (["UD"] if args.ud else [])
+    for label in labels:
+        if label == "UD":
+            qt = None
+        elif label in ("F16", "BF16"):
             qt = getattr(gguf.GGMLQuantizationType, label)
         elif label in base.BLOCKS:
             qt = getattr(gguf.GGMLQuantizationType, label, None)
@@ -218,17 +241,19 @@ def main():
                 continue
             shape = [int(x) for x in reversed(t.shape)]
             src = np.array(t.data, dtype=np.float32).reshape(shape)
-            blck = 1 if label in ("F16", "BF16") else base.BLOCKS[label][0]
+            tl = ud_type(t.name) if label == "UD" else label
+            tq = getattr(gguf.GGMLQuantizationType, tl) if label == "UD" else qt
+            blck = 1 if tl in ("F16", "BF16") else base.BLOCKS[tl][0]
             if shape[-1] % blck:
                 continue                       # a row this type does not tile: stays F32
-            if label in ("F16", "BF16"):
-                q = quants.quantize(src, qt)
-                deq = quants.dequantize(q, qt).astype(np.float32).reshape(shape)
-                replace[t.name] = (qt, q)
+            if tl in ("F16", "BF16"):
+                q = quants.quantize(src, tq)
+                deq = quants.dequantize(q, tq).astype(np.float32).reshape(shape)
+                replace[t.name] = (tq, q)
             else:
-                raw = base.synth_quant(quants, qt, label, shape, float(np.std(src)) or 0.02, rng)
-                deq = base.dequant(quants, qt, label, raw.reshape(-1)).reshape(shape)
-                replace[t.name] = (qt, raw)
+                raw = base.synth_quant(quants, tq, tl, shape, float(np.std(src)) or 0.02, rng)
+                deq = base.dequant(quants, tq, tl, raw.reshape(-1)).reshape(shape)
+                replace[t.name] = (tq, raw)
             updates.update(to_hf(t.name, deq, cfg) or {})
         updates = finish(updates, hf, cfg)
         vpath = work / f"variant_{label}.gguf"

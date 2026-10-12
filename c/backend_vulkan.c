@@ -8,6 +8,8 @@
 // M2 scope: correctness + a standalone GPU-vs-CPU test harness. Synchronous
 // submit/wait per call; async queues and zero-copy import come in M4.
 #include "backend_vulkan.h"
+#include "ggml_grids.h"              /* the block formats' tables (blockdec_table.h) */
+#include "shaders/blockdec_table.h"
 #include "vk_alloc.h"
 #include "vk_load.h"
 #include <pthread.h>
@@ -240,6 +242,8 @@ struct ColiVkTensor {
     uint8_t *wmap, *smap;  /* mapped memory: the rows' and the scales' mapping (coli_vk_tensor_refill) */
     VkDeviceMemory imp;    /* coli_vk_tensor_import: the host memory its rows are read from, in place */
     struct ColiVkTensor *imp_next;   /* the live imports, freed at shutdown */
+    size_t wcap, scap;     /* the bytes its two ranges hold (tensor_alloc_pad: room for a bigger format) */
+    size_t acct;           /* what tensor_alloc added to the pool's counters, taken back at the release */
 };
 
 /* ---- memory placement without Resizable BAR (docs/vulkan.md) ------------------------
@@ -1767,7 +1771,13 @@ static void pool_destroy(VkWPool *P) {
  * are device-local: *wptr and *sptr are then a zeroed host image of the same layout
  * that coli_vk_tensor_commit copies over (or, wptr NULL, nothing: upload_tensor_pool
  * streams the rows itself). */
-static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, void **wptr, void **sptr) {
+/* tensor_alloc with ranges of at least pad_w and pad_s bytes: room for the tensor to take
+ * a bigger format later (coli_vk_tensor_refill_as), and every tensor of a tier whose
+ * layers mix formats the same size, so a freed one leaves a hole any other fits in. */
+static VkBuffer bdtab_buf(int dev);
+static ColiVkTensor *tensor_alloc_pad(VkWPool *P, int fmt, int I, int O, int gs, size_t pad_w, size_t pad_s,
+                                      void **wptr, void **sptr) {
+    if (bd_fmt(fmt) && !bdtab_buf(P->dev)) return NULL;   /* its decoder reads the table */
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
@@ -1775,9 +1785,11 @@ static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, voi
     t->dev = P->dev; t->pool = P;
     t->wbytes = (size_t)t->rowWords * 4 * (size_t)O;
     size_t sbytes = scale_floats(fmt, I, O, gs) * sizeof(float);
+    t->wcap = t->wbytes > pad_w ? t->wbytes : pad_w;
+    t->scap = sbytes > pad_s ? sbytes : pad_s;
     void *wp = NULL, *sp = NULL;
-    if (!pool_suballoc(P, t->wbytes, &t->wbuf, &wp, &t->wr)) { free(t); return NULL; }
-    if (!pool_suballoc(P, sbytes, &t->sbuf, &sp, &t->sr)) {
+    if (!pool_suballoc(P, t->wcap, &t->wbuf, &wp, &t->wr)) { free(t); return NULL; }
+    if (!pool_suballoc(P, t->scap, &t->sbuf, &sp, &t->sr)) {
         vkDestroyBuffer(pool_device(P), t->wbuf, NULL); pool_free_range(P, t->wr); free(t); return NULL;
     }
     if (g_up[P->dev].on) {
@@ -1791,15 +1803,19 @@ static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, voi
         memset(*wptr, 0, t->wbytes);
         t->wmap = wp; t->smap = sp;
     }
-    __atomic_add_fetch(&P->bytes, t->wbytes + sbytes, __ATOMIC_RELAXED);
+    t->acct = t->wcap + t->scap;
+    __atomic_add_fetch(&P->bytes, t->acct, __ATOMIC_RELAXED);
     __atomic_add_fetch(&P->tensors, 1, __ATOMIC_RELAXED);
     if (P->counted) {
         // Counters are touched concurrently: frees run from expert_load under
         // `#pragma omp parallel`, so RMW them atomically (torn counts otherwise).
-        __atomic_add_fetch(&G.used_bytes, t->wbytes + sbytes, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&G.used_bytes, t->acct, __ATOMIC_RELAXED);
         __atomic_add_fetch(&G.tensor_count, 1, __ATOMIC_RELAXED);
     }
     return t;
+}
+static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, void **wptr, void **sptr) {
+    return tensor_alloc_pad(P, fmt, I, O, gs, 0, 0, wptr, sptr);
 }
 static int fmt_uploadable(int fmt, int gs) {
     return fmt == 1 || fmt == 2 || fmt == 5 || fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt) ||   /* fmt=4/7: word-aligned groups only */
@@ -1824,7 +1840,7 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
         size_t z = 0;
         int ok = ((rows.cpu_rb == rows.stride && up_add_host(u, weights, t->wbytes, 1, &t->wbuf, &z, &z, &t->wbytes)) ||
                   up_add(u, P->dev, t->wbuf, 0, t->wbytes, up_fill_rows, &rows)) &&
-                 up_add(u, P->dev, t->sbuf, 0, sb, up_fill_bytes, fmt == 10 || fmt == 11 || fmt == 14 ? (const void *)&one : scales);
+                 up_add(u, P->dev, t->sbuf, 0, sb, up_fill_bytes, fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt) ? (const void *)&one : scales);
         ok = up_finish(u, P->dev) && ok;
         pthread_mutex_unlock(&u->mx);
         if (!ok) {   /* the matrix stays on the CPU (with the device, if it was lost) */
@@ -1844,7 +1860,7 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
         memcpy((uint8_t *)wptr + (size_t)o * stride,
                (const uint8_t *)weights + (size_t)o * cpu_rb, cpu_rb);
     size_t sfl = scale_floats(fmt, I, O, gs);            // fmt=5: O*ceil(I/64) group scales
-    if (fmt == 10 || fmt == 11 || fmt == 14) ((float *)sptr)[0] = 1.0f;   /* float weights: no scales */
+    if (fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt)) ((float *)sptr)[0] = 1.0f;   /* float weights, blocks: no scales */
     else memcpy(sptr, scales, sfl * sizeof(float));
     *out = t;
     return 1;
@@ -1852,6 +1868,57 @@ static int upload_tensor_pool(VkWPool *P, ColiVkTensor **out, const void *weight
 static int upload_tensor(ColiVkTensor **out, const void *weights, const float *scales,
                          int fmt, int I, int O, int gs) {
     return upload_tensor_pool(&g_wpool, out, weights, scales, fmt, I, O, gs);
+}
+
+/* ---- the block formats' table (shaders/blockdec_table.h) --------------------------
+ * One per device, made at the first block-format tensor and bound in the place of every
+ * block-format tensor's scales, which those formats do not have (sbuf_of). */
+static ColiVkTensor *g_bdtab[2];
+static pthread_mutex_t g_bdtab_mx = PTHREAD_MUTEX_INITIALIZER;
+static int bd_dev_ready(int dev);   /* after G2 */
+static void bdtab_fill(uint32_t *t) {
+    memset(t, 0, (size_t)BDT_WORDS * 4);
+    for (int i = 0; i < 43; i++) { t[BDT_BLK + i] = BD_BLK[i]; t[BDT_BYTES + i] = BD_BYTES[i]; }
+    for (int i = 0; i < 128; i++) t[BDT_KSIGNS + i] = GGML_KSIGNS_IQ2XS[i];
+    for (int i = 0; i < 16; i++) {
+        t[BDT_IQ4NL + i] = (uint32_t)(int32_t)GGML_KVALUES_IQ4NL[i];
+        t[BDT_MXFP4 + i] = (uint32_t)(int32_t)GGML_KVALUES_MXFP4[i];
+    }
+    /* the grids' bytes as little-endian words, as the shader reads them */
+    memcpy(t + BDT_IQ2XXS, GGML_IQ2XXS_GRID, sizeof GGML_IQ2XXS_GRID);
+    memcpy(t + BDT_IQ2XS, GGML_IQ2XS_GRID, sizeof GGML_IQ2XS_GRID);
+    memcpy(t + BDT_IQ2S, GGML_IQ2S_GRID, sizeof GGML_IQ2S_GRID);
+    memcpy(t + BDT_IQ3XXS, GGML_IQ3XXS_GRID, sizeof GGML_IQ3XXS_GRID);
+    memcpy(t + BDT_IQ3S, GGML_IQ3S_GRID, sizeof GGML_IQ3S_GRID);
+    memcpy(t + BDT_IQ1S, GGML_IQ1S_GRID, sizeof GGML_IQ1S_GRID);
+}
+_Static_assert(BDT_IQ2XS - BDT_IQ2XXS == sizeof GGML_IQ2XXS_GRID / 4 && BDT_IQ2S - BDT_IQ2XS == sizeof GGML_IQ2XS_GRID / 4 &&
+               BDT_IQ3XXS - BDT_IQ2S == sizeof GGML_IQ2S_GRID / 4 && BDT_IQ3S - BDT_IQ3XXS == sizeof GGML_IQ3XXS_GRID / 4 &&
+               BDT_IQ1S - BDT_IQ3S == sizeof GGML_IQ3S_GRID / 4 && BDT_WORDS - BDT_IQ1S == sizeof GGML_IQ1S_GRID / 4,
+               "shaders/blockdec_table.h does not match ggml_grids.h");
+/* the table's buffer on device dev, made now if it is not there yet; NULL handle when
+ * the device has no room for it (no block format goes there then) */
+static VkBuffer bdtab_buf(int dev) {
+    ColiVkTensor *t = __atomic_load_n(&g_bdtab[dev], __ATOMIC_ACQUIRE);
+    if (t) return t->wbuf;
+    pthread_mutex_lock(&g_bdtab_mx);
+    if (!g_bdtab[dev] && bd_dev_ready(dev)) {
+        uint32_t *w = malloc((size_t)BDT_WORDS * 4);
+        ColiVkTensor *n = NULL;
+        if (w) { bdtab_fill(w); upload_tensor_pool(dev ? &g_wpool2 : &g_wpool, &n, w, NULL, 10, BDT_WORDS, 1, 0); free(w); }
+        __atomic_store_n(&g_bdtab[dev], n, __ATOMIC_RELEASE);
+    }
+    t = g_bdtab[dev];
+    pthread_mutex_unlock(&g_bdtab_mx);
+    return t ? t->wbuf : VK_NULL_HANDLE;
+}
+static void bdtab_free(int dev) {
+    if (g_bdtab[dev]) { tensor_release(g_bdtab[dev]); g_bdtab[dev] = NULL; }
+}
+/* what a tensor's scales binding names: the table for a block format, else its scales */
+static VkBuffer sbuf_of(const ColiVkTensor *t) {
+    if (bd_fmt(t->fmt)) { VkBuffer b = bdtab_buf(t->dev); if (b) return b; }
+    return t->sbuf;
 }
 
 /* Upload a resident tensor without computing (for the expert tier: gate/up/down are
@@ -2121,7 +2188,7 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
         VkDescriptorBufferInfo bi[4] = {
             {.buffer = G.x.buf, .range = VK_WHOLE_SIZE},
             {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
-            {.buffer = t->sbuf, .range = VK_WHOLE_SIZE},
+            {.buffer = sbuf_of(t), .range = VK_WHOLE_SIZE},
             {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
         VkWriteDescriptorSet w[4];
         for (int i = 0; i < 4; i++) w[i] = (VkWriteDescriptorSet){
@@ -2456,8 +2523,8 @@ int coli_vk_gate_up(ColiVkTensor **gate, ColiVkTensor **up, float *hidden, const
 
     VkDescriptorBufferInfo bi[6] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = tg->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = tg->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = tu->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = tu->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.h.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(tg), .range = VK_WHOLE_SIZE}, {.buffer = tu->wbuf, .range = VK_WHOLE_SIZE},
+        {.buffer = sbuf_of(tu), .range = VK_WHOLE_SIZE}, {.buffer = G.h.buf, .range = VK_WHOLE_SIZE}};
     VkWriteDescriptorSet w[6];
     for (int i = 0; i < 6; i++) w[i] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = G.dset_gu,
@@ -2545,12 +2612,12 @@ static int eg_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *up
         VkDeviceSize xo = (VkDeviceSize)off[c]*D*4, ho = (VkDeviceSize)off[c]*I*4, yo = (VkDeviceSize)off[c]*D*4;
         VkDescriptorBufferInfo gi[6] = {
             {G.eg_x.buf, xo, (VkDeviceSize)rows[c]*D*4}, {gates[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {gates[c]->sbuf, 0, VK_WHOLE_SIZE}, {ups[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {ups[c]->sbuf, 0, VK_WHOLE_SIZE}, {G.eg_h.buf, ho, (VkDeviceSize)rows[c]*I*4}};
+            {sbuf_of(gates[c]), 0, VK_WHOLE_SIZE}, {ups[c]->wbuf, 0, VK_WHOLE_SIZE},
+            {sbuf_of(ups[c]), 0, VK_WHOLE_SIZE}, {G.eg_h.buf, ho, (VkDeviceSize)rows[c]*I*4}};
         wr_desc(G.eg_gu[c], 6, gi);
         VkDescriptorBufferInfo di[4] = {
             {G.eg_h.buf, ho, (VkDeviceSize)rows[c]*I*4}, {downs[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G.eg_y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
+            {sbuf_of(downs[c]), 0, VK_WHOLE_SIZE}, {G.eg_y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
         wr_desc(G.eg_dn[c], 4, di);
     }
     if (G.eg_prof) G.eg_t2 = vk_now();
@@ -2675,6 +2742,7 @@ static int scratch_reserve_d2(Scratch *s, size_t bytes, uint32_t memtype) {
     return 1;
 }
 static VkDevice pool_device(const VkWPool *P) { return P->dev ? G2.dev : G.dev; }
+static int bd_dev_ready(int dev) { return dev ? G2.ready : G.ready; }
 static uint32_t pool_memtype(const VkWPool *P) {
     return g_up[P->dev].on ? g_up[P->dev].mt_dev : P->dev ? G2.memtype : G.memtype;
 }
@@ -2940,12 +3008,12 @@ static int eg2_prepare_submit(ColiVkTensor *const *gates, ColiVkTensor *const *u
         VkDeviceSize xo = (VkDeviceSize)off[c]*D*4, ho = (VkDeviceSize)off[c]*I*4, yo = (VkDeviceSize)off[c]*D*4;
         VkDescriptorBufferInfo gi[6] = {
             {G2.x.buf, xo, (VkDeviceSize)rows[c]*D*4}, {gates[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {gates[c]->sbuf, 0, VK_WHOLE_SIZE}, {ups[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {ups[c]->sbuf, 0, VK_WHOLE_SIZE}, {G2.h.buf, ho, (VkDeviceSize)rows[c]*I*4}};
+            {sbuf_of(gates[c]), 0, VK_WHOLE_SIZE}, {ups[c]->wbuf, 0, VK_WHOLE_SIZE},
+            {sbuf_of(ups[c]), 0, VK_WHOLE_SIZE}, {G2.h.buf, ho, (VkDeviceSize)rows[c]*I*4}};
         wr_desc_dev(G2.dev, G2.gu[c], 6, gi);
         VkDescriptorBufferInfo di[4] = {
             {G2.h.buf, ho, (VkDeviceSize)rows[c]*I*4}, {downs[c]->wbuf, 0, VK_WHOLE_SIZE},
-            {downs[c]->sbuf, 0, VK_WHOLE_SIZE}, {G2.y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
+            {sbuf_of(downs[c]), 0, VK_WHOLE_SIZE}, {G2.y.buf, yo, (VkDeviceSize)rows[c]*D*4}};
         wr_desc_dev(G2.dev, G2.dn[c], 4, di);
     }
     if (G.eg_prof) { tA = vk_now(); q_desc += tA - t0; t0 = tA; }
@@ -3167,7 +3235,7 @@ int coli_vk_attention_absorb(ColiVkTensor **kvb, const void *w, const float *sc,
 
     VkDescriptorBufferInfo bi[7] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = t->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = kv->bl, .range = VK_WHOLE_SIZE},
+        {.buffer = sbuf_of(t), .range = VK_WHOLE_SIZE}, {.buffer = kv->bl, .range = VK_WHOLE_SIZE},
         {.buffer = kv->br, .range = VK_WHOLE_SIZE}, {.buffer = G.att_sc.buf, .range = VK_WHOLE_SIZE},
         {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
     VkWriteDescriptorSet wd[7];
@@ -3227,10 +3295,10 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
     }
     VkDescriptorBufferInfo b1[4] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = t1->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = t1->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(t1), .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
     VkDescriptorBufferInfo b2[4] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = t2->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = t2->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(t2), .range = VK_WHOLE_SIZE}, {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE}};
     wr_desc(G.dset, 4, b1);
     wr_desc(G.dset_pair, 4, b2);
 
@@ -3303,16 +3371,16 @@ int coli_vk_attn_qprep(int layer,
 
     VkDescriptorBufferInfo b1[4] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = tqa->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = tqa->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.qp1.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(tqa), .range = VK_WHOLE_SIZE}, {.buffer = G.qp1.buf, .range = VK_WHOLE_SIZE}};
     VkDescriptorBufferInfo b2[4] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = tkv->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = tkv->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(tkv), .range = VK_WHOLE_SIZE}, {.buffer = G.y2.buf, .range = VK_WHOLE_SIZE}};
     VkDescriptorBufferInfo bn[3] = {
         {.buffer = G.qp1.buf, .range = VK_WHOLE_SIZE}, {.buffer = G.lnbuf[layer], .range = VK_WHOLE_SIZE},
         {.buffer = G.qp2.buf, .range = VK_WHOLE_SIZE}};
     VkDescriptorBufferInfo b3[4] = {
         {.buffer = G.qp2.buf, .range = VK_WHOLE_SIZE}, {.buffer = tqb->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = tqb->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(tqb), .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
     if (!G.pair_pool) {   /* the chain reuses the pair's 2nd matmul set */
         VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4};
         VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -3397,7 +3465,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
 
     VkDescriptorBufferInfo bi[7] = {
         {.buffer = G.x.buf, .range = VK_WHOLE_SIZE}, {.buffer = t->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = t->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = kv->bl, .range = VK_WHOLE_SIZE},
+        {.buffer = sbuf_of(t), .range = VK_WHOLE_SIZE}, {.buffer = kv->bl, .range = VK_WHOLE_SIZE},
         {.buffer = kv->br, .range = VK_WHOLE_SIZE}, {.buffer = G.att_sc.buf, .range = VK_WHOLE_SIZE},
         {.buffer = G.att_ctx.buf, .range = VK_WHOLE_SIZE}};
     VkWriteDescriptorSet wd[7];
@@ -3408,7 +3476,7 @@ int coli_vk_attention_absorb_project(ColiVkTensor **kvb, const void *w, const fl
     vkUpdateDescriptorSets(G.dev, 7, wd, 0, NULL);
     VkDescriptorBufferInfo oi[4] = {
         {.buffer = G.att_ctx.buf, .range = VK_WHOLE_SIZE}, {.buffer = to->wbuf, .range = VK_WHOLE_SIZE},
-        {.buffer = to->sbuf, .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
+        {.buffer = sbuf_of(to), .range = VK_WHOLE_SIZE}, {.buffer = G.y.buf, .range = VK_WHOLE_SIZE}};
     wr_desc(G.dset, 4, oi);
 
     VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
@@ -3479,7 +3547,7 @@ static void tensor_release(ColiVkTensor *t) {
     }
     // Mirror tensor_alloc exactly (rows + scales), atomically: frees run from
     // expert_load under `#pragma omp parallel` and from the tier's uploader.
-    size_t b = t->wbytes + scale_floats(t->fmt, t->I, t->O, t->gs) * sizeof(float);
+    size_t b = t->acct ? t->acct : t->wbytes + scale_floats(t->fmt, t->I, t->O, t->gs) * sizeof(float);
     __atomic_sub_fetch(&P->bytes, b, __ATOMIC_RELAXED);
     __atomic_sub_fetch(&P->tensors, 1, __ATOMIC_RELAXED);
     if (P->counted) {
@@ -3732,16 +3800,16 @@ static int xb_buf(XbCtx *X, XbBuf *b, size_t region, uint32_t memtype, int map) 
 static void xb_write_sets(ColiVkExpert *e) {
     XbCtx *X = e->X;
     VkDescriptorBufferInfo gu[6] = {
-        {X->x.buf, 0, X->x.region}, {e->g->wbuf, 0, VK_WHOLE_SIZE}, {e->g->sbuf, 0, VK_WHOLE_SIZE},
-        {e->u->wbuf, 0, VK_WHOLE_SIZE}, {e->u->sbuf, 0, VK_WHOLE_SIZE}, {X->h.buf, 0, X->h.region}};
+        {X->x.buf, 0, X->x.region}, {e->g->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->g), 0, VK_WHOLE_SIZE},
+        {e->u->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->u), 0, VK_WHOLE_SIZE}, {X->h.buf, 0, X->h.region}};
     VkDescriptorBufferInfo dn[4] = {
-        {X->h.buf, 0, X->h.region}, {e->d->wbuf, 0, VK_WHOLE_SIZE}, {e->d->sbuf, 0, VK_WHOLE_SIZE},
+        {X->h.buf, 0, X->h.region}, {e->d->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->d), 0, VK_WHOLE_SIZE},
         {X->y.buf, 0, X->y.region}};
     VkDescriptorBufferInfo mg[4] = {
-        {X->x.buf, 0, X->x.region}, {e->g->wbuf, 0, VK_WHOLE_SIZE}, {e->g->sbuf, 0, VK_WHOLE_SIZE},
+        {X->x.buf, 0, X->x.region}, {e->g->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->g), 0, VK_WHOLE_SIZE},
         {X->g.buf, 0, X->g.region}};
     VkDescriptorBufferInfo mu[4] = {
-        {X->x.buf, 0, X->x.region}, {e->u->wbuf, 0, VK_WHOLE_SIZE}, {e->u->sbuf, 0, VK_WHOLE_SIZE},
+        {X->x.buf, 0, X->x.region}, {e->u->wbuf, 0, VK_WHOLE_SIZE}, {sbuf_of(e->u), 0, VK_WHOLE_SIZE},
         {X->u.buf, 0, X->u.region}};
     VkWriteDescriptorSet w[18]; int n = 0;
     struct { VkDescriptorSet set; VkDescriptorBufferInfo *bi; int nb, d0, d1; } sets[4] = {
@@ -4888,14 +4956,23 @@ static void xb_shutdown(XbCtx *X) {
  * rows of cpu_row_bytes at *stride bytes apart (the padding is zero), and the
  * scales (fmt 10/11: one float the caller sets to 1). The tier's uploader thread
  * calls this; the pool's lock is the only shared state it touches. */
-int coli_vk_tier_tensor_dev(int dev, ColiVkTensor **t, int fmt, int I, int O, int gs,
+int coli_vk_tier_tensor_pad(int dev, ColiVkTensor **t, int fmt, int I, int O, int gs, size_t pad_w, size_t pad_s,
                             uint8_t **rows, size_t *stride, float **scales) {
     if ((dev == 1 ? !G2.ready : !G.ready) || !fmt_uploadable(fmt, gs)) return 0;
     void *w, *s;
-    ColiVkTensor *n = tensor_alloc(dev == 1 ? &g_tpool2 : &g_tpool, fmt, I, O, gs, &w, &s);
+    ColiVkTensor *n = tensor_alloc_pad(dev == 1 ? &g_tpool2 : &g_tpool, fmt, I, O, gs, pad_w, pad_s, &w, &s);
     if (!n) return 0;
     *t = n; *rows = w; *stride = (size_t)n->rowWords * 4; *scales = s;
     return 1;
+}
+int coli_vk_tier_tensor_dev(int dev, ColiVkTensor **t, int fmt, int I, int O, int gs,
+                            uint8_t **rows, size_t *stride, float **scales) {
+    return coli_vk_tier_tensor_pad(dev, t, fmt, I, O, gs, 0, 0, rows, stride, scales);
+}
+size_t coli_vk_tensor_alloc_bytes(int fmt, int I, int O, int gs, size_t *scale_bytes) {
+    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
+    if (scale_bytes) *scale_bytes = scale_floats(fmt, I, O, gs) * sizeof(float);
+    return (size_t)rowwords(fmt, I) * 4 * (size_t)O;
 }
 int coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
                         uint8_t **rows, size_t *stride, float **scales) {
@@ -4955,6 +5032,22 @@ int coli_vk_tensor_refill(ColiVkTensor *t, uint8_t **rows, size_t *stride, float
     *stride = (size_t)t->rowWords * 4;
     return 1;
 }
+/* coli_vk_tensor_refill in another format (a streaming slot of a tier whose layers mix
+ * formats): the tensor takes fmt/I/O/gs when its ranges hold them (tensor_alloc_pad's
+ * room), the rows zeroed past their bytes. 0 = no room or no memory. */
+int coli_vk_tensor_refill_as(ColiVkTensor *t, int fmt, int I, int O, int gs,
+                             uint8_t **rows, size_t *stride, float **scales) {
+    if (!G.ready || !t || t->pool != &g_tpool) return 0;
+    if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
+    if (t->fmt != fmt || t->I != I || t->O != O || t->gs != gs) {
+        if (!fmt_uploadable(fmt, gs) || bd_fmt(fmt) != bd_fmt(t->fmt)) return 0;   /* its sets name the table or its scales */
+        size_t wb = (size_t)rowwords(fmt, I) * 4 * (size_t)O, sb = scale_floats(fmt, I, O, gs) * sizeof(float);
+        if (wb > t->wcap || sb > t->scap) return 0;
+        t->fmt = fmt; t->I = I; t->O = O; t->gs = gs; t->rowWords = rowwords(fmt, I); t->wbytes = wb;
+        if (!g_up[t->dev].on && t->wmap) memset(t->wmap, 0, wb);   /* staged: refill's image is zeroed */
+    }
+    return coli_vk_tensor_refill(t, rows, stride, scales);
+}
 int coli_vk_staged(void) { return G.ready && g_up[0].on; }
 size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); }
 /* elements per block of a block format (shaders/blockdec.glsl), 0 for any other format */
@@ -5005,6 +5098,7 @@ static void dev2_shutdown(void) {
     G2.inflight = 0;
     g_async_inflight[1] = 0;   /* idle: the deferred frees run now */
     tensor_reap(1);
+    bdtab_free(1);
     Scratch *sc[3] = {&G2.x, &G2.h, &G2.y};
     for (int k = 0; k < 3; k++) if (sc[k]->buf) { vkDestroyBuffer(G2.dev, sc[k]->buf, NULL); vkFreeMemory(G2.dev, sc[k]->mem, NULL); }
     if (G2.pool) vkDestroyDescriptorPool(G2.dev, G2.pool, NULL);
@@ -5080,6 +5174,7 @@ void coli_vk_shutdown(void) {
     }
     g_async_inflight[0] = 0;   /* idle after vkDeviceWaitIdle: the deferred frees run now */
     tensor_reap(0);
+    bdtab_free(0);
     pthread_mutex_lock(&g_imports_mx);   /* imported rows: their memory objects go before the device */
     for (ColiVkTensor *t = g_imports; t; t = t->imp_next) {
         vkDestroyBuffer(G.dev, t->wbuf, NULL); vkFreeMemory(G.dev, t->imp, NULL);
@@ -5574,7 +5669,7 @@ static double bench_experts_fair(int fmt, int D, int I, int K, int Npass) {
     vkAllocateDescriptorSets(G.dev, &dsa, sets);
     memcpy(G.x.ptr, x, (size_t)D*4);
     for (int c = 0; c < K; c++) {
-        VkDescriptorBufferInfo bi[6] = {{.buffer=G.x.buf,.range=VK_WHOLE_SIZE},{.buffer=tg[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=tg[c]->sbuf,.range=VK_WHOLE_SIZE},{.buffer=tu[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=tu[c]->sbuf,.range=VK_WHOLE_SIZE},{.buffer=G.h.buf,.range=VK_WHOLE_SIZE}};
+        VkDescriptorBufferInfo bi[6] = {{.buffer=G.x.buf,.range=VK_WHOLE_SIZE},{.buffer=tg[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=sbuf_of(tg[c]),.range=VK_WHOLE_SIZE},{.buffer=tu[c]->wbuf,.range=VK_WHOLE_SIZE},{.buffer=sbuf_of(tu[c]),.range=VK_WHOLE_SIZE},{.buffer=G.h.buf,.range=VK_WHOLE_SIZE}};
         VkWriteDescriptorSet w[6]; for (int i = 0; i < 6; i++) w[i] = (VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=sets[c],.dstBinding=(uint32_t)i,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&bi[i]};
         vkUpdateDescriptorSets(G.dev, 6, w, 0, NULL);
     }
