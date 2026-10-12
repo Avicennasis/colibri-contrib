@@ -1325,25 +1325,46 @@ static void serve_data_lp(const char *id, const char *p, int n, const char *tail
     fputc('\n',stdout); fflush(stdout);
 }
 
-/* temperature + top-p sampler (ported from kimi_k3.c; vocab ~250k -> qsort O(V log V) per token) */
+/* temperature + top-p sampler. The nucleus is the head of the probabilities in
+ * descending order (ties by id), and the tokens at or above a threshold are such a
+ * head: when their mass covers top_p only they are sorted, else the threshold goes
+ * down. A full qsort of the ~250k vocabulary per token took ~22 ms on one thread, 2-3
+ * tokens a forward with MTP: most of a chat's time beyond the forward at temperature
+ * > 0. The same probabilities, the same head in the same order, the same draw. With
+ * top_p >= 1 there is no nucleus: the draw walks the vocabulary in id order (the same
+ * distribution, without the sort). */
 typedef struct { float p; int id; } SampleProb;
 static int sample_prob_desc(const void *a, const void *b){
-    float pa=((const SampleProb*)a)->p, pb=((const SampleProb*)b)->p;
-    return (pb>pa)-(pa>pb);
+    const SampleProb *x=(const SampleProb*)a,*y=(const SampleProb*)b;
+    if(x->p!=y->p) return x->p>y->p?-1:1;
+    return (x->id>y->id)-(x->id<y->id);
 }
 static int serve_sample(const float *lo, int V, float temp, float top_p){
     if(temp<=0.f){ int b=0; for(int i=1;i<V;i++) if(lo[i]>lo[b]) b=i; return b; }
-    SampleProb *rank=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
-    if(!rank){ fprintf(stderr,"OOM sampling\n"); exit(1); }
+    float *p=malloc((size_t)V*sizeof(float)); SampleProb *head=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
+    if(!p||!head){ fprintf(stderr,"OOM sampling\n"); exit(1); }
     for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
     double sum=0;
-    for(int i=0;i<V;i++){ float p=expf((lo[i]-mx)/temp); sum+=p; rank[i]=(SampleProb){p,i}; }
-    qsort(rank,(size_t)V,sizeof(SampleProb),sample_prob_desc);
-    double cut=(top_p>0.f&&top_p<1.f)?top_p*sum:sum, kept=0; int n=0;
-    while(n<V&&kept<cut) kept+=rank[n++].p;
-    double r=((double)rand()/RAND_MAX)*kept, acc=0; int pick=rank[0].id;
-    for(int i=0;i<n;i++){ acc+=rank[i].p; if(acc>=r){ pick=rank[i].id; break; } }
-    free(rank); return pick;
+    for(int i=0;i<V;i++){ p[i]=expf((lo[i]-mx)/temp); sum+=p[i]; }
+    int pick=0;
+    if(!(top_p>0.f&&top_p<1.f)){
+        double r=((double)rand()/RAND_MAX)*sum, acc=0; pick=V-1;
+        for(int i=0;i<V;i++){ acc+=p[i]; if(acc>=r){ pick=i; break; } }
+    } else {
+        const double cut=top_p*sum; const float ths[3]={1e-4f,1e-9f,0.f};
+        double kept=0; int n=0;
+        for(int a=0;a<3;a++){
+            int m=0;
+            for(int i=0;i<V;i++) if(p[i]>=ths[a]) head[m++]=(SampleProb){p[i],i};
+            qsort(head,(size_t)m,sizeof(SampleProb),sample_prob_desc);
+            kept=0; n=0;
+            while(n<m&&kept<cut) kept+=head[n++].p;
+            if(kept>=cut||m==V) break;           /* else the nucleus reaches below the threshold */
+        }
+        double r=((double)rand()/RAND_MAX)*kept, acc=0; pick=head[0].id;
+        for(int i=0;i<n;i++){ acc+=head[i].p; if(acc>=r){ pick=head[i].id; break; } }
+    }
+    free(p); free(head); return pick;
 }
 
 /* Chat turns end on <|im_end|>, base completions on <|endoftext|>. Resolve
