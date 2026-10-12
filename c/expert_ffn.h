@@ -266,6 +266,52 @@ static inline float xf_dot_i8(const uint8_t *w, const float *sc, const int8_t *x
 #endif
 }
 
+/* n (1..XF_MAX_ROWS) activation rows against one weight row, y[r*ystride] =
+ * xf_dot_i8(w, sc, xq + r*I, xsum + r*(I/64), sx[r], I): each block's nibbles split
+ * once for every row (an MTP verify of 3 rows decoded the row 3 times), each row's
+ * arithmetic xf_dot_i8's, so the bits are its. */
+#define XF_MAX_ROWS 4
+#ifdef XF_HAVE_AVX2
+static inline __attribute__((always_inline)) void xf_dot_i8_rows_body(float *y, int ystride, const uint8_t *w, const float *sc,
+                                                                      const int8_t *xq, const float *xsum, const float *sx, int I, const int n) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F), z = _mm256_setzero_si256();
+    __m256 acc[XF_MAX_ROWS];
+    for (int r = 0; r < n; r++) acc[r] = _mm256_setzero_ps();
+    const int ng = I / XF_BLOCK;
+    for (int g = 0; g < ng; g++) {
+        __m256i bb = _mm256_loadu_si256((const __m256i *)(w + (size_t)g * XF_BLOCK_BYTES));
+        __m256i lo = _mm256_and_si256(bb, m4), hi = _mm256_and_si256(_mm256_srli_epi16(bb, 4), m4);
+        __m256 scg = _mm256_set1_ps(sc[g]);
+        for (int r = 0; r < n; r++) {
+            const int8_t *xb = xq + (size_t)r * I + g * XF_BLOCK;
+            __m256i d = xf_dpbusd(z, lo, _mm256_loadu_si256((const __m256i *)xb));
+            d = xf_dpbusd(d, hi, _mm256_loadu_si256((const __m256i *)(xb + 32)));
+            acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(d), scg, acc[r]);
+        }
+    }
+    for (int r = 0; r < n; r++) {
+        const float *xs = xsum + (size_t)r * ng;
+        float c = 0.f;
+        for (int g = 0; g < ng; g++) c = fmaf(sc[g], xs[g], c);
+        y[(size_t)r * ystride] = (xf_hsum8(acc[r]) - 8.f * c) * sx[r];
+    }
+}
+#endif
+static inline void xf_dot_i8_rows(float *y, int ystride, const uint8_t *w, const float *sc, const int8_t *xq,
+                                  const float *xsum, const float *sx, int I, int n) {
+#ifdef XF_HAVE_AVX2
+    switch (n) {
+    case 1: xf_dot_i8_rows_body(y, ystride, w, sc, xq, xsum, sx, I, 1); break;
+    case 2: xf_dot_i8_rows_body(y, ystride, w, sc, xq, xsum, sx, I, 2); break;
+    case 3: xf_dot_i8_rows_body(y, ystride, w, sc, xq, xsum, sx, I, 3); break;
+    default: xf_dot_i8_rows_body(y, ystride, w, sc, xq, xsum, sx, I, 4); break;
+    }
+#else
+    for (int r = 0; r < n; r++)
+        y[(size_t)r * ystride] = xf_dot_i8_ref(w, sc, xq + (size_t)r * I, xsum + (size_t)r * (I / XF_BLOCK), sx[r], I);
+#endif
+}
+
 /* ---- one expert ------------------------------------------------------------- */
 
 typedef struct {

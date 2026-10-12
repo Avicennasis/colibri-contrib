@@ -208,6 +208,54 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
     return sum;
 }
 
+/* n (1..4) activation rows against one weight row: out[r] = dot_i8i8(w, x + r*I, I).
+ * The weight's absolute value is taken once per chunk and each activation row only
+ * signed and multiplied: an MTP verify (3 rows) pays the weight's share once. Integer
+ * sums, so every out[r] is dot_i8i8's to the bit whatever the order. */
+#define IDOT_MAX_ROWS 4
+static inline void dot_i8i8_rows(const int8_t *w, const int8_t *x, int I, int n, int32_t *out){
+    int i=0;
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    __m512i acc[IDOT_MAX_ROWS];
+    for(int r=0;r<n;r++) acc[r]=_mm512_setzero_si512();
+    for(;i+64<=I;i+=64){
+        __m512i wv=_mm512_loadu_si512((const void*)(w+i)), aw=_mm512_abs_epi8(wv);
+        __mmask64 neg=_mm512_movepi8_mask(wv);
+        for(int r=0;r<n;r++){
+            __m512i xv=_mm512_loadu_si512((const void*)(x+(size_t)r*I+i));
+            acc[r]=_mm512_dpbusd_epi32(acc[r],aw,_mm512_mask_sub_epi8(xv,neg,_mm512_setzero_si512(),xv));
+        }
+    }
+    for(int r=0;r<n;r++) out[r]=_mm512_reduce_add_epi32(acc[r]);
+#elif defined(__AVXVNNI__) && defined(__AVX2__)
+    __m256i acc[IDOT_MAX_ROWS];
+    for(int r=0;r<n;r++) acc[r]=_mm256_setzero_si256();
+    for(;i+32<=I;i+=32){
+        __m256i wv=_mm256_loadu_si256((const __m256i*)(w+i)), aw=_mm256_abs_epi8(wv);
+        for(int r=0;r<n;r++){
+            __m256i xv=_mm256_loadu_si256((const __m256i*)(x+(size_t)r*I+i));
+            acc[r]=_mm256_dpbusd_avx_epi32(acc[r],aw,_mm256_sign_epi8(xv,wv));
+        }
+    }
+    for(int r=0;r<n;r++) out[r]=hsum256_i32(acc[r]);
+#elif defined(__AVX2__)
+    __m256i acc[IDOT_MAX_ROWS]; const __m256i ones=_mm256_set1_epi16(1);
+    for(int r=0;r<n;r++) acc[r]=_mm256_setzero_si256();
+    for(;i+32<=I;i+=32){
+        __m256i wv=_mm256_loadu_si256((const __m256i*)(w+i)), aw=_mm256_sign_epi8(wv,wv);
+        for(int r=0;r<n;r++){
+            __m256i xv=_mm256_loadu_si256((const __m256i*)(x+(size_t)r*I+i));
+            acc[r]=_mm256_add_epi32(acc[r],_mm256_madd_epi16(_mm256_maddubs_epi16(aw,_mm256_sign_epi8(xv,wv)),ones));
+        }
+    }
+    for(int r=0;r<n;r++) out[r]=hsum256_i32(acc[r]);
+#else
+    for(int r=0;r<n;r++) out[r]=dot_i8i8(w,x+(size_t)r*I,I);
+    i=I;
+#endif
+    for(int r=0;r<n;r++){ int32_t t=0; const int8_t *xr=x+(size_t)r*I; for(int j=i;j<I;j++) t+=(int32_t)w[j]*xr[j]; out[r]+=t; }
+}
+
 /* dot int4(packed)*int8 */
 static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     int32_t sum=0; int i=0;
@@ -457,7 +505,12 @@ static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int
 #endif
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
-        for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
+        for(int s0=0;s0<S;s0+=IDOT_MAX_ROWS){
+            int n=S-s0<IDOT_MAX_ROWS?S-s0:IDOT_MAX_ROWS; int32_t d[IDOT_MAX_ROWS];
+            if(n==1) d[0]=dot_i8i8(w,xq+(int64_t)s0*I,I);
+            else dot_i8i8_rows(w,xq+(int64_t)s0*I,I,n,d);
+            for(int r=0;r<n;r++) y[(int64_t)(s0+r)*O+o]=(float)d[r]*sc*sx[s0+r];
+        } }
 }
 static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
                            const float *scale, int S, int I, int O){

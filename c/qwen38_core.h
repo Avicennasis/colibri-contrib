@@ -639,9 +639,9 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
         for(int s=0;s<S;s++)sx[s]=xf_act_i8(x+(int64_t)s*I,I,xq+(int64_t)s*I,xsum+(int64_t)s*ng);
         double started=now_s();
         #pragma omp parallel for schedule(static)
-        for(int o=0;o<O;o++)for(int s=0;s<S;s++)
-            y[(int64_t)s*O+o]=xf_dot_i8(weight->q4+(size_t)o*rb,weight->q4sc+(size_t)o*ng,xq+(int64_t)s*I,
-                                        xsum+(int64_t)s*ng,sx[s],I);
+        for(int o=0;o<O;o++)for(int s0=0;s0<S;s0+=XF_MAX_ROWS)   /* each row's nibbles split once for every s */
+            xf_dot_i8_rows(y+(int64_t)s0*O+o,O,weight->q4+(size_t)o*rb,weight->q4sc+(size_t)o*ng,xq+(int64_t)s0*I,
+                           xsum+(int64_t)s0*ng,sx+s0,I,S-s0<XF_MAX_ROWS?S-s0:XF_MAX_ROWS);
         (void)started;
         free(xq);free(xsum);free(sx);
         return;
@@ -3649,12 +3649,211 @@ static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,
     q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
 }
 
+/* ---- decode rows grouped by expert --------------------------------------------
+ * The decode loop below runs every routed expert of every row on its own: three
+ * parallel regions per expert and row, about 90 a layer for an MTP verify of 3 rows,
+ * each a few hundred rows of work. Here the rows are routed first, the distinct
+ * experts loaded as one batch, and one parallel region runs gate+up over (expert, row
+ * block) items for all the rows each expert received, the hidden rows, then down.
+ * Every output row comes from the per-row kernel q38_weight_matmul calls for that
+ * matrix (q38_matmul_int4g64, x2_matmul, xl_matmul: a row's bits do not depend on how
+ * many activation rows share the call), and each row's sum is added in rank order as
+ * the decode loop adds it, so the output is the decode loop's to the bit.
+ * Q38_MOE_GROUPED=0 keeps the decode loop. */
+enum { Q38_ROWS_NONE = 0, Q38_ROWS_F32 = 1, Q38_ROWS_X2 = 2 };
+/* how a routed expert's matrix takes its input here: f32 (int4-g64), int8 per 32
+ * (int2-g32, int2-g16, int3-g16), or not at all */
+static int q38_rows_kind(const Q38Weight *w) {
+    if(!w->data||w->q4||w->q8||w->gpu||w->act2)return Q38_ROWS_NONE;
+    if(w->kind==Q38_WEIGHT_INT4G64&&w->scales)return Q38_ROWS_F32;
+    if((w->kind==Q38_WEIGHT_INT2G32||w->kind==Q38_WEIGHT_LOWBIT16)&&w->scales&&w->x2q)return Q38_ROWS_X2;
+    return Q38_ROWS_NONE;
+}
+/* rows [r0,r1) of w (O x I) for n activation rows: y[a*ys + o]; xr[a] the f32 rows,
+ * xq/dx the int8-per-32 ones ([n][I], [n][I/32]) */
+static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
+                     const float *const *xr,const int8_t *xq,const float *dx,int n) {
+    if(w->kind==Q38_WEIGHT_INT4G64){
+        const int64_t rb=q38_int4_row_bytes(I),groups=q38_int4_groups(I);const int body=I/XF_BLOCK*XF_BLOCK;
+        for(int o=r0;o<r1;o++){
+            const uint8_t *wr=(const uint8_t*)w->data+(int64_t)o*rb;const float *sc=w->scales+(int64_t)o*groups;
+            for(int a=0;a<n;a++){
+                const float *xs=xr[a];
+                float v=body?xf_dot_f32(wr,sc,xs,body):0.f;
+                if(body<I){
+                    float tail=0.f;
+                    for(int i=body;i<I;i++)tail+=(float)((int)((wr[i>>1]>>((i&1)*4))&15)-8)*xs[i];
+                    v=fmaf(tail,sc[groups-1],v);
+                }
+                y[(int64_t)a*ys+o]=v;
+            }
+        }
+        return;
+    }
+    const int ng=I/32;
+    const int lb=w->kind==Q38_WEIGHT_LOWBIT16;
+    const size_t cb=lb?xl_code_bytes(w->lbits,I):x2_code_bytes(I),qb=lb?xl_scale_bytes(I):(size_t)ng;
+    for(int o=r0;o<r1;o++)
+        for(int a0=0;a0<n;a0+=X2_MAX_ROWS){
+            const int k=n-a0<X2_MAX_ROWS?n-a0:X2_MAX_ROWS;
+            const uint8_t *code=(const uint8_t*)w->data+(size_t)o*cb,*q=w->x2q+(size_t)o*qb;
+            if(lb)xl_dot(y+(int64_t)a0*ys+o,ys,code,q,w->scales[o],w->lbits,xq+(size_t)a0*I,dx+(size_t)a0*ng,I,k);
+            else  x2_dot(y+(int64_t)a0*ys+o,ys,code,q,w->scales[o],xq+(size_t)a0*I,dx+(size_t)a0*ng,I,k);
+        }
+}
+static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int S,float *out,
+                                  const float *logits_in,int routed_only) {
+    static int on=-1;
+    if(on<0){const char *e=getenv("Q38_MOE_GROUPED");on=!(e&&e[0]=='0');}
+    Cfg *c=&m->c;const int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
+    if(!on||S<1||!q38_layer_int4(m,layer)||H%32||I%32)return 0;
+    /* the device tiers take experts per row; the statistics hooks keep the loop's order */
+    if((vkt_ready()&&layer<vkt_layers())||(qt_ready()&&layer<c->layers))return 0;
+    if(g_q38_act||g_q38_dump||g_q38_cov)return 0;
+    const int np=S*K;
+    /* scratch: routes, then per assignment in grouped order its input and outputs */
+    float *logits=falloc((int64_t)S*E),*gates=falloc(np),*sg=falloc((int64_t)S*SI),*su=falloc((int64_t)S*SI);
+    float *sh=falloc((int64_t)S*SI),*shared=falloc((int64_t)S*H),*sgate=falloc(S);
+    float *eg=falloc((int64_t)np*I),*eu=falloc((int64_t)np*I),*ehf=falloc((int64_t)np*I),*eo=falloc((int64_t)np*H);
+    float *dxt=falloc((int64_t)S*(H/32)),*dxg=falloc((int64_t)np*(H/32)),*ehdx=falloc((int64_t)np*(I/32));
+    int8_t *xqt=(int8_t*)malloc((size_t)S*H),*xg=(int8_t*)malloc((size_t)np*H),*ehq=(int8_t*)malloc((size_t)np*I);
+    int *idx=(int*)malloc((size_t)np*sizeof(int)),*pos=(int*)malloc((size_t)np*sizeof(int));
+    int *uniq=(int*)malloc((size_t)np*sizeof(int)),*cnt=(int*)calloc((size_t)np,sizeof(int)),*start=(int*)malloc((size_t)np*sizeof(int));
+    int *who=(int*)malloc((size_t)np*sizeof(int));   /* grouped position -> assignment s*K+z */
+    const float **xr=(const float**)malloc((size_t)np*sizeof(float*)),**hr=(const float**)malloc((size_t)np*sizeof(float*));
+    Slot **slot=(Slot**)malloc((size_t)np*sizeof(Slot*));
+    if(!xqt||!xg||!ehq||!idx||!pos||!uniq||!cnt||!start||!who||!xr||!hr||!slot){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
+    /* route every row, in the decode loop's order and with its side effects */
+    if(logits_in)memcpy(logits,logits_in,(size_t)S*E*sizeof(float));
+    else q38_dense_matmul(m,logits,x,&l->router,S,H,E);
+    for(int s=0;s<S;s++){
+        float *lg=logits+(int64_t)s*E;
+        float mx=lg[0];for(int e=1;e<E;e++)if(lg[e]>mx)mx=lg[e];
+        double all=0;for(int e=0;e<E;e++){lg[e]=expf(lg[e]-mx);all+=lg[e];}
+        int *ix=idx+(int64_t)s*K;float val[Q38_MAX_TOPK];
+        for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=0;for(int j=0;j<z;j++)if(ix[j]==e)used=1;if(!used&&lg[e]>bv){bv=lg[e];best=e;}}ix[z]=rt_router_pick(best,z,E,layer);val[z]=lg[ix[z]];}
+        double top=0;for(int z=0;z<K;z++)top+=val[z];double den=c->norm_topk?top:all;
+        for(int z=0;z<K;z++)gates[s*K+z]=(float)(val[z]/den);
+        rt_route(layer,s,ix,gates+(int64_t)s*K,K);
+    }
+    /* the distinct experts in first-seen order and each one's assignments, grouped */
+    int nu=0;
+    for(int i=0;i<np;i++){
+        int j=0;for(;j<nu;j++)if(uniq[j]==idx[i])break;
+        if(j==nu)uniq[nu++]=idx[i];
+        cnt[j]++;
+    }
+    for(int j=0,p=0;j<nu;j++){start[j]=p;p+=cnt[j];cnt[j]=0;}
+    for(int i=0;i<np;i++){
+        int j=0;while(uniq[j]!=idx[i])j++;
+        int p=start[j]+cnt[j]++;pos[i]=p;who[p]=i;
+    }
+    q38_prefetch_experts(m,layer,uniq,nu);
+    /* the shared expert, all rows at once (each row's bits as one at a time) */
+    double started=now_s();
+    if(!routed_only){
+        q38_weight_matmul(sg,x,&l->sh_g,S,H,SI);q38_weight_matmul(su,x,&l->sh_u,S,H,SI);
+        for(int64_t j=0;j<(int64_t)S*SI;j++)sh[j]=q38_silu(sg[j])*su[j];
+        q38_weight_matmul(shared,sh,&l->sh_d,S,SI,H);
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*H;float g=0.f;
+            for(int d=0;d<H;d++)g+=xs[d]*l->sh_gate[d];
+            sgate[s]=q38_sigmoid(g);
+        }
+        q38_tm_add(m,Q38_TM_SHARED_EXPERT,started);
+    }
+    started=now_s();
+    int loaded=nu>=2?q38_expert_get_batch(m,layer,uniq,nu,slot):0;
+    if(nu==1){slot[0]=q38_expert_get(m,layer,uniq[0]);loaded=1;}
+    int kin=Q38_ROWS_NONE,kdn=Q38_ROWS_NONE;
+    if(loaded){
+        kin=q38_rows_kind(&slot[0]->gate);kdn=q38_rows_kind(&slot[0]->down);
+        for(int j=0;j<nu;j++)
+            if(q38_rows_kind(&slot[j]->gate)!=kin||q38_rows_kind(&slot[j]->up)!=kin||q38_rows_kind(&slot[j]->down)!=kdn)kin=Q38_ROWS_NONE;
+    }
+    if(!loaded||kin==Q38_ROWS_NONE||kdn==Q38_ROWS_NONE){
+        /* no batch of slots (or a kind without a row kernel here): each expert used as
+         * soon as it is loaded, as the decode loop does */
+        for(int i=0;i<np;i++){
+            int p=pos[i];Slot *ex=NULL;
+            if(loaded){for(int j=0;j<nu;j++)if(uniq[j]==idx[i])ex=slot[j];}
+            else ex=q38_expert_get(m,layer,idx[i]);
+            const float *xs=x+(int64_t)(i/K)*H;float *g=eg+(int64_t)p*I,*u=eu+(int64_t)p*I,*h=ehf+(int64_t)p*I;
+            q38_weight_matmul(g,xs,&ex->gate,1,H,I);q38_weight_matmul(u,xs,&ex->up,1,H,I);
+            for(int j=0;j<I;j++)h[j]=q38_silu(g[j])*u[j];
+            q38_weight_matmul(eo+(int64_t)p*H,h,&ex->down,1,I,H);
+        }
+    } else {
+        /* the inputs: f32 row pointers, or int8 per 32 once per row, gathered per assignment */
+        for(int p=0;p<np;p++){xr[p]=x+(int64_t)(who[p]/K)*H;hr[p]=ehf+(int64_t)p*I;}
+        if(kin==Q38_ROWS_X2){
+            for(int s=0;s<S;s++)x2_quant_act(x+(int64_t)s*H,H,xqt+(int64_t)s*H,dxt+(int64_t)s*(H/32));
+            for(int p=0;p<np;p++){
+                int s=who[p]/K;
+                memcpy(xg+(int64_t)p*H,xqt+(int64_t)s*H,(size_t)H);
+                memcpy(dxg+(int64_t)p*(H/32),dxt+(int64_t)s*(H/32),(size_t)(H/32)*sizeof(float));
+            }
+        }
+        int T=1;
+#ifdef _OPENMP
+        T=omp_get_max_threads();
+#endif
+        /* (expert, row block) items: enough for every thread, blocks of 8 rows or more */
+        int cF=(4*T+nu-1)/nu;if(cF>I/8)cF=I/8;if(cF<1)cF=1;
+        int cH=(4*T+nu-1)/nu;if(cH>H/8)cH=H/8;if(cH<1)cH=1;
+        const int rF=(I+cF-1)/cF,rH=(H+cH-1)/cH;
+        cF=(I+rF-1)/rF;cH=(H+rH-1)/rH;
+        #pragma omp parallel
+        {
+            #pragma omp for schedule(dynamic,1)
+            for(int it=0;it<nu*cF;it++){
+                const int j=it/cF,r0=(it%cF)*rF,r1=r0+rF<I?r0+rF:I,p0=start[j],n=cnt[j];
+                q38_rows(eg+(int64_t)p0*I,I,&slot[j]->gate,H,r0,r1,xr+p0,xg+(int64_t)p0*H,dxg+(int64_t)p0*(H/32),n);
+                q38_rows(eu+(int64_t)p0*I,I,&slot[j]->up,H,r0,r1,xr+p0,xg+(int64_t)p0*H,dxg+(int64_t)p0*(H/32),n);
+            }
+            #pragma omp for schedule(static)
+            for(int p=0;p<np;p++){
+                const float *g=eg+(int64_t)p*I,*u=eu+(int64_t)p*I;float *h=ehf+(int64_t)p*I;
+                for(int j=0;j<I;j++)h[j]=q38_silu(g[j])*u[j];
+                if(kdn==Q38_ROWS_X2)x2_quant_act(h,I,ehq+(int64_t)p*I,ehdx+(int64_t)p*(I/32));
+            }
+            #pragma omp for schedule(dynamic,1)
+            for(int it=0;it<nu*cH;it++){
+                const int j=it/cH,r0=(it%cH)*rH,r1=r0+rH<H?r0+rH:H,p0=start[j],n=cnt[j];
+                q38_rows(eo+(int64_t)p0*H,H,&slot[j]->down,I,r0,r1,hr+p0,ehq+(int64_t)p0*I,ehdx+(int64_t)p0*(I/32),n);
+            }
+        }
+    }
+    q38_tm_add(m,Q38_TM_ROUTED_EXPERT,started);
+    static int said;
+    if(!said&&kin!=Q38_ROWS_NONE&&kdn!=Q38_ROWS_NONE&&loaded){
+        said=1;
+        fprintf(stderr,"[qwen38] decode rows' routed experts grouped by expert, one parallel region a layer "
+                       "(Q38_MOE_GROUPED=0: one expert at a time)\n");
+    }
+    /* each row: its experts' outputs in rank order, then the shared expert */
+    for(int s=0;s<S;s++){
+        float *ys=out+(int64_t)s*H;memset(ys,0,(size_t)H*sizeof(float));
+        for(int z=0;z<K;z++){
+            const float g=gates[s*K+z];const float *e=eo+(int64_t)pos[s*K+z]*H;
+            for(int d=0;d<H;d++)ys[d]+=g*e[d];
+        }
+        if(!routed_only)for(int d=0;d<H;d++)ys[d]+=sgate[s]*shared[(int64_t)s*H+d];
+    }
+    rt_trace_end();
+    free(logits);free(gates);free(sg);free(su);free(sh);free(shared);free(sgate);
+    free(eg);free(eu);free(ehf);free(eo);free(dxt);free(dxg);free(ehdx);free(xqt);free(xg);free(ehq);
+    free(idx);free(pos);free(uniq);free(cnt);free(start);free(who);free(xr);free(hr);free(slot);
+    return 1;
+}
+
 /* logits_in: the router's raw rows (S x E) when the caller has them, else NULL and the
  * router runs here; routed_only = 1: `out` gets the routed experts' rank-order sum
  * without the shared expert (the Vulkan dense chain runs the router and the shared
  * expert on the device and adds them there). q38_moe passes NULL, 0: unchanged. */
 static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,float *out,
                               const float *logits_in,int routed_only) {
+    if(q38_moe_decode_grouped(m,l,layer,x,S,out,logits_in,routed_only))return;
     Cfg *c=&m->c;int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
     float *logits=falloc(E),*sg=falloc(SI),*su=falloc(SI),*sh=falloc(SI),*shared=falloc(H);
     float *eg=falloc(I),*eu=falloc(I),*eh=falloc(I),*eo=falloc(H);
