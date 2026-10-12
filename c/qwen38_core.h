@@ -3667,6 +3667,7 @@ static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,
  * the decode loop adds it, so the output is the decode loop's to the bit.
  * Q38_MOE_GROUPED=0 keeps the decode loop. */
 enum { Q38_ROWS_NONE = 0, Q38_ROWS_F32 = 1, Q38_ROWS_X2 = 2, Q38_ROWS_GQ = 3 };
+#define Q38_GROUPED_ROWS 16   /* decode rows and MTP verifies (a prompt's chunks keep the prefill MoE) */
 /* how a routed expert's matrix takes its input here: f32 (int4-g64), int8 per 32
  * (int2-g32, int2-g16, int3-g16), a GGUF block type's integer form (gq_act), or not
  * at all (GQ_EXACT=1's float path among them) */
@@ -3719,7 +3720,9 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     static int on=-1;
     if(on<0){const char *e=getenv("Q38_MOE_GROUPED");on=!(e&&e[0]=='0');}
     Cfg *c=&m->c;const int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
-    if(!on||S<1||!(q38_layer_int4(m,layer)||g_q38_gguf)||H%32||I%32)return 0;
+    if(!on||S<1||S>Q38_GROUPED_ROWS||!(q38_layer_int4(m,layer)||g_q38_gguf)||H%32||I%32)return 0;
+    /* every distinct expert of the rows in the cache at once, or the per-expert paths */
+    if(S*K>m->cache[layer].cap)return 0;
     /* the device tiers take experts per row; the statistics hooks keep the loop's order */
     if((vkt_ready()&&layer<vkt_layers())||(qt_ready()&&layer<c->layers))return 0;
     if(g_q38_act||g_q38_dump||g_q38_cov)return 0;
@@ -4264,6 +4267,9 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
 
 static void q38_moe_ex(Model *m,Layer *l,int layer,const float *x,int S,float *out,
                        const float *logits_in,int routed_only) {
+    /* A few rows (decode, an MTP verify) grouped by expert in one parallel region
+     * when it applies; it gives the bits the paths below give. */
+    if(S>1&&q38_moe_decode_grouped(m,l,layer,x,S,out,logits_in,routed_only))return;
     /* An MTP verify on the CUDA tier routes row by row as decode does, so
      * the tier's resident experts serve it (the batched path is CPU only). */
     if(S<=1||!m->prefill_batch||(g_q38_rowwise&&qt_ready()&&layer<m->c.layers))
