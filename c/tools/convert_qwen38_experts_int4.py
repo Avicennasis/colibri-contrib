@@ -530,6 +530,49 @@ def dequantize_lowbit(codes, q, d, fmt):
             (d[:, None].astype(np.float64) * q.astype(np.float64))[..., None]).reshape(rows, cols)
 
 
+def unpack_lowbit(packed, cols, fmt):
+    """pack_lowbit's inverse: u8 [R, row_code_bytes] -> codes [R, C]"""
+    rows, nb = packed.shape[0], cols // 128
+    blk = packed.reshape(rows, nb, 48 if fmt.bits == 3 else 32)
+    low = blk[:, :, :32]
+    c = np.stack([(low >> (2 * h)) & 3 for h in range(4)], axis=2).reshape(rows, nb, 128)
+    if fmt.bits == 3:   # byte k of the plane: elements k, k+16, ..., k+112 in bits 0..7
+        bits = np.unpackbits(blk[:, :, 32:], axis=2, bitorder="little").reshape(rows, nb, 16, 8)
+        c = c | (bits.transpose(0, 1, 3, 2).reshape(rows, nb, 128) << 2)
+    return c.reshape(rows, cols).astype(np.uint8)
+
+
+def unpack_scales(packed, fmt):
+    """pack_scales' inverse"""
+    if fmt.smax == 255:
+        return packed.astype(np.uint8)
+    q = np.empty((packed.shape[0], packed.shape[1] * 2), dtype=np.uint8)
+    q[:, 0::2] = packed & 15
+    q[:, 1::2] = packed >> 4
+    return q
+
+
+def output_rescale(w3, wq, x, gates, lo=0.8, hi=1.25):
+    """The factor that brings a quantized expert's output back to the original's scale on
+    its calibration rows: <y, yq> / <yq, yq>, each row weighted by its squared gate (the
+    weight it has in the layer's sum), clipped to [lo, hi]; 1 without rows. Measured on 23
+    Qwen3.8 experts, rows never seen: least-squares low-bit experts come out ~4% smaller
+    than the original at every token (best rescale 1.039 int2-g16, 1.035 int3-g16; ISTA's
+    Q2_0 1.005), an error with the same sign in every layer; this factor takes it to 1.008."""
+    if len(x) == 0:
+        return 1.0
+    x = np.asarray(x, dtype=np.float64)
+    g2 = np.asarray(gates, dtype=np.float64) ** 2
+
+    def out(w):
+        g = x @ w[0].T.astype(np.float64)
+        return (g / (1 + np.exp(-g)) * (x @ w[1].T.astype(np.float64))) @ w[2].T.astype(np.float64)
+
+    y, yq = out(w3), out(wq)
+    num, den = float((g2[:, None] * y * yq).sum()), float((g2[:, None] * yq * yq).sum())
+    return float(np.clip(num / den, lo, hi)) if den > 0 else 1.0
+
+
 def dequantize_int2(codes, q, d):
     return dequantize_lowbit(codes, q, d, INT2G32)
 
@@ -761,8 +804,9 @@ _FMT = None
 _ALPHA = 0.1
 
 
-def _init_worker(model_dir, act_path=None, bits=4, cov_path=None, dump_path=None, fmt_name=None, alpha=0.1):
-    global _SOURCE, _ACT, _BITS, _COV, _DUMP, _FMT, _ALPHA
+def _init_worker(model_dir, act_path=None, bits=4, cov_path=None, dump_path=None, fmt_name=None, alpha=0.1,
+                 rescale=False):
+    global _SOURCE, _ACT, _BITS, _COV, _DUMP, _FMT, _ALPHA, _RESCALE
     _SOURCE = Source(model_dir)
     _ACT = ActStats(act_path) if act_path else None
     _BITS = bits
@@ -770,6 +814,7 @@ def _init_worker(model_dir, act_path=None, bits=4, cov_path=None, dump_path=None
     _DUMP = Dump(dump_path) if dump_path else None
     _FMT = LOWBIT[fmt_name] if fmt_name else (INT2G32 if bits == 2 else None)
     _ALPHA = alpha
+    _RESCALE = rescale
 
 
 def convert_expert_int2(layer, expert):
@@ -780,6 +825,9 @@ def convert_expert_int2(layer, expert):
     if _DUMP is not None:
         x, gates = _DUMP.rows(layer, expert)
         out = quantize_expert_lowbit_exact(w3, x, gates, _DUMP.layer_moment(layer), alpha=_ALPHA, fmt=fmt)
+        if _RESCALE:   # down's row scales carry the factor
+            a = output_rescale(w3, [dequantize_lowbit(*o, fmt) for o in out], x, gates)
+            out[2] = (out[2][0], out[2][1], (out[2][2].astype(np.float64) * a).astype(np.float32))
     else:
         out = []
         for k in range(3):
@@ -947,8 +995,88 @@ def peak_rss_mb():
     return peak / (1 << 20) if sys.platform == "darwin" else peak / 1024
 
 
+def _rescale_expert(task):
+    """(layer, expert, path, offset of its record) -> (expert, factor, down's new row scales)"""
+    layer, expert, path, off = task
+    fmt, geo = _FMT, _SOURCE.geometry
+    g = Geometry(geo.layers, geo.experts, geo.hidden, geo.inter, fmt=fmt)
+    with open(path, "rb") as f:
+        f.seek(off)
+        raw = f.read(g.record_bytes)
+    if len(raw) != g.record_bytes:
+        raise RuntimeError(f"{path}: short record of expert {expert} ({len(raw)} bytes)")
+    rec = np.frombuffer(raw, dtype=np.uint8)
+    wq, pos = [], [0, 0, 0]
+    o = 0
+    for k in range(3):
+        pos[k] = o; o += g.code_bytes[k]
+    qo = o
+    for k, (r, c) in enumerate(g.shape):
+        codes = unpack_lowbit(rec[pos[k]:pos[k] + g.code_bytes[k]].reshape(r, fmt.row_code_bytes(c)), c, fmt)
+        qoff = qo + sum(g.q_count[:k])
+        q = unpack_scales(rec[qoff:qoff + g.q_count[k]].reshape(r, fmt.row_scale_bytes(c)), fmt)
+        doff = g.scale_off + 4 * sum(g.scale_count[:k])
+        d = rec[doff:doff + 4 * r].view(np.float32)
+        wq.append((codes, q, d))
+    x, gates = _DUMP.rows(layer, expert)
+    w3 = [_SOURCE.matrix(layer, expert, k) for k in range(3)]
+    a = output_rescale(w3, [dequantize_lowbit(*t, fmt) for t in wq], x, gates)
+    return expert, a, (wq[2][2].astype(np.float64) * a).astype(np.float32).tobytes()
+
+
+def rescale_sidecar(model_dir, out_dir, dump_path, fmt_name, workers=1, layers=None):
+    """--rescale-only: an existing low-bit sidecar's down row scales times each expert's
+    output_rescale factor, in place; the index lists the layers done, never twice."""
+    src = Source(model_dir)
+    geo = src.geometry
+    src.geometry = Geometry(geo.layers, geo.experts, geo.hidden, geo.inter, fmt=LOWBIT[fmt_name])
+    g = src.geometry
+    with open(os.path.join(out_dir, "index.json"), encoding="utf-8") as f:
+        index = json.load(f)
+    if index.get("format") != g.fmt.format or index.get("record_bytes") != g.record_bytes or not index.get("complete"):
+        sys.exit(f"{out_dir}: not a complete {fmt_name} sidecar of this snapshot")
+    done = set(index.get("output_rescale", []))
+    todo = [i for i in parse_layers(layers, g.layers) if i not in done]
+    pool = None
+    if workers > 1 and todo:
+        from multiprocessing import get_context
+        for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ.setdefault(var, "1")
+        pool = get_context("spawn").Pool(workers, initializer=_init_worker,
+                                         initargs=(model_dir, None, 2, None, dump_path, fmt_name, 0.1))
+    else:
+        _init_worker(model_dir, None, 2, None, dump_path, fmt_name, 0.1)
+    down_off = g.scale_off + 4 * (g.scale_count[0] + g.scale_count[1])
+    try:
+        for layer in todo:
+            started = time.time()
+            path = os.path.join(out_dir, layer_file(layer))
+            head = len(layer_header(g, src.prefix, layer))
+            tasks = [(layer, e, path, head + e * g.record_bytes) for e in range(g.experts)]
+            res = pool.imap(_rescale_expert, tasks, chunksize=4) if pool else map(_rescale_expert, tasks)
+            factors = []
+            with open(path, "r+b") as f:
+                for expert, a, d in res:   # one writer: seek and write (no pwrite on Windows)
+                    f.seek(head + expert * g.record_bytes + down_off)
+                    f.write(d)
+                    factors.append(a)
+                f.flush()
+                os.fsync(f.fileno())
+            done.add(layer)
+            index["output_rescale"] = sorted(done)
+            write_index(out_dir, index)
+            fa = np.array(factors)
+            print(f"  layer {layer:3d}: {len(fa)} experts in {time.time() - started:6.1f}s, output rescale mean "
+                  f"{fa.mean():.4f} (min {fa.min():.4f} max {fa.max():.4f}, {int((fa == 1.0).sum())} without rows)", flush=True)
+    finally:
+        if pool:
+            pool.close()
+            pool.join()
+    print(f"{out_dir}: output rescale on {len(done)}/{g.layers} layers")
+
+
 def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_path=None, bits=4, cov_path=None,
-            dump_path=None, fmt_name=None, alpha=0.1):
+            dump_path=None, fmt_name=None, alpha=0.1, rescale=False):
     """Write (or finish) model_dir's sidecar; returns its directory."""
     src = Source(model_dir)
     if fmt_name or bits == 2:
@@ -993,7 +1121,8 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
         if dump_path:
             quantizer = (f"{g.fmt.name}, every expert fitted to the rows it received (Q38_ACT_DUMP "
                          f"{os.path.basename(dump_path.rstrip('/'))}): gate and up with GPTQ under H = sum g^2 x x^T + "
-                         f"{alpha} x the layer's moment, down with GPTQ under the quantized gate/up's SwiGLU outputs")
+                         f"{alpha} x the layer's moment, down with GPTQ under the quantized gate/up's SwiGLU outputs"
+                         + ("; down's row scales times the output rescale on those rows" if rescale else ""))
         if cov:
             quantizer = (quantizer or "uniform weights") + (
                 f"; gate and up with the error carried column by column (GPTQ) under H = D^1/2 C D^1/2 "
@@ -1017,9 +1146,9 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
         from multiprocessing import get_context
         for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
             os.environ.setdefault(var, "1")   # one BLAS thread per worker: the workers are the parallelism
-        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha))
+        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha, rescale))
     else:
-        _init_worker(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha)
+        _init_worker(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha, rescale)
     worst = 0.0
     try:
         for layer in todo:
@@ -1063,9 +1192,22 @@ def main():
                                                             "(groups of 16 with 4-bit scales), into <model>/experts-<name>/")
     ap.add_argument("--alpha", type=float, default=0.1, help="with --dump: the weight of the layer's moment in each "
                                                              "expert's H (default 0.1)")
+    ap.add_argument("--rescale", action="store_true", help="with --dump: down's row scales times each expert's output "
+                                                           "rescale on its rows (the least-squares fit's ~4%% shrink undone)")
+    ap.add_argument("--rescale-only", action="store_true", help="with --dump and --lowbit: apply --rescale to the "
+                                                                "existing sidecar --out in place (layers done are kept in "
+                                                                "its index, never scaled twice)")
     a = ap.parse_args()
+    if a.rescale_only:
+        if not (a.dump and a.lowbit):
+            sys.exit("--rescale-only needs --dump and --lowbit")
+        fmt = LOWBIT[a.lowbit]
+        rescale_sidecar(a.model, a.out or os.path.join(a.model, fmt.sidecar), a.dump, a.lowbit, a.workers, a.layers)
+        return
+    if a.rescale and not a.dump:
+        sys.exit("--rescale needs --dump")
     convert(a.model, a.out, a.workers, a.layers, a.plan, a.act_stats, 2 if (a.int2 or a.lowbit) else 4, a.cov, a.dump,
-            a.lowbit or ("int2g32" if a.int2 else None), a.alpha)
+            a.lowbit or ("int2g32" if a.int2 else None), a.alpha, a.rescale)
 
 
 if __name__ == "__main__":

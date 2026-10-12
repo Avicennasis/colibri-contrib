@@ -191,6 +191,22 @@ class Int2Convert(unittest.TestCase):
         self.assertEqual(g3.record_bytes, 2012160)
         self.assertEqual([t[0].rsplit(".", 1)[-1] for t in g3.tensors("m", 0, 0)][3:6], ["q4"] * 3)
 
+    def test_unpack_and_output_rescale(self):
+        # --rescale-only reads the records back: unpack_lowbit / unpack_scales invert the packers
+        for fmt in (cv.INT2G32, cv.INT2G16, cv.INT3G16):
+            codes = self.rng.integers(0, 2 ** fmt.bits, (6, 384)).astype(np.uint8)
+            back = cv.unpack_lowbit(cv.pack_lowbit(codes, fmt), 384, fmt)
+            self.assertTrue(np.array_equal(back, codes), fmt.name)
+            q = self.rng.integers(0, fmt.smax + 1, (6, 384 // fmt.gs)).astype(np.uint8)
+            self.assertTrue(np.array_equal(cv.unpack_scales(cv.pack_scales(q, fmt), fmt), q), fmt.name)
+        # an expert whose down came out 10% small: the factor finds it back (1/0.9), and it
+        # is clipped, and 1 without rows
+        w3 = [(self.rng.standard_normal(s) * 0.05).astype(np.float32) for s in ((64, 128), (64, 128), (128, 64))]
+        x = self.rng.standard_normal((40, 128)); g = self.rng.uniform(0.05, 0.5, 40)
+        self.assertAlmostEqual(cv.output_rescale(w3, w3[:2] + [w3[2] * 0.9], x, g), 1 / 0.9, places=6)
+        self.assertEqual(cv.output_rescale(w3, w3[:2] + [w3[2] * 0.5], x, g), 1.25)
+        self.assertEqual(cv.output_rescale(w3, w3, x[:0], g[:0]), 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
