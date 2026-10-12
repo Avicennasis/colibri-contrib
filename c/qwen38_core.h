@@ -2780,6 +2780,20 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
             float *z_row=z+(int64_t)s*V;
             float *b_row=bb+(int64_t)s*VH;
             float *a_row=aa+(int64_t)s*VH;
+            /* One parallel region per row: the causal conv by channel, then each value
+             * head on its own (its q/k normalized, the recurrence, the rollback copy,
+             * the gated norm). Each value comes from the code and in the order the
+             * serial loops had, so the bits are theirs; the serial conv and norms (an
+             * expf per channel, 10240 a row) were most of dn-recur. */
+            const float *qi=conv,*ki=conv+K,*vi=conv+2*K;
+            float *norm_row=norm+(int64_t)s*V;
+            /* a verify: the state this row leaves, for the rollback of a draft rejected
+             * after it (q38_spec_rollback), each head copied by its thread right after
+             * its update, while it is in that core's cache */
+            float *snap_rec=base+s<m->snap_rows?m->snap_rec[base+s][layer]:NULL;
+            #pragma omp parallel
+            {
+            #pragma omp for schedule(static)
             for(int d=0;d<CD;d++) {
                 float value=l->dn_conv[(int64_t)d*CK+CK-1]*qkv_row[d];
                 float *history=ring+(int64_t)d*(CK-1);
@@ -2789,7 +2803,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                 for(int tap=0;tap<CK-2;tap++)history[tap]=history[tap+1];
                 history[CK-2]=qkv_row[d];
             }
-            const float *qi=conv,*ki=conv+K,*vi=conv+2*K;
+            #pragma omp for schedule(static)
             for(int h=0;h<VH;h++) {
                 float *qh=q+(int64_t)h*KD,*kh=k+(int64_t)h*KD;
                 int kh_of=g_q38_dn_tiled?h%KH:h/rep;   /* GGUF: value heads tiled over the key heads */
@@ -2803,17 +2817,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                 float qscale=1.f/sqrtf((float)qsum)/sqrtf((float)KD);
                 float kscale=1.f/sqrtf((float)ksum);
                 for(int d=0;d<KD;d++){qh[d]*=qscale;kh[d]*=kscale;}
-            }
-            /* a verify: the state this row leaves, for the rollback of a draft rejected
-             * after it (q38_spec_rollback), each head copied by its thread right after
-             * its update, while it is in that core's cache (one thread copying 3 MB a
-             * layer after the loop was most of dn-snap) */
-            float *snap_rec=base+s<m->snap_rows?m->snap_rec[base+s][layer]:NULL;
-            #pragma omp parallel for schedule(static)
-            for(int h=0;h<VH;h++) {
                 float *state=rec+(int64_t)h*KD*VD;
-                const float *qh=q+(int64_t)h*KD;
-                const float *kh=k+(int64_t)h*KD;
                 const float *vh=vi+(int64_t)h*VD;
                 float alpha=expf((g_q38_a_direct?l->dn_alog[h]:-expf(l->dn_alog[h]))*
                                  q38_softplus(a_row[h]+l->dn_dtbias[h]));
@@ -2838,11 +2842,9 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                     }
                 }
                 if(snap_rec)memcpy(snap_rec+(int64_t)h*KD*VD,state,(size_t)KD*VD*sizeof(float));
+                q38_rmsg(norm_row+(int64_t)h*VD,current,z_row+(int64_t)h*VD,l->dn_norm,VD,c->eps,1);
             }
-            float *norm_row=norm+(int64_t)s*V;
-            for(int h=0;h<VH;h++)
-                q38_rmsg(norm_row+(int64_t)h*VD,core+(int64_t)h*VD,
-                         z_row+(int64_t)h*VD,l->dn_norm,VD,c->eps,1);
+            }
             /* and the conv ring this row leaves (the state went with the heads above) */
             if(base+s<m->snap_rows){
                 double snap_started=now_s();
