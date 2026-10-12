@@ -1015,6 +1015,9 @@ def resume_index(out_dir, src):
             print(f"layer {layer}: listed as done but {path} is missing or the wrong size; converting it again")
     fresh["done"] = sorted(done)
     fresh["complete"] = len(done) == src.geometry.layers
+    for key in ("quantizer", "output_rescale", "output_rescale_factors"):   # what the earlier run recorded
+        if key in index:
+            fresh[key] = index[key]
     return fresh
 
 
