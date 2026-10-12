@@ -752,8 +752,15 @@ static void q38_rmsg(float *out,const float *x,const float *gate,const float *w,
 
 static void q38_rope(float *x, int dim, int rotary_dim, int pos, float theta) {
     int half=rotary_dim/2;
+    /* theta^(2i/rotary_dim), the same powf, kept per thread for the last base: the
+     * indexer ropes every context block of every layer each forward */
+    static __thread float base_theta, base[256]; static __thread int base_rd;
+    if((base_theta!=theta||base_rd!=rotary_dim)&&half<=256){
+        for(int i=0;i<half;i++)base[i]=powf(theta,(float)(2*i)/rotary_dim);
+        base_theta=theta;base_rd=rotary_dim;
+    }
     for(int i=0;i<half;i++) {
-        float ang=(float)pos/powf(theta,(float)(2*i)/rotary_dim);
+        float ang=(float)pos/(half<=256?base[i]:powf(theta,(float)(2*i)/rotary_dim));
         float co=cosf(ang), si=sinf(ang), a=x[i], b=x[i+half];
         x[i]=a*co-b*si; x[i+half]=b*co+a*si;
     }
@@ -2896,60 +2903,75 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         memcpy(IKl+(int64_t)pos*ID,ip+(int64_t)s*(IQ+1)*ID+(int64_t)IQ*ID,(size_t)ID*sizeof(float));
     }
     float *heads=falloc((int64_t)S*QH*D);
-    /* Ranking and attention are independent per position: no shared writes
-     * (heads is row-disjoint, the scratch is per-thread) and no FP order
-     * changes inside a position, so the result is bit-identical to the
-     * serial path. The scheduling is dynamic because the ranking cost grows
-     * with the position (the IK prefix to read is O(pos)). */
-    double index_dt=0,attn_dt=0;
-    /* Wall, not aggregate CPU: the reduction below sums per-thread seconds, so
-     * at prefill these two phases would report ~20x what the clock saw while
-     * every other phase reports wall -- on a 3006-token prompt the phase sum
-     * came to 510 s against a 268 s TTFT, the parts outweighing the whole.
-     * Take the clock across the whole team and split it by CPU share.  At
-     * decode S==1 the loop is serial, cpu_total equals the wall, and the
-     * rescale below is an exact no-op. */
-    double qsa_wall_started=now_s();
-    #pragma omp parallel for schedule(dynamic,8) reduction(+:index_dt,attn_dt) if(S>1)
+    /* Three phases, every value from the code and in the order the per-row loop had,
+     * so the bits are its (the ranking and attention are independent per position):
+     *   A  each context block's pooled, normed and roped key, once for all the rows,
+     *      scored against every row that sees it -- by block, on every thread (the
+     *      per-row loop ran a row's whole context on one thread: three threads in a
+     *      verify, one in decode, thousands of blocks at a long context);
+     *   B  each row's ranking and selection;
+     *   C  attention by (row, head). */
+    double qsa_started=now_s();
+    int maxblocks=0;
+    int *nblk=(int*)malloc((size_t)S*sizeof(int)),*nsel=(int*)calloc((size_t)S,sizeof(int));
+    float *qidx=falloc((int64_t)S*IQ*ID);
+    int *selected=(int*)malloc((size_t)S*maxsel*sizeof(int));
+    if(!nblk||!nsel||!selected){fprintf(stderr,"OOM QSA selection\n");exit(1);}
     for(int s=0;s<S;s++){
-        int pos=mr?mr[s].pos:pos_base+s,visible=pos+1,blocks=visible/R,tail=blocks*R;
-        const float *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
-        const float *IKl=mr?mr[s].seq->IK[layer]:m->IK[layer];
-        double phase_started=now_s();
-        float *qidx=falloc((int64_t)IQ*ID),*pool=falloc(ID);
-        int *selected=(int*)malloc((size_t)maxsel*sizeof(int));
-        if(!selected){fprintf(stderr,"OOM QSA selection\n");exit(1);}
-        for(int h=0;h<IQ;h++){float *qh=qidx+(int64_t)h*ID;memcpy(qh,ip+(int64_t)s*(IQ+1)*ID+(int64_t)h*ID,(size_t)ID*sizeof(float));q38_rms0(qh,qh,l->idx_qn,ID,c->eps);q38_rope(qh,ID,c->rotary_dim,pos,theta);}
-        int take=blocks<c->idx_budget/R?blocks:c->idx_budget/R,nsel=0;
-        Q38Block *rank=blocks?(Q38Block*)malloc((size_t)blocks*sizeof(Q38Block)):NULL;
-        if(blocks&&!rank){fprintf(stderr,"OOM QSA block ranking\n");exit(1);}
-        for(int b=0;b<blocks;b++){
+        int pos=mr?mr[s].pos:pos_base+s;nblk[s]=(pos+1)/R;if(nblk[s]>maxblocks)maxblocks=nblk[s];
+        for(int h=0;h<IQ;h++){float *qh=qidx+((int64_t)s*IQ+h)*ID;memcpy(qh,ip+(int64_t)s*(IQ+1)*ID+(int64_t)h*ID,(size_t)ID*sizeof(float));q38_rms0(qh,qh,l->idx_qn,ID,c->eps);q38_rope(qh,ID,c->rotary_dim,pos,theta);}
+    }
+    Q38Block *rank=maxblocks?(Q38Block*)malloc((size_t)S*maxblocks*sizeof(Q38Block)):NULL;
+    if(maxblocks&&!rank){fprintf(stderr,"OOM QSA block ranking\n");exit(1);}
+    /* the rows share one conversation's IK unless multiplexed: then the blocks by row */
+    const int shared_ik=!mr;
+    const int items=shared_ik?maxblocks:S*maxblocks;
+    #pragma omp parallel
+    {
+        float *pool=falloc(ID);
+        #pragma omp for schedule(dynamic,16)
+        for(int it=0;it<items;it++){
+            const int b=shared_ik?it:it%maxblocks,s0=shared_ik?0:it/maxblocks,s1=shared_ik?S:s0+1;
+            if(!shared_ik&&b>=nblk[s0])continue;
+            const float *IKl=mr?mr[s0].seq->IK[layer]:m->IK[layer];
             memset(pool,0,(size_t)ID*sizeof(float));for(int r=0;r<R;r++){const float *raw=IKl+(int64_t)(b*R+r)*ID;for(int d=0;d<ID;d++)pool[d]+=raw[d]/R;}
             q38_rms0(pool,pool,l->idx_kn,ID,c->eps);q38_rope(pool,ID,c->rotary_dim,b*R,theta);
-            float score=0.f;for(int h=0;h<IQ;h++){float a=0.f;for(int d=0;d<ID;d++)a+=qidx[(int64_t)h*ID+d]*pool[d];if(a>0.f)score+=a;}rank[b]=(Q38Block){score/sqrtf((float)ID),b};
+            for(int s=s0;s<s1;s++){
+                if(b>=nblk[s])continue;
+                const float *qs=qidx+(int64_t)s*IQ*ID;
+                float score=0.f;for(int h=0;h<IQ;h++){float a=0.f;for(int d=0;d<ID;d++)a+=qs[(int64_t)h*ID+d]*pool[d];if(a>0.f)score+=a;}
+                rank[(int64_t)s*maxblocks+b]=(Q38Block){score/sqrtf((float)ID),b};
+            }
         }
-        if(blocks)qsort(rank,(size_t)blocks,sizeof(Q38Block),q38_block_desc);
-        for(int z=0;z<take;z++)for(int r=0;r<R;r++)selected[nsel++]=rank[z].block*R+r;
-        for(int t=tail;t<visible;t++)selected[nsel++]=t;free(rank);
-        index_dt+=now_s()-phase_started; phase_started=now_s();
-        for(int h=0;h<QH;h++){
-            float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)h*2*D;
-            float *qh=falloc(D);memcpy(qh,qraw,(size_t)D*sizeof(float));q38_rms0(qh,qh,l->qn,D,c->eps);q38_rope(qh,D,c->rotary_dim,pos,theta);
-            float *score=falloc(nsel);float mx=-INFINITY;
-            int khidx=h/(QH/KVH);for(int j=0;j<nsel;j++){const float *kh=Kl+((int64_t)khidx*m->kv_cap+selected[j])*D;float a=0.f;for(int d=0;d<D;d++)a+=qh[d]*kh[d];a/=sqrtf((float)D);score[j]=a;if(a>mx)mx=a;}
-            float den=0.f;for(int j=0;j<nsel;j++){score[j]=expf(score[j]-mx);den+=score[j];}
-            float *oh=heads+(int64_t)s*QH*D+(int64_t)h*D;memset(oh,0,(size_t)D*sizeof(float));
-            for(int j=0;j<nsel;j++){float a=score[j]/den;const float *vh=Vl+((int64_t)khidx*m->kv_cap+selected[j])*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
-            for(int d=0;d<D;d++)oh[d]*=q38_sigmoid(qraw[D+d]);free(qh);free(score);
+        free(pool);
+        #pragma omp for schedule(static)
+        for(int s=0;s<S;s++){
+            int pos=mr?mr[s].pos:pos_base+s,visible=pos+1,blocks=nblk[s],tail=blocks*R;
+            int take=blocks<c->idx_budget/R?blocks:c->idx_budget/R,n=0;
+            Q38Block *rk=rank+(int64_t)s*maxblocks;int *sel=selected+(int64_t)s*maxsel;
+            if(blocks)qsort(rk,(size_t)blocks,sizeof(Q38Block),q38_block_desc);
+            for(int z=0;z<take;z++)for(int r=0;r<R;r++)sel[n++]=rk[z].block*R+r;
+            for(int t=tail;t<visible;t++)sel[n++]=t;
+            nsel[s]=n;
         }
-        attn_dt+=now_s()-phase_started;
-        free(qidx);free(pool);free(selected);
     }
-    double qsa_wall=now_s()-qsa_wall_started,cpu_total=index_dt+attn_dt;
-    if(cpu_total>0.0){
-        index_dt=qsa_wall*(index_dt/cpu_total);
-        attn_dt =qsa_wall*(attn_dt /cpu_total);
+    double index_dt=now_s()-qsa_started;qsa_started=now_s();
+    #pragma omp parallel for schedule(dynamic,1)
+    for(int it=0;it<S*QH;it++){
+        const int s=it/QH,h=it%QH,pos=mr?mr[s].pos:pos_base+s,ns=nsel[s];
+        const float *Kl=mr?mr[s].seq->K[layer]:m->K[layer],*Vl=mr?mr[s].seq->V[layer]:m->V[layer];
+        const int *sel=selected+(int64_t)s*maxsel;
+        float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)h*2*D;
+        float *qh=falloc(D);memcpy(qh,qraw,(size_t)D*sizeof(float));q38_rms0(qh,qh,l->qn,D,c->eps);q38_rope(qh,D,c->rotary_dim,pos,theta);
+        float *score=falloc(ns>0?ns:1);float mx=-INFINITY;
+        int khidx=h/(QH/KVH);for(int j=0;j<ns;j++){const float *kh=Kl+((int64_t)khidx*m->kv_cap+sel[j])*D;float a=0.f;for(int d=0;d<D;d++)a+=qh[d]*kh[d];a/=sqrtf((float)D);score[j]=a;if(a>mx)mx=a;}
+        float den=0.f;for(int j=0;j<ns;j++){score[j]=expf(score[j]-mx);den+=score[j];}
+        float *oh=heads+(int64_t)s*QH*D+(int64_t)h*D;memset(oh,0,(size_t)D*sizeof(float));
+        for(int j=0;j<ns;j++){float a=score[j]/den;const float *vh=Vl+((int64_t)khidx*m->kv_cap+sel[j])*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
+        for(int d=0;d<D;d++)oh[d]*=q38_sigmoid(qraw[D+d]);free(qh);free(score);
     }
+    double attn_dt=now_s()-qsa_started;
+    free(nblk);free(nsel);free(qidx);free(selected);free(rank);
     m->timers.seconds[Q38_TM_QSA_INDEX]+=index_dt;
     m->timers.seconds[Q38_TM_QSA_ATTENTION]+=attn_dt;
     q38_dense_matmul(m,out,heads,&l->o,S,QH*D,H);
