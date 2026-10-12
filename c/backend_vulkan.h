@@ -222,6 +222,7 @@ int    coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
 int    coli_vk_tensor_commit(ColiVkTensor *const *t, int n);
 int    coli_vk_staged(void);   /* 1 = resident data goes to the device through staged uploads */
 size_t coli_vk_tensor_row_bytes(int fmt, int I);
+int coli_vk_block_elems(int fmt);   /* block formats (100 + ggml type, 200-202): elements per block; else 0 */
 /* What coli_vk_tensor_ensure(fmt, I, O, gs) adds to coli_vk_mem_info's bytes: the rows
  * at their padded stride and the scales (0 for a grouped format without a group size). */
 size_t coli_vk_tensor_payload(int fmt, int I, int O, int gs);

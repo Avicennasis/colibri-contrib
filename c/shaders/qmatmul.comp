@@ -18,6 +18,7 @@
 //   - grid-stride over rows so a fixed, occupancy-friendly workgroup count
 //     covers any O and any subgroup width (RADV wave32/64).
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer X  { float x[]; };
@@ -37,6 +38,13 @@ layout(push_constant) uniform P {
 // and read x straight from the storage buffer — an unstaged read is coalesced across
 // the subgroup and still correct, while an unchecked stage would write past xsh.
 shared float xsh[6144];
+
+// block formats (fmt >= 100: ggml types, colibri's low-bit experts), shaders/blockdec.glsl
+bool bd_staged; int bd_xoff;
+#define BD_P mv_
+#define BD_W(i) w[i]
+#define BD_X(i) (bd_staged ? xsh[int(i)] : x[bd_xoff + int(i)])
+#include "blockdec.glsl"
 
 float i8(uint word, int lane) {
     int b = int((word >> (uint(lane) * 8u)) & 0xffu);
@@ -77,6 +85,7 @@ void main() {
     if (staged) for (int i = tid; i < p.I; i += nth) xsh[i] = x[s * p.I + i];
     barrier();
     int xoff = s * p.I;
+    bd_staged = staged; bd_xoff = xoff;
 
     int sg      = int(gl_SubgroupID);
     int lane    = int(gl_SubgroupInvocationID);
@@ -169,6 +178,10 @@ void main() {
                 }
                 sum += a * scale[sb + uint(i0 / p.gs)];
             }
+        } else if (p.fmt >= 100) { // block formats: lanes stride the row's 32-weight units, the
+            // scales inside the row (blockdec.glsl), so the per-row scale must NOT run
+            uint units = uint(p.I) >> 5;
+            for (uint un = uint(lane); un < units; un += uint(sgsize)) sum += mv_unit(p.fmt, rowBase * 4u, un, uint(p.I));
         } else { // int4
             int words = (p.I + 7) / 8;
             if (staged) for (int wi = lane; wi < words; wi += sgsize) {
@@ -180,7 +193,7 @@ void main() {
             }
         }
         float tot = subgroupAdd(sum);
-        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 10 || p.fmt == 11 || p.fmt == 12 || p.fmt == 13 || p.fmt == 14)
+        if (lane == 0) y[s * p.O + o] = (p.fmt == 5 || p.fmt == 4 || p.fmt == 7 || p.fmt == 10 || p.fmt == 11 || p.fmt == 12 || p.fmt == 13 || p.fmt == 14 || p.fmt >= 100)
                                         ? tot : tot * scale[o];
     }
 }

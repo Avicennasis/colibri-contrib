@@ -132,6 +132,11 @@
  *   VKT_SRC_FP8_GS        e4m3, f32 per (row, gs)                -> fmt 12
  *   VKT_SRC_FP8_BLOCK     e4m3, f32 per gs x gs block            -> fmt 12 (qwen38 native)
  *   VKT_SRC_BF16, VKT_SRC_F32                                    -> fmt 11, 10
+ *   VKT_SRC_GGML + t      ggml block type t, rows as the GGUF stores them -> fmt 100 + t
+ *                         (no scales: they are in the blocks; shaders/blockdec.glsl)
+ *   VKT_SRC_LB_I2G32, _I2G16, _I3G16  colibri's int2-g32 / int2-g16 / int3-g16 codes, and
+ *                         as "scales" per matrix its group scales (I/32 bytes a row) then
+ *                         its f32 row scales                -> fmt 200, 201, 202
  * Activations (VktConfig.act): VKT_ACT_SWIGLU silu(g)*u, act_limit > 0 clamps the
  * gate from above and up to [-limit, limit] first (GLM-5.3, DeepSeek V4/V4.1);
  * VKT_ACT_SITU a*tanh(g/a)*sigmoid(g) * b*tanh(u/b) with act_a, act_b (Kimi K3);
@@ -151,7 +156,9 @@ typedef enum {
     VKT_SRC_I8_ROW, VKT_SRC_I8_GS, VKT_SRC_I8_AS_I4_ROW, VKT_SRC_I8_AS_I4_GS,
     VKT_SRC_I4S_PAIRS_ROW, VKT_SRC_I4S_PAIRS_GS, VKT_SRC_I4U_PAIRS_ROW, VKT_SRC_I4U_PAIRS_GS,
     VKT_SRC_I4U_PLANAR64, VKT_SRC_I3_G64, VKT_SRC_MXFP4_F32, VKT_SRC_MXFP4_E8M0,
-    VKT_SRC_FP8_GS, VKT_SRC_FP8_BLOCK, VKT_SRC_BF16, VKT_SRC_F32
+    VKT_SRC_FP8_GS, VKT_SRC_FP8_BLOCK, VKT_SRC_BF16, VKT_SRC_F32,
+    VKT_SRC_LB_I2G32, VKT_SRC_LB_I2G16, VKT_SRC_LB_I3G16,
+    VKT_SRC_GGML = 64                   /* + the ggml type: VKT_SRC_GGML + t, t < 43 */
 } VktSrc;
 typedef struct { VktSrc kind; int gs; } VktFmt;     /* gs: group (block) size, 0 = per row */
 

@@ -767,9 +767,23 @@ static int scratch_reserve_mt(Scratch *s, size_t bytes, uint32_t memtype) {
 }
 static int scratch_reserve(Scratch *s, size_t bytes) { return scratch_reserve_mt(s, bytes, G.memtype); }
 
+/* Block formats (shaders/blockdec.glsl): fmt 100 + t is ggml block type t, its rows as the
+ * GGUF file stores them; 200, 201, 202 are colibri's int2-g32, int2-g16 and int3-g16 experts
+ * as codes | group scales (I/32 bytes) | f32 row scale. The scales live in the rows: the
+ * scale array is bound but unused. Elements and bytes per block, by ggml type. */
+static const uint16_t BD_BLK[43] = {1,1,32,32,0,0,32,32,32,0,256,256,256,256,256,0,256,256,256,256,32,256,256,256,
+                                    0,0,0,0,0,256,0,0,0,0,256,256,0,0,0,32,64,128,64};
+static const uint16_t BD_BYTES[43] = {4,2,18,20,0,0,22,24,34,0,84,110,144,176,210,0,66,74,98,50,18,110,82,136,
+                                      0,0,0,0,0,56,0,0,0,0,54,66,0,0,0,17,36,18,18};
+static int bd_fmt(int fmt) { return (fmt >= 102 && fmt < 143 && BD_BLK[fmt - 100] >= 32) || (fmt >= 200 && fmt <= 202); }
+static size_t bd_row_bytes(int fmt, int I) {
+    if (fmt >= 200) return (size_t)I / 128 * (fmt == 202 ? 48 : 32) + (size_t)I / 32 + 4;
+    return (size_t)I / BD_BLK[fmt - 100] * BD_BYTES[fmt - 100];
+}
 /* Bytes of one weight row on the CPU side. fmt 10 (f32) and 11 (bf16) are the plain
  * float weights the newer engines keep resident; they carry no scales. */
 static size_t cpu_row_bytes(int fmt, int I) {
+    if (bd_fmt(fmt)) return bd_row_bytes(fmt, I);
     return fmt == 1 || fmt == 12 || fmt == 13 ? (size_t)I   // int8, fp8: one byte per weight
          : fmt == 5  ? ((size_t)I + 63) / 64 * 24            // int3-g64: 24B per 64-group
          : fmt == 10 ? (size_t)I * 4
@@ -782,7 +796,7 @@ static int rowwords(int fmt, int I) {
 /* Scale floats per tensor: per-row formats carry O, int3-g64 carries O*ceil(I/64)
  * (one f32 per 64-input group). upload_tensor and tensor_free must agree on this. */
 static size_t scale_floats(int fmt, int I, int O, int gs) {
-    if (fmt == 10 || fmt == 11 || fmt == 14) return 1;    // unused by the shader; bound anyway
+    if (fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt)) return 1;    // unused by the shader; bound anyway
     if (fmt == 5) return (size_t)O * (((size_t)I + 63) / 64);
     if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13)
         return (size_t)O * (((size_t)I + gs - 1) / gs);   // per-group [O,ng]
@@ -807,6 +821,25 @@ static VkShaderModule load_spv(VkDevice dev, const char *path) {
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
+/* The subgroup size a device's pipelines run at (vk_pin_sg, 0 = the driver's choice).
+ * The GEMV shaders size their reductions by gl_SubgroupSize; an Intel GPU compiles a
+ * shader at 8, 16 or 32 lanes by its register pressure, and the heavier block-format
+ * decoders (blockdec.glsl) came out at another width than the one they read: every row
+ * wrong on Iris Xe while RADV was exact. Pinned, as the chain's pipelines are (#1954). */
+static int dev_pin_sg(VkDevice dev);
+static const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *pin_info(VkDevice dev,
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *rss) {
+#ifdef VK_EXT_subgroup_size_control
+    int n = dev_pin_sg(dev);
+    if (n <= 0) return NULL;
+    *rss = (VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT){
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .requiredSubgroupSize = (uint32_t)n};
+    return rss;
+#else
+    (void)dev; (void)rss; return NULL;
+#endif
+}
 /* Build a compute pipeline + descriptor pool/set for nbind storage buffers with a
  * pc_size-byte push constant. Used by the 4-binding matmul, 6-binding gate_up and
  * 7-binding absorb attention pipelines. */
@@ -824,8 +857,9 @@ static int build_pipeline(VkDevice dev, int nbind, size_t pc_size, VkShaderModul
     VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1, .pSetLayouts = dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
     VKCHECK(vkCreatePipelineLayout(dev, &pli, NULL, plyt), "pipelineLayout");
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss;
     VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = pin_info(dev, &rss),
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main"},
         .layout = *plyt};
     VKCHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, NULL, pipe), "pipeline");
@@ -1768,7 +1802,7 @@ static ColiVkTensor *tensor_alloc(VkWPool *P, int fmt, int I, int O, int gs, voi
     return t;
 }
 static int fmt_uploadable(int fmt, int gs) {
-    return fmt == 1 || fmt == 2 || fmt == 5 || fmt == 10 || fmt == 11 || fmt == 14 ||   /* fmt=4/7: word-aligned groups only */
+    return fmt == 1 || fmt == 2 || fmt == 5 || fmt == 10 || fmt == 11 || fmt == 14 || bd_fmt(fmt) ||   /* fmt=4/7: word-aligned groups only */
            ((fmt == 4 || fmt == 7) && gs >= 8 && gs % 8 == 0) ||
            ((fmt == 12 || fmt == 13) && gs >= 4 && gs % 4 == 0);           /* fp8 / int8: 4 per word */
 }
@@ -3669,6 +3703,7 @@ typedef struct XbCtx {
 } XbCtx;
 static XbCtx g_xb[2];
 static int xb_dev_ready(const XbCtx *X) { return X->d ? G2.ready : G.ready; }
+static int dev_pin_sg(VkDevice dev) { return dev == G.dev ? G.pin_sg : dev == G2.dev ? G2.pin_sg : 0; }
 struct PCV4 { int rows, n; };
 struct PCGRP { int I, O; float limit; int ibase; int kgat; int rpw; };   /* qmatmul_grp.comp, qmatmul_grp_gemv.comp (rpw) */
 #define XB_GV_RPW 64   /* outputs per grouped-GEMV workgroup */
@@ -3788,9 +3823,10 @@ static int xb_layout(XbCtx *X, int nbind, unsigned dynmask, size_t pc, VkDescrip
     return 1;
 }
 static int xb_pipeline(XbCtx *X, VkShaderModule sh, VkPipelineLayout pl, const VkSpecializationInfo *si, VkPipeline *pipe) {
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss;
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                  .module = sh, .pName = "main", .pSpecializationInfo = si}, .layout = pl};
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = pin_info(X->dev, &rss),
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = sh, .pName = "main", .pSpecializationInfo = si}, .layout = pl};
     VKCHECK(vkCreateComputePipelines(X->dev, VK_NULL_HANDLE, 1, &ci, NULL, pipe), "xb pipeline");
     return 1;
 }
@@ -4302,7 +4338,8 @@ static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQuer
     else {
         for (int c = 0; c < count; c++) {
             int k = X->gemm_rows && rows[c] >= X->gemm_rows ? xb_gemm_slot(X, rows[c]) : -1;
-            route[c] = k >= 0 && X->p_mm[k] ? k : -1;
+            /* the block formats have the GEMVs only (blockdec.glsl in qmatmul*.comp) */
+            route[c] = k >= 0 && X->p_mm[k] && !bd_fmt(ex[c]->g->fmt) && !bd_fmt(ex[c]->d->fmt) ? k : -1;
             ngemm += route[c] >= 0;
         }
         /* phase 1: gate and up of every expert (fused GEMV, or two GEMMs) */
@@ -4920,6 +4957,8 @@ int coli_vk_tensor_refill(ColiVkTensor *t, uint8_t **rows, size_t *stride, float
 }
 int coli_vk_staged(void) { return G.ready && g_up[0].on; }
 size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); }
+/* elements per block of a block format (shaders/blockdec.glsl), 0 for any other format */
+int coli_vk_block_elems(int fmt) { return !bd_fmt(fmt) ? 0 : fmt >= 200 ? 128 : (int)BD_BLK[fmt - 100]; }
 size_t coli_vk_tensor_payload(int fmt, int I, int O, int gs) {
     if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
     return (size_t)rowwords(fmt, I) * 4 * (size_t)O + scale_floats(fmt, I, O, gs) * sizeof(float);

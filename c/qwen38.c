@@ -2897,6 +2897,26 @@ static int q38_vk_load_batch(void *ctx,int layer,const int *e,int n,VktExpertSrc
     for(int i=0;i<n;i++){srcs[i]=q38_vk_src(sl[i]);h[i]=sl[i];}
     return n;
 }
+/* GGUF: the tier's forms of layers [begin,end)'s experts as the file's blocks
+ * (blockdec.glsl reads them on the device): gate and up of one ggml type, down of
+ * one, in every layer, a type the shaders decode and widths of whole blocks. 0 when
+ * not so (the experts then go to the device as int8 per 32, q38_vk_native_fmt). */
+static int q38_vk_gguf_fmts(Model *m,int begin,int end,VktFmt *gu,VktFmt *dn,size_t *ram_expert){
+    Cfg *c=&m->c;int tg=-1,td=-1;
+    const char *e=getenv("COLI_VK_GGUF_RAW");
+    if(e&&e[0]=='0')return 0;
+    if(begin>=c->layers&&g_q38_gg_mtp_layer<0)return 0;
+    for(int l=begin;l<end;l++){
+        const gguf_tensor *t[3];q38_gg_expert_tensors(m,l,t);
+        if(t[0]->type!=t[1]->type)return 0;
+        if(l==begin){tg=t[0]->type;td=t[2]->type;*ram_expert=0;for(int k=0;k<3;k++)*ram_expert+=(size_t)(t[k]->nbytes/c->experts);}
+        else if(t[0]->type!=tg||t[2]->type!=td)return 0;
+    }
+    int bg=coli_vk_block_elems(100+tg),bd=coli_vk_block_elems(100+td);
+    if(!bg||!bd||c->hidden%bg||c->inter%bd)return 0;
+    gu->kind=(VktSrc)(VKT_SRC_GGML+tg);gu->gs=0;dn->kind=(VktSrc)(VKT_SRC_GGML+td);dn->gs=0;
+    return 1;
+}
 /* The tier's source form of layers [begin,end)'s routed experts as the snapshot
  * keeps them (not the int4 sidecar's), and one expert's bytes in RAM; VKT_SRC_NONE
  * when they mix formats. */
@@ -2928,13 +2948,20 @@ static void q38_vk_tier_start(Model *m,int cap){
         return;
     }
     Cfg *c=&m->c;int H=c->hidden,F=c->inter;
-    VktFmt f={VKT_SRC_NONE,0};size_t ram_expert=0;
+    VktFmt f={VKT_SRC_NONE,0},fd;size_t ram_expert=0;
     if(m->x4&&m->x4->lb){
-        fprintf(stderr,"[VK] tier qwen38: the %s experts have no device kernel yet; they stay on the CPU\n",m->x4->lb->name);
-        return;
+        /* colibri's low-bit experts: the same codes and scales on the device (blockdec.glsl) */
+        f.kind=!strcmp(m->x4->lb->name,"int2g32")?VKT_SRC_LB_I2G32:!strcmp(m->x4->lb->name,"int2g16")?VKT_SRC_LB_I2G16:VKT_SRC_LB_I3G16;
+        f.gs=0;ram_expert=(size_t)m->x4->record_bytes;
     }
-    if(m->x4){ f.kind=VKT_SRC_I4U_PLANAR64; f.gs=64; ram_expert=(size_t)m->x4->record_bytes; }
+    else if(m->x4){ f.kind=VKT_SRC_I4U_PLANAR64; f.gs=64; ram_expert=(size_t)m->x4->record_bytes; }
+    else if(g_q38_gguf&&q38_vk_gguf_fmts(m,0,c->layers,&f,&fd,&ram_expert)){
+        g_q38_vk_raw=1;
+        fprintf(stderr,"[VK] tier qwen38: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down; COLI_VK_GGUF_RAW=0: int8 per 32)\n",
+                gq_type_name((int)(f.kind-VKT_SRC_GGML)),gq_type_name((int)(fd.kind-VKT_SRC_GGML)));
+    }
     else f=q38_vk_native_fmt(m,0,c->layers,&ram_expert);
+    if(!g_q38_vk_raw)fd=f;
     if(f.kind==VKT_SRC_NONE){
         fprintf(stderr,"[VK] tier qwen38: the routed experts mix formats; they stay on the CPU\n");
         return;
@@ -2945,13 +2972,15 @@ static void q38_vk_tier_start(Model *m,int cap){
     VktFmt fm={VKT_SRC_NONE,0};size_t ram_mtp=0;
     const char *tm=getenv("COLI_VK_TIER_MTP");
     int want_mtp=tm&&*tm?*tm!='0':!coli_vk_device_shares_ram();
+    VktFmt fmd={VKT_SRC_NONE,0};
     if(m->mtp&&want_mtp){
-        fm=q38_vk_native_fmt(m,c->layers,c->layers+1,&ram_mtp);
+        if(g_q38_vk_raw){ if(!q38_vk_gguf_fmts(m,c->layers,c->layers+1,&fm,&fmd,&ram_mtp))fm.kind=VKT_SRC_NONE; }
+        else { fm=q38_vk_native_fmt(m,c->layers,c->layers+1,&ram_mtp); fmd=fm; }
         if(fm.kind==VKT_SRC_NONE)fprintf(stderr,"[VK] tier qwen38: the MTP head's experts mix formats; they stay on the CPU\n");
     }
     VktConfig vc={.engine="qwen38",.layers=c->layers,.experts=c->experts,.hidden=H,.inter=F,.topk=c->topk,
-                  .gate_up=f,.down=f,.act=VKT_ACT_SWIGLU,
-                  .extra_layers=fm.kind!=VKT_SRC_NONE,.extra_gate_up=fm,.extra_down=fm,
+                  .gate_up=f,.down=fd,.act=VKT_ACT_SWIGLU,
+                  .extra_layers=fm.kind!=VKT_SRC_NONE,.extra_gate_up=fm,.extra_down=fmd,
                   .max_rows=q38_moe_prefill_rows(c,q38_prefill_batch_rows())*c->topk,
                   .ram_reserve=ram_expert*(size_t)cap*(size_t)c->layers,
                   .dense_bytes=q38_vk_dense_bytes(m),
@@ -2970,7 +2999,7 @@ static void q38_vk_tier_start(Model *m,int cap){
     if(n>0){
         double t0=now_s();
         int64_t bufb=m->x4?m->x4->record_bytes:(int64_t)3*H*F;
-        int direct=m->x4||f.kind==VKT_SRC_FP8_BLOCK;
+        int direct=(m->x4&&!m->x4->lb)||f.kind==VKT_SRC_FP8_BLOCK;   /* the int4 record or FP8 ranges read straight */
         if(direct){
             #pragma omp parallel
             {

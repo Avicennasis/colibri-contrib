@@ -150,7 +150,10 @@ static int kind_of(int layer) { return layer >= T.main_layers; }   /* the form o
 static int src_per_row(VktSrc k) {
     return k == VKT_SRC_I8_ROW || k == VKT_SRC_I8_AS_I4_ROW || k == VKT_SRC_I4S_PAIRS_ROW || k == VKT_SRC_I4U_PAIRS_ROW;
 }
+static int src_lowbit(VktSrc k) { return k == VKT_SRC_LB_I2G32 || k == VKT_SRC_LB_I2G16 || k == VKT_SRC_LB_I3G16; }
 static size_t src_row_bytes(VktSrc k, int I) {
+    if (k >= VKT_SRC_GGML) return coli_vk_tensor_row_bytes(100 + (int)(k - VKT_SRC_GGML), I);   /* as the device holds it */
+    if (src_lowbit(k)) return (size_t)I * (k == VKT_SRC_LB_I3G16 ? 3 : 2) / 8;
     switch (k) {
     case VKT_SRC_I8_ROW: case VKT_SRC_I8_GS: case VKT_SRC_I8_AS_I4_ROW: case VKT_SRC_I8_AS_I4_GS:
     case VKT_SRC_FP8_GS: case VKT_SRC_FP8_BLOCK: return (size_t)I;
@@ -161,7 +164,8 @@ static size_t src_row_bytes(VktSrc k, int I) {
     }
 }
 static size_t src_scale_bytes(VktFmt f, int I, int O) {
-    if (f.kind == VKT_SRC_BF16 || f.kind == VKT_SRC_F32) return 0;
+    if (f.kind == VKT_SRC_BF16 || f.kind == VKT_SRC_F32 || f.kind >= VKT_SRC_GGML) return 0;
+    if (src_lowbit(f.kind)) return (size_t)O * ((size_t)I / 32 + 4);   /* group scales, then f32 row scales */
     if (src_per_row(f.kind)) return (size_t)O * 4;
     if (f.kind == VKT_SRC_I4U_PLANAR64 || f.kind == VKT_SRC_I3_G64) return (size_t)O * (((size_t)I + 63) / 64) * 4;
     size_t ng = ((size_t)I + f.gs - 1) / f.gs;
@@ -172,6 +176,8 @@ static size_t src_scale_bytes(VktFmt f, int I, int O) {
 /* The backend format a source kind lands in; 0 when the combination is not one. */
 static int dev_fmt(VktFmt f, int *fmt, int *gs) {
     int g = f.gs;
+    if (f.kind >= VKT_SRC_GGML) { *fmt = 100 + (int)(f.kind - VKT_SRC_GGML); *gs = 0; return coli_vk_block_elems(*fmt) > 0; }
+    if (src_lowbit(f.kind)) { *fmt = f.kind == VKT_SRC_LB_I2G32 ? 200 : f.kind == VKT_SRC_LB_I2G16 ? 201 : 202; *gs = 0; return 1; }
     switch (f.kind) {
     case VKT_SRC_I8_ROW: *fmt = 1; *gs = 0; return 1;
     case VKT_SRC_I8_GS: *fmt = 13; *gs = g; return g >= 4 && g % 4 == 0;
@@ -201,6 +207,19 @@ static void convert_par(VktFmt f, int I, int O, const uint8_t *codes, const void
                         uint8_t *rows, size_t stride, float *sc, int par) {
     size_t rb = src_row_bytes(f.kind, I);
     par = par && O >= 64;
+    if (src_lowbit(f.kind)) {   /* device row: codes | group scales | f32 row scale (blockdec.glsl) */
+        const uint8_t *q = scales; const size_t qb = (size_t)I / 32;
+        const uint8_t *d = q + (size_t)O * qb;
+        #pragma omp parallel for schedule(static) if (par)
+        for (int o = 0; o < O; o++) {
+            uint8_t *dst = rows + (size_t)o * stride;
+            memcpy(dst, codes + (size_t)o * rb, rb);
+            memcpy(dst + rb, q + (size_t)o * qb, qb);
+            memcpy(dst + rb + qb, d + (size_t)o * 4, 4);
+        }
+        sc[0] = 1.0f;
+        return;
+    }
     switch (f.kind) {
     case VKT_SRC_I8_AS_I4_ROW: case VKT_SRC_I8_AS_I4_GS:   /* int8 in [-8,7] -> v+8 nibble pairs */
         #pragma omp parallel for schedule(static) if (par)
@@ -243,7 +262,7 @@ static void convert_par(VktFmt f, int I, int O, const uint8_t *codes, const void
         for (int o = 0; o < O; o++) memcpy(rows + (size_t)o * stride, codes + (size_t)o * rb, rb);
         break;
     }
-    if (f.kind == VKT_SRC_BF16 || f.kind == VKT_SRC_F32) { sc[0] = 1.0f; return; }
+    if (f.kind == VKT_SRC_BF16 || f.kind == VKT_SRC_F32 || f.kind >= VKT_SRC_GGML) { sc[0] = 1.0f; return; }
     if (f.kind == VKT_SRC_MXFP4_E8M0) {        /* ue8m0 -> f32 2^(s-127), quant.h's mx4_scale */
         size_t n = (size_t)O * (((size_t)I + f.gs - 1) / f.gs);
         const uint8_t *e = scales;
@@ -1413,6 +1432,9 @@ static int form_init(int k, VktFmt gu, VktFmt dn) {
     __typeof__(T.form[0]) *fm = &T.form[k];
     const int H = T.c.hidden, F = T.c.inter;
     if (!dev_fmt(gu, &fm->gu_fmt, &fm->gu_gs) || !dev_fmt(dn, &fm->dn_fmt, &fm->dn_gs)) return 0;
+    /* a block format reads whole blocks of a row */
+    int bg = coli_vk_block_elems(fm->gu_fmt), bd = coli_vk_block_elems(fm->dn_fmt);
+    if ((bg && H % bg) || (bd && F % bd)) return 0;
     fm->gu = gu; fm->dn = dn;
     fm->gu_codes = src_row_bytes(gu.kind, H) * (size_t)F;
     fm->d_codes = src_row_bytes(dn.kind, F) * (size_t)H;
