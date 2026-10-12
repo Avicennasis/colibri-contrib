@@ -2424,6 +2424,7 @@ int main(int argc, char **argv) {
                 g_q38_mux_slots);
     }
     q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */
+    q38_draft_head_build(&m);  /* Q38_DRAFT_HEAD=int4: the MTP drafts' lm_head in int4 */
     q38_expert_report(&m, cap);         /* expert format, bytes per expert, what the cache costs */
 #ifdef COLI_VULKAN
     /* After the trunk is int8: those rows upload at their first matmul. No

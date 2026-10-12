@@ -134,6 +134,9 @@ typedef enum {
     Q38_TM_QSA_ATTENTION,
     Q38_TM_PLE,
     Q38_TM_LM_HEAD,
+    Q38_TM_DN_RECUR,               /* inside deltanet: conv, recurrence, gated norm (no weights) */
+    Q38_TM_DN_SNAP,                /* inside deltanet: a verify's per-row state copies */
+    Q38_TM_LM_DRAFT,               /* the MTP head's lm-head (its drafts), apart from lm-head */
     Q38_TM_COUNT
 } Q38Timer;
 
@@ -220,6 +223,7 @@ typedef struct {
     shards S;
     char prefix[32];
     Q38Weight embed, lm_head;
+    uint8_t *draft_codes; float *draft_sc;   /* Q38_DRAFT_HEAD=int4: lm_head as planar int4-g64 for the MTP drafts only */
     GatedResidual final_gr;
     Layer *L;
     LCache *cache;
@@ -2744,6 +2748,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
         q38_dense_matmul(m,bb,chunk,&l->dn_b,rows,H,VH);
         q38_dense_matmul(m,aa,chunk,&l->dn_a,rows,H,VH);
 
+        double recur_started=now_s(),snap_s=0.0;
         for(int s=0;s<rows;s++) {
             if(m->mux_rows){rec=m->mux_rows[base+s].seq->DN_rec[layer];ring=m->mux_rows[base+s].seq->DN_conv[layer];}
             float *qkv_row=qkv+(int64_t)s*CD;
@@ -2783,22 +2788,24 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                 float alpha=expf((g_q38_a_direct?l->dn_alog[h]:-expf(l->dn_alog[h]))*
                                  q38_softplus(a_row[h]+l->dn_dtbias[h]));
                 float beta=q38_sigmoid(b_row[h]);
-                float delta[512];
-                int64_t state_cells=(int64_t)KD*VD;
-                for(int64_t cell=0;cell<state_cells;cell++)state[cell]*=alpha;
-                for(int value=0;value<VD;value++) {
-                    float previous=0.f;
-                    for(int d=0;d<KD;d++)
-                        previous+=kh[d]*state[(int64_t)d*VD+value];
-                    delta[value]=(vh[value]-previous)*beta;
+                /* Two passes over the state, both along its rows (contiguous,
+                 * vectorized): decay and k^T S, then the update and q^T S on the
+                 * updated row. Every value's sums run over d in order, as the
+                 * column loops did; explicit fmaf keeps the bits independent of
+                 * the compiler's contraction choices. */
+                float previous[512],delta[512],*current=core+(int64_t)h*VD;
+                for(int value=0;value<VD;value++)previous[value]=0.f;
+                for(int d=0;d<KD;d++){
+                    float *row=state+(int64_t)d*VD;const float kd=kh[d];
+                    for(int value=0;value<VD;value++){row[value]*=alpha;previous[value]=fmaf(kd,row[value],previous[value]);}
                 }
-                for(int d=0;d<KD;d++)for(int value=0;value<VD;value++)
-                    state[(int64_t)d*VD+value]+=kh[d]*delta[value];
-                for(int value=0;value<VD;value++) {
-                    float current=0.f;
-                    for(int d=0;d<KD;d++)
-                        current+=qh[d]*state[(int64_t)d*VD+value];
-                    core[(int64_t)h*VD+value]=current;
+                for(int value=0;value<VD;value++){delta[value]=(vh[value]-previous[value])*beta;current[value]=0.f;}
+                for(int d=0;d<KD;d++){
+                    float *row=state+(int64_t)d*VD;const float kd=kh[d],qd=qh[d];
+                    for(int value=0;value<VD;value++){
+                        row[value]=fmaf(kd,delta[value],row[value]);
+                        current[value]=fmaf(qd,row[value],current[value]);
+                    }
                 }
             }
             float *norm_row=norm+(int64_t)s*V;
@@ -2808,10 +2815,14 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
             /* a verify: the state this row leaves, for the rollback of a
              * draft rejected after it (q38_spec_rollback) */
             if(base+s<m->snap_rows){
+                double snap_started=now_s();
                 memcpy(m->snap_rec[base+s][layer],rec,(size_t)VH*KD*VD*sizeof(float));
                 memcpy(m->snap_conv[base+s][layer],ring,(size_t)CD*(CK-1)*sizeof(float));
+                snap_s+=now_s()-snap_started;
             }
         }
+        m->timers.seconds[Q38_TM_DN_RECUR]+=now_s()-recur_started-snap_s;
+        m->timers.seconds[Q38_TM_DN_SNAP]+=snap_s;
         q38_dense_matmul(m,out+(int64_t)base*H,norm,&l->dn_out,
                          rows,V,H);
         base+=rows;
@@ -3061,6 +3072,60 @@ static void q38_trunk_cpu_int8(Model *m) {
     }
     fprintf(stderr,"[qwen38] trunk: %d matrices int8 on the CPU (%.2f GiB, %.2f GiB of BF16 released) in %.1fs; Q38_TRUNK_CPU_INT8=0 keeps BF16\n",
             n,bytes/1073741824.0,released/1073741824.0,now_s()-t0);
+}
+
+/* Q38_DRAFT_HEAD=int4: the MTP drafts' lm_head as planar int4-g64 (expert_ffn.h's
+ * layout, absmax/7 per 64), built once from the rows the model keeps (int8 or BF16).
+ * A draft only needs the most likely token and the verify recomputes every row with
+ * the full lm_head, so the generated text is the same; what can change is how often a
+ * draft is right. Half the bytes of the int8 rows, read with int8 activations. */
+static void q38_draft_head_build(Model *m) {
+    const char *e=getenv("Q38_DRAFT_HEAD");
+    if(!e||strcmp(e,"int4")||!m->mtp_wiring||!m->lm_head.rows)return;
+    const int V=m->lm_head.rows,H=m->lm_head.cols;
+    if(H%XF_BLOCK){fprintf(stderr,"[qwen38] Q38_DRAFT_HEAD=int4: hidden %d is not a multiple of 64, ignored\n",H);return;}
+    double t0=now_s();
+    m->draft_codes=(uint8_t*)malloc((size_t)V*xf_row_bytes(H));
+    m->draft_sc=(float*)malloc((size_t)V*xf_groups(H)*sizeof(float));
+    if(!m->draft_codes||!m->draft_sc){fprintf(stderr,"OOM draft head\n");exit(1);}
+    const Q38Weight *w=&m->lm_head;
+    #pragma omp parallel
+    {
+        float *row=falloc(H);
+        #pragma omp for schedule(static)
+        for(int r=0;r<V;r++){
+            if(w->q8)for(int i=0;i<H;i++)row[i]=(float)w->q8[(size_t)r*H+i]*w->q8sc[r];   /* the trunk's int8 rows (BF16 released) */
+            else q38_weight_row(w,r,row);
+            uint8_t *dst=m->draft_codes+(size_t)r*xf_row_bytes(H);
+            for(int g=0;g<H/XF_BLOCK;g++){
+                const float *v=row+g*XF_BLOCK;float am=0.f;
+                for(int i=0;i<XF_BLOCK;i++){float a=fabsf(v[i]);if(a>am)am=a;}
+                float sc=am>0.f?am/7.f:1.f,inv=1.f/sc;
+                m->draft_sc[(size_t)r*xf_groups(H)+g]=sc;
+                for(int k=0;k<32;k++){
+                    int lo=(int)lrintf(v[k]*inv),hi=(int)lrintf(v[k+32]*inv);
+                    lo=lo<-8?-8:lo>7?7:lo;hi=hi<-8?-8:hi>7?7:hi;
+                    dst[g*XF_BLOCK_BYTES+k]=(uint8_t)((lo+8)|((hi+8)<<4));
+                }
+            }
+        }
+        free(row);
+    }
+    fprintf(stderr,"[qwen38] MTP drafts: lm_head as int4-g64 (%.2f GiB, built in %.1fs); the verify keeps the full one\n",
+            ((double)V*xf_row_bytes(H)+(double)V*xf_groups(H)*sizeof(float))/1073741824.0,now_s()-t0);
+}
+/* logit[V] for one row x[H]: the draft head when there is one, else lm_head */
+static void q38_draft_logits(Model *m,float *logit,const float *x) {
+    const int V=m->lm_head.rows,H=m->lm_head.cols;
+    if(!m->draft_codes){q38_weight_matmul(logit,x,&m->lm_head,1,H,V);return;}
+    int8_t *xq=(int8_t*)malloc((size_t)H);float *xsum=falloc(H/XF_BLOCK);
+    if(!xq){fprintf(stderr,"OOM draft activation\n");exit(1);}
+    float sx=xf_act_i8(x,H,xq,xsum);
+    const size_t rb=xf_row_bytes(H);const int ng=xf_groups(H);
+    #pragma omp parallel for schedule(static)
+    for(int r=0;r<V;r++)
+        logit[r]=xf_dot_i8(m->draft_codes+(size_t)r*rb,m->draft_sc+(size_t)r*ng,xq,xsum,sx,H);
+    free(xq);free(xsum);
 }
 #ifdef COLI_VULKAN
 /* ---- dense weights on the device only (COLI_VK_DENSE_HOST) ----------------------
@@ -4196,8 +4261,8 @@ static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int
         if(logit&&base+rows==S){
             double started=now_s();
             q38_gr_read(m,&m->mtp_mixer,hyper+(int64_t)(rows-1)*W,1,mixed,NULL);
-            q38_weight_matmul(logit,mixed,&m->lm_head,1,H,c->vocab);
-            q38_tm_add(m,Q38_TM_LM_HEAD,started);
+            q38_draft_logits(m,logit,mixed);
+            q38_tm_add(m,Q38_TM_LM_DRAFT,started);
         }
     }
     free(hyper);free(mixed);free(inject);free(block);
@@ -4273,8 +4338,8 @@ static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row) {
     memcpy(hidden,hyper,(size_t)W*sizeof(float));
     double started=now_s();
     q38_gr_read(m,&m->mtp_mixer,hyper,1,mixed,NULL);
-    q38_weight_matmul(logit,mixed,&m->lm_head,1,H,c->vocab);
-    q38_tm_add(m,Q38_TM_LM_HEAD,started);
+    q38_draft_logits(m,logit,mixed);
+    q38_tm_add(m,Q38_TM_LM_DRAFT,started);
     int draft=q38_argmax(logit,c->vocab);
     free(hyper);free(mixed);free(inject);free(block);free(logit);
     return draft;
@@ -4672,7 +4737,8 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
     if(!q38_tm_enabled())return;
     static const char *names[Q38_TM_COUNT]={
         "expert-read","fp8-expand","routed-expert","shared-expert",
-        "resident-mm","deltanet","qsa-index","qsa-attn","ple","lm-head"
+        "resident-mm","deltanet","qsa-index","qsa-attn","ple","lm-head",
+        "dn-recur","dn-snap","lm-draft"
     };
     double per=timers->forwards?1000.0/timers->forwards:0.0;
     fprintf(stderr,"[qwen38 timers] %s: %llu forwards\n",scope,
@@ -4761,6 +4827,7 @@ static void q38_model_free(Model *m) {
     if(m->x4){st_destroy(&m->x4->S);free(m->x4->fd);free(m->x4->off);free(m->x4);}
     free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->dn_dev_fresh); free(m->dn_host_stale); free(m->K); free(m->V); free(m->IK);
     q38_weight_free(&m->embed);q38_weight_free(&m->lm_head);
+    free(m->draft_codes);free(m->draft_sc);m->draft_codes=NULL;m->draft_sc=NULL;
     free(m->final_gr.norm);q38_weight_free(&m->final_gr.down);q38_weight_free(&m->final_gr.up);q38_weight_free(&m->final_gr.inject);
     free(m->ple_history); free(m->PLE_conv_state); free(m->c.is_attn); st_destroy(&m->S);
     memset(m,0,sizeof(*m));
