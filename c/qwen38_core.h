@@ -106,6 +106,8 @@ typedef struct {
     Q38WeightKind kind;
     unsigned owns_data:1, owns_scales:1;
     int gpu;                       /* 0 = CPU; else 1 + tier handle of an int8 copy resident in VRAM (decode, S == 1) */
+    uint8_t *q4; float *q4sc;      /* Q38_TRUNK_CPU_INT4: the trunk's rows as planar int4-g64 (expert_ffn.h), one scale per 64 */
+    double *act2; int64_t act_n;   /* Q38_TRUNK_STATS: sum of x^2 per input column over the rows this matrix met */
     int8_t *q8; float *q8sc;       /* the trunk's int8 rows on the CPU (default; Q38_TRUNK_CPU_INT8=0 keeps BF16): the same rows the GPU holds, met by an int8 activation in idot.h */
     void *vk; int vk_off;          /* COLI_VULKAN=1: device copy of q8, or of the BF16/F32 rows (uploaded at the first matmul), vk_off = upload failed, stays on the CPU */
     int vk_res;                    /* COLI_VULKAN=1: a resident matrix (q38_load_weight), never an expert slot that is refilled in place */
@@ -368,6 +370,7 @@ static void q38_weight_free(Q38Weight *weight) {
     if(weight->owns_data)free(weight->data);
     if(weight->owns_scales)free(weight->scales);
     free(weight->q8); free(weight->q8sc);
+    free(weight->q4); free(weight->q4sc); free(weight->act2);
 #ifdef COLI_VULKAN
     if(weight->vk)coli_vk_tensor_free((ColiVkTensor*)weight->vk);
     free(weight->vk_name);
@@ -619,6 +622,28 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
 #endif
        )){
         for(int s=0;s<S;s++)q38_weight_matmul(y+(int64_t)s*O,x+(int64_t)s*I,weight,1,I,O);
+        return;
+    }
+    if(weight&&weight->act2&&weight->cols==I){   /* Q38_TRUNK_STATS: what this matrix reads */
+        Q38Weight *wm=(Q38Weight*)weight;
+        for(int s=0;s<S;s++){const float *xs=x+(int64_t)s*I;for(int i=0;i<I;i++)wm->act2[i]+=(double)xs[i]*xs[i];}
+        wm->act_n+=S;
+    }
+    if(weight&&weight->q4&&weight->rows==O&&weight->cols==I){
+        /* Q38_TRUNK_CPU_INT4: int8 activations per row (as the int8 trunk), planar int4-g64
+         * rows through expert_ffn.h's integer dot; a row's result does not depend on S */
+        const int ng=xf_groups(I);const size_t rb=xf_row_bytes(I);
+        int8_t *xq=(int8_t*)malloc((size_t)S*I);float *xsum=(float*)malloc((size_t)S*ng*sizeof(float));
+        float *sx=(float*)malloc((size_t)S*sizeof(float));
+        if(!xq||!xsum||!sx){fprintf(stderr,"OOM int4 trunk activation\n");exit(1);}
+        for(int s=0;s<S;s++)sx[s]=xf_act_i8(x+(int64_t)s*I,I,xq+(int64_t)s*I,xsum+(int64_t)s*ng);
+        double started=now_s();
+        #pragma omp parallel for schedule(static)
+        for(int o=0;o<O;o++)for(int s=0;s<S;s++)
+            y[(int64_t)s*O+o]=xf_dot_i8(weight->q4+(size_t)o*rb,weight->q4sc+(size_t)o*ng,xq+(int64_t)s*I,
+                                        xsum+(int64_t)s*ng,sx[s],I);
+        (void)started;
+        free(xq);free(xsum);free(sx);
         return;
     }
     /* A matrix the tier placed in VRAM (q38_trunk_place) answers a decode
@@ -3052,6 +3077,109 @@ static void q38_trunk_quantize(const Q38Weight *w,int8_t **qp,float **scp) {
  * the memory. Default on; Q38_TRUNK_CPU_INT8=0 keeps the BF16 rows and the
  * f32 kernel, the numeric reference. A matrix the tier already quantized for
  * the GPU keeps those same rows here (prefill rows run on the CPU). */
+/* ---- the trunk in int4 on the CPU (Q38_TRUNK_CPU_INT4=1) ----------------------------
+ * Q38_TRUNK_STATS=<file> collects, for every trunk matrix, the sum of the squares of
+ * each input column over the rows it met (added to the file at exit, by name and
+ * layer, so several runs add up). Q38_TRUNK_CPU_INT4=1 then builds the trunk's rows
+ * as planar int4-g64 straight from BF16, the scale of each group of 64 chosen among
+ * absmax/7 times 1.0..0.6 for the least activation-weighted error when
+ * Q38_TRUNK_STATS_IN=<file> names such statistics (plain absmax/7 without), as the
+ * routed experts' weighted int4 does. lm_head (unless Q38_TRUNK_INT4_HEAD=1) and the
+ * routers stay int8, and so does a matrix whose width is not a multiple of 64. CPU
+ * only: with COLI_VULKAN=1 or COLI_CUDA=1 the devices read the int8 rows. */
+static char g_q38_tstats_path[4096];
+static void q38_tstats_write(void) {
+    if(!g_q38_tstats_path[0])return;
+    /* an earlier run's sums: added, matched by name and layer */
+    FILE *f=fopen(g_q38_tstats_path,"rb");
+    if(f){
+        char magic[8];int32_t cnt=0;
+        if(fread(magic,8,1,f)==1&&!memcmp(magic,"Q38TRK1\0",8)&&fread(&cnt,4,1,f)==1){
+            for(int32_t i=0;i<cnt;i++){
+                char name[16];int32_t layer,cols;int64_t n;
+                if(fread(name,16,1,f)!=1||fread(&layer,4,1,f)!=1||fread(&cols,4,1,f)!=1||fread(&n,8,1,f)!=1)break;
+                double *a=(double*)malloc((size_t)cols*sizeof(double));
+                if(!a||fread(a,sizeof(double),(size_t)cols,f)!=(size_t)cols){free(a);break;}
+                for(int j=0;j<g_trunk_n;j++){
+                    Q38Weight *w=g_trunk[j].w;
+                    if(w->act2&&g_trunk[j].layer==layer&&w->cols==cols&&!strncmp(g_trunk[j].name,name,16)){
+                        for(int c=0;c<cols;c++)w->act2[c]+=a[c];
+                        w->act_n+=n;break;
+                    }
+                }
+                free(a);
+            }
+        }
+        fclose(f);
+    }
+    f=fopen(g_q38_tstats_path,"wb");
+    if(!f){perror(g_q38_tstats_path);return;}
+    int32_t cnt=0;for(int j=0;j<g_trunk_n;j++)cnt+=g_trunk[j].w->act2!=NULL;
+    int ok=fwrite("Q38TRK1\0",8,1,f)==1&&fwrite(&cnt,4,1,f)==1;
+    for(int j=0;ok&&j<g_trunk_n;j++){
+        Q38Weight *w=g_trunk[j].w;if(!w->act2)continue;
+        char name[16]={0};memcpy(name,g_trunk[j].name,sizeof name);
+        int32_t layer=g_trunk[j].layer,cols=w->cols;int64_t n=w->act_n;
+        ok=fwrite(name,16,1,f)==1&&fwrite(&layer,4,1,f)==1&&fwrite(&cols,4,1,f)==1&&fwrite(&n,8,1,f)==1&&
+           fwrite(w->act2,sizeof(double),(size_t)cols,f)==(size_t)cols;
+    }
+    if(fclose(f)||!ok)fprintf(stderr,"[trunk-stats] %s: write failed\n",g_q38_tstats_path);
+    else fprintf(stderr,"[trunk-stats] %s: %d matrices\n",g_q38_tstats_path,(int)cnt);
+}
+/* importance per column for trunk item j from a Q38_TRUNK_STATS file (mean x^2), NULL if absent */
+static float *q38_tstats_importance(FILE *f,const Q38TrunkItem *it,int cols) {
+    if(!f)return NULL;
+    rewind(f);
+    char magic[8];int32_t cnt=0;
+    if(fread(magic,8,1,f)!=1||memcmp(magic,"Q38TRK1\0",8)||fread(&cnt,4,1,f)!=1)return NULL;
+    for(int32_t i=0;i<cnt;i++){
+        char name[16];int32_t layer,c;int64_t n;
+        if(fread(name,16,1,f)!=1||fread(&layer,4,1,f)!=1||fread(&c,4,1,f)!=1||fread(&n,8,1,f)!=1)return NULL;
+        if(layer==it->layer&&c==cols&&!strncmp(name,it->name,16)&&n>0){
+            double *a=(double*)malloc((size_t)c*sizeof(double));float *imp=(float*)malloc((size_t)c*sizeof(float));
+            if(!a||!imp||fread(a,sizeof(double),(size_t)c,f)!=(size_t)c){free(a);free(imp);return NULL;}
+            for(int k=0;k<c;k++)imp[k]=(float)(a[k]/(double)n)+1e-12f;
+            free(a);return imp;
+        }
+        if(fseek(f,(long)c*(long)sizeof(double),SEEK_CUR))return NULL;
+    }
+    return NULL;
+}
+/* one trunk matrix's rows as planar int4-g64, from its BF16/F32 rows */
+static void q38_trunk_int4(Q38Weight *w,const float *imp) {
+    const int O=w->rows,I=w->cols,ng=xf_groups(I);const size_t rb=xf_row_bytes(I);
+    uint8_t *q=(uint8_t*)malloc((size_t)O*rb);float *sc=(float*)malloc((size_t)O*ng*sizeof(float));
+    if(!q||!sc){fprintf(stderr,"OOM int4 trunk\n");exit(1);}
+    static const float alphas[9]={1.f,.95f,.9f,.85f,.8f,.75f,.7f,.65f,.6f};
+    #pragma omp parallel
+    {
+        float *row=falloc(I);
+        #pragma omp for schedule(static)
+        for(int r=0;r<O;r++){
+            q38_weight_row(w,r,row);
+            uint8_t *dst=q+(size_t)r*rb;
+            for(int g=0;g<ng;g++){
+                const float *v=row+g*XF_BLOCK;const float *a=imp?imp+g*XF_BLOCK:NULL;
+                float am=0.f;for(int i=0;i<XF_BLOCK;i++){float t=fabsf(v[i]);if(t>am)am=t;}
+                float base=am>0.f?am/7.f:1.f,best_s=base;double best_e=-1.0;
+                for(int k=0;k<(a?9:1);k++){
+                    float s=base*alphas[k],inv=1.f/s;double e=0.0;
+                    for(int i=0;i<XF_BLOCK;i++){int c=(int)lrintf(v[i]*inv);c=c<-8?-8:c>7?7:c;double d=v[i]-s*(float)c;e+=(a?a[i]:1.f)*d*d;}
+                    if(best_e<0||e<best_e){best_e=e;best_s=s;}
+                }
+                sc[(size_t)r*ng+g]=best_s;
+                float inv=1.f/best_s;
+                for(int k=0;k<32;k++){
+                    int lo=(int)lrintf(v[k]*inv),hi=(int)lrintf(v[k+32]*inv);
+                    lo=lo<-8?-8:lo>7?7:lo;hi=hi<-8?-8:hi>7?7:hi;
+                    dst[g*XF_BLOCK_BYTES+k]=(uint8_t)((lo+8)|((hi+8)<<4));
+                }
+            }
+        }
+        free(row);
+    }
+    w->q4=q;w->q4sc=sc;
+}
 static int q38_trunk_cpu_int8_wanted(void) {
     const char *e=getenv("Q38_TRUNK_CPU_INT8"); return !(e&&e[0]=='0'&&!e[1]);
 }
@@ -3059,8 +3187,36 @@ static void q38_trunk_cpu_int8(Model *m) {
     if(!q38_trunk_cpu_int8_wanted())return;
     if(!m->trunk_table_built)q38_trunk_offer_all(m);   /* the tier may have built it already */
     double t0=now_s(); size_t bytes=0,released=0; int n=0;
+    const char *ts=getenv("Q38_TRUNK_STATS");
+    if(ts&&*ts){
+        snprintf(g_q38_tstats_path,sizeof g_q38_tstats_path,"%s",ts);
+        for(int i=0;i<g_trunk_n;i++)g_trunk[i].w->act2=(double*)calloc((size_t)g_trunk[i].w->cols,sizeof(double));
+        atexit(q38_tstats_write);
+        fprintf(stderr,"[trunk-stats] collecting the trunk's input statistics into %s\n",ts);
+    }
+    const char *t4=getenv("Q38_TRUNK_CPU_INT4"),*vk=getenv("COLI_VULKAN"),*cu=getenv("COLI_CUDA");
+    int int4=t4&&t4[0]=='1'&&!t4[1];
+    if(int4&&((vk&&vk[0]=='1')||(cu&&cu[0]=='1'))){
+        fprintf(stderr,"[qwen38] Q38_TRUNK_CPU_INT4=1 ignored: a device tier reads the trunk's int8 rows\n");int4=0;
+    }
+    const char *head4=getenv("Q38_TRUNK_INT4_HEAD"),*sin=getenv("Q38_TRUNK_STATS_IN");
+    FILE *stats_in=int4&&sin&&*sin?fopen(sin,"rb"):NULL;
+    if(int4&&sin&&*sin&&!stats_in){perror(sin);exit(1);}
+    int n4=0,weighted=0;size_t bytes4=0;
     for(int i=0;i<g_trunk_n;i++){
         Q38Weight *w=g_trunk[i].w;
+        int take4=int4&&w->data&&!w->q8&&w->cols%XF_BLOCK==0&&strcmp(g_trunk[i].name,"router")&&
+                  (strcmp(g_trunk[i].name,"lmhead")||(head4&&head4[0]=='1'));
+        if(take4){
+            float *imp=q38_tstats_importance(stats_in,&g_trunk[i],w->cols);
+            q38_trunk_int4(w,imp);weighted+=imp!=NULL;free(imp);
+            size_t b=(size_t)w->rows*(xf_row_bytes(w->cols)+(size_t)xf_groups(w->cols)*sizeof(float));
+            bytes4+=b;n4++;
+            uint64_t was=q38_weight_bytes(w);
+            if(w->owns_data){free(w->data);w->data=NULL;w->owns_data=0;released+=was;
+                             m->resident_weight_bytes-=was;m->resident_weight_bytes+=b;}
+            continue;
+        }
         if(!w->q8)q38_trunk_quantize(w,&w->q8,&w->q8sc);
         bytes+=(size_t)w->rows*w->cols+(size_t)w->rows*sizeof(float); n++;
         if(w->owns_data&&w->data){
@@ -3070,6 +3226,9 @@ static void q38_trunk_cpu_int8(Model *m) {
             m->resident_weight_bytes-=was; m->resident_weight_bytes+=(size_t)w->rows*w->cols+(size_t)w->rows*sizeof(float);
         }
     }
+    if(stats_in)fclose(stats_in);
+    if(n4)fprintf(stderr,"[qwen38] trunk: %d matrices int4-g64 on the CPU (%.2f GiB, %d weighted by Q38_TRUNK_STATS_IN), the rest int8\n",
+                  n4,bytes4/1073741824.0,weighted);
     fprintf(stderr,"[qwen38] trunk: %d matrices int8 on the CPU (%.2f GiB, %.2f GiB of BF16 released) in %.1fs; Q38_TRUNK_CPU_INT8=0 keeps BF16\n",
             n,bytes/1073741824.0,released/1073741824.0,now_s()-t0);
 }
@@ -4796,6 +4955,7 @@ static void q38_layer_free(Layer *l) {
 
 static void q38_model_free(Model *m) {
     if(!m) return;
+    q38_tstats_write();g_q38_tstats_path[0]=0;   /* Q38_TRUNK_STATS: while the sums still exist */
     kv_prefix_free(&m->kvp);
     int rows=q38_layer_rows(m);
     for(int i=0;i<rows;i++) {
