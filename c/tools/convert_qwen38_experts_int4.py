@@ -64,6 +64,14 @@ end up with. The record:
 
 named <...>.weight, <...>.weight.q8 and <...>.weight.d.
 
+--lowbit vq2g32 writes vq2_g32.h's format into <model>/experts-vq2g32/: each 8 weights of
+a row are one vector A[a] + B[b] of two 256 x 8 int8 codebooks (an index byte each, 2 bits
+per weight) times a 4-bit scale per 32 inputs under one f32 per row; 2.125 bits per weight.
+The codebooks are fitted first (k-means on 8-vectors of sample experts over their group's
+RMS, then on what the first book leaves), scaled to int8 so any a + b stays an int8, and
+written into index.json, where the engine reads them. The record is the low-bit one with
+scale bytes [rows, cols/64].
+
 Usage:
   python3 tools/convert_qwen38_experts_int4.py --model /path/to/qwen38-fp8 --plan
   python3 tools/convert_qwen38_experts_int4.py --model /path/to/qwen38-fp8 [--workers N]
@@ -137,11 +145,36 @@ class Lowbit:
     def row_scale_bytes(self, cols):
         return cols // self.gs if self.smax == 255 else cols // self.gs // 2
 
+    vq = False
+
+
+VQ_BOOK, VQ_DIM, VQ_BEAM = 256, 8, 4
+
+
+class VqFormat(Lowbit):
+    """vq2_g32.h: a row's 8-vectors as a[i] + b[j] of two 256 x 8 int8 codebooks (one index
+    byte each: a0 b0 a1 b1 ..., cols/4 bytes a row), a 4-bit scale per 32 inputs (two to a
+    byte) under one f32 per row. `books` (set_books) holds the codebooks as float64 integers
+    and the factor K they were scaled by: a weight is d * q * (a + b), d = the row scale the
+    quantizer fits over K."""
+    vq = True
+
+    def __init__(self):
+        super().__init__("vq2g32", 2, (-1.0, 1.0), 32, 15, "vq2-2x256x8-int8")
+        self.books = None
+
+    def set_books(self, a8, b8, k):
+        a8, b8 = np.asarray(a8, np.int64).reshape(VQ_BOOK, VQ_DIM), np.asarray(b8, np.int64).reshape(VQ_BOOK, VQ_DIM)
+        if int((np.abs(a8).max(axis=0) + np.abs(b8).max(axis=0)).max()) > 127:
+            raise ValueError("vq2 codebooks: some a + b leaves int8")
+        self.books = (a8.astype(np.float64), b8.astype(np.float64), float(k))
+
 
 INT2G32 = Lowbit("int2g32", 2, (-10, -3, 3, 10), 32, 255, CODES2)
 INT2G16 = Lowbit("int2g16", 2, (-10, -3, 3, 10), 16, 15, CODES2)
 INT3G16 = Lowbit("int3g16", 3, (-26, -16, -9, -3, 3, 9, 16, 26), 16, 15, "planar128-3bit-lv26")
-LOWBIT = {f.name: f for f in (INT2G32, INT2G16, INT3G16)}
+VQ2G32 = VqFormat()
+LOWBIT = {f.name: f for f in (INT2G32, INT2G16, INT3G16, VQ2G32)}
 FP8_BLOCK = 128
 
 _FLOAT_DTYPES = {"BF16": 2, "F16": 2, "F32": 4}
@@ -285,6 +318,9 @@ def quantize_lowbit(w, imp=None, fmt=INT2G32, iters=6):
     against sum_i imp_i * (w_i - s * level_i)^2 (imp uniform without statistics), then the
     scales are stored as integers up to fmt.smax under the row's largest and refitted, with
     the codes, for what those integers can hold."""
+    if fmt.vq:   # no correlations: GPTQ under H = diag(imp) is the importance-weighted search, no carry
+        a = np.ones(w.shape[1]) if imp is None else np.maximum(imp.astype(np.float64), 1e-30)
+        return quantize_vq_gptq(w, np.diag(1.0 / np.sqrt(a)), fmt)
     rows, cols = w.shape
     gs, top, L = fmt.gs, float(fmt.smax), fmt.levels
     ng = cols // gs
@@ -318,6 +354,8 @@ def quantize_lowbit_gptq(w, imp, U, fmt=INT2G32, iters=6, batch=128, margin=1.4)
     as the earlier groups' errors left them. The row scale d is fixed first, from the
     groups' weighted RMS with `margin` of room for what the updates add. Works on the
     transpose, so a column is contiguous; a code is one comparison per level boundary."""
+    if fmt.vq:
+        return quantize_vq_gptq(w, U, fmt)
     rows, cols = w.shape
     gs, top, L = fmt.gs, float(fmt.smax), fmt.levels
     ng = cols // gs
@@ -357,6 +395,126 @@ def quantize_lowbit_gptq(w, imp, U, fmt=INT2G32, iters=6, batch=128, margin=1.4)
             E1[i] = err
         WT[b1:] -= U[b0:b1, b1:].T @ E1
     return np.ascontiguousarray(codes.T), np.ascontiguousarray(qs.T), d.astype(np.float32)
+
+
+def _vq_search(xw, aw, bw, beam):
+    """xw [R, 8] targets and aw, bw [256, 8] the codebooks, all in whitened coordinates: the
+    pair (i, j) with the least |xw - aw[i] - bw[j]|^2 among the `beam` nearest aw[i]."""
+    d0 = (aw * aw).sum(1)[None, :] - 2 * xw @ aw.T
+    top = np.argpartition(d0, beam, axis=1)[:, :beam] if beam < len(aw) else np.broadcast_to(np.arange(len(aw)), d0.shape)
+    res = xw[:, None, :] - aw[top]                                           # [R, beam, 8]
+    d1 = (bw * bw).sum(1)[None, None, :] - 2 * res @ bw.T                     # + |res|^2, per (row, candidate)
+    d1 += (res * res).sum(2)[:, :, None]
+    flat = d1.reshape(len(xw), -1).argmin(1)
+    k, j = flat // len(bw), flat % len(bw)
+    return top[np.arange(len(xw)), k], j
+
+
+def quantize_vq_gptq(w, U, fmt=VQ2G32, beam=VQ_BEAM, batch=128):
+    """w f32 [R, C] (C % 32 == 0) -> (codes u8 [R, C/8, 2], q u8 [R, C/32], d f32 [R]) with
+    w ~ d[r] * q[r, g] * (A[a] + B[b]): GPTQ over blocks of 8 columns. U is the upper
+    Cholesky factor of H^-1; a block's vectors are searched in the coordinates U_BB^-1
+    whitens (|(w - s c) U_BB^-1|, the block's cost once the later columns absorb its error),
+    and the error is carried on as W[:, after] -= (delta U_BB^-1) U[B, after], lazily per
+    `batch` columns as quantize_lowbit_gptq does. A group's scale q (1..15) is its current
+    weights' RMS over d K, fixed when its first block comes up; d = the row's largest group
+    RMS / (15 K), K the codebooks' scale (fmt.books)."""
+    A, B, K = fmt.books
+    W = w.astype(np.float64).copy()
+    rows, cols = W.shape
+    top = float(fmt.smax)
+    rms = np.sqrt((W.reshape(rows, cols // 32, 32) ** 2).mean(axis=2))
+    d = np.maximum(rms.max(axis=1) / (top * K), 1e-30).astype(np.float32).astype(np.float64)   # the stored f32
+    codes = np.zeros((rows, cols // VQ_DIM, 2), np.uint8)
+    qs = np.zeros((rows, cols // 32), np.uint8)
+    s = np.ones((rows, 1))
+    for b0 in range(0, cols, batch):
+        b1 = min(b0 + batch, cols)
+        W1 = W[:, b0:b1].copy()
+        E1 = np.zeros_like(W1)
+        for c0 in range(b0, b1, VQ_DIM):
+            i = c0 - b0
+            if c0 % 32 == 0:
+                q = np.clip(np.rint(np.sqrt((W1[:, i:i + 32] ** 2).mean(axis=1)) / (d * K)), 1, top)
+                qs[:, c0 // 32] = q
+                s = (d * q)[:, None]
+            ubb = U[c0:c0 + VQ_DIM, c0:c0 + VQ_DIM]
+            m = np.linalg.inv(ubb)
+            ia, ib = _vq_search((W1[:, i:i + VQ_DIM] / s) @ m, A @ m, B @ m, beam)
+            codes[:, c0 // VQ_DIM, 0], codes[:, c0 // VQ_DIM, 1] = ia, ib
+            e = (W1[:, i:i + VQ_DIM] - (A[ia] + B[ib]) * s) @ m
+            E1[:, i:i + VQ_DIM] = e
+            if i + VQ_DIM < b1 - b0:
+                W1[:, i + VQ_DIM:] -= e @ U[c0:c0 + VQ_DIM, c0 + VQ_DIM:b1]
+        if b1 < cols:
+            W[:, b1:] -= E1 @ U[b0:b1, b1:]
+    return codes, qs, d.astype(np.float32)
+
+
+def dequantize_vq(codes, q, d, fmt=VQ2G32):
+    A, B, _ = fmt.books
+    rows = codes.shape[0]
+    v = (A[codes[:, :, 0]] + B[codes[:, :, 1]]).reshape(rows, -1, 32)
+    return (v * (d[:, None].astype(np.float64) * q.astype(np.float64))[..., None]).reshape(rows, -1)
+
+
+def _vq_vectors(w):
+    """a matrix's 8-vectors over the RMS of their group of 32 (what the codebooks code)"""
+    rows, cols = w.shape
+    g = w.reshape(rows, cols // 32, 32).astype(np.float64)
+    return (g / (np.sqrt((g * g).mean(axis=2, keepdims=True)) + 1e-12)).reshape(-1, VQ_DIM)
+
+
+def _vq_nearest(x, c):
+    out = np.empty(len(x), np.int64)
+    cc = (c * c).sum(1)[None, :]
+    for a in range(0, len(x), 65536):
+        out[a:a + 65536] = (cc - 2 * x[a:a + 65536] @ c.T).argmin(1)
+    return out
+
+
+def _vq_kmeans(x, k, rng, iters=25):
+    c = x[rng.choice(len(x), k, replace=False)].copy()
+    for _ in range(iters):
+        idx = _vq_nearest(x, c)
+        n = np.bincount(idx, minlength=k)
+        for j in range(x.shape[1]):
+            c[:, j] = np.where(n > 0, np.bincount(idx, weights=x[:, j], minlength=k) / np.maximum(n, 1), c[:, j])
+        empty = np.nonzero(n == 0)[0]
+        if len(empty):
+            c[empty] = x[rng.integers(len(x), size=len(empty))]
+    return c
+
+
+def train_vq_books(sample, seed=38, iters=25):
+    """sample [N, 8] normalized vectors -> (a8, b8 int64 [256, 8], K): k-means for A, then
+    for what A leaves; both times K = 127 / max over coordinates of (max|A| + max|B|), rounded,
+    so any a + b is an int8 (K lowered until the rounding keeps that too)."""
+    rng = np.random.default_rng(seed)
+    a = _vq_kmeans(sample, VQ_BOOK, rng, iters)
+    b = _vq_kmeans(sample - a[_vq_nearest(sample, a)], VQ_BOOK, rng, iters)
+    k = 127.0 / float((np.abs(a).max(axis=0) + np.abs(b).max(axis=0)).max())
+    while True:
+        a8, b8 = np.rint(a * k).astype(np.int64), np.rint(b * k).astype(np.int64)
+        if int((np.abs(a8).max(axis=0) + np.abs(b8).max(axis=0)).max()) <= 127:
+            return a8, b8, k
+        k *= 0.999
+
+
+def vq_book_sample(src, experts_per_layer=4, layer_step=4, vectors=400000, seed=38):
+    """the codebooks' training vectors: `experts_per_layer` experts of every `layer_step`-th
+    layer, chosen with `seed`, their three matrices, an equal share of vectors from each"""
+    rng = np.random.default_rng(seed)
+    g = src.geometry
+    picks = [(layer, int(e)) for layer in range(0, g.layers, layer_step)
+             for e in rng.choice(g.experts, min(experts_per_layer, g.experts), replace=False)]
+    share = max(1, vectors // (3 * len(picks)))
+    out = []
+    for layer, expert in picks:
+        for k in range(3):
+            v = _vq_vectors(src.matrix(layer, expert, k))
+            out.append(v[rng.choice(len(v), min(share, len(v)), replace=False)])
+    return np.concatenate(out), picks
 
 
 def quantize_int2_g32(w, imp=None, iters=6):
@@ -545,7 +703,9 @@ def pack_lowbit(codes, fmt):
     """u8 codes [R, C] -> the rows as fmt lays them: per block of 128 the low two bits as
     pack_int2 does (32 bytes), then for 3 bits the high bits (16 bytes: byte k holds
     elements k, k+16, ..., k+112 in bits 0..7, lowbit_g16.h)."""
-    rows, cols = codes.shape
+    rows, cols = codes.shape[0], codes.shape[1]
+    if fmt.vq:   # a0 b0 a1 b1 ...
+        return np.ascontiguousarray(codes.reshape(rows, -1))
     low = pack_int2(codes & 3)
     if fmt.bits == 2:
         return low
@@ -564,13 +724,17 @@ def pack_scales(q, fmt):
 
 
 def dequantize_lowbit(codes, q, d, fmt):
+    if fmt.vq:
+        return dequantize_vq(codes, q, d, fmt)
     rows, cols = codes.shape
     return (fmt.levels[codes].reshape(rows, cols // fmt.gs, fmt.gs) *
             (d[:, None].astype(np.float64) * q.astype(np.float64))[..., None]).reshape(rows, cols)
 
 
 def unpack_lowbit(packed, cols, fmt):
-    """pack_lowbit's inverse: u8 [R, row_code_bytes] -> codes [R, C]"""
+    """pack_lowbit's inverse: u8 [R, row_code_bytes] -> codes [R, C] ([R, C/8, 2] for vq)"""
+    if fmt.vq:
+        return packed.reshape(packed.shape[0], cols // VQ_DIM, 2).astype(np.uint8)
     rows, nb = packed.shape[0], cols // 128
     blk = packed.reshape(rows, nb, 48 if fmt.bits == 3 else 32)
     low = blk[:, :, :32]
@@ -844,8 +1008,10 @@ _ALPHA = 0.1
 
 
 def _init_worker(model_dir, act_path=None, bits=4, cov_path=None, dump_path=None, fmt_name=None, alpha=0.1,
-                 rescale=False, target_path=None, dump_tokens=None):
+                 rescale=False, target_path=None, dump_tokens=None, books=None):
     global _SOURCE, _ACT, _BITS, _COV, _DUMP, _FMT, _ALPHA, _RESCALE, _TARGET
+    if books is not None:
+        VQ2G32.set_books(*books)
     _SOURCE = Source(model_dir)
     _ACT = ActStats(act_path) if act_path else None
     _BITS = bits
@@ -962,7 +1128,7 @@ def write_index(out_dir, index):
 def new_index(src):
     g = src.geometry
     if g.fmt:
-        return {
+        out = {
             "format": g.fmt.format, "version": VERSION, "complete": False,
             "group_size": g.fmt.gs, "codes": g.fmt.codes, "scales": g.fmt.scales,
             "layers": g.layers, "experts": g.experts,
@@ -977,6 +1143,10 @@ def new_index(src):
             "done": [],
             "source": src.fingerprint(),
         }
+        if g.fmt.vq:
+            out["quantizer"] = (f"per 8 inputs one vector of two 256 x 8 int8 codebooks, the pair searched with a beam "
+                                f"of {VQ_BEAM}; a 4-bit scale per 32 (the group's RMS) under the row's largest (uniform weights)")
+        return out
     return {
         "format": FORMAT, "version": VERSION, "complete": False,
         "group_size": GS, "codes": CODES, "scales": SCALES,
@@ -1015,7 +1185,7 @@ def resume_index(out_dir, src):
             print(f"layer {layer}: listed as done but {path} is missing or the wrong size; converting it again")
     fresh["done"] = sorted(done)
     fresh["complete"] = len(done) == src.geometry.layers
-    for key in ("quantizer", "output_rescale", "output_rescale_factors"):   # what the earlier run recorded
+    for key in ("quantizer", "output_rescale", "output_rescale_factors", "codebooks"):   # what the earlier run recorded
         if key in index:
             fresh[key] = index[key]
     return fresh
@@ -1085,6 +1255,7 @@ def rescale_sidecar(model_dir, out_dir, dump_path, fmt_name, workers=1, layers=N
         index = json.load(f)
     if index.get("format") != g.fmt.format or index.get("record_bytes") != g.record_bytes or not index.get("complete"):
         sys.exit(f"{out_dir}: not a complete {fmt_name} sidecar of this snapshot")
+    books = index_books(index) if g.fmt.vq else None
     done = set(index.get("output_rescale", []))
     todo = [i for i in parse_layers(layers, g.layers) if i not in done]
     pool = None
@@ -1093,9 +1264,10 @@ def rescale_sidecar(model_dir, out_dir, dump_path, fmt_name, workers=1, layers=N
         for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
             os.environ.setdefault(var, "1")
         pool = get_context("spawn").Pool(workers, initializer=_init_worker,
-                                         initargs=(model_dir, None, 2, None, dump_path, fmt_name, 0.1))
+                                         initargs=(model_dir, None, 2, None, dump_path, fmt_name, 0.1, False, None,
+                                                   None, books))
     else:
-        _init_worker(model_dir, None, 2, None, dump_path, fmt_name, 0.1)
+        _init_worker(model_dir, None, 2, None, dump_path, fmt_name, 0.1, books=books)
     down_off = g.scale_off + 4 * (g.scale_count[0] + g.scale_count[1])
     try:
         for layer in todo:
@@ -1124,6 +1296,16 @@ def rescale_sidecar(model_dir, out_dir, dump_path, fmt_name, workers=1, layers=N
             pool.close()
             pool.join()
     print(f"{out_dir}: output rescale on {len(done)}/{g.layers} layers")
+
+
+def index_books(index):
+    """(a8, b8, K) from a vq sidecar's index.json"""
+    cb = index.get("codebooks") or {}
+    try:
+        return (np.array(cb["a"], np.int64).reshape(VQ_BOOK, VQ_DIM), np.array(cb["b"], np.int64).reshape(VQ_BOOK, VQ_DIM),
+                float(cb["scale"]))
+    except (KeyError, ValueError, TypeError):
+        sys.exit("index.json: no vq codebooks (a, b: 256 x 8, scale)")
 
 
 def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_path=None, bits=4, cov_path=None,
@@ -1184,10 +1366,27 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
         quantizer = (f"weighted: per 64 inputs the scale among absmax/7 * {list(ALPHAS)} with the least "
                      f"activation-weighted squared error (Q38_ACT_STATS {os.path.basename(act_path)}, "
                      f"{act.rows} expert rows)") if act else None
+    if quantizer and g.fmt and g.fmt.vq:
+        quantizer = quantizer.replace(f"{g.fmt.name}, ", f"{g.fmt.name} (8-vectors of two int8 codebooks, beam "
+                                                         f"{VQ_BEAM}, GPTQ over blocks of 8 columns), ", 1)
     if quantizer and index["done"] and index.get("quantizer") != quantizer:
         sys.exit(f"{out_dir}: started with another quantizer; give a new --out")
     if quantizer:
         index["quantizer"] = quantizer
+    books = None
+    if g.fmt and g.fmt.vq:
+        if "codebooks" in index:   # a resumed run keeps the books its layers were coded with
+            books = index_books(index)
+        else:
+            started = time.time()
+            sample, picks = vq_book_sample(src)
+            books = train_vq_books(sample)
+            index["codebooks"] = {"a": books[0].ravel().tolist(), "b": books[1].ravel().tolist(), "scale": books[2],
+                                  "fitted_on": f"{len(sample)} 8-vectors of {len(picks)} experts "
+                                               f"(layers {picks[0][0]}..{picks[-1][0]})"}
+            print(f"  vq codebooks: k-means on {len(sample)} vectors of {len(picks)} experts in "
+                  f"{time.time() - started:.0f}s, int8 scale {books[2]:.2f}", flush=True)
+        g.fmt.set_books(*books)
     wanted = parse_layers(layers, g.layers)
     todo = [i for i in wanted if i not in index["done"]]
     if len(wanted) > len(todo):
@@ -1199,9 +1398,9 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
         from multiprocessing import get_context
         for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
             os.environ.setdefault(var, "1")   # one BLAS thread per worker: the workers are the parallelism
-        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha, rescale, target_path, dump_tokens))
+        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha, rescale, target_path, dump_tokens, books))
     else:
-        _init_worker(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha, rescale, target_path, dump_tokens)
+        _init_worker(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha, rescale, target_path, dump_tokens, books)
     worst = 0.0
     try:
         for layer in todo:
@@ -1242,7 +1441,8 @@ def main():
     ap.add_argument("--dump", help="the engine's Q38_ACT_DUMP directory (with --int2): every expert fitted with GPTQ "
                                    "to the inputs it really received, down to the SwiGLU outputs of its quantized gate/up")
     ap.add_argument("--lowbit", choices=sorted(LOWBIT), help="a low-bit format: int2g32 (= --int2), int2g16 or int3g16 "
-                                                            "(groups of 16 with 4-bit scales), into <model>/experts-<name>/")
+                                                            "(groups of 16 with 4-bit scales), vq2g32 (8-vectors of two "
+                                                            "int8 codebooks), into <model>/experts-<name>/")
     ap.add_argument("--alpha", type=float, default=0.1, help="with --dump: the weight of the layer's moment in each "
                                                              "expert's H (default 0.1)")
     ap.add_argument("--rescale", action="store_true", help="with --dump: down's row scales times each expert's output "

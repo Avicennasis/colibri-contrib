@@ -239,6 +239,44 @@ class Int2Convert(unittest.TestCase):
         self.assertEqual(cv.output_rescale(w3, w3[:2] + [w3[2] * 0.5], x, g), 1.25)
         self.assertEqual(cv.output_rescale(w3, w3, x[:0], g[:0]), 1.0)
 
+    def test_vq2(self):
+        # vq2_g32.h: codebooks whose sums stay int8, codes a0 b0 a1 b1 ... per row, scales a
+        # nibble per 32, d * q * (a + b) as the kernel reads it; GPTQ over blocks of 8 lowers the
+        # output error under a correlated H; the release's record 1,320,960 bytes
+        fmt = cv.VQ2G32
+        a8, b8, k = cv.train_vq_books(self.rng.standard_normal((20000, 8)), iters=8)
+        self.assertLessEqual(int((np.abs(a8).max(axis=0) + np.abs(b8).max(axis=0)).max()), 127)
+        self.assertGreater(int((np.abs(a8).max(axis=0) + np.abs(b8).max(axis=0)).max()), 120)
+        fmt.set_books(a8, b8, k)
+        w = (self.rng.standard_normal((48, 256)) * 0.02).astype(np.float32)
+        c, q, d = cv.quantize_lowbit(w, None, fmt)
+        self.assertEqual((c.shape, q.shape, d.shape), ((48, 32, 2), (48, 8), (48,)))
+        self.assertEqual((c.dtype, q.dtype, d.dtype), (np.uint8, np.uint8, np.float32))
+        self.assertTrue(1 <= int(q.min()) and int(q.max()) == 15)
+        deq = cv.dequantize_lowbit(c, q, d, fmt)
+        err = cv.rel_l2(w, deq)
+        self.assertTrue(0.25 < err < 0.33, err)   # 2.125 bits a weight on a Gaussian
+        packed, ps = cv.pack_lowbit(c, fmt), cv.pack_scales(q, fmt)
+        self.assertEqual((packed.shape, ps.shape), ((48, 64), (48, 4)))
+        self.assertTrue(np.array_equal(cv.unpack_lowbit(packed, 256, fmt), c))
+        self.assertTrue(np.array_equal(cv.unpack_scales(ps, fmt), q))
+        # the kernel's reading, element by element (vq2_value, vq2_scale)
+        r, i = 5, np.arange(256)
+        v = a8[packed[r, (i // 8) * 2], i % 8] + b8[packed[r, (i // 8) * 2 + 1], i % 8]
+        sc = (ps[r, i // 64] >> (4 * ((i // 32) % 2))) & 15
+        np.testing.assert_allclose(deq[r], np.float64(d[r]) * sc * v, rtol=1e-12)
+        # GPTQ: correlated inputs, the output error lower than the plain search's
+        a = self.rng.standard_normal((256, 16))
+        h = a @ a.T + 0.5 * np.eye(256)
+        g = cv.quantize_lowbit_gptq(w, np.diag(h).astype(np.float32), cv._upper_inv(h), fmt)
+        plain = cv.dequantize_lowbit(*cv.quantize_lowbit(w, np.diag(h).astype(np.float32), fmt), fmt)
+        self.assertLess(out_err(w.astype(np.float64), cv.dequantize_lowbit(*g, fmt), h),
+                        0.8 * out_err(w.astype(np.float64), plain, h))
+        geo = cv.Geometry(48, 512, 2560, 640, fmt=fmt)
+        self.assertEqual(geo.record_bytes, 1320960)
+        self.assertEqual([t[0].rsplit(".", 1)[-1] for t in geo.tensors("m", 0, 0)][3:6], ["q4"] * 3)
+        self.assertEqual(geo.tensors("m", 0, 0)[3][2], [640, 40])
+
 
 if __name__ == "__main__":
     unittest.main()

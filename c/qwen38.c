@@ -2987,6 +2987,10 @@ static void q38_vk_tier_start(Model *m,int cap){
     /* a GGUF's types by layer, for the tier when they differ */
     VktFmt *lgu=g_q38_gguf?(VktFmt*)malloc((size_t)c->layers*sizeof(VktFmt)):NULL,
            *ldn=g_q38_gguf?(VktFmt*)malloc((size_t)c->layers*sizeof(VktFmt)):NULL;
+    if(m->x4&&m->x4->lb&&m->x4->lb->vq){
+        fprintf(stderr,"[VK] tier qwen38: the vq2 experts have no device form yet; the tier stays off\n");
+        free(lgu);free(ldn);return;
+    }
     if(m->x4&&m->x4->lb){
         /* colibri's low-bit experts: the same codes and scales on the device (blockdec.glsl) */
         f.kind=!strcmp(m->x4->lb->name,"int2g32")?VKT_SRC_LB_I2G32:!strcmp(m->x4->lb->name,"int2g16")?VKT_SRC_LB_I2G16:VKT_SRC_LB_I3G16;
