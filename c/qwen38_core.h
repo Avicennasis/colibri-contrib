@@ -3660,19 +3660,26 @@ static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,
  * many activation rows share the call), and each row's sum is added in rank order as
  * the decode loop adds it, so the output is the decode loop's to the bit.
  * Q38_MOE_GROUPED=0 keeps the decode loop. */
-enum { Q38_ROWS_NONE = 0, Q38_ROWS_F32 = 1, Q38_ROWS_X2 = 2 };
+enum { Q38_ROWS_NONE = 0, Q38_ROWS_F32 = 1, Q38_ROWS_X2 = 2, Q38_ROWS_GQ = 3 };
 /* how a routed expert's matrix takes its input here: f32 (int4-g64), int8 per 32
- * (int2-g32, int2-g16, int3-g16), or not at all */
+ * (int2-g32, int2-g16, int3-g16), a GGUF block type's integer form (gq_act), or not
+ * at all (GQ_EXACT=1's float path among them) */
 static int q38_rows_kind(const Q38Weight *w) {
     if(!w->data||w->q4||w->q8||w->gpu||w->act2)return Q38_ROWS_NONE;
     if(w->kind==Q38_WEIGHT_INT4G64&&w->scales)return Q38_ROWS_F32;
     if((w->kind==Q38_WEIGHT_INT2G32||w->kind==Q38_WEIGHT_LOWBIT16)&&w->scales&&w->x2q)return Q38_ROWS_X2;
+    if(w->kind==Q38_WEIGHT_GGML&&gq_int_ok(w->gq_type,w->cols)&&gq_row_bytes(w->gq_type,w->cols)>0)return Q38_ROWS_GQ;
     return Q38_ROWS_NONE;
 }
 /* rows [r0,r1) of w (O x I) for n activation rows: y[a*ys + o]; xr[a] the f32 rows,
- * xq/dx the int8-per-32 ones ([n][I], [n][I/32]) */
+ * xq/dx the int8-per-32 ones ([n][I], [n][I/32]), ga the GGUF types' (n rows) */
 static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
-                     const float *const *xr,const int8_t *xq,const float *dx,int n) {
+                     const float *const *xr,const int8_t *xq,const float *dx,const gq_act *ga,int n) {
+    if(w->kind==Q38_WEIGHT_GGML){   /* gq_matmul_act's rows */
+        const int64_t rb=gq_row_bytes(w->gq_type,I);
+        for(int o=r0;o<r1;o++)gq_row_all(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,w->gq_type,I);
+        return;
+    }
     if(w->kind==Q38_WEIGHT_INT4G64){
         const int64_t rb=q38_int4_row_bytes(I),groups=q38_int4_groups(I);const int body=I/XF_BLOCK*XF_BLOCK;
         for(int o=r0;o<r1;o++){
@@ -3706,7 +3713,7 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     static int on=-1;
     if(on<0){const char *e=getenv("Q38_MOE_GROUPED");on=!(e&&e[0]=='0');}
     Cfg *c=&m->c;const int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
-    if(!on||S<1||!q38_layer_int4(m,layer)||H%32||I%32)return 0;
+    if(!on||S<1||!(q38_layer_int4(m,layer)||g_q38_gguf)||H%32||I%32)return 0;
     /* the device tiers take experts per row; the statistics hooks keep the loop's order */
     if((vkt_ready()&&layer<vkt_layers())||(qt_ready()&&layer<c->layers))return 0;
     if(g_q38_act||g_q38_dump||g_q38_cov)return 0;
@@ -3717,6 +3724,7 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     float *eg=falloc((int64_t)np*I),*eu=falloc((int64_t)np*I),*ehf=falloc((int64_t)np*I),*eo=falloc((int64_t)np*H);
     float *dxt=falloc((int64_t)S*(H/32)),*dxg=falloc((int64_t)np*(H/32)),*ehdx=falloc((int64_t)np*(I/32));
     int8_t *xqt=(int8_t*)malloc((size_t)S*H),*xg=(int8_t*)malloc((size_t)np*H),*ehq=(int8_t*)malloc((size_t)np*I);
+    gq_act gin,gh;memset(&gin,0,sizeof gin);memset(&gh,0,sizeof gh);   /* the GGUF kinds' inputs, grouped order */
     int *idx=(int*)malloc((size_t)np*sizeof(int)),*pos=(int*)malloc((size_t)np*sizeof(int));
     int *uniq=(int*)malloc((size_t)np*sizeof(int)),*cnt=(int*)calloc((size_t)np,sizeof(int)),*start=(int*)malloc((size_t)np*sizeof(int));
     int *who=(int*)malloc((size_t)np*sizeof(int));   /* grouped position -> assignment s*K+z */
@@ -3786,6 +3794,17 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     } else {
         /* the inputs: f32 row pointers, or int8 per 32 once per row, gathered per assignment */
         for(int p=0;p<np;p++){xr[p]=x+(int64_t)(who[p]/K)*H;hr[p]=ehf+(int64_t)p*I;}
+        if(kin==Q38_ROWS_GQ){   /* a row's quantization is gq_matmul's, once per assignment */
+            float *xgf=falloc((int64_t)np*H);
+            for(int p=0;p<np;p++)memcpy(xgf+(int64_t)p*H,xr[p],(size_t)H*sizeof(float));
+            if(gq_act_set(&gin,xgf,np,H)){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
+            free(xgf);
+        }
+        if(kdn==Q38_ROWS_GQ){
+            gh.q=(int8_t*)malloc((size_t)np*I);gh.d=falloc((int64_t)np*(I/32));gh.s=(int32_t*)malloc((size_t)np*(I/16)*sizeof(int32_t));
+            if(!gh.q||!gh.d||!gh.s){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
+            gh.S=np;gh.I=I;gh.cap=np*I;
+        }
         if(kin==Q38_ROWS_X2){
             for(int s=0;s<S;s++)x2_quant_act(x+(int64_t)s*H,H,xqt+(int64_t)s*H,dxt+(int64_t)s*(H/32));
             for(int p=0;p<np;p++){
@@ -3808,19 +3827,22 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
             #pragma omp for schedule(dynamic,1)
             for(int it=0;it<nu*cF;it++){
                 const int j=it/cF,r0=(it%cF)*rF,r1=r0+rF<I?r0+rF:I,p0=start[j],n=cnt[j];
-                q38_rows(eg+(int64_t)p0*I,I,&slot[j]->gate,H,r0,r1,xr+p0,xg+(int64_t)p0*H,dxg+(int64_t)p0*(H/32),n);
-                q38_rows(eu+(int64_t)p0*I,I,&slot[j]->up,H,r0,r1,xr+p0,xg+(int64_t)p0*H,dxg+(int64_t)p0*(H/32),n);
+                const gq_act ga={gin.q+(int64_t)p0*H,gin.d+(int64_t)p0*(H/32),gin.s+(int64_t)p0*(H/16),n,H,0};
+                q38_rows(eg+(int64_t)p0*I,I,&slot[j]->gate,H,r0,r1,xr+p0,xg+(int64_t)p0*H,dxg+(int64_t)p0*(H/32),&ga,n);
+                q38_rows(eu+(int64_t)p0*I,I,&slot[j]->up,H,r0,r1,xr+p0,xg+(int64_t)p0*H,dxg+(int64_t)p0*(H/32),&ga,n);
             }
             #pragma omp for schedule(static)
             for(int p=0;p<np;p++){
                 const float *g=eg+(int64_t)p*I,*u=eu+(int64_t)p*I;float *h=ehf+(int64_t)p*I;
                 for(int j=0;j<I;j++)h[j]=q38_silu(g[j])*u[j];
                 if(kdn==Q38_ROWS_X2)x2_quant_act(h,I,ehq+(int64_t)p*I,ehdx+(int64_t)p*(I/32));
+                if(kdn==Q38_ROWS_GQ)gq_quant_act(h,I,gh.q+(int64_t)p*I,gh.d+(int64_t)p*(I/32),gh.s+(int64_t)p*(I/16));
             }
             #pragma omp for schedule(dynamic,1)
             for(int it=0;it<nu*cH;it++){
                 const int j=it/cH,r0=(it%cH)*rH,r1=r0+rH<H?r0+rH:H,p0=start[j],n=cnt[j];
-                q38_rows(eo+(int64_t)p0*H,H,&slot[j]->down,I,r0,r1,hr+p0,ehq+(int64_t)p0*I,ehdx+(int64_t)p0*(I/32),n);
+                const gq_act ga={gh.q+(int64_t)p0*I,gh.d+(int64_t)p0*(I/32),gh.s+(int64_t)p0*(I/16),n,I,0};
+                q38_rows(eo+(int64_t)p0*H,H,&slot[j]->down,I,r0,r1,hr+p0,ehq+(int64_t)p0*I,ehdx+(int64_t)p0*(I/32),&ga,n);
             }
         }
     }
@@ -3844,6 +3866,7 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     free(logits);free(gates);free(sg);free(su);free(sh);free(shared);free(sgate);
     free(eg);free(eu);free(ehf);free(eo);free(dxt);free(dxg);free(ehdx);free(xqt);free(xg);free(ehq);
     free(idx);free(pos);free(uniq);free(cnt);free(start);free(who);free(xr);free(hr);free(slot);
+    gq_act_free(&gin);gq_act_free(&gh);
     return 1;
 }
 
