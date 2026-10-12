@@ -2887,6 +2887,23 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
     q38_tm_add(m,Q38_TM_DELTANET,phase_started);
 }
 
+/* sum a[i]*b[i] over 8 lanes (lane = i % 8, in order) and a fixed tree of the lanes: the
+ * same bits with and without AVX2. QSA's query-key and indexer dots were scalar loops the
+ * compiler cannot vectorize without reordering the sum (35 ms a forward at 3k tokens). */
+static inline float q38_dot8(const float *a,const float *b,int n){
+#if defined(__AVX2__)&&defined(__FMA__)
+    __m256 acc=_mm256_setzero_ps();int i=0;
+    for(;i+8<=n;i+=8)acc=_mm256_fmadd_ps(_mm256_loadu_ps(a+i),_mm256_loadu_ps(b+i),acc);
+    float l[8];_mm256_storeu_ps(l,acc);
+#else
+    float l[8]={0,0,0,0,0,0,0,0};int i=0;
+    for(;i+8<=n;i+=8)for(int k=0;k<8;k++)l[k]=fmaf(a[i+k],b[i+k],l[k]);
+#endif
+    float r=((l[0]+l[4])+(l[2]+l[6]))+((l[1]+l[5])+(l[3]+l[7]));
+    for(;i<n;i++)r=fmaf(a[i],b[i],r);
+    return r;
+}
+
 typedef struct { float score; int block; } Q38Block;
 static int q38_block_desc(const void *aa,const void *bb){
     const Q38Block *a=(const Q38Block*)aa,*b=(const Q38Block*)bb;
@@ -2955,7 +2972,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
             for(int s=s0;s<s1;s++){
                 if(b>=nblk[s])continue;
                 const float *qs=qidx+(int64_t)s*IQ*ID;
-                float score=0.f;for(int h=0;h<IQ;h++){float a=0.f;for(int d=0;d<ID;d++)a+=qs[(int64_t)h*ID+d]*pool[d];if(a>0.f)score+=a;}
+                float score=0.f;for(int h=0;h<IQ;h++){float a=q38_dot8(qs+(int64_t)h*ID,pool,ID);if(a>0.f)score+=a;}
                 rank[(int64_t)s*maxblocks+b]=(Q38Block){score/sqrtf((float)ID),b};
             }
         }
@@ -2980,7 +2997,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)h*2*D;
         float *qh=falloc(D);memcpy(qh,qraw,(size_t)D*sizeof(float));q38_rms0(qh,qh,l->qn,D,c->eps);q38_rope(qh,D,c->rotary_dim,pos,theta);
         float *score=falloc(ns>0?ns:1);float mx=-INFINITY;
-        int khidx=h/(QH/KVH);for(int j=0;j<ns;j++){const float *kh=Kl+((int64_t)khidx*m->kv_cap+sel[j])*D;float a=0.f;for(int d=0;d<D;d++)a+=qh[d]*kh[d];a/=sqrtf((float)D);score[j]=a;if(a>mx)mx=a;}
+        int khidx=h/(QH/KVH);for(int j=0;j<ns;j++){const float *kh=Kl+((int64_t)khidx*m->kv_cap+sel[j])*D;float a=q38_dot8(qh,kh,D);a/=sqrtf((float)D);score[j]=a;if(a>mx)mx=a;}
         float den=0.f;for(int j=0;j<ns;j++){score[j]=expf(score[j]-mx);den+=score[j];}
         float *oh=heads+(int64_t)s*QH*D+(int64_t)h*D;memset(oh,0,(size_t)D*sizeof(float));
         for(int j=0;j<ns;j++){float a=score[j]/den;const float *vh=Vl+((int64_t)khidx*m->kv_cap+sel[j])*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
