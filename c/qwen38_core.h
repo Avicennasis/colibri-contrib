@@ -3326,6 +3326,48 @@ static void q38_cov_init(Model *m) {
     fprintf(stderr,"[cov] collecting the routed experts' input second moments into %s\n",p);
 }
 
+/* Q38_ACT_DUMP=<dir>: every token's routed-expert input with its route, one file per
+ * layer, for the quantizer that fits each expert to the rows it really receives
+ * (tools/convert_qwen38_experts_int4.py --dump). <dir>/layer-NNN.bin: "Q38DMP1\0",
+ * int32 hidden and top-k, then per token K int32 expert ids in rank order, their K f32
+ * gates (the weights of the reduction) and the H f32 inputs. Runs append, so the
+ * calibration blocks add up. Prefill chunks and decode rows alike. */
+static FILE **g_q38_dump; static int g_q38_dump_layers;
+static void q38_dump_add(int layer,const float *x,const int *idx,const float *gates,int K,int H) {
+    if(!g_q38_dump||layer<0||layer>=g_q38_dump_layers)return;
+    FILE *f=g_q38_dump[layer];int32_t ids[Q38_MAX_TOPK];
+    for(int k=0;k<K;k++)ids[k]=idx[k];
+    if(fwrite(ids,sizeof(int32_t),(size_t)K,f)!=(size_t)K||fwrite(gates,sizeof(float),(size_t)K,f)!=(size_t)K||
+       fwrite(x,sizeof(float),(size_t)H,f)!=(size_t)H){perror("Q38_ACT_DUMP");exit(1);}
+}
+static void q38_dump_close(void) {
+    for(int l=0;l<g_q38_dump_layers;l++)if(g_q38_dump[l]&&fclose(g_q38_dump[l]))perror("Q38_ACT_DUMP");
+    fprintf(stderr,"[dump] %d layer files closed\n",g_q38_dump_layers);
+}
+static void q38_dump_init(Model *m) {
+    const char *dir=getenv("Q38_ACT_DUMP");
+    if(!dir||!*dir||m->c.experts<1)return;
+    const int L=m->c.layers;const int32_t dims[2]={m->c.hidden,m->c.topk};
+    g_q38_dump=(FILE**)calloc((size_t)L,sizeof(FILE*));
+    if(!g_q38_dump){fprintf(stderr,"Q38_ACT_DUMP: out of memory\n");exit(1);}
+    for(int l=0;l<L;l++){
+        char path[4200];snprintf(path,sizeof path,"%s/layer-%03d.bin",dir,l);
+        FILE *probe=fopen(path,"rb");char head[16];
+        int fresh=!probe;
+        if(probe){   /* an earlier run's file: the same geometry, or refuse */
+            if(fread(head,1,16,probe)!=16||memcmp(head,"Q38DMP1\0",8)||memcmp(head+8,dims,8)){
+                fprintf(stderr,"Q38_ACT_DUMP: %s holds another model's rows\n",path);exit(1);
+            }
+            fclose(probe);
+        }
+        if(!(g_q38_dump[l]=fopen(path,"ab"))){perror(path);exit(1);}
+        if(fresh&&(fwrite("Q38DMP1\0",8,1,g_q38_dump[l])!=1||fwrite(dims,sizeof dims,1,g_q38_dump[l])!=1)){perror(path);exit(1);}
+    }
+    g_q38_dump_layers=L;
+    atexit(q38_dump_close);
+    fprintf(stderr,"[dump] the routed experts' inputs and routes of %d layers into %s\n",L,dir);
+}
+
 static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,float *eu,float *eh,float *eo) {
     Cfg *c=&m->c;int H=c->hidden,I=c->inter;
     Slot *ex=q38_expert_get(m,layer,eid);double started=now_s();
@@ -3360,6 +3402,7 @@ static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,f
         float route_gates[Q38_MAX_TOPK];
         for(int z=0;z<K;z++) route_gates[z]=(float)(val[z]/den);
         rt_route(layer,s,idx,route_gates,K); /* shared counts + post-normalization trace */
+        if(g_q38_dump)q38_dump_add(layer,xs,idx,route_gates,K,H);
         /* Resident experts run on the GPU from here on (asynchronously); the
          * CPU only loads and computes the rest, in route order. The tier
          * knows the model's layers only: the MTP head's stays on the CPU. */
@@ -3565,6 +3608,7 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
                 group_counts[selected[rank]]++;
             }
             rt_route(layer,base+s,selected,gates,K);
+            if(g_q38_dump)q38_dump_add(layer,x+(int64_t)(base+s)*H,selected,gates,K,H);
         }
 
         /* Prefixing by expert makes every group contiguous while the inverse

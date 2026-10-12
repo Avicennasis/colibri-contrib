@@ -1437,6 +1437,31 @@ memInfo.free:                     23.50 GB (97%)
             self.assertNotIn("qwen38_int4_experts", partial["model"])
             self.assertEqual(partial["model"]["per_cap_bytes"], 384)
 
+    def test_qwen38_int2_sidecar_is_priced_when_the_engine_takes_it(self):
+        # Q38_EXPERT_INT2=1 makes qwen38 load experts-int2g32/ (int2_g32.h) instead of
+        # the int4 one: its records are what the cache holds, and nothing else
+        self.write_qwen38()
+        geometry = {"version": 1, "complete": True, "layers": 2, "experts": 2,
+                    "hidden_size": 8, "moe_intermediate_size": 4}
+        for name, fmt, record in (("experts-int4g64", "colibri.qwen38.experts-int4g64", 112),
+                                  ("experts-int2g32", "colibri.qwen38.experts-int2g32", 60)):
+            (self.model / name).mkdir()
+            (self.model / name / "index.json").write_text(json.dumps(dict(geometry, format=fmt, record_bytes=record)))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("Q38_EXPERT_INT4", None)
+            os.environ.pop("Q38_EXPERT_INT2", None)
+            plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertEqual(plan["model"]["per_cap_bytes"], 112)
+            os.environ["Q38_EXPERT_INT2"] = "1"
+            plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertTrue(plan["model"]["qwen38_int4_experts"])
+            self.assertEqual((plan["model"]["per_cap_bytes"], plan["model"]["expert_bytes"]), (60, 120))
+            # the int2 index of another format or still being written is not priced
+            (self.model / "experts-int2g32" / "index.json").write_text(
+                json.dumps(dict(geometry, format="colibri.qwen38.experts-int2g32", record_bytes=60, complete=False)))
+            plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertEqual(plan["model"]["per_cap_bytes"], 384)
+
     def test_cli_emits_versioned_json(self):
         cli = Path(__file__).parents[1] / "coli"
         run = subprocess.run([

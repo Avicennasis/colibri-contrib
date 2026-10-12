@@ -126,6 +126,38 @@ class Int2Convert(unittest.TestCase):
             gptq = cv.dequantize_int2(*cv.quantize_int2_g32_gptq(w, imp, u))
             self.assertLess(out_err(w.astype(np.float64), gptq, h), 0.8 * out_err(w.astype(np.float64), plain, h))
 
+    def test_dump_rows_and_exact_quantizer(self):
+        h, k, n, experts = 256, 4, 600, 6
+        ids = np.stack([self.rng.permutation(experts)[:k] for _ in range(n)]).astype(np.int32)
+        gates = self.rng.dirichlet(np.ones(k), n).astype(np.float32)
+        basis = self.rng.standard_normal((16, h))
+        x = (self.rng.standard_normal((n, 16)) @ basis + 0.1 * self.rng.standard_normal((n, h))).astype(np.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "layer-000.bin"), "wb") as f:
+                f.write(b"Q38DMP1\0" + struct.pack("<2i", h, k))
+                f.write(np.concatenate([ids.view(np.uint8).reshape(n, -1), gates.view(np.uint8).reshape(n, -1),
+                                        x.view(np.uint8).reshape(n, -1)], axis=1).tobytes())
+            dump = cv.Dump(tmp)
+            xe, ge = dump.rows(0, 2)
+            want = (ids == 2).any(axis=1)
+            np.testing.assert_array_equal(xe, x[want].astype(np.float64))
+            np.testing.assert_allclose(ge, (gates * (ids == 2)).sum(axis=1)[want])
+            np.testing.assert_allclose(dump.layer_moment(0), x.astype(np.float64).T @ x / n, rtol=1e-12)
+            w3 = [(self.rng.standard_normal(shape) * 0.05).astype(np.float32) for shape in ((128, h), (128, h), (h, 128))]
+
+            def out(ws, rows):
+                g = rows @ ws[0].T
+                return (g / (1 + np.exp(-g)) * (rows @ ws[1].T)) @ ws[2].T
+            y = out([w.astype(np.float64) for w in w3], xe)
+            exact = [cv.dequantize_int2(*o) for o in cv.quantize_expert_int2_exact(w3, xe, ge, dump.layer_moment(0))]
+            plain = [cv.dequantize_int2(*cv.quantize_int2_g32(w)) for w in w3]
+            e_exact = np.linalg.norm(y - out(exact, xe)) / np.linalg.norm(y)
+            e_plain = np.linalg.norm(y - out(plain, xe)) / np.linalg.norm(y)
+            self.assertLess(e_exact, 0.7 * e_plain)
+            # an expert the calibration never routed: the layer's moment alone, down plain
+            none = cv.quantize_expert_int2_exact(w3, np.zeros((0, h)), np.zeros(0), dump.layer_moment(0))
+            self.assertEqual([o[0].shape for o in none], [(128, h), (128, h), (h, 128)])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1708,6 +1708,7 @@ def analyze_model(model):
 
 
 QWEN38_INT4_SIDECAR = "experts-int4g64"
+QWEN38_INT2_SIDECAR = "experts-int2g32"
 
 
 def qwen38_int4_sidecar(info):
@@ -1722,18 +1723,22 @@ def qwen38_int4_sidecar(info):
     sidecar that disagrees with it. Returns the analysis unchanged when the
     sidecar does not apply, otherwise a copy priced with its records and
     marked `qwen38_int4_experts`: no FP8 scale bank is built either.
+    Q38_EXPERT_INT2=1 makes the engine load experts-int2g32/ instead (int2_g32.h,
+    1.40 MB a record on the release), priced the same way.
     """
     resolved = info["resolved_family"]
-    if resolved.descriptor.id != "qwen38" or os.environ.get("Q38_EXPERT_INT4") == "0":
+    int2 = os.environ.get("Q38_EXPERT_INT2") == "1"
+    if resolved.descriptor.id != "qwen38" or (os.environ.get("Q38_EXPERT_INT4") == "0" and not int2):
         return info
     try:
-        index = json.loads((Path(info["path"]) / QWEN38_INT4_SIDECAR / "index.json")
-                           .read_text(encoding="utf-8"))
+        index = json.loads((Path(info["path"]) / (QWEN38_INT2_SIDECAR if int2 else QWEN38_INT4_SIDECAR) /
+                            "index.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return info
     config = info["config"]
     text = config.get("text_config", config) if isinstance(config, dict) else {}
-    want = {"format": "colibri.qwen38.experts-int4g64", "version": 1, "complete": True,
+    want = {"format": "colibri.qwen38.experts-int2g32" if int2 else "colibri.qwen38.experts-int4g64",
+            "version": 1, "complete": True,
             "layers": text.get("num_hidden_layers"), "experts": text.get("num_experts"),
             "hidden_size": text.get("hidden_size"),
             "moe_intermediate_size": text.get("moe_intermediate_size")}

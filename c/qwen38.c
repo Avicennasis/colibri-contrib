@@ -2402,6 +2402,7 @@ int main(int argc, char **argv) {
     else q38_mtp_attach(&m, cap);       /* Q38_MTP=1: the checkpoint's MTP head drafts (qwen38_core.h) */
     q38_act_init(&m);                   /* Q38_ACT_STATS: the experts' input statistics, for a calibrated quantizer */
     q38_cov_init(&m);                   /* Q38_ACT_COV: their input second moments, for the error-compensating one */
+    q38_dump_init(&m);                  /* Q38_ACT_DUMP: their inputs and routes, row by row */
     if (g_q38_gguf) {   /* a tensor the files have and nothing loaded: a weight the engine would ignore */
         int unused = 0, head = 0; char hp[32]; snprintf(hp, sizeof hp, "blk.%d.", m.c.layers);
         const gguf_ctx *files[2] = { &g_q38gg, &g_q38gg_mtp };

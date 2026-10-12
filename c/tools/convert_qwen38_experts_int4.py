@@ -348,6 +348,85 @@ class CovStats:
         return self._factor(layer) / np.sqrt(np.maximum(imp.astype(np.float64), 1e-30))[None, :]
 
 
+class Dump:
+    """The engine's Q38_ACT_DUMP directory: per layer, every calibration token's routed-expert
+    input with its route (K expert ids, K gates). rows(layer, expert) are the inputs that expert
+    really received and the gates they were weighed with; the layer's full matrix of inputs is
+    kept for the prior of experts with few rows."""
+    def __init__(self, path, max_tokens=None):
+        self.dir, self.max_tokens, self._layer = path, max_tokens, None
+
+    def _load(self, layer):
+        if self._layer == layer:
+            return
+        raw = np.fromfile(os.path.join(self.dir, f"layer-{layer:03d}.bin"), np.uint8)
+        if raw[:8].tobytes() != b"Q38DMP1\0":
+            raise ValueError(f"{self.dir}: layer {layer} is not a Q38_ACT_DUMP file")
+        h, k = struct.unpack("<2i", raw[8:16].tobytes())
+        rec = raw[16:].reshape(-1, 8 * k + 4 * h)
+        if self.max_tokens:
+            rec = rec[:self.max_tokens]
+        self.ids = np.ascontiguousarray(rec[:, :4 * k]).view(np.int32)
+        self.gates = np.ascontiguousarray(rec[:, 4 * k:8 * k]).view(np.float32)
+        self.x = np.ascontiguousarray(rec[:, 8 * k:]).view(np.float32)
+        self.pool = None
+        self._layer = layer
+
+    def rows(self, layer, expert):
+        self._load(layer)
+        hit = self.ids == expert
+        rows = hit.any(axis=1)
+        gate = (self.gates * hit).sum(axis=1)       # a route lists an expert once; summed all the same
+        return self.x[rows].astype(np.float64), gate[rows].astype(np.float64)
+
+    def layer_moment(self, layer):
+        """sum_t x x^T / tokens over every token of the layer (the prior)."""
+        self._load(layer)
+        if self.pool is None:
+            x = self.x.astype(np.float64)
+            self.pool = x.T @ x / max(len(x), 1)
+        return self.pool
+
+
+def _upper_inv(h):
+    """The upper Cholesky factor U of h^-1 (h^-1 = U^T U), for GPTQ."""
+    return np.linalg.cholesky(np.linalg.inv(h)).T
+
+
+def _hessian(x, wts, prior, alpha, damp):
+    """sum_t w_t x_t x_t^T, plus alpha times the prior scaled to its trace, plus damp times
+    its mean diagonal: rows are few next to the width, so the prior fills the directions
+    they never visit."""
+    h = (x * wts[:, None]).T @ x if len(x) else np.zeros((prior.shape[0],) * 2)
+    if prior is not None:
+        tp = float(np.trace(prior))
+        th = float(np.trace(h))
+        h = h + (alpha * th / tp if th > 0 and tp > 0 else 1.0) * prior
+    h = h + damp * float(np.mean(np.diag(h))) * np.eye(h.shape[0])
+    return h
+
+
+def quantize_expert_int2_exact(w3, x, gates, layer_prior, alpha=0.1, damp=0.01, gate_weight=True):
+    """One expert from the rows it really received: gate and up with GPTQ under
+    H = sum_t g_t^2 x_t x_t^T (+ the layer's moment as a prior), then down with GPTQ under the
+    SwiGLU outputs of the QUANTIZED gate and up on the same rows (what down will really see).
+    w3 = (gate, up, down) f32; returns [(codes, q, d)] * 3."""
+    wts = gates ** 2 if gate_weight else np.ones(len(x))
+    h = _hessian(x, wts, layer_prior, alpha, damp)
+    u = _upper_inv(h)
+    imp = np.diag(h).astype(np.float32)
+    out = [quantize_int2_g32_gptq(w3[k], imp, u) for k in range(2)]
+    if len(x):
+        g = x @ dequantize_int2(*out[0]).T
+        hid = g / (1.0 + np.exp(-g)) * (x @ dequantize_int2(*out[1]).T)
+        hd = (hid * wts[:, None]).T @ hid
+        hd = hd + alpha * np.diag(np.diag(hd)) + damp * float(np.mean(np.diag(hd)) or 1.0) * np.eye(hd.shape[0])
+        out.append(quantize_int2_g32_gptq(w3[2], np.diag(hd).astype(np.float32), _upper_inv(hd)))
+    else:
+        out.append(quantize_int2_g32(w3[2]))
+    return out
+
+
 def pack_int2(codes):
     """u8 codes [R, C] (0..3) -> u8 [R, C/4]: blocks of 128, byte k holding elements
     k, k+32, k+64, k+96 in bits 0-1, 2-3, 4-5, 6-7 (int2_g32.h)."""
@@ -581,18 +660,29 @@ _SOURCE = None
 _ACT = None
 _BITS = 4
 _COV = None
+_DUMP = None
 
 
-def _init_worker(model_dir, act_path=None, bits=4, cov_path=None):
-    global _SOURCE, _ACT, _BITS, _COV
+def _init_worker(model_dir, act_path=None, bits=4, cov_path=None, dump_path=None):
+    global _SOURCE, _ACT, _BITS, _COV, _DUMP
     _SOURCE = Source(model_dir)
     _ACT = ActStats(act_path) if act_path else None
     _BITS = bits
     _COV = CovStats(cov_path) if cov_path else None
+    _DUMP = Dump(dump_path) if dump_path else None
 
 
 def convert_expert_int2(layer, expert):
     codes, qs, ds, errors = [], [], [], []
+    if _DUMP is not None:
+        w3 = [_SOURCE.matrix(layer, expert, k) for k in range(3)]
+        x, gates = _DUMP.rows(layer, expert)
+        for k, (c, q, d) in enumerate(quantize_expert_int2_exact(w3, x, gates, _DUMP.layer_moment(layer))):
+            errors.append(rel_l2(w3[k], dequantize_int2(c, q, d)))
+            codes.append(pack_int2(c).tobytes())
+            qs.append(q.tobytes())
+            ds.append(d.tobytes())
+        return b"".join(codes) + b"".join(qs) + b"".join(ds), errors, peak_rss_mb()
     for k in range(3):
         w = _SOURCE.matrix(layer, expert, k)
         imp = _ACT.importance(layer, expert, k) if _ACT else None
@@ -756,7 +846,8 @@ def peak_rss_mb():
     return peak / (1 << 20) if sys.platform == "darwin" else peak / 1024
 
 
-def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_path=None, bits=4, cov_path=None):
+def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_path=None, bits=4, cov_path=None,
+            dump_path=None):
     """Write (or finish) model_dir's sidecar; returns its directory."""
     src = Source(model_dir)
     if bits == 2:
@@ -785,8 +876,10 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
 
     os.makedirs(out_dir, exist_ok=True)
     index = resume_index(out_dir, src)
-    if cov_path and bits != 2:
-        sys.exit("--cov is for --int2")
+    if (cov_path or dump_path) and bits != 2:
+        sys.exit("--cov and --dump are for --int2")
+    if dump_path and (cov_path or act_path):
+        sys.exit("--dump carries the statistics itself: no --act-stats or --cov with it")
     cov = CovStats(cov_path) if cov_path else None
     if cov and (cov.layers, cov.hidden) != (g.layers, g.hidden):
         sys.exit(f"{cov_path}: matrices of another geometry")
@@ -794,6 +887,10 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
         quantizer = (f"weighted: per 32 inputs levels -10 -3 3 10, scale and codes fitted in turn against the "
                      f"activation-weighted squared error (Q38_ACT_STATS {os.path.basename(act_path)}, "
                      f"{act.rows} expert rows), scales as u8 under the row's largest and refitted") if act else None
+        if dump_path:
+            quantizer = ("every expert fitted to the rows it received (Q38_ACT_DUMP " + os.path.basename(dump_path.rstrip("/")) +
+                         "): gate and up with GPTQ under H = sum g^2 x x^T + 0.1 x the layer's moment, down with GPTQ "
+                         "under the quantized gate/up's SwiGLU outputs; levels -10 -3 3 10, u8 scales per 32")
         if cov:
             quantizer = (quantizer or "uniform weights") + (
                 f"; gate and up with the error carried column by column (GPTQ) under H = D^1/2 C D^1/2 "
@@ -817,9 +914,9 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
         from multiprocessing import get_context
         for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
             os.environ.setdefault(var, "1")   # one BLAS thread per worker: the workers are the parallelism
-        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir, act_path, bits, cov_path))
+        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir, act_path, bits, cov_path, dump_path))
     else:
-        _init_worker(model_dir, act_path, bits, cov_path)
+        _init_worker(model_dir, act_path, bits, cov_path, dump_path)
     worst = 0.0
     try:
         for layer in todo:
@@ -857,8 +954,10 @@ def main():
                                                         "instead (qwen38: Q38_EXPERT_INT2=1)")
     ap.add_argument("--cov", help="the engine's Q38_ACT_COV file (with --int2): gate and up quantized with the "
                                   "error carried column by column under the layer's input correlations")
+    ap.add_argument("--dump", help="the engine's Q38_ACT_DUMP directory (with --int2): every expert fitted with GPTQ "
+                                   "to the inputs it really received, down to the SwiGLU outputs of its quantized gate/up")
     a = ap.parse_args()
-    convert(a.model, a.out, a.workers, a.layers, a.plan, a.act_stats, 2 if a.int2 else 4, a.cov)
+    convert(a.model, a.out, a.workers, a.layers, a.plan, a.act_stats, 2 if a.int2 else 4, a.cov, a.dump)
 
 
 if __name__ == "__main__":
