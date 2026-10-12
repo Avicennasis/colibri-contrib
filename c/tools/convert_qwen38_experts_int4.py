@@ -422,11 +422,25 @@ class Dump:
         self._layer = layer
 
     def rows(self, layer, expert):
+        x, gate, _ = self.rows_idx(layer, expert)
+        return x, gate
+
+    def rows_idx(self, layer, expert):
+        """rows(), and the token indices they are at (to pair them with another dump of the
+        same calibration blocks)"""
         self._load(layer)
         hit = self.ids == expert
         rows = hit.any(axis=1)
         gate = (self.gates * hit).sum(axis=1)       # a route lists an expert once; summed all the same
-        return self.x[rows].astype(np.float64), gate[rows].astype(np.float64)
+        return self.x[rows].astype(np.float64), gate[rows].astype(np.float64), np.nonzero(rows)[0]
+
+    def tokens(self, layer):
+        self._load(layer)
+        return len(self.x)
+
+    def x_at(self, layer, idx):
+        self._load(layer)
+        return self.x[idx].astype(np.float64)
 
     def layer_moment(self, layer):
         """sum_t x x^T / tokens over every token of the layer (the prior)."""
@@ -466,25 +480,50 @@ def _hessian(x, wts, prior, alpha, damp):
     return h
 
 
-def quantize_expert_lowbit_exact(w3, x, gates, layer_prior, alpha=0.1, damp=0.01, gate_weight=True, fmt=INT2G32):
+def _target_weights(w, h, data, cross):
+    """The weights GPTQ should quantize when the rows' targets are not w's own outputs on
+    them: with inputs X~ (data = sum g^2 x~ x~^T, h = data + R, R the prior and damping
+    added to it) and targets w x (cross = sum g^2 x x~^T over the same rows), the
+    regularized least-squares map is W' = w (cross + R) h^-1, and
+    sum g^2 |w x - q x~|^2 + |w - q|_R^2 = const + (W' - q) h (W' - q)^T, so GPTQ under h on
+    W' minimizes it. cross = data (targets on the same inputs) gives W' = w."""
+    m = np.linalg.solve(h, (cross + (h - data)).T).T
+    return (w.astype(np.float64) @ m).astype(np.float32)
+
+
+def quantize_expert_lowbit_exact(w3, x, gates, layer_prior, alpha=0.1, damp=0.01, gate_weight=True, fmt=INT2G32,
+                                 x_orig=None):
     """One expert from the rows it really received: gate and up with GPTQ under
     H = sum_t g_t^2 x_t x_t^T (+ the layer's moment as a prior), then down with GPTQ under the
     SwiGLU outputs of the QUANTIZED gate and up on the same rows (what down will really see).
-    w3 = (gate, up, down) f32; returns [(codes, q, d)] * 3."""
+    w3 = (gate, up, down) f32; returns [(codes, q, d)] * 3.
+    x_orig: the same tokens' inputs in the original model when x comes from a model whose
+    earlier layers are already quantized (the sequential calibration): the targets are then
+    the original expert's outputs on x_orig, the error upstream left in x compensated where
+    a linear map can (_target_weights), down's against the original expert's output."""
     wts = gates ** 2 if gate_weight else np.ones(len(x))
     h = _hessian(x, wts, layer_prior, alpha, damp)
     u = _upper_inv(h)
     imp = np.diag(h).astype(np.float32)
     # gate and up share H: one pass over their stacked rows (rows are independent in GPTQ)
     rows = w3[0].shape[0]
-    c, q, d = quantize_lowbit_gptq(np.vstack([w3[0], w3[1]]), imp, u, fmt)
+    wgu = np.vstack([w3[0], w3[1]])
+    if x_orig is not None and len(x):
+        data = (x * wts[:, None]).T @ x
+        wgu = _target_weights(wgu, h, data, (x_orig * wts[:, None]).T @ x)
+    c, q, d = quantize_lowbit_gptq(wgu, imp, u, fmt)
     out = [(c[:rows], q[:rows], d[:rows]), (c[rows:], q[rows:], d[rows:])]
     if len(x):
         g = x @ dequantize_lowbit(*out[0], fmt).T
         hid = g / (1.0 + np.exp(-g)) * (x @ dequantize_lowbit(*out[1], fmt).T)
-        hd = (hid * wts[:, None]).T @ hid
-        hd = hd + alpha * np.diag(np.diag(hd)) + damp * float(np.mean(np.diag(hd)) or 1.0) * np.eye(hd.shape[0])
-        out.append(quantize_lowbit_gptq(w3[2], np.diag(hd).astype(np.float32), _upper_inv(hd), fmt))
+        data_d = (hid * wts[:, None]).T @ hid
+        hd = data_d + alpha * np.diag(np.diag(data_d)) + damp * float(np.mean(np.diag(data_d)) or 1.0) * np.eye(data_d.shape[0])
+        wd = w3[2]
+        if x_orig is not None:   # down's target: the original expert's output on the original input
+            go = x_orig @ w3[0].T.astype(np.float64)
+            ho = go / (1.0 + np.exp(-go)) * (x_orig @ w3[1].T.astype(np.float64))
+            wd = _target_weights(wd, hd, data_d, (ho * wts[:, None]).T @ hid)
+        out.append(quantize_lowbit_gptq(wd, np.diag(hd).astype(np.float32), _upper_inv(hd), fmt))
     else:
         out.append(quantize_lowbit(w3[2], None, fmt))
     return out
@@ -805,16 +844,17 @@ _ALPHA = 0.1
 
 
 def _init_worker(model_dir, act_path=None, bits=4, cov_path=None, dump_path=None, fmt_name=None, alpha=0.1,
-                 rescale=False):
-    global _SOURCE, _ACT, _BITS, _COV, _DUMP, _FMT, _ALPHA, _RESCALE
+                 rescale=False, target_path=None, dump_tokens=None):
+    global _SOURCE, _ACT, _BITS, _COV, _DUMP, _FMT, _ALPHA, _RESCALE, _TARGET
     _SOURCE = Source(model_dir)
     _ACT = ActStats(act_path) if act_path else None
     _BITS = bits
     _COV = CovStats(cov_path) if cov_path else None
-    _DUMP = Dump(dump_path) if dump_path else None
+    _DUMP = Dump(dump_path, max_tokens=dump_tokens) if dump_path else None
     _FMT = LOWBIT[fmt_name] if fmt_name else (INT2G32 if bits == 2 else None)
     _ALPHA = alpha
     _RESCALE = rescale
+    _TARGET = Dump(target_path, max_tokens=dump_tokens) if target_path else None
 
 
 def convert_expert_int2(layer, expert):
@@ -823,8 +863,14 @@ def convert_expert_int2(layer, expert):
     codes, qs, ds, errors = [], [], [], []
     w3 = [_SOURCE.matrix(layer, expert, k) for k in range(3)]
     if _DUMP is not None:
-        x, gates = _DUMP.rows(layer, expert)
-        out = quantize_expert_lowbit_exact(w3, x, gates, _DUMP.layer_moment(layer), alpha=_ALPHA, fmt=fmt)
+        x, gates, idx = _DUMP.rows_idx(layer, expert)
+        x_orig = None
+        if _TARGET is not None:   # the same tokens in the original model (the sequential calibration)
+            if _TARGET.tokens(layer) != _DUMP.tokens(layer):
+                raise RuntimeError(f"layer {layer}: the --dump has {_DUMP.tokens(layer)} tokens, the --dump-target "
+                                   f"{_TARGET.tokens(layer)}: not the same calibration blocks")
+            x_orig = _TARGET.x_at(layer, idx)
+        out = quantize_expert_lowbit_exact(w3, x, gates, _DUMP.layer_moment(layer), alpha=_ALPHA, fmt=fmt, x_orig=x_orig)
         if _RESCALE:   # down's row scales carry the factor
             a = output_rescale(w3, [dequantize_lowbit(*o, fmt) for o in out], x, gates)
             out[2] = (out[2][0], out[2][1], (out[2][2].astype(np.float64) * a).astype(np.float32))
@@ -1078,7 +1124,7 @@ def rescale_sidecar(model_dir, out_dir, dump_path, fmt_name, workers=1, layers=N
 
 
 def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_path=None, bits=4, cov_path=None,
-            dump_path=None, fmt_name=None, alpha=0.1, rescale=False):
+            dump_path=None, fmt_name=None, alpha=0.1, rescale=False, target_path=None, dump_tokens=None):
     """Write (or finish) model_dir's sidecar; returns its directory."""
     src = Source(model_dir)
     if fmt_name or bits == 2:
@@ -1124,7 +1170,9 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
             quantizer = (f"{g.fmt.name}, every expert fitted to the rows it received (Q38_ACT_DUMP "
                          f"{os.path.basename(dump_path.rstrip('/'))}): gate and up with GPTQ under H = sum g^2 x x^T + "
                          f"{alpha} x the layer's moment, down with GPTQ under the quantized gate/up's SwiGLU outputs"
-                         + ("; down's row scales times the output rescale on those rows" if rescale else ""))
+                         + ("; down's row scales times the output rescale on those rows" if rescale else "")
+                         + ("; inputs from a model with the earlier layers quantized, targets the original model's "
+                            "outputs on the same tokens (--dump-target, the sequential calibration)" if target_path else ""))
         if cov:
             quantizer = (quantizer or "uniform weights") + (
                 f"; gate and up with the error carried column by column (GPTQ) under H = D^1/2 C D^1/2 "
@@ -1148,9 +1196,9 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
         from multiprocessing import get_context
         for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
             os.environ.setdefault(var, "1")   # one BLAS thread per worker: the workers are the parallelism
-        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha, rescale))
+        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha, rescale, target_path, dump_tokens))
     else:
-        _init_worker(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha, rescale)
+        _init_worker(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha, rescale, target_path, dump_tokens)
     worst = 0.0
     try:
         for layer in todo:
@@ -1199,7 +1247,14 @@ def main():
     ap.add_argument("--rescale-only", action="store_true", help="with --dump and --lowbit: apply --rescale to the "
                                                                 "existing sidecar --out in place (layers done are kept in "
                                                                 "its index, never scaled twice)")
+    ap.add_argument("--dump-target", help="with --dump: the original model's Q38_ACT_DUMP over the same calibration "
+                                          "blocks, when --dump comes from a model whose earlier layers are already "
+                                          "quantized (Q38_EXPERT_PARTIAL): the targets are the original outputs")
+    ap.add_argument("--dump-tokens", type=int, help="with --dump: only each layer's first N tokens (the same calibration "
+                                                     "blocks in dumps of different lengths)")
     a = ap.parse_args()
+    if a.dump_target and not a.dump:
+        sys.exit("--dump-target needs --dump")
     if a.rescale_only:
         if not (a.dump and a.lowbit):
             sys.exit("--rescale-only needs --dump and --lowbit")
@@ -1209,7 +1264,7 @@ def main():
     if a.rescale and not a.dump:
         sys.exit("--rescale needs --dump")
     convert(a.model, a.out, a.workers, a.layers, a.plan, a.act_stats, 2 if (a.int2 or a.lowbit) else 4, a.cov, a.dump,
-            a.lowbit or ("int2g32" if a.int2 else None), a.alpha, a.rescale)
+            a.lowbit or ("int2g32" if a.int2 else None), a.alpha, a.rescale, a.dump_target, a.dump_tokens)
 
 
 if __name__ == "__main__":

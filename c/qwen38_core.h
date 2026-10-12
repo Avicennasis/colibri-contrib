@@ -1834,7 +1834,7 @@ static int q38_try_load_native_fp8_expert(Model *m,int layer,int expert,Slot *sl
  * the model's layers only: the MTP head's layer (index c.layers) keeps the
  * snapshot's FP8 experts with a sidecar or without one. */
 static inline int q38_layer_int4(const Model *m,int layer) {
-    return m->x4&&layer>=0&&layer<m->c.layers;
+    return m->x4&&layer>=0&&layer<m->c.layers&&m->x4->fd[layer]>=0;   /* a partial sidecar (Q38_EXPERT_PARTIAL) misses some */
 }
 
 /* Advise the kernel of the experts a route is about to miss: the int4
@@ -2121,7 +2121,22 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
        q38_json_int(root,"record_bytes")!=x->record_bytes||x->scale_off%(int64_t)sizeof(float))
         q38_int4_refuse(dir,"index.json was written for another geometry than config.json's");
     jval *complete=json_get(root,"complete"),*done=json_get(root,"done");
-    if(!complete||complete->t!=J_BOOL||!complete->boolean){
+    /* Q38_EXPERT_PARTIAL=1: a sidecar still being written serves the layers it lists as
+     * done, the others keep the snapshot's experts -- the sequential calibration
+     * (tools/convert_qwen38_experts_int4.py --dump-target) dumps the inputs a model with
+     * its first layers already quantized gives the next ones. CPU only. */
+    const char *pe=getenv("Q38_EXPERT_PARTIAL");
+    int partial=pe&&pe[0]=='1'&&(!complete||complete->t!=J_BOOL||!complete->boolean)&&done&&done->t==J_ARR&&done->len>0;
+    uint8_t *have=NULL;
+    if(partial){
+        have=(uint8_t*)calloc((size_t)c->layers,1);
+        if(!have){fprintf(stderr,"OOM partial sidecar\n");exit(1);}
+        for(int i=0;i<done->len;i++){const jval *v=done->kids[i];if(v->t==J_NUM&&v->num>=0&&v->num<c->layers)have[(int)v->num]=1;}
+        int n=0;for(int l=0;l<c->layers;l++)n+=have[l];
+        fprintf(stderr,"[qwen38] %s: partial sidecar (Q38_EXPERT_PARTIAL=1), %d of %d layers; the others keep "
+                       "the snapshot's experts\n",dir,n,c->layers);
+    }
+    if(!partial&&(!complete||complete->t!=J_BOOL||!complete->boolean)){
         int layers_done=done&&done->t==J_ARR?done->len:0;
         if(wanted>0){
             fprintf(stderr,"[qwen38] %s: conversion incomplete (%d of %d layers); "
@@ -2142,7 +2157,7 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
         for(int expert=0;expert<c->experts;expert++)x->off[(int64_t)layer*c->experts+expert]=-1;
     }
     for(int layer=m->range_begin;layer<m->range_end;layer++)
-        for(int expert=0;expert<c->experts;expert++){
+        for(int expert=0;expert<c->experts&&(!have||have[layer]);expert++){
             int fd=-1;int64_t start=-1;
             if(q38_int4_record_at(m,x,layer,expert,&fd,&start)||
                (x->fd[layer]>=0&&fd!=x->fd[layer])){
@@ -2153,6 +2168,7 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
             }
             x->fd[layer]=fd;x->off[(int64_t)layer*c->experts+expert]=start;
         }
+    free(have);
     m->x4=x;
 }
 
@@ -3633,7 +3649,7 @@ static void q38_cov_init(Model *m) {
  * calibration blocks add up. Prefill chunks and decode rows alike. */
 static FILE **g_q38_dump; static int g_q38_dump_layers;
 static void q38_dump_add(int layer,const float *x,const int *idx,const float *gates,int K,int H) {
-    if(!g_q38_dump||layer<0||layer>=g_q38_dump_layers)return;
+    if(!g_q38_dump||layer<0||layer>=g_q38_dump_layers||!g_q38_dump[layer])return;
     FILE *f=g_q38_dump[layer];int32_t ids[Q38_MAX_TOPK];
     for(int k=0;k<K;k++)ids[k]=idx[k];
     if(fwrite(ids,sizeof(int32_t),(size_t)K,f)!=(size_t)K||fwrite(gates,sizeof(float),(size_t)K,f)!=(size_t)K||
@@ -3647,6 +3663,8 @@ static void q38_dump_init(Model *m) {
     const char *dir=getenv("Q38_ACT_DUMP");
     if(!dir||!*dir||m->c.experts<1)return;
     const int L=m->c.layers;const int32_t dims[2]={m->c.hidden,m->c.topk};
+    int dlo=0,dhi=L-1;const char *dl=getenv("Q38_ACT_DUMP_LAYERS");   /* "a-b": only those layers' files */
+    if(dl&&*dl&&sscanf(dl,"%d-%d",&dlo,&dhi)!=2){fprintf(stderr,"Q38_ACT_DUMP_LAYERS must be a-b\n");exit(1);}
     g_q38_dump=(FILE**)calloc((size_t)L,sizeof(FILE*));
     if(!g_q38_dump){fprintf(stderr,"Q38_ACT_DUMP: out of memory\n");exit(1);}
     for(int l=0;l<L;l++){
@@ -3659,6 +3677,7 @@ static void q38_dump_init(Model *m) {
             }
             fclose(probe);
         }
+        if(l<dlo||l>dhi)continue;   /* Q38_ACT_DUMP_LAYERS: these layers only */
         if(!(g_q38_dump[l]=fopen(path,"ab"))){perror(path);exit(1);}
         if(fresh&&(fwrite("Q38DMP1\0",8,1,g_q38_dump[l])!=1||fwrite(dims,sizeof dims,1,g_q38_dump[l])!=1)){perror(path);exit(1);}
     }

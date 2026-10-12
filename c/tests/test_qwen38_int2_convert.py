@@ -191,6 +191,38 @@ class Int2Convert(unittest.TestCase):
         self.assertEqual(g3.record_bytes, 2012160)
         self.assertEqual([t[0].rsplit(".", 1)[-1] for t in g3.tensors("m", 0, 0)][3:6], ["q4"] * 3)
 
+    def test_sequential_targets(self):
+        # --dump-target: the inputs x~ of a model with its earlier layers quantized, the
+        # targets the original expert on the original inputs x of the same tokens
+        fmt = cv.INT2G16
+        w3 = [(self.rng.standard_normal(s) * 0.05).astype(np.float32) for s in ((128, 256), (128, 256), (256, 128))]
+        x = self.rng.standard_normal((300, 256)); g = self.rng.uniform(0.05, 0.5, 300)
+        prior = x.T @ x / len(x)
+
+        def out(w, xi):
+            a = xi @ w[0].T.astype(np.float64)
+            return (a / (1 + np.exp(-a)) * (xi @ w[1].T.astype(np.float64))) @ w[2].T.astype(np.float64)
+
+        def deq(o):
+            return [cv.dequantize_lowbit(*t, fmt) for t in o]
+        y = out(w3, x)
+
+        def err(w, xi):
+            return float(np.sqrt((((out(w, xi) - y) ** 2) * (g ** 2)[:, None]).sum() / ((y ** 2) * (g ** 2)[:, None]).sum()))
+        # the original inputs as their own targets: gate and up the plain fit's but for a rounding
+        # flip here and there (W' = W to rounding), down aimed at the expert's true output instead of
+        # its own output on the quantized hidden rows, so no worse on them
+        po = cv.quantize_expert_lowbit_exact(w3, x, g, prior, alpha=2.0, fmt=fmt)
+        so = cv.quantize_expert_lowbit_exact(w3, x, g, prior, alpha=2.0, fmt=fmt, x_orig=x)
+        for k in range(2):
+            self.assertGreater(float((po[k][0] == so[k][0]).mean()), 0.999)
+        self.assertLessEqual(err(deq(so), x), err(deq(po), x) + 1e-4)
+        # upstream error that shrinks the inputs: the targeted fit maps x~ back to the original output
+        xt = 0.85 * x + 0.02 * self.rng.standard_normal(x.shape)
+        blind = err(deq(cv.quantize_expert_lowbit_exact(w3, xt, g, prior, alpha=2.0, fmt=fmt)), xt)
+        aimed = err(deq(cv.quantize_expert_lowbit_exact(w3, xt, g, prior, alpha=2.0, fmt=fmt, x_orig=x)), xt)
+        self.assertLess(aimed, 0.9 * blind, (aimed, blind))
+
     def test_unpack_and_output_rescale(self):
         # --rescale-only reads the records back: unpack_lowbit / unpack_scales invert the packers
         for fmt in (cv.INT2G32, cv.INT2G16, cv.INT3G16):
