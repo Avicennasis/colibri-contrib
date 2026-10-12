@@ -1026,7 +1026,8 @@ def _rescale_expert(task):
 
 def rescale_sidecar(model_dir, out_dir, dump_path, fmt_name, workers=1, layers=None):
     """--rescale-only: an existing low-bit sidecar's down row scales times each expert's
-    output_rescale factor, in place; the index lists the layers done, never twice."""
+    output_rescale factor, in place; the index lists the layers done (never scaled twice)
+    and each one's factors (dividing by them undoes it)."""
     src = Source(model_dir)
     geo = src.geometry
     src.geometry = Geometry(geo.layers, geo.experts, geo.hidden, geo.inter, fmt=LOWBIT[fmt_name])
@@ -1064,6 +1065,7 @@ def rescale_sidecar(model_dir, out_dir, dump_path, fmt_name, workers=1, layers=N
                 os.fsync(f.fileno())
             done.add(layer)
             index["output_rescale"] = sorted(done)
+            index.setdefault("output_rescale_factors", {})[str(layer)] = [round(float(v), 6) for v in factors]
             write_index(out_dir, index)
             fa = np.array(factors)
             print(f"  layer {layer:3d}: {len(fa)} experts in {time.time() - started:6.1f}s, output rescale mean "
