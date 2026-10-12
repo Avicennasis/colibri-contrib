@@ -274,49 +274,58 @@ def quantize_int2_g32(w, imp=None, iters=6):
     return code.reshape(rows, cols).astype(np.uint8), q.astype(np.uint8), d.astype(np.float32)
 
 
-def quantize_int2_g32_gptq(w, imp, U, iters=6, batch=128, margin=1.25):
+def quantize_int2_g32_gptq(w, imp, U, iters=6, batch=128, margin=1.4):
     """quantize_int2_g32 with the error of every quantized column carried into the columns
     still to come (GPTQ's update, written from the paper): U is the upper Cholesky factor
     of H^-1 for this matrix's inputs, so quantizing column i moves the rest of its row by
     -(w_i - q_i) / U[i,i] * U[i, i+1:], which is the least-squares answer under H. Columns
     go in order; a group's scale is fitted when its first column comes up, on the weights
-    as the earlier groups' errors left them. The row scale d is fixed first (the plain
-    fit's, times `margin` for the room the updates may need)."""
+    as the earlier groups' errors left them. The row scale d is fixed first, from the
+    groups' weighted RMS with `margin` of room for what the updates add. Works on the
+    transpose, so a column is contiguous; with four levels a code is three comparisons."""
     rows, cols = w.shape
-    W = w.astype(np.float64).copy()
+    ng = cols // GS2
+    WT = np.ascontiguousarray(w.astype(np.float64).T)          # [cols, rows]
     a = np.ones(cols) if imp is None else imp.astype(np.float64)
-    _, _, d0 = quantize_int2_g32(w, imp)
-    d = (d0.astype(np.float64) * margin).astype(np.float32).astype(np.float64)
-    edges = (LEVELS2[1:] + LEVELS2[:-1]) / 2
-    codes = np.zeros((rows, cols), np.uint8)
-    qs = np.zeros((rows, cols // GS2), np.uint8)
+    rms_l = math.sqrt(float(np.mean(LEVELS2 ** 2)))
+    ga_all = a.reshape(ng, GS2, 1)
+    s0 = np.sqrt((ga_all * WT.reshape(ng, GS2, rows) ** 2).sum(axis=1) / ga_all.sum(axis=1)) / rms_l
+    d = np.maximum(s0.max(axis=0) * margin / 255.0, 1e-30).astype(np.float32).astype(np.float64)
+    e0, e1, e2 = (LEVELS2[1:] + LEVELS2[:-1]) / 2
+    l0, l1, l2, l3 = LEVELS2
+    codes = np.zeros((cols, rows), np.uint8)
+    qs = np.zeros((ng, rows), np.uint8)
     tiny = 1e-30
-    s = np.ones(rows)
+    s = inv_s = np.ones(rows)
     for b0 in range(0, cols, batch):
         b1 = min(b0 + batch, cols)
-        W1 = W[:, b0:b1].copy()
-        E1 = np.zeros_like(W1)
+        W1 = WT[b0:b1].copy()
+        E1 = np.empty_like(W1)
         U1 = U[b0:b1, b0:b1]
         for i in range(b1 - b0):
             col = b0 + i
             if col % GS2 == 0:
-                g = W1[:, i:i + GS2]
-                ga = a[col:col + GS2][None, :]
-                s = np.sqrt((ga * g * g).sum(axis=1) / ga.sum()) / math.sqrt(float(np.mean(LEVELS2 ** 2)))
+                g = W1[i:i + GS2]
+                ga = a[col:col + GS2][:, None]
+                s = np.sqrt((ga * g * g).sum(axis=0) / ga.sum()) / rms_l
                 for _ in range(iters):
-                    lv = LEVELS2[np.searchsorted(edges, g / np.maximum(s, tiny)[:, None])]
-                    num, den = (ga * g * lv).sum(axis=1), (ga * lv * lv).sum(axis=1)
+                    v = g / np.maximum(s, tiny)
+                    lv = np.where(v > e1, np.where(v > e2, l3, l2), np.where(v > e0, l1, l0))
+                    num, den = (ga * g * lv).sum(axis=0), (ga * lv * lv).sum(axis=0)
                     s = np.where(den > 0, num / np.maximum(den, tiny), s)
                 u = np.clip(np.rint(s / d), 1, 255)
-                qs[:, col // GS2] = u
+                qs[col // GS2] = u
                 s = d * u
-            c = np.searchsorted(edges, W1[:, i] / np.maximum(s, tiny))
-            codes[:, col] = c
-            err = (W1[:, i] - LEVELS2[c] * s) / U1[i, i]
-            W1[:, i + 1:] -= np.outer(err, U1[i, i + 1:])
-            E1[:, i] = err
-        W[:, b1:] -= E1 @ U[b0:b1, b1:]
-    return codes, qs, d.astype(np.float32)
+                inv_s = 1.0 / s
+            wi = W1[i]
+            v = wi * inv_s
+            c = (v > e0).astype(np.uint8) + (v > e1) + (v > e2)
+            codes[col] = c
+            err = (wi - LEVELS2[c] * s) / U1[i, i]
+            W1[i + 1:] -= np.outer(U1[i, i + 1:], err)
+            E1[i] = err
+        WT[b1:] -= U[b0:b1, b1:].T @ E1
+    return np.ascontiguousarray(codes.T), np.ascontiguousarray(qs.T), d.astype(np.float32)
 
 
 class CovStats:
@@ -363,7 +372,8 @@ class Dump:
         if raw[:8].tobytes() != b"Q38DMP1\0":
             raise ValueError(f"{self.dir}: layer {layer} is not a Q38_ACT_DUMP file")
         h, k = struct.unpack("<2i", raw[8:16].tobytes())
-        rec = raw[16:].reshape(-1, 8 * k + 4 * h)
+        width = 8 * k + 4 * h
+        rec = raw[16:16 + (len(raw) - 16) // width * width].reshape(-1, width)   # whole records only
         if self.max_tokens:
             rec = rec[:self.max_tokens]
         self.ids = np.ascontiguousarray(rec[:, :4 * k]).view(np.int32)
@@ -389,8 +399,19 @@ class Dump:
 
 
 def _upper_inv(h):
-    """The upper Cholesky factor U of h^-1 (h^-1 = U^T U), for GPTQ."""
-    return np.linalg.cholesky(np.linalg.inv(h)).T
+    """The upper Cholesky factor U of h^-1 (h^-1 = U^T U), for GPTQ, without forming h^-1:
+    with P the reversal, P h P = L L^T gives h^-1 = (P L^-T P)(P L^-1 P), so U = P L^-1 P,
+    one Cholesky and one triangular inverse (half of inv + Cholesky). scipy for the
+    triangular inverse where it is installed, numpy's general inverse otherwise."""
+    lower = np.linalg.cholesky(np.ascontiguousarray(h[::-1, ::-1]))
+    try:
+        from scipy.linalg import lapack
+        inv, info = lapack.dtrtri(lower, lower=1)
+        if info:
+            raise np.linalg.LinAlgError(f"dtrtri info {info}")
+    except ImportError:
+        inv = np.linalg.inv(lower)
+    return np.ascontiguousarray(np.tril(inv)[::-1, ::-1])
 
 
 def _hessian(x, wts, prior, alpha, damp):
@@ -415,7 +436,10 @@ def quantize_expert_int2_exact(w3, x, gates, layer_prior, alpha=0.1, damp=0.01, 
     h = _hessian(x, wts, layer_prior, alpha, damp)
     u = _upper_inv(h)
     imp = np.diag(h).astype(np.float32)
-    out = [quantize_int2_g32_gptq(w3[k], imp, u) for k in range(2)]
+    # gate and up share H: one pass over their stacked rows (rows are independent in GPTQ)
+    rows = w3[0].shape[0]
+    c, q, d = quantize_int2_g32_gptq(np.vstack([w3[0], w3[1]]), imp, u)
+    out = [(c[:rows], q[:rows], d[:rows]), (c[rows:], q[rows:], d[rows:])]
     if len(x):
         g = x @ dequantize_int2(*out[0]).T
         hid = g / (1.0 + np.exp(-g)) * (x @ dequantize_int2(*out[1]).T)
