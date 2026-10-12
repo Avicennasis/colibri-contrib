@@ -1456,6 +1456,14 @@ memInfo.free:                     23.50 GB (97%)
             plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
             self.assertTrue(plan["model"]["qwen38_int4_experts"])
             self.assertEqual((plan["model"]["per_cap_bytes"], plan["model"]["expert_bytes"]), (60, 120))
+            os.environ.pop("Q38_EXPERT_INT2")
+            (self.model / "experts-int3g16").mkdir()
+            (self.model / "experts-int3g16" / "index.json").write_text(
+                json.dumps(dict(geometry, format="colibri.qwen38.experts-int3g16", record_bytes=86)))
+            with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": "int3g16"}):
+                plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertEqual(plan["model"]["per_cap_bytes"], 86)
+            os.environ["Q38_EXPERT_INT2"] = "1"
             # the int2 index of another format or still being written is not priced
             (self.model / "experts-int2g32" / "index.json").write_text(
                 json.dumps(dict(geometry, format="colibri.qwen38.experts-int2g32", record_bytes=60, complete=False)))

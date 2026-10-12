@@ -1709,6 +1709,7 @@ def analyze_model(model):
 
 QWEN38_INT4_SIDECAR = "experts-int4g64"
 QWEN38_INT2_SIDECAR = "experts-int2g32"
+QWEN38_LOWBIT = ("int2g32", "int2g16", "int3g16")   # Q38_EXPERT_LOWBIT: experts-<name>/ (qwen38_core.h)
 
 
 def qwen38_int4_sidecar(info):
@@ -1723,21 +1724,24 @@ def qwen38_int4_sidecar(info):
     sidecar that disagrees with it. Returns the analysis unchanged when the
     sidecar does not apply, otherwise a copy priced with its records and
     marked `qwen38_int4_experts`: no FP8 scale bank is built either.
-    Q38_EXPERT_INT2=1 makes the engine load experts-int2g32/ instead (int2_g32.h,
-    1.40 MB a record on the release), priced the same way.
+    Q38_EXPERT_LOWBIT=int2g32|int2g16|int3g16 (Q38_EXPERT_INT2=1: int2g32) makes the
+    engine load experts-<name>/ instead (1.40 MB a record at 2 bits, 2.01 MB at 3 on the
+    release), priced the same way.
     """
     resolved = info["resolved_family"]
-    int2 = os.environ.get("Q38_EXPERT_INT2") == "1"
-    if resolved.descriptor.id != "qwen38" or (os.environ.get("Q38_EXPERT_INT4") == "0" and not int2):
+    lowbit = (os.environ.get("Q38_EXPERT_LOWBIT") or "").strip()
+    if lowbit not in QWEN38_LOWBIT:
+        lowbit = "int2g32" if os.environ.get("Q38_EXPERT_INT2") == "1" else ""
+    if resolved.descriptor.id != "qwen38" or (os.environ.get("Q38_EXPERT_INT4") == "0" and not lowbit):
         return info
     try:
-        index = json.loads((Path(info["path"]) / (QWEN38_INT2_SIDECAR if int2 else QWEN38_INT4_SIDECAR) /
+        index = json.loads((Path(info["path"]) / (f"experts-{lowbit}" if lowbit else QWEN38_INT4_SIDECAR) /
                             "index.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return info
     config = info["config"]
     text = config.get("text_config", config) if isinstance(config, dict) else {}
-    want = {"format": "colibri.qwen38.experts-int2g32" if int2 else "colibri.qwen38.experts-int4g64",
+    want = {"format": f"colibri.qwen38.experts-{lowbit}" if lowbit else "colibri.qwen38.experts-int4g64",
             "version": 1, "complete": True,
             "layers": text.get("num_hidden_layers"), "experts": text.get("num_experts"),
             "hidden_size": text.get("hidden_size"),

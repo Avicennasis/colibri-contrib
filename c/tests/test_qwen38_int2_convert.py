@@ -158,6 +158,39 @@ class Int2Convert(unittest.TestCase):
             none = cv.quantize_expert_int2_exact(w3, np.zeros((0, h)), np.zeros(0), dump.layer_moment(0))
             self.assertEqual([o[0].shape for o in none], [(128, h), (128, h), (h, 128)])
 
+    def test_lowbit_g16_layouts(self):
+        # lowbit_g16.h: low two bits as int2_g32.h, then for 3 bits 16 bytes per block of 128
+        # where byte k holds elements k, k+16, ..., k+112 in bits 0..7; scales two to a byte
+        for name, bits in (("int2g16", 2), ("int3g16", 3)):
+            fmt = cv.LOWBIT[name]
+            codes = self.rng.integers(0, 2 ** bits, (3, 256), dtype=np.uint8)
+            packed = cv.pack_lowbit(codes, fmt)
+            self.assertEqual(packed.shape, (3, 256 * bits // 8))
+            back = np.zeros_like(codes)
+            for i in range(256):
+                blk = packed[:, (i // 128) * (16 * bits):]
+                k = i % 128
+                c = (blk[:, k % 32] >> (2 * (k // 32))) & 3
+                if bits == 3:
+                    c |= ((blk[:, 32 + k % 16] >> (k // 16)) & 1) << 2
+                back[:, i] = c
+            np.testing.assert_array_equal(back, codes)
+            q = self.rng.integers(0, 16, (3, 16), dtype=np.uint8)
+            ps = cv.pack_scales(q, fmt)
+            self.assertEqual(ps.shape, (3, 8))
+            np.testing.assert_array_equal(np.stack([ps & 15, ps >> 4], axis=2).reshape(3, 16), q)
+            w = (self.rng.standard_normal((32, 256)) * 0.02).astype(np.float32)
+            c, qq, d = cv.quantize_lowbit(w, None, fmt)
+            self.assertLessEqual(int(qq.max()), 15)
+            self.assertLessEqual(int(c.max()), 2 ** bits - 1)
+            err = cv.rel_l2(w, cv.dequantize_lowbit(c, qq, d, fmt))
+            self.assertTrue((0.28 < err < 0.34) if bits == 2 else (0.14 < err < 0.18), (name, err))
+        # the release's records: int2g16 the size of int2g32, int3g16 2.01 MB
+        self.assertEqual(cv.Geometry(48, 512, 2560, 640, fmt=cv.INT2G16).record_bytes, 1397760)
+        g3 = cv.Geometry(48, 512, 2560, 640, fmt=cv.INT3G16)
+        self.assertEqual(g3.record_bytes, 2012160)
+        self.assertEqual([t[0].rsplit(".", 1)[-1] for t in g3.tensors("m", 0, 0)][3:6], ["q4"] * 3)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -106,6 +106,42 @@ GS2 = 32
 CODES2 = "planar128-2bit-lv10"
 SCALES2 = "u8-per-32-f32-per-row"
 LEVELS2 = np.array([-10.0, -3.0, 3.0, 10.0])
+
+
+class Lowbit:
+    """A low-bit expert format: `bits`-bit codes on fixed integer `levels` (the Lloyd-Max
+    grid of a bell-shaped weight; levels fitted per layer on Qwen3.8 came out the same), one
+    scale per `gs` inputs stored as an integer up to `smax` (255: a byte each, 15: a nibble,
+    two to a byte) under one f32 per row. Codes in planar blocks of 128: the low two bits as
+    int2_g32.h lays them (32 bytes), and for 3 bits a plane of the high bits after them
+    (16 bytes: byte k holds elements k, k+16, ..., k+112 in bits 0..7)."""
+    def __init__(self, name, bits, levels, gs, smax, codes):
+        self.name, self.bits, self.gs, self.smax, self.codes = name, bits, gs, smax, codes
+        self.levels = np.array(levels, np.float64)
+        self.edges = (self.levels[1:] + self.levels[:-1]) / 2
+        self.rms = math.sqrt(float(np.mean(self.levels ** 2)))
+        self.sidecar = "experts-" + name
+        self.format = "colibri.qwen38.experts-" + name
+        self.scales = ("u8" if smax == 255 else "u4") + f"-per-{gs}-f32-per-row"
+        self.q_suffix = ".q8" if smax == 255 else ".q4"
+
+    def code_of(self, v):
+        c = np.zeros(np.shape(v), np.uint8)
+        for e in self.edges:
+            c += v > e
+        return c
+
+    def row_code_bytes(self, cols):
+        return cols * self.bits // 8
+
+    def row_scale_bytes(self, cols):
+        return cols // self.gs if self.smax == 255 else cols // self.gs // 2
+
+
+INT2G32 = Lowbit("int2g32", 2, (-10, -3, 3, 10), 32, 255, CODES2)
+INT2G16 = Lowbit("int2g16", 2, (-10, -3, 3, 10), 16, 15, CODES2)
+INT3G16 = Lowbit("int3g16", 3, (-26, -16, -9, -3, 3, 9, 16, 26), 16, 15, "planar128-3bit-lv26")
+LOWBIT = {f.name: f for f in (INT2G32, INT2G16, INT3G16)}
 FP8_BLOCK = 128
 
 _FLOAT_DTYPES = {"BF16": 2, "F16": 2, "F32": 4}
@@ -243,56 +279,53 @@ def unpack_planar(packed, cols):
     return out
 
 
-def quantize_int2_g32(w, imp=None, iters=6):
-    """w f32 [R, C] (C % 128 == 0) -> (codes u8 [R, C] in 0..3, q u8 [R, C/32], d f32 [R]):
-    w ~ d[r] * q[r, g] * LEVELS2[code]. Per group of 32 the scale and the codes are
-    fitted in turn against sum_i imp_i * (w_i - s * level_i)^2 (imp uniform without
-    statistics), then the scales are stored as u8 under the row's largest and refitted,
-    with the codes, for what the u8 can hold."""
+def quantize_lowbit(w, imp=None, fmt=INT2G32, iters=6):
+    """w f32 [R, C] (C % 128 == 0) -> (codes u8 [R, C], q u8 [R, C/gs], d f32 [R]):
+    w ~ d[r] * q[r, g] * levels[code]. Per group the scale and the codes are fitted in turn
+    against sum_i imp_i * (w_i - s * level_i)^2 (imp uniform without statistics), then the
+    scales are stored as integers up to fmt.smax under the row's largest and refitted, with
+    the codes, for what those integers can hold."""
     rows, cols = w.shape
-    ng = cols // GS2
-    g = w.reshape(rows, ng, GS2).astype(np.float64)
-    a = np.ones((1, ng, GS2)) if imp is None else imp.astype(np.float64).reshape(1, ng, GS2)
-    edges = (LEVELS2[1:] + LEVELS2[:-1]) / 2
+    gs, top, L = fmt.gs, float(fmt.smax), fmt.levels
+    ng = cols // gs
+    g = w.reshape(rows, ng, gs).astype(np.float64)
+    a = np.ones((1, ng, gs)) if imp is None else imp.astype(np.float64).reshape(1, ng, gs)
     tiny = 1e-30
 
     def refit(scale):
-        code = np.searchsorted(edges, g / np.maximum(scale, tiny)[..., None])
-        lv = LEVELS2[code]
+        lv = L[fmt.code_of(g / np.maximum(scale, tiny)[..., None])]
         num, den = (a * g * lv).sum(axis=2), (a * lv * lv).sum(axis=2)
         return np.where(den > 0, num / np.maximum(den, tiny), scale)
 
-    s = np.sqrt((a * g * g).sum(axis=2) / a.sum(axis=2)) / math.sqrt(float(np.mean(LEVELS2 ** 2)))
+    s = np.sqrt((a * g * g).sum(axis=2) / a.sum(axis=2)) / fmt.rms
     for _ in range(iters):
         s = refit(s)
-    d = np.maximum(s.max(axis=1), tiny) / 255.0
+    d = np.maximum(s.max(axis=1), tiny) / top
     d = d.astype(np.float32).astype(np.float64)          # the f32 the file stores
-    q = np.clip(np.rint(s / d[:, None]), 1, 255)
+    q = np.clip(np.rint(s / d[:, None]), 1, top)
     for _ in range(2):
-        q = np.clip(np.rint(refit(d[:, None] * q) / d[:, None]), 0, 255)
-    code = np.searchsorted(edges, g / np.maximum(d[:, None] * q, tiny)[..., None])
-    return code.reshape(rows, cols).astype(np.uint8), q.astype(np.uint8), d.astype(np.float32)
+        q = np.clip(np.rint(refit(d[:, None] * q) / d[:, None]), 0, top)
+    code = fmt.code_of(g / np.maximum(d[:, None] * q, tiny)[..., None])
+    return code.reshape(rows, cols), q.astype(np.uint8), d.astype(np.float32)
 
 
-def quantize_int2_g32_gptq(w, imp, U, iters=6, batch=128, margin=1.4):
-    """quantize_int2_g32 with the error of every quantized column carried into the columns
+def quantize_lowbit_gptq(w, imp, U, fmt=INT2G32, iters=6, batch=128, margin=1.4):
+    """quantize_lowbit with the error of every quantized column carried into the columns
     still to come (GPTQ's update, written from the paper): U is the upper Cholesky factor
     of H^-1 for this matrix's inputs, so quantizing column i moves the rest of its row by
     -(w_i - q_i) / U[i,i] * U[i, i+1:], which is the least-squares answer under H. Columns
     go in order; a group's scale is fitted when its first column comes up, on the weights
     as the earlier groups' errors left them. The row scale d is fixed first, from the
     groups' weighted RMS with `margin` of room for what the updates add. Works on the
-    transpose, so a column is contiguous; with four levels a code is three comparisons."""
+    transpose, so a column is contiguous; a code is one comparison per level boundary."""
     rows, cols = w.shape
-    ng = cols // GS2
+    gs, top, L = fmt.gs, float(fmt.smax), fmt.levels
+    ng = cols // gs
     WT = np.ascontiguousarray(w.astype(np.float64).T)          # [cols, rows]
     a = np.ones(cols) if imp is None else imp.astype(np.float64)
-    rms_l = math.sqrt(float(np.mean(LEVELS2 ** 2)))
-    ga_all = a.reshape(ng, GS2, 1)
-    s0 = np.sqrt((ga_all * WT.reshape(ng, GS2, rows) ** 2).sum(axis=1) / ga_all.sum(axis=1)) / rms_l
-    d = np.maximum(s0.max(axis=0) * margin / 255.0, 1e-30).astype(np.float32).astype(np.float64)
-    e0, e1, e2 = (LEVELS2[1:] + LEVELS2[:-1]) / 2
-    l0, l1, l2, l3 = LEVELS2
+    ga_all = a.reshape(ng, gs, 1)
+    s0 = np.sqrt((ga_all * WT.reshape(ng, gs, rows) ** 2).sum(axis=1) / ga_all.sum(axis=1)) / fmt.rms
+    d = np.maximum(s0.max(axis=0) * margin / top, 1e-30).astype(np.float32).astype(np.float64)
     codes = np.zeros((cols, rows), np.uint8)
     qs = np.zeros((ng, rows), np.uint8)
     tiny = 1e-30
@@ -304,28 +337,34 @@ def quantize_int2_g32_gptq(w, imp, U, iters=6, batch=128, margin=1.4):
         U1 = U[b0:b1, b0:b1]
         for i in range(b1 - b0):
             col = b0 + i
-            if col % GS2 == 0:
-                g = W1[i:i + GS2]
-                ga = a[col:col + GS2][:, None]
-                s = np.sqrt((ga * g * g).sum(axis=0) / ga.sum()) / rms_l
+            if col % gs == 0:
+                g = W1[i:i + gs]
+                ga = a[col:col + gs][:, None]
+                s = np.sqrt((ga * g * g).sum(axis=0) / ga.sum()) / fmt.rms
                 for _ in range(iters):
-                    v = g / np.maximum(s, tiny)
-                    lv = np.where(v > e1, np.where(v > e2, l3, l2), np.where(v > e0, l1, l0))
+                    lv = L[fmt.code_of(g / np.maximum(s, tiny))]
                     num, den = (ga * g * lv).sum(axis=0), (ga * lv * lv).sum(axis=0)
                     s = np.where(den > 0, num / np.maximum(den, tiny), s)
-                u = np.clip(np.rint(s / d), 1, 255)
-                qs[col // GS2] = u
+                u = np.clip(np.rint(s / d), 1, top)
+                qs[col // gs] = u
                 s = d * u
                 inv_s = 1.0 / s
             wi = W1[i]
-            v = wi * inv_s
-            c = (v > e0).astype(np.uint8) + (v > e1) + (v > e2)
+            c = fmt.code_of(wi * inv_s)
             codes[col] = c
-            err = (wi - LEVELS2[c] * s) / U1[i, i]
+            err = (wi - L[c] * s) / U1[i, i]
             W1[i + 1:] -= np.outer(U1[i, i + 1:], err)
             E1[i] = err
         WT[b1:] -= U[b0:b1, b1:].T @ E1
     return np.ascontiguousarray(codes.T), np.ascontiguousarray(qs.T), d.astype(np.float32)
+
+
+def quantize_int2_g32(w, imp=None, iters=6):
+    return quantize_lowbit(w, imp, INT2G32, iters)
+
+
+def quantize_int2_g32_gptq(w, imp, U, iters=6, batch=128, margin=1.4):
+    return quantize_lowbit_gptq(w, imp, U, INT2G32, iters, batch, margin)
 
 
 class CovStats:
@@ -427,7 +466,7 @@ def _hessian(x, wts, prior, alpha, damp):
     return h
 
 
-def quantize_expert_int2_exact(w3, x, gates, layer_prior, alpha=0.1, damp=0.01, gate_weight=True):
+def quantize_expert_lowbit_exact(w3, x, gates, layer_prior, alpha=0.1, damp=0.01, gate_weight=True, fmt=INT2G32):
     """One expert from the rows it really received: gate and up with GPTQ under
     H = sum_t g_t^2 x_t x_t^T (+ the layer's moment as a prior), then down with GPTQ under the
     SwiGLU outputs of the QUANTIZED gate and up on the same rows (what down will really see).
@@ -438,17 +477,21 @@ def quantize_expert_int2_exact(w3, x, gates, layer_prior, alpha=0.1, damp=0.01, 
     imp = np.diag(h).astype(np.float32)
     # gate and up share H: one pass over their stacked rows (rows are independent in GPTQ)
     rows = w3[0].shape[0]
-    c, q, d = quantize_int2_g32_gptq(np.vstack([w3[0], w3[1]]), imp, u)
+    c, q, d = quantize_lowbit_gptq(np.vstack([w3[0], w3[1]]), imp, u, fmt)
     out = [(c[:rows], q[:rows], d[:rows]), (c[rows:], q[rows:], d[rows:])]
     if len(x):
-        g = x @ dequantize_int2(*out[0]).T
-        hid = g / (1.0 + np.exp(-g)) * (x @ dequantize_int2(*out[1]).T)
+        g = x @ dequantize_lowbit(*out[0], fmt).T
+        hid = g / (1.0 + np.exp(-g)) * (x @ dequantize_lowbit(*out[1], fmt).T)
         hd = (hid * wts[:, None]).T @ hid
         hd = hd + alpha * np.diag(np.diag(hd)) + damp * float(np.mean(np.diag(hd)) or 1.0) * np.eye(hd.shape[0])
-        out.append(quantize_int2_g32_gptq(w3[2], np.diag(hd).astype(np.float32), _upper_inv(hd)))
+        out.append(quantize_lowbit_gptq(w3[2], np.diag(hd).astype(np.float32), _upper_inv(hd), fmt))
     else:
-        out.append(quantize_int2_g32(w3[2]))
+        out.append(quantize_lowbit(w3[2], None, fmt))
     return out
+
+
+def quantize_expert_int2_exact(w3, x, gates, layer_prior, alpha=0.1, damp=0.01, gate_weight=True):
+    return quantize_expert_lowbit_exact(w3, x, gates, layer_prior, alpha, damp, gate_weight, INT2G32)
 
 
 def pack_int2(codes):
@@ -459,9 +502,36 @@ def pack_int2(codes):
     return (c[:, :, 0] | (c[:, :, 1] << 2) | (c[:, :, 2] << 4) | (c[:, :, 3] << 6)).reshape(rows, cols // 4)
 
 
-def dequantize_int2(codes, q, d):
+def pack_lowbit(codes, fmt):
+    """u8 codes [R, C] -> the rows as fmt lays them: per block of 128 the low two bits as
+    pack_int2 does (32 bytes), then for 3 bits the high bits (16 bytes: byte k holds
+    elements k, k+16, ..., k+112 in bits 0..7, lowbit_g16.h)."""
     rows, cols = codes.shape
-    return (LEVELS2[codes].reshape(rows, cols // GS2, GS2) * (d[:, None] * q.astype(np.float64))[..., None]).reshape(rows, cols)
+    low = pack_int2(codes & 3)
+    if fmt.bits == 2:
+        return low
+    hi = ((codes >> 2) & 1).astype(np.uint8).reshape(rows, cols // 128, 8, 16)
+    plane = np.packbits(hi, axis=2, bitorder="little").reshape(rows, cols // 128, 16)
+    return np.concatenate([low.reshape(rows, cols // 128, 32), plane], axis=2).reshape(rows, fmt.row_code_bytes(cols))
+
+
+def pack_scales(q, fmt):
+    """u8 group scales [R, C/gs] -> as stored: a byte each, or two nibbles to a byte
+    (group 2k low, 2k+1 high)."""
+    if fmt.smax == 255:
+        return np.ascontiguousarray(q.astype(np.uint8))
+    q = q.astype(np.uint8)
+    return np.ascontiguousarray(q[:, 0::2] | (q[:, 1::2] << 4))
+
+
+def dequantize_lowbit(codes, q, d, fmt):
+    rows, cols = codes.shape
+    return (fmt.levels[codes].reshape(rows, cols // fmt.gs, fmt.gs) *
+            (d[:, None].astype(np.float64) * q.astype(np.float64))[..., None]).reshape(rows, cols)
+
+
+def dequantize_int2(codes, q, d):
+    return dequantize_lowbit(codes, q, d, INT2G32)
 
 
 def dequantize(codes, scales):
@@ -483,16 +553,17 @@ def rel_l2(reference, approx):
 # ---------- the geometry of one record ----------
 
 class Geometry:
-    def __init__(self, layers, experts, hidden, inter, bits=4):
+    def __init__(self, layers, experts, hidden, inter, bits=4, fmt=None):
         self.layers, self.experts, self.hidden, self.inter = layers, experts, hidden, inter
-        self.bits = bits
+        self.fmt = fmt if fmt is not None else (INT2G32 if bits == 2 else None)
+        self.bits = self.fmt.bits if self.fmt else 4
         self.shape = ((inter, hidden), (inter, hidden), (hidden, inter))
-        if bits == 2:
+        if self.fmt:
             if hidden % 128 or inter % 128:
-                raise ValueError(f"hidden={hidden}, moe_intermediate_size={inter}: int2-g32 needs "
+                raise ValueError(f"hidden={hidden}, moe_intermediate_size={inter}: {self.fmt.name} needs "
                                  f"widths that are multiples of 128")
-            self.code_bytes = [r * c // 4 for r, c in self.shape]
-            self.q_count = [r * c // GS2 for r, c in self.shape]
+            self.code_bytes = [r * self.fmt.row_code_bytes(c) for r, c in self.shape]
+            self.q_count = [r * self.fmt.row_scale_bytes(c) for r, c in self.shape]
             self.scale_count = [r for r, c in self.shape]
             self.scale_off = sum(self.code_bytes) + sum(self.q_count)
             self.record_bytes = self.scale_off + 4 * sum(self.scale_count)
@@ -510,12 +581,13 @@ class Geometry:
         """(name, dtype, shape, offset in the record, bytes) in record order."""
         base = f"{prefix}.layers.{layer}.mlp.experts.{expert}"
         out, off = [], 0
-        if self.bits == 2:
+        if self.fmt:
             for k, (r, c) in enumerate(self.shape):
-                out.append((f"{base}.{PROJ[k]}.weight", "U8", [r, c // 4], off, self.code_bytes[k]))
+                out.append((f"{base}.{PROJ[k]}.weight", "U8", [r, self.fmt.row_code_bytes(c)], off, self.code_bytes[k]))
                 off += self.code_bytes[k]
             for k, (r, c) in enumerate(self.shape):
-                out.append((f"{base}.{PROJ[k]}.weight.q8", "U8", [r, c // GS2], off, self.q_count[k]))
+                out.append((f"{base}.{PROJ[k]}.weight{self.fmt.q_suffix}", "U8", [r, self.fmt.row_scale_bytes(c)],
+                            off, self.q_count[k]))
                 off += self.q_count[k]
             for k, (r, c) in enumerate(self.shape):
                 out.append((f"{base}.{PROJ[k]}.weight.d", "F32", [r, 1], off, 4 * r))
@@ -685,39 +757,43 @@ _ACT = None
 _BITS = 4
 _COV = None
 _DUMP = None
+_FMT = None
+_ALPHA = 0.1
 
 
-def _init_worker(model_dir, act_path=None, bits=4, cov_path=None, dump_path=None):
-    global _SOURCE, _ACT, _BITS, _COV, _DUMP
+def _init_worker(model_dir, act_path=None, bits=4, cov_path=None, dump_path=None, fmt_name=None, alpha=0.1):
+    global _SOURCE, _ACT, _BITS, _COV, _DUMP, _FMT, _ALPHA
     _SOURCE = Source(model_dir)
     _ACT = ActStats(act_path) if act_path else None
     _BITS = bits
     _COV = CovStats(cov_path) if cov_path else None
     _DUMP = Dump(dump_path) if dump_path else None
+    _FMT = LOWBIT[fmt_name] if fmt_name else (INT2G32 if bits == 2 else None)
+    _ALPHA = alpha
 
 
 def convert_expert_int2(layer, expert):
+    """One expert in a low-bit format (_FMT): codes, then group scales, then row scales."""
+    fmt = _FMT
     codes, qs, ds, errors = [], [], [], []
+    w3 = [_SOURCE.matrix(layer, expert, k) for k in range(3)]
     if _DUMP is not None:
-        w3 = [_SOURCE.matrix(layer, expert, k) for k in range(3)]
         x, gates = _DUMP.rows(layer, expert)
-        for k, (c, q, d) in enumerate(quantize_expert_int2_exact(w3, x, gates, _DUMP.layer_moment(layer))):
-            errors.append(rel_l2(w3[k], dequantize_int2(c, q, d)))
-            codes.append(pack_int2(c).tobytes())
-            qs.append(q.tobytes())
-            ds.append(d.tobytes())
-        return b"".join(codes) + b"".join(qs) + b"".join(ds), errors, peak_rss_mb()
-    for k in range(3):
-        w = _SOURCE.matrix(layer, expert, k)
-        imp = _ACT.importance(layer, expert, k) if _ACT else None
-        if _COV is not None and k < 2:   # gate and up read the layer's hidden row; down an expert's own
-            c, q, d = quantize_int2_g32_gptq(w, imp, _COV.upper_inv(layer, imp if imp is not None else np.ones(w.shape[1])))
-        else:
-            c, q, d = quantize_int2_g32(w, imp)
-        errors.append(rel_l2(w, dequantize_int2(c, q, d)))
-        codes.append(pack_int2(c).tobytes())
-        qs.append(q.tobytes())
-        ds.append(d.tobytes())
+        out = quantize_expert_lowbit_exact(w3, x, gates, _DUMP.layer_moment(layer), alpha=_ALPHA, fmt=fmt)
+    else:
+        out = []
+        for k in range(3):
+            imp = _ACT.importance(layer, expert, k) if _ACT else None
+            if _COV is not None and k < 2:   # gate and up read the layer's hidden row; down an expert's own
+                out.append(quantize_lowbit_gptq(w3[k], imp, _COV.upper_inv(
+                    layer, imp if imp is not None else np.ones(w3[k].shape[1])), fmt))
+            else:
+                out.append(quantize_lowbit(w3[k], imp, fmt))
+    for k, (c, q, d) in enumerate(out):
+        errors.append(rel_l2(w3[k], dequantize_lowbit(c, q, d, fmt)))
+        codes.append(pack_lowbit(c, fmt).tobytes())
+        qs.append(pack_scales(q, fmt).tobytes())
+        ds.append(d.astype(np.float32).tobytes())
     return b"".join(codes) + b"".join(qs) + b"".join(ds), errors, peak_rss_mb()
 
 
@@ -743,7 +819,7 @@ def layer_file(layer):
 
 def layer_header(geometry, prefix, layer):
     """The layer file's header, padded so the data region starts on DATA_ALIGN."""
-    header, meta = {}, {"format": FORMAT2 if geometry.bits == 2 else FORMAT, "version": str(VERSION), "layer": str(layer)}
+    header, meta = {}, {"format": geometry.fmt.format if geometry.fmt else FORMAT, "version": str(VERSION), "layer": str(layer)}
     for expert in range(geometry.experts):
         base = expert * geometry.record_bytes
         for name, dtype, shape, off, n in geometry.tensors(prefix, layer, expert):
@@ -791,17 +867,18 @@ def write_index(out_dir, index):
 
 def new_index(src):
     g = src.geometry
-    if g.bits == 2:
+    if g.fmt:
         return {
-            "format": FORMAT2, "version": VERSION, "complete": False,
-            "group_size": GS2, "codes": CODES2, "scales": SCALES2,
+            "format": g.fmt.format, "version": VERSION, "complete": False,
+            "group_size": g.fmt.gs, "codes": g.fmt.codes, "scales": g.fmt.scales,
             "layers": g.layers, "experts": g.experts,
             "hidden_size": g.hidden, "moe_intermediate_size": g.inter,
             "prefix": src.prefix, "record_bytes": g.record_bytes,
             "record": ["gate codes", "up codes", "down codes", "gate q", "up q", "down q",
                        "gate d", "up d", "down d"],
-            "quantizer": "per 32 inputs: levels -10 -3 3 10, scale and codes fitted in turn (uniform "
-                         "weights), scales as u8 under the row's largest and refitted",
+            "quantizer": f"per {g.fmt.gs} inputs: levels {' '.join(str(int(v)) for v in g.fmt.levels)}, scale and "
+                         f"codes fitted in turn (uniform weights), scales as integers to {g.fmt.smax} under the "
+                         f"row's largest and refitted",
             "files": [layer_file(i) for i in range(g.layers)],
             "done": [],
             "source": src.fingerprint(),
@@ -871,13 +948,15 @@ def peak_rss_mb():
 
 
 def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_path=None, bits=4, cov_path=None,
-            dump_path=None):
+            dump_path=None, fmt_name=None, alpha=0.1):
     """Write (or finish) model_dir's sidecar; returns its directory."""
     src = Source(model_dir)
-    if bits == 2:
+    if fmt_name or bits == 2:
+        fmt_name = fmt_name or INT2G32.name
+        bits = 2
         geo = src.geometry
         try:
-            src.geometry = Geometry(geo.layers, geo.experts, geo.hidden, geo.inter, bits=2)
+            src.geometry = Geometry(geo.layers, geo.experts, geo.hidden, geo.inter, fmt=LOWBIT[fmt_name])
         except ValueError as exc:
             sys.exit(f"{model_dir}: {exc}")
     act = ActStats(act_path) if act_path else None
@@ -885,8 +964,8 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
                                                                   src.geometry.hidden, src.geometry.inter):
         sys.exit(f"{act_path}: statistics of another geometry")
     g = src.geometry
-    out_dir = out_dir or os.path.join(model_dir, SIDECAR_DIR2 if bits == 2 else SIDECAR_DIR)
-    label = "int2-g32" if bits == 2 else "int4-g64"
+    out_dir = out_dir or os.path.join(model_dir, g.fmt.sidecar if g.fmt else SIDECAR_DIR)
+    label = g.fmt.name if g.fmt else "int4-g64"
     total = sum(layer_file_bytes(g, src.prefix, i) for i in range(g.layers))
     fp8 = g.fp8_expert_bytes() * g.experts * g.layers
     print(f"{model_dir}: {g.layers} layers x {g.experts} experts, hidden {g.hidden}, "
@@ -901,7 +980,7 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
     os.makedirs(out_dir, exist_ok=True)
     index = resume_index(out_dir, src)
     if (cov_path or dump_path) and bits != 2:
-        sys.exit("--cov and --dump are for --int2")
+        sys.exit("--cov and --dump are for --int2 and --lowbit")
     if dump_path and (cov_path or act_path):
         sys.exit("--dump carries the statistics itself: no --act-stats or --cov with it")
     cov = CovStats(cov_path) if cov_path else None
@@ -912,9 +991,9 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
                      f"activation-weighted squared error (Q38_ACT_STATS {os.path.basename(act_path)}, "
                      f"{act.rows} expert rows), scales as u8 under the row's largest and refitted") if act else None
         if dump_path:
-            quantizer = ("every expert fitted to the rows it received (Q38_ACT_DUMP " + os.path.basename(dump_path.rstrip("/")) +
-                         "): gate and up with GPTQ under H = sum g^2 x x^T + 0.1 x the layer's moment, down with GPTQ "
-                         "under the quantized gate/up's SwiGLU outputs; levels -10 -3 3 10, u8 scales per 32")
+            quantizer = (f"{g.fmt.name}, every expert fitted to the rows it received (Q38_ACT_DUMP "
+                         f"{os.path.basename(dump_path.rstrip('/'))}): gate and up with GPTQ under H = sum g^2 x x^T + "
+                         f"{alpha} x the layer's moment, down with GPTQ under the quantized gate/up's SwiGLU outputs")
         if cov:
             quantizer = (quantizer or "uniform weights") + (
                 f"; gate and up with the error carried column by column (GPTQ) under H = D^1/2 C D^1/2 "
@@ -938,9 +1017,9 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
         from multiprocessing import get_context
         for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
             os.environ.setdefault(var, "1")   # one BLAS thread per worker: the workers are the parallelism
-        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir, act_path, bits, cov_path, dump_path))
+        pool = get_context("spawn").Pool(workers, initializer=_init_worker, initargs=(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha))
     else:
-        _init_worker(model_dir, act_path, bits, cov_path, dump_path)
+        _init_worker(model_dir, act_path, bits, cov_path, dump_path, fmt_name, alpha)
     worst = 0.0
     try:
         for layer in todo:
@@ -980,8 +1059,13 @@ def main():
                                   "error carried column by column under the layer's input correlations")
     ap.add_argument("--dump", help="the engine's Q38_ACT_DUMP directory (with --int2): every expert fitted with GPTQ "
                                    "to the inputs it really received, down to the SwiGLU outputs of its quantized gate/up")
+    ap.add_argument("--lowbit", choices=sorted(LOWBIT), help="a low-bit format: int2g32 (= --int2), int2g16 or int3g16 "
+                                                            "(groups of 16 with 4-bit scales), into <model>/experts-<name>/")
+    ap.add_argument("--alpha", type=float, default=0.1, help="with --dump: the weight of the layer's moment in each "
+                                                             "expert's H (default 0.1)")
     a = ap.parse_args()
-    convert(a.model, a.out, a.workers, a.layers, a.plan, a.act_stats, 2 if a.int2 else 4, a.cov, a.dump)
+    convert(a.model, a.out, a.workers, a.layers, a.plan, a.act_stats, 2 if (a.int2 or a.lowbit) else 4, a.cov, a.dump,
+            a.lowbit or ("int2g32" if a.int2 else None), a.alpha)
 
 
 if __name__ == "__main__":

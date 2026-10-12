@@ -2791,7 +2791,7 @@ static void q38_expert_report(Model *m, int cap) {
         per_expert = (uint64_t)m->x4->record_bytes;
         snprintf(extra, sizeof extra, " (the snapshot's %s: %llu bytes)", what,
                  (unsigned long long)snapshot_expert);
-        what = m->x4->bits == 2 ? "int2-g32 from " Q38_INT2_DIR "/" : "int4-g64 from " Q38_INT4_DIR "/";   /* and no FP8 scale bank is built */
+        what = m->x4->lb ? m->x4->lb->dir : "int4-g64 from " Q38_INT4_DIR "/";   /* and no FP8 scale bank is built */
     } else if (fixed) {
         snprintf(extra, sizeof extra, " + %.1f MiB resident scale bank", fixed / 1048576.0);
     }
@@ -2928,8 +2928,8 @@ static void q38_vk_tier_start(Model *m,int cap){
     }
     Cfg *c=&m->c;int H=c->hidden,F=c->inter;
     VktFmt f={VKT_SRC_NONE,0};size_t ram_expert=0;
-    if(m->x4&&m->x4->bits==2){
-        fprintf(stderr,"[VK] tier qwen38: the int2-g32 experts have no device kernel yet; they stay on the CPU\n");
+    if(m->x4&&m->x4->lb){
+        fprintf(stderr,"[VK] tier qwen38: the %s experts have no device kernel yet; they stay on the CPU\n",m->x4->lb->name);
         return;
     }
     if(m->x4){ f.kind=VKT_SRC_I4U_PLANAR64; f.gs=64; ram_expert=(size_t)m->x4->record_bytes; }

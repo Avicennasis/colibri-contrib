@@ -2194,6 +2194,8 @@ tests/test_expert_ffn$(EXE): tests/test_expert_ffn.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_int2_g32$(EXE): tests/test_int2_g32.c int2_g32.h ggml_quants.h ggml_grids.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_lowbit_g16$(EXE): tests/test_lowbit_g16.c lowbit_g16.h int2_g32.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # The Vulkan weight pool's offset allocator (vk_alloc.h): bookkeeping only, no
 # device, so it is an ordinary gate.
