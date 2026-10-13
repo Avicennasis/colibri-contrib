@@ -3549,15 +3549,17 @@ static int g_q38_vk_raw;   /* the tier holds the GGUF experts' blocks as the fil
 static VktExpertSrc q38_vk_src(Slot *ex) {
     if(g_q38_gguf&&ex->gate.kind==Q38_WEIGHT_GGML&&g_q38_vk_raw)
         return (VktExpertSrc){ex->gate.data,ex->up.data,ex->down.data,NULL,NULL,NULL};
-    if(ex->gate.kind==Q38_WEIGHT_INT2G32||ex->gate.kind==Q38_WEIGHT_LOWBIT16){
-        /* the low-bit forms (VKT_SRC_LB_*): codes, and per matrix its group scales then its
-         * f32 row scales in one block, the copy freed by q38_vk_src_done */
+    if(ex->gate.kind==Q38_WEIGHT_INT2G32||ex->gate.kind==Q38_WEIGHT_LOWBIT16||ex->gate.kind==Q38_WEIGHT_VQ2){
+        /* the low-bit forms (VKT_SRC_LB_*): codes, and per matrix its group scales (a byte
+         * per 32 inputs, vq2 per 64) then its f32 row scales in one block, the copy freed by
+         * q38_vk_src_done */
         const Q38Weight *w[3]={&ex->gate,&ex->up,&ex->down};size_t tot=0;
-        for(int k=0;k<3;k++)tot+=(size_t)w[k]->rows*((size_t)w[k]->cols/32+4);
+        const size_t per=ex->gate.kind==Q38_WEIGHT_VQ2?64:32;
+        for(int k=0;k<3;k++)tot+=(size_t)w[k]->rows*((size_t)w[k]->cols/per+4);
         if(!ex->t8&&!(ex->t8=(int8_t*)malloc(tot))){fprintf(stderr,"OOM low-bit expert for the Vulkan tier\n");exit(1);}
         uint8_t *b=(uint8_t*)ex->t8;const void *bl[3];
         for(int k=0;k<3;k++){
-            size_t qr=(size_t)w[k]->rows*((size_t)w[k]->cols/32);
+            size_t qr=(size_t)w[k]->rows*((size_t)w[k]->cols/per);
             memcpy(b,w[k]->x2q,qr);memcpy(b+qr,w[k]->scales,(size_t)w[k]->rows*sizeof(float));
             bl[k]=b;b+=qr+(size_t)w[k]->rows*sizeof(float);
         }

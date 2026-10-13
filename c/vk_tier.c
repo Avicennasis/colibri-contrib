@@ -157,7 +157,8 @@ static int form_of(int layer) { return T.per_layer && layer < T.main_layers ? T.
 static int src_per_row(VktSrc k) {
     return k == VKT_SRC_I8_ROW || k == VKT_SRC_I8_AS_I4_ROW || k == VKT_SRC_I4S_PAIRS_ROW || k == VKT_SRC_I4U_PAIRS_ROW;
 }
-static int src_lowbit(VktSrc k) { return k == VKT_SRC_LB_I2G32 || k == VKT_SRC_LB_I2G16 || k == VKT_SRC_LB_I3G16; }
+static int src_lowbit(VktSrc k) { return k == VKT_SRC_LB_I2G32 || k == VKT_SRC_LB_I2G16 || k == VKT_SRC_LB_I3G16 || k == VKT_SRC_LB_VQ2; }
+static size_t src_lb_qbytes(VktSrc k, int I) { return (size_t)I / (k == VKT_SRC_LB_VQ2 ? 64 : 32); }   /* group scales a row */
 static size_t src_row_bytes(VktSrc k, int I) {
     if (k >= VKT_SRC_GGML) return coli_vk_tensor_row_bytes(100 + (int)(k - VKT_SRC_GGML), I);   /* as the device holds it */
     if (src_lowbit(k)) return (size_t)I * (k == VKT_SRC_LB_I3G16 ? 3 : 2) / 8;
@@ -172,7 +173,7 @@ static size_t src_row_bytes(VktSrc k, int I) {
 }
 static size_t src_scale_bytes(VktFmt f, int I, int O) {
     if (f.kind == VKT_SRC_BF16 || f.kind == VKT_SRC_F32 || f.kind >= VKT_SRC_GGML) return 0;
-    if (src_lowbit(f.kind)) return (size_t)O * ((size_t)I / 32 + 4);   /* group scales, then f32 row scales */
+    if (src_lowbit(f.kind)) return (size_t)O * (src_lb_qbytes(f.kind, I) + 4);   /* group scales, then f32 row scales */
     if (src_per_row(f.kind)) return (size_t)O * 4;
     if (f.kind == VKT_SRC_I4U_PLANAR64 || f.kind == VKT_SRC_I3_G64) return (size_t)O * (((size_t)I + 63) / 64) * 4;
     size_t ng = ((size_t)I + f.gs - 1) / f.gs;
@@ -184,7 +185,7 @@ static size_t src_scale_bytes(VktFmt f, int I, int O) {
 static int dev_fmt(VktFmt f, int *fmt, int *gs) {
     int g = f.gs;
     if (f.kind >= VKT_SRC_GGML) { *fmt = 100 + (int)(f.kind - VKT_SRC_GGML); *gs = 0; return coli_vk_block_elems(*fmt) > 0; }
-    if (src_lowbit(f.kind)) { *fmt = f.kind == VKT_SRC_LB_I2G32 ? 200 : f.kind == VKT_SRC_LB_I2G16 ? 201 : 202; *gs = 0; return 1; }
+    if (src_lowbit(f.kind)) { *fmt = f.kind == VKT_SRC_LB_I2G32 ? 200 : f.kind == VKT_SRC_LB_I2G16 ? 201 : f.kind == VKT_SRC_LB_VQ2 ? 203 : 202; *gs = 0; return 1; }
     switch (f.kind) {
     case VKT_SRC_I8_ROW: *fmt = 1; *gs = 0; return 1;
     case VKT_SRC_I8_GS: *fmt = 13; *gs = g; return g >= 4 && g % 4 == 0;
@@ -215,7 +216,7 @@ static void convert_par(VktFmt f, int I, int O, const uint8_t *codes, const void
     size_t rb = src_row_bytes(f.kind, I);
     par = par && O >= 64;
     if (src_lowbit(f.kind)) {   /* device row: codes | group scales | f32 row scale (blockdec.glsl) */
-        const uint8_t *q = scales; const size_t qb = (size_t)I / 32;
+        const uint8_t *q = scales; const size_t qb = src_lb_qbytes(f.kind, I);
         const uint8_t *d = q + (size_t)O * qb;
         #pragma omp parallel for schedule(static) if (par)
         for (int o = 0; o < O; o++) {

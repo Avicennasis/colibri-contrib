@@ -2987,13 +2987,15 @@ static void q38_vk_tier_start(Model *m,int cap){
     /* a GGUF's types by layer, for the tier when they differ */
     VktFmt *lgu=g_q38_gguf?(VktFmt*)malloc((size_t)c->layers*sizeof(VktFmt)):NULL,
            *ldn=g_q38_gguf?(VktFmt*)malloc((size_t)c->layers*sizeof(VktFmt)):NULL;
-    if(m->x4&&m->x4->lb&&m->x4->lb->vq){
-        fprintf(stderr,"[VK] tier qwen38: the vq2 experts have no device form yet; the tier stays off\n");
+    if(m->x4&&m->x4->lb&&m->x4->lb->vq&&coli_vk_set_vq2_books(&m->x4->vqb->a[0][0],&m->x4->vqb->b[0][0])){
+        fprintf(stderr,"[VK] tier qwen38: the device's block table already holds other vq2 codebooks; the experts stay on the CPU\n");
         free(lgu);free(ldn);return;
     }
     if(m->x4&&m->x4->lb){
-        /* colibri's low-bit experts: the same codes and scales on the device (blockdec.glsl) */
-        f.kind=!strcmp(m->x4->lb->name,"int2g32")?VKT_SRC_LB_I2G32:!strcmp(m->x4->lb->name,"int2g16")?VKT_SRC_LB_I2G16:VKT_SRC_LB_I3G16;
+        /* colibri's low-bit experts: the same codes and scales on the device (blockdec.glsl;
+         * vq2's codebooks in its table buffer, set above) */
+        f.kind=m->x4->lb->vq?VKT_SRC_LB_VQ2:!strcmp(m->x4->lb->name,"int2g32")?VKT_SRC_LB_I2G32:
+               !strcmp(m->x4->lb->name,"int2g16")?VKT_SRC_LB_I2G16:VKT_SRC_LB_I3G16;
         f.gs=0;ram_expert=(size_t)m->x4->record_bytes;
     }
     else if(m->x4){ f.kind=VKT_SRC_I4U_PLANAR64; f.gs=64; ram_expert=(size_t)m->x4->record_bytes; }

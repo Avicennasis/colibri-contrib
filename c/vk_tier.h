@@ -137,6 +137,8 @@
  *   VKT_SRC_LB_I2G32, _I2G16, _I3G16  colibri's int2-g32 / int2-g16 / int3-g16 codes, and
  *                         as "scales" per matrix its group scales (I/32 bytes a row) then
  *                         its f32 row scales                -> fmt 200, 201, 202
+ *   VKT_SRC_LB_VQ2        vq2's index bytes, as "scales" its 4-bit scales (I/64 bytes a
+ *                         row) then its f32 row scales; coli_vk_set_vq2_books first -> fmt 203
  * Activations (VktConfig.act): VKT_ACT_SWIGLU silu(g)*u, act_limit > 0 clamps the
  * gate from above and up to [-limit, limit] first (GLM-5.3, DeepSeek V4/V4.1);
  * VKT_ACT_SITU a*tanh(g/a)*sigmoid(g) * b*tanh(u/b) with act_a, act_b (Kimi K3);
@@ -157,7 +159,7 @@ typedef enum {
     VKT_SRC_I4S_PAIRS_ROW, VKT_SRC_I4S_PAIRS_GS, VKT_SRC_I4U_PAIRS_ROW, VKT_SRC_I4U_PAIRS_GS,
     VKT_SRC_I4U_PLANAR64, VKT_SRC_I3_G64, VKT_SRC_MXFP4_F32, VKT_SRC_MXFP4_E8M0,
     VKT_SRC_FP8_GS, VKT_SRC_FP8_BLOCK, VKT_SRC_BF16, VKT_SRC_F32,
-    VKT_SRC_LB_I2G32, VKT_SRC_LB_I2G16, VKT_SRC_LB_I3G16,
+    VKT_SRC_LB_I2G32, VKT_SRC_LB_I2G16, VKT_SRC_LB_I3G16, VKT_SRC_LB_VQ2,
     VKT_SRC_GGML = 64                   /* + the ggml type: VKT_SRC_GGML + t, t < 43 */
 } VktSrc;
 typedef struct { VktSrc kind; int gs; } VktFmt;     /* gs: group (block) size, 0 = per row */

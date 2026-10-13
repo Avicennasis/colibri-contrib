@@ -17,5 +17,7 @@
 #define BDT_IQ3XXS  3830   /* 256 rows of 4 bytes */
 #define BDT_IQ3S    4086   /* 512 rows of 4 bytes */
 #define BDT_IQ1S    4598   /* 2048 rows of 8 signed bytes */
-#define BDT_WORDS   8694
+#define BDT_VQ2     8694   /* 1024: vq2's codebooks, A then B, 256 rows of 8 signed bytes each (the model's,
+                             set by coli_vk_set_vq2_books; zeros until then) */
+#define BDT_WORDS   9718
 #endif

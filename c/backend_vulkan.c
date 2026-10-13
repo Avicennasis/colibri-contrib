@@ -773,14 +773,16 @@ static int scratch_reserve(Scratch *s, size_t bytes) { return scratch_reserve_mt
 
 /* Block formats (shaders/blockdec.glsl): fmt 100 + t is ggml block type t, its rows as the
  * GGUF file stores them; 200, 201, 202 are colibri's int2-g32, int2-g16 and int3-g16 experts
+ * (203 vq2: codes | 4-bit scales per 32 | f32 row scale, its codebooks in the table buffer)
  * as codes | group scales (I/32 bytes) | f32 row scale. The scales live in the rows: the
  * scale array is bound but unused. Elements and bytes per block, by ggml type. */
 static const uint16_t BD_BLK[43] = {1,1,32,32,0,0,32,32,32,0,256,256,256,256,256,0,256,256,256,256,32,256,256,256,
                                     0,0,0,0,0,256,0,0,0,0,256,256,0,0,0,32,64,128,64};
 static const uint16_t BD_BYTES[43] = {4,2,18,20,0,0,22,24,34,0,84,110,144,176,210,0,66,74,98,50,18,110,82,136,
                                       0,0,0,0,0,56,0,0,0,0,54,66,0,0,0,17,36,18,18};
-static int bd_fmt(int fmt) { return (fmt >= 102 && fmt < 143 && BD_BLK[fmt - 100] >= 32) || (fmt >= 200 && fmt <= 202); }
+static int bd_fmt(int fmt) { return (fmt >= 102 && fmt < 143 && BD_BLK[fmt - 100] >= 32) || (fmt >= 200 && fmt <= 203); }
 static size_t bd_row_bytes(int fmt, int I) {
+    if (fmt == 203) return (size_t)I / 4 + (size_t)I / 64 + 4;
     if (fmt >= 200) return (size_t)I / 128 * (fmt == 202 ? 48 : 32) + (size_t)I / 32 + 4;
     return (size_t)I / BD_BLK[fmt - 100] * BD_BYTES[fmt - 100];
 }
@@ -1876,8 +1878,10 @@ static int upload_tensor(ColiVkTensor **out, const void *weights, const float *s
 static ColiVkTensor *g_bdtab[2];
 static pthread_mutex_t g_bdtab_mx = PTHREAD_MUTEX_INITIALIZER;
 static int bd_dev_ready(int dev);   /* after G2 */
+static uint32_t g_vq2_words[BDT_WORDS - BDT_VQ2];   /* coli_vk_set_vq2_books */
 static void bdtab_fill(uint32_t *t) {
     memset(t, 0, (size_t)BDT_WORDS * 4);
+    memcpy(t + BDT_VQ2, g_vq2_words, sizeof g_vq2_words);
     for (int i = 0; i < 43; i++) { t[BDT_BLK + i] = BD_BLK[i]; t[BDT_BYTES + i] = BD_BYTES[i]; }
     for (int i = 0; i < 128; i++) t[BDT_KSIGNS + i] = GGML_KSIGNS_IQ2XS[i];
     for (int i = 0; i < 16; i++) {
@@ -1894,7 +1898,8 @@ static void bdtab_fill(uint32_t *t) {
 }
 _Static_assert(BDT_IQ2XS - BDT_IQ2XXS == sizeof GGML_IQ2XXS_GRID / 4 && BDT_IQ2S - BDT_IQ2XS == sizeof GGML_IQ2XS_GRID / 4 &&
                BDT_IQ3XXS - BDT_IQ2S == sizeof GGML_IQ2S_GRID / 4 && BDT_IQ3S - BDT_IQ3XXS == sizeof GGML_IQ3XXS_GRID / 4 &&
-               BDT_IQ1S - BDT_IQ3S == sizeof GGML_IQ3S_GRID / 4 && BDT_WORDS - BDT_IQ1S == sizeof GGML_IQ1S_GRID / 4,
+               BDT_IQ1S - BDT_IQ3S == sizeof GGML_IQ3S_GRID / 4 && BDT_VQ2 - BDT_IQ1S == sizeof GGML_IQ1S_GRID / 4 &&
+               BDT_WORDS - BDT_VQ2 == 2 * 256 * 8 / 4,
                "shaders/blockdec_table.h does not match ggml_grids.h");
 /* the table's buffer on device dev, made now if it is not there yet; NULL handle when
  * the device has no room for it (no block format goes there then) */
@@ -5051,7 +5056,19 @@ int coli_vk_tensor_refill_as(ColiVkTensor *t, int fmt, int I, int O, int gs,
 int coli_vk_staged(void) { return G.ready && g_up[0].on; }
 size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); }
 /* elements per block of a block format (shaders/blockdec.glsl), 0 for any other format */
-int coli_vk_block_elems(int fmt) { return !bd_fmt(fmt) ? 0 : fmt >= 200 ? 128 : (int)BD_BLK[fmt - 100]; }
+int coli_vk_block_elems(int fmt) { return !bd_fmt(fmt) ? 0 : fmt == 203 ? 64 : fmt >= 200 ? 128 : (int)BD_BLK[fmt - 100]; }
+/* vq2's codebooks (two 256 x 8 int8, row-major) into the table buffer. The table is built
+ * once, at the first block-format tensor: call this before (the tier's start); -1 when a
+ * table is already on a device with other books. */
+int coli_vk_set_vq2_books(const int8_t *a, const int8_t *b) {
+    uint32_t w[BDT_WORDS - BDT_VQ2];
+    memcpy(w, a, 2048); memcpy((uint8_t *)w + 2048, b, 2048);
+    pthread_mutex_lock(&g_bdtab_mx);
+    int built = g_bdtab[0] || g_bdtab[1], same = !memcmp(w, g_vq2_words, sizeof w);
+    if (!built) memcpy(g_vq2_words, w, sizeof w);
+    pthread_mutex_unlock(&g_bdtab_mx);
+    return built && !same ? -1 : 0;
+}
 size_t coli_vk_tensor_payload(int fmt, int I, int O, int gs) {
     if (fmt == 4 || fmt == 7 || fmt == 12 || fmt == 13) { if (gs < 1) return 0; } else gs = 0;
     return (size_t)rowwords(fmt, I) * 4 * (size_t)O + scale_floats(fmt, I, O, gs) * sizeof(float);

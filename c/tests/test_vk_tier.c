@@ -303,6 +303,17 @@ static void block_fix(int t, uint8_t *b) {
     #undef F16AT
 }
 static int lb_bits(VktSrc k) { return k == VKT_SRC_LB_I3G16 ? 3 : 2; }
+/* vq2's codebooks for the test: per coordinate max|a| + max|b| = 127, as the converter scales them */
+static int8_t g_vq_a[256][8], g_vq_b[256][8];
+static void vq_books(void) {
+    for (int j = 0; j < 8; j++) {
+        int ta = 30 + (int)(rnd() % 70), tb = 127 - ta;
+        for (int e = 0; e < 256; e++) {
+            g_vq_a[e][j] = (int8_t)(e < 2 ? (e ? -ta : ta) : (int)(rnd() % (2 * ta + 1)) - ta);
+            g_vq_b[e][j] = (int8_t)(e < 2 ? (e ? -tb : tb) : (int)(rnd() % (2 * tb + 1)) - tb);
+        }
+    }
+}
 static void mat_make_block(Mat *m, VktFmt f, int I, int O) {
     m->f = f; m->I = I; m->O = O;
     m->w = malloc((size_t)I * O * sizeof(float));
@@ -318,10 +329,10 @@ static void mat_make_block(Mat *m, VktFmt f, int I, int O) {
         }
         return;
     }
-    /* colibri low-bit: codes, then as "scales" the group scales (I/32 bytes a row) and the
-     * f32 row scales; decoded here from lowbit_g16.h's description */
-    int bits = lb_bits(f.kind), g32 = f.kind == VKT_SRC_LB_I2G32;
-    size_t rb = (size_t)I * bits / 8, qb = (size_t)I / 32;
+    /* colibri low-bit: codes, then as "scales" the group scales (I/32 bytes a row, vq2 I/64)
+     * and the f32 row scales; decoded here from lowbit_g16.h's and vq2_g32.h's descriptions */
+    int bits = lb_bits(f.kind), g32 = f.kind == VKT_SRC_LB_I2G32, vq = f.kind == VKT_SRC_LB_VQ2;
+    size_t rb = (size_t)I * bits / 8, qb = (size_t)I / (vq ? 64 : 32);
     m->codes = malloc(rb * O);
     for (size_t i = 0; i < rb * O; i++) m->codes[i] = (uint8_t)rnd();
     uint8_t *sc = malloc((size_t)O * (qb + 4)); m->scales = sc;
@@ -331,7 +342,12 @@ static void mat_make_block(Mat *m, VktFmt f, int I, int O) {
     for (int o = 0; o < O; o++) {
         d[o] = 0.0005f + (rnd() % 100) / 100000.0f;
         const uint8_t *row = m->codes + (size_t)o * rb, *q = sc + (size_t)o * qb;
-        for (int i = 0; i < I; i++) {
+        for (int i = 0; vq && i < I; i++) {   /* vq2: index bytes a, b per 8, a nibble per 32 */
+            const uint8_t *v = row + (size_t)(i / 8) * 2;
+            int qs = (q[i / 64] >> (4 * ((i / 32) & 1))) & 15;
+            m->w[(size_t)o * I + i] = d[o] * (float)qs * (float)(g_vq_a[v[0]][i % 8] + g_vq_b[v[1]][i % 8]);
+        }
+        for (int i = 0; !vq && i < I; i++) {
             const uint8_t *blk = row + (size_t)(i / 128) * (bits == 3 ? 48 : 32);
             int k = i % 128, c = (blk[k % 32] >> (2 * (k / 32))) & 3;
             if (bits == 3) c |= ((blk[32 + k % 16] >> (k / 16)) & 1) << 2;
@@ -353,11 +369,14 @@ static void blocks(void) {
         {GQ_IQ1_S, GQ_IQ1_S, "IQ1_S"}, {GQ_IQ1_M, GQ_IQ1_M, "IQ1_M"}, {GQ_IQ4_XS, GQ_IQ4_XS, "IQ4_XS"},
         {GQ_TQ1_0, GQ_TQ1_0, "TQ1_0"}, {GQ_TQ2_0, GQ_TQ2_0, "TQ2_0"},
         {-1, -1, "colibri int2-g32"}, {-2, -2, "colibri int2-g16"}, {-3, -3, "colibri int3-g16"},
+        {-4, -4, "colibri vq2"},
     };
+    vq_books();   /* before the first block-format tensor builds the device's table */
+    CHECK(!coli_vk_set_vq2_books(&g_vq_a[0][0], &g_vq_b[0][0]), "vq2: the codebooks did not reach the table");
     for (size_t c = 0; c < sizeof cs / sizeof *cs; c++) {
         VktFmt gu, dn;
         if (cs[c].gu >= 0) { gu.kind = (VktSrc)(VKT_SRC_GGML + cs[c].gu); dn.kind = (VktSrc)(VKT_SRC_GGML + cs[c].dn); }
-        else { VktSrc k = cs[c].gu == -1 ? VKT_SRC_LB_I2G32 : cs[c].gu == -2 ? VKT_SRC_LB_I2G16 : VKT_SRC_LB_I3G16; gu.kind = dn.kind = k; }
+        else { VktSrc k = cs[c].gu == -1 ? VKT_SRC_LB_I2G32 : cs[c].gu == -2 ? VKT_SRC_LB_I2G16 : cs[c].gu == -3 ? VKT_SRC_LB_I3G16 : VKT_SRC_LB_VQ2; gu.kind = dn.kind = k; }
         gu.gs = dn.gs = 0;
         for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) {
             mat_make_block(&ex[l][e].g, gu, H, F); mat_make_block(&ex[l][e].u, gu, H, F); mat_make_block(&ex[l][e].d, dn, F, H);

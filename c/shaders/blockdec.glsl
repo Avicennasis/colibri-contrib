@@ -5,6 +5,8 @@
 //             is sw[g] * w - mw[g] over groups of 16 as the CPU's integer form has it)
 //   200 int2-g32, 201 int2-g16, 202 int3-g16: colibri's low-bit experts (int2_g32.h,
 //             lowbit_g16.h) laid out on the device as codes | group scales | f32 row scale
+//   203 vq2 (vq2_g32.h): codes (two index bytes per 8 weights) | 4-bit scales per 32 |
+//             f32 row scale, the codebooks in the table buffer at BDT_VQ2
 // The including shader defines, before #include:
 //   BD_P      a prefix for the function names (one instance per weight buffer)
 //   BD_W(i)   uint word i of that buffer
@@ -51,7 +53,16 @@ float BDN(unit)(int fmt, uint rb, uint u, uint I) {
     int wv[32];   /* not w: the including shader's weight buffer may be named w (BD_W) */
     float sA = 0.0, mA = 0.0, sB = 0.0, mB = 0.0;   // scale and min of elements 0..15 and 16..31
     uint xb = u * 32u;
-    if (fmt >= 200) {
+    if (fmt == 203) {
+        // vq2: the unit is four vectors a0 b0 .. a3 b3, each A[a] + B[b] (8 signed bytes a row)
+        uint cbytes = I / 4u, ub = rb + u * 8u;
+        float d = uintBitsToFloat(BDN(u32)(rb + cbytes + I / 64u));
+        sA = sB = d * float((BDN(u8)(rb + cbytes + (u >> 1u)) >> (4u * (u & 1u))) & 15u);
+        for (uint v = 0u; v < 4u; v++) {
+            uvec2 ga = BDN(g2)(BDT_VQ2, BDN(u8)(ub + 2u * v)), gb = BDN(g2)(BDT_VQ2 + 512u, BDN(u8)(ub + 2u * v + 1u));
+            for (uint j = 0u; j < 8u; j++) wv[8u * v + j] = bd_sbyte(ga, j) + bd_sbyte(gb, j);
+        }
+    } else if (fmt >= 200) {
         // colibri low-bit: codes (blocks of 128: 32 bytes of low bits, then 16 of high
         // bits at 3 bits), the group scales (I/32 bytes), the f32 row scale
         int bits = fmt == 202 ? 3 : 2;
