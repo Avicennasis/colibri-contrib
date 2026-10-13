@@ -17,6 +17,7 @@
 #include "int2_g32.h"     /* the int2-g32 routed experts (experts-int2g32/ sidecar) */
 #include "lowbit_g16.h"   /* the int2-g16 and int3-g16 routed experts (experts-int2g16/, experts-int3g16/) */
 #include "vq2_g32.h"     /* the vq2 routed experts: two-stage vector codes (experts-vq2g32/) */
+#include "vq1_g64.h"     /* the vq1 routed experts: 16-dim vector codes at ~1.3 bits (experts-vq1g64/) */
 #include "gguf.h"         /* SNAP = a tools/gguf_import.py directory: llama.cpp's qwen4exp GGUF, read in place */
 #include <pthread.h>   /* q38_ehit_mark publishes the lazy HITS table under a lock */
 #ifdef COLI_VULKAN
@@ -68,7 +69,8 @@ typedef enum {
     Q38_WEIGHT_GGML,               /* GGUF mode: rows of ggml blocks of gq_type, as the file stores them */
     Q38_WEIGHT_INT2G32,            /* routed experts from the experts-int2g32/ sidecar: data codes, x2q group scales, scales row scales */
     Q38_WEIGHT_LOWBIT16,           /* routed experts from experts-int2g16/ or -int3g16/ (lowbit_g16.h): as INT2G32, lbits bits, 4-bit scales per 16 */
-    Q38_WEIGHT_VQ2                 /* routed experts from experts-vq2g32/ (vq2_g32.h): data codes, x2q 4-bit scales per 32, scales row scales, vqb the codebooks */
+    Q38_WEIGHT_VQ2,                /* routed experts from experts-vq2g32/ (vq2_g32.h): data codes, x2q 4-bit scales per 32, scales row scales, vqb the codebooks */
+    Q38_WEIGHT_VQ1                 /* routed experts from experts-vq1g64/ (vq1_g64.h): as VQ2 with 10-bit indices of 16-vectors, scales per 64, vq1b the codebooks */
 } Q38WeightKind;
 
 /* GGUF mode (SNAP holds gguf.json, written by tools/gguf_import.py). llama.cpp's
@@ -119,6 +121,7 @@ typedef struct {
     const uint8_t *x2q;            /* Q38_WEIGHT_INT2G32: u8 scale per row and 32 inputs; LOWBIT16: two 4-bit ones per byte (borrowed, like data) */
     int lbits;                     /* Q38_WEIGHT_LOWBIT16: 2 or 3 */
     const Vq2Books *vqb;           /* Q38_WEIGHT_VQ2: the sidecar's codebooks (borrowed) */
+    const Vq1Books *vq1b;          /* Q38_WEIGHT_VQ1: the sidecar's codebooks (borrowed) */
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -193,7 +196,8 @@ typedef struct {
     int64_t code_bytes[3], scale_count[3];   /* gate, up, down */
     int64_t scale_off, record_bytes;
     const struct Q38Lowbit *lb;    /* NULL: experts-int4g64/; else the low-bit format of the sidecar */
-    Vq2Books *vqb;                 /* lb->vq: the codebooks index.json carries */
+    Vq2Books *vqb;                 /* lb->vq == 1: the codebooks index.json carries */
+    Vq1Books *vq1b;                /* lb->vq == 2 */
     int bits;                      /* 4: experts-int4g64/; 2: experts-int2g32/, whose record holds
                                     * the u8 group scales at q_off and one f32 per row at scale_off */
     int64_t q_off, q_bytes[3];
@@ -422,6 +426,8 @@ static uint64_t q38_weight_bytes(const Q38Weight *weight) {
         return (uint64_t)weight->rows*(xl_code_bytes(weight->lbits,weight->cols)+xl_scale_bytes(weight->cols)+sizeof(float));
     if(weight->kind==Q38_WEIGHT_VQ2)
         return (uint64_t)weight->rows*(vq2_code_bytes(weight->cols)+vq2_scale_bytes(weight->cols)+sizeof(float));
+    if(weight->kind==Q38_WEIGHT_VQ1)
+        return (uint64_t)weight->rows*(vq1_code_bytes(weight->cols)+vq1_scale_bytes(weight->cols)+sizeof(float));
     uint64_t element_size=weight->kind==Q38_WEIGHT_F32?sizeof(float):
                           weight->kind==Q38_WEIGHT_BF16?sizeof(uint16_t):
                           weight->kind==Q38_WEIGHT_FP8?sizeof(uint8_t):0;
@@ -704,6 +710,11 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
     else if(weight->kind==Q38_WEIGHT_VQ2&&weight->scales&&weight->x2q&&weight->vqb){
         if(vq2_matmul(y,x,weight->vqb,(const uint8_t*)weight->data,weight->x2q,weight->scales,S,I,O)){
             fprintf(stderr,"OOM vq2 activation\n");exit(1);
+        }
+    }
+    else if(weight->kind==Q38_WEIGHT_VQ1&&weight->scales&&weight->x2q&&weight->vq1b){
+        if(vq1_matmul(y,x,weight->vq1b,(const uint8_t*)weight->data,weight->x2q,weight->scales,S,I,O)){
+            fprintf(stderr,"OOM vq1 activation\n");exit(1);
         }
     }
     else if(weight->kind==Q38_WEIGHT_GGML){
@@ -1983,21 +1994,24 @@ static void q38_load_expert_slice(Model *m,const char *name,const st_tensor *ten
  * per 32) and int2-g16 / int3-g16 (lowbit_g16.h, a nibble per 16), written by
  * tools/convert_qwen38_experts_int4.py --lowbit NAME into <snap>/experts-NAME/.
  * Q38_EXPERT_LOWBIT=NAME attaches one; Q38_EXPERT_INT2=1 is int2g32. vq2g32
- * (vq2_g32.h) keeps the record but not the cols/32 scale bytes: a nibble per 32,
+ * (vq2_g32.h, vq 1) and vq1g64 (vq1_g64.h, vq 2: 10-bit indices, cols/64 x 10 code bytes,
+ * a nibble per 64, 1024 x 16 books) keep the record but not the cols/32 scale bytes: a nibble per 32,
  * and two 256 x 8 int8 codebooks in index.json ("codebooks": {"a": [...], "b": [...]}). */
 typedef struct Q38Lowbit { const char *name,*dir,*format,*codes,*scales,*qtail; int bits,gs,vq; } Q38Lowbit;
-static const Q38Lowbit Q38_LOWBIT[4]={
+static const Q38Lowbit Q38_LOWBIT[5]={
     {"int2g32","experts-int2g32","colibri.qwen38.experts-int2g32","planar128-2bit-lv10","u8-per-32-f32-per-row",".q8",2,32,0},
     {"int2g16","experts-int2g16","colibri.qwen38.experts-int2g16","planar128-2bit-lv10","u4-per-16-f32-per-row",".q4",2,16,0},
     {"int3g16","experts-int3g16","colibri.qwen38.experts-int3g16","planar128-3bit-lv26","u4-per-16-f32-per-row",".q4",3,16,0},
     {"vq2g32","experts-vq2g32","colibri.qwen38.experts-vq2g32","vq2-2x256x8-int8","u4-per-32-f32-per-row",".q4",2,32,1},
+    {"vq1g64","experts-vq1g64","colibri.qwen38.experts-vq1g64","vq1-2x1024x16-int8","u4-per-64-f32-per-row",".q4",2,64,2},
 };
-static size_t q38_lb_scale_bytes(const Q38Lowbit *lb,int cols) { return lb->vq?vq2_scale_bytes(cols):xl_scale_bytes(cols); }
+static size_t q38_lb_scale_bytes(const Q38Lowbit *lb,int cols) { return lb->vq==2?vq1_scale_bytes(cols):lb->vq?vq2_scale_bytes(cols):xl_scale_bytes(cols); }
+static size_t q38_lb_code_bytes(const Q38Lowbit *lb,int cols) { return lb->vq==2?vq1_code_bytes(cols):xl_code_bytes(lb->bits,cols); }
 static const Q38Lowbit *q38_expert_lowbit_wanted(void) {
     const char *name=getenv("Q38_EXPERT_LOWBIT");
     if(name&&*name){
-        for(int i=0;i<4;i++)if(!strcmp(name,Q38_LOWBIT[i].name))return &Q38_LOWBIT[i];
-        fprintf(stderr,"Q38_EXPERT_LOWBIT must be int2g32, int2g16, int3g16 or vq2g32\n");exit(1);
+        for(int i=0;i<5;i++)if(!strcmp(name,Q38_LOWBIT[i].name))return &Q38_LOWBIT[i];
+        fprintf(stderr,"Q38_EXPERT_LOWBIT must be int2g32, int2g16, int3g16, vq2g32 or vq1g64\n");exit(1);
     }
     const char *value=getenv("Q38_EXPERT_INT2");
     if(!value||!*value||(value[0]=='0'&&!value[1]))return NULL;
@@ -2047,7 +2061,7 @@ static int q38_int4_record_at(Model *m,Q38Int4Experts *x,int layer,int expert,
         q38_name(m,name,sizeof name,layer,suffix);
         st_tensor *t=st_find(&x->S,name);
         int is_f32=int2?kind==2:kind==1;
-        int64_t width=int2?(kind==0?(int64_t)xl_code_bytes(x->lb->bits,cols[k]):kind==1?(int64_t)q38_lb_scale_bytes(x->lb,cols[k]):1):
+        int64_t width=int2?(kind==0?(int64_t)q38_lb_code_bytes(x->lb,cols[k]):kind==1?(int64_t)q38_lb_scale_bytes(x->lb,cols[k]):1):
                       kind?q38_int4_groups(cols[k]):q38_int4_row_bytes(cols[k]);
         int64_t bytes=int2?(kind==0?x->code_bytes[k]:kind==1?x->q_bytes[k]:x->scale_count[k]*(int64_t)sizeof(float)):
                       kind?x->scale_count[k]*(int64_t)sizeof(float):x->code_bytes[k];
@@ -2117,7 +2131,7 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
         for(int k=0;k<3;k++)if(!xl_layout_ok(cols[k]))
             q38_int4_refuse(dir,"the low-bit formats need widths that are multiples of 128");
         for(int k=0;k<3;k++){
-            x->code_bytes[k]=(int64_t)rows[k]*(int64_t)xl_code_bytes(lb->bits,cols[k]);
+            x->code_bytes[k]=(int64_t)rows[k]*(int64_t)q38_lb_code_bytes(lb,cols[k]);
             x->q_bytes[k]=(int64_t)rows[k]*(int64_t)q38_lb_scale_bytes(lb,cols[k]);
             x->scale_count[k]=rows[k];
             x->q_off+=x->code_bytes[k];
@@ -2136,27 +2150,36 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
        q38_json_int(root,"record_bytes")!=x->record_bytes||x->scale_off%(int64_t)sizeof(float))
         q38_int4_refuse(dir,"index.json was written for another geometry than config.json's");
     if(int2&&lb->vq){
-        /* the codebooks: 256 x 8 int8 each, row-major; per coordinate max|a| + max|b| <= 127 */
+        /* the codebooks, row-major int8: vq2 256 x 8, vq1 1024 x 16; per coordinate
+         * max|a| + max|b| <= 127, so any sum is an int8 */
+        const int nb=lb->vq==2?VQ1_BOOK:VQ2_BOOK,dim=lb->vq==2?16:8;
+        int8_t *dsta,*dstb;
+        if(lb->vq==2){
+            if(!(x->vq1b=(Vq1Books*)calloc(1,sizeof(Vq1Books)))){fprintf(stderr,"OOM vq1 codebooks\n");exit(1);}
+            dsta=&x->vq1b->a[0][0];dstb=&x->vq1b->b[0][0];
+        } else {
+            if(!(x->vqb=(Vq2Books*)calloc(1,sizeof(Vq2Books)))){fprintf(stderr,"OOM vq2 codebooks\n");exit(1);}
+            dsta=&x->vqb->a[0][0];dstb=&x->vqb->b[0][0];
+        }
         jval *books=json_get(root,"codebooks");
-        if(!(x->vqb=(Vq2Books*)calloc(1,sizeof(Vq2Books)))){fprintf(stderr,"OOM vq2 codebooks\n");exit(1);}
         for(int which=0;which<2;which++){
             jval *list=books&&books->t==J_OBJ?json_get(books,which?"b":"a"):NULL;
-            if(!list||list->t!=J_ARR||list->len!=VQ2_BOOK*8)q38_int4_refuse(dir,"index.json has no codebooks of 256 x 8");
-            int8_t *dst=which?&x->vqb->b[0][0]:&x->vqb->a[0][0];
-            for(int i=0;i<VQ2_BOOK*8;i++){
+            if(!list||list->t!=J_ARR||list->len!=nb*dim)q38_int4_refuse(dir,"index.json has no codebooks of the format's size");
+            int8_t *dst=which?dstb:dsta;
+            for(int i=0;i<nb*dim;i++){
                 const jval *v=list->kids[i];
                 if(v->t!=J_NUM||v->num!=floor(v->num)||v->num<-127||v->num>127)
                     q38_int4_refuse(dir,"a codebook entry is not an integer in -127..127");
                 dst[i]=(int8_t)v->num;
             }
         }
-        int top_a[8]={0},top_b[8]={0};
-        for(int e=0;e<VQ2_BOOK;e++)for(int j=0;j<8;j++){
-            int a=abs(x->vqb->a[e][j]),b=abs(x->vqb->b[e][j]);
+        int top_a[16]={0},top_b[16]={0};
+        for(int e=0;e<nb;e++)for(int j=0;j<dim;j++){
+            int a=abs(dsta[e*dim+j]),b=abs(dstb[e*dim+j]);
             if(a>top_a[j])top_a[j]=a;
             if(b>top_b[j])top_b[j]=b;
         }
-        for(int j=0;j<8;j++)if(top_a[j]+top_b[j]>127)q38_int4_refuse(dir,"the codebooks' sums leave int8");
+        for(int j=0;j<dim;j++)if(top_a[j]+top_b[j]>127)q38_int4_refuse(dir,"the codebooks' sums leave int8");
     }
     jval *complete=json_get(root,"complete"),*done=json_get(root,"done");
     /* Q38_EXPERT_PARTIAL=1: a sidecar still being written serves the layers it lists as
@@ -2182,7 +2205,7 @@ static void q38_expert_int4_attach(Model *m,const char *snap) {
         }
         fprintf(stderr,"[qwen38] %s: conversion incomplete (%d of %d layers); "
                        "the routed experts stay as the snapshot has them\n",dir,layers_done,c->layers);
-        json_free(root);free(arena);free(text);free(x->vqb);free(x);
+        json_free(root);free(arena);free(text);free(x->vqb);free(x->vq1b);free(x);
         return;
     }
     json_free(root);free(arena);free(text);
@@ -2222,8 +2245,8 @@ static void q38_bind_int4_record(Model *m,Slot *slot,uint8_t *record) {
             Q38Weight *weight=dst[k];q38_weight_free(weight);
             weight->data=codes;weight->x2q=q;weight->scales=scales;weight->rows=rows[k];weight->cols=cols[k];
             weight->elements=(int64_t)rows[k]*cols[k];weight->scale_count=x->scale_count[k];
-            weight->kind=x->lb->vq?Q38_WEIGHT_VQ2:x->lb->gs==32?Q38_WEIGHT_INT2G32:Q38_WEIGHT_LOWBIT16;weight->lbits=x->lb->bits;
-            weight->vqb=x->vqb;
+            weight->kind=x->lb->vq==2?Q38_WEIGHT_VQ1:x->lb->vq?Q38_WEIGHT_VQ2:x->lb->gs==32?Q38_WEIGHT_INT2G32:Q38_WEIGHT_LOWBIT16;
+            weight->lbits=x->lb->bits;weight->vqb=x->vqb;weight->vq1b=x->vq1b;
             codes+=x->code_bytes[k];q+=x->q_bytes[k];scales+=x->scale_count[k];
         }
         return;
@@ -3775,6 +3798,7 @@ static int q38_rows_kind(const Q38Weight *w) {
     if(w->kind==Q38_WEIGHT_INT4G64&&w->scales)return Q38_ROWS_F32;
     if((w->kind==Q38_WEIGHT_INT2G32||w->kind==Q38_WEIGHT_LOWBIT16)&&w->scales&&w->x2q)return Q38_ROWS_X2;
     if(w->kind==Q38_WEIGHT_VQ2&&w->scales&&w->x2q&&w->vqb)return Q38_ROWS_X2;
+    if(w->kind==Q38_WEIGHT_VQ1&&w->scales&&w->x2q&&w->vq1b)return Q38_ROWS_X2;
     if(w->kind==Q38_WEIGHT_GGML&&gq_int_ok(w->gq_type,w->cols)&&gq_row_bytes(w->gq_type,w->cols)>0)return Q38_ROWS_GQ;
     return Q38_ROWS_NONE;
 }
@@ -3805,6 +3829,16 @@ static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
         return;
     }
     const int ng=I/32;
+    if(w->kind==Q38_WEIGHT_VQ1){
+        const size_t cb=vq1_code_bytes(I),qb=vq1_scale_bytes(I);
+        for(int o=r0;o<r1;o++)
+            for(int a0=0;a0<n;a0+=X2_MAX_ROWS){
+                const int k=n-a0<X2_MAX_ROWS?n-a0:X2_MAX_ROWS;
+                vq1_dot(y+(int64_t)a0*ys+o,ys,w->vq1b,(const uint8_t*)w->data+(size_t)o*cb,w->x2q+(size_t)o*qb,
+                        w->scales[o],xq+(size_t)a0*I,dx+(size_t)a0*ng,I,k);
+            }
+        return;
+    }
     if(w->kind==Q38_WEIGHT_VQ2){
         const size_t cb=vq2_code_bytes(I),qb=vq2_scale_bytes(I);
         for(int o=r0;o<r1;o++)

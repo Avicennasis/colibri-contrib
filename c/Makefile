@@ -2200,6 +2200,8 @@ tests/test_lowbit_g16$(EXE): tests/test_lowbit_g16.c lowbit_g16.h int2_g32.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_vq2_g32$(EXE): tests/test_vq2_g32.c vq2_g32.h int2_g32.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_vq1_g64$(EXE): tests/test_vq1_g64.c vq1_g64.h int2_g32.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # The Vulkan weight pool's offset allocator (vk_alloc.h): bookkeeping only, no
 # device, so it is an ordinary gate.

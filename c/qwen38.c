@@ -2987,6 +2987,10 @@ static void q38_vk_tier_start(Model *m,int cap){
     /* a GGUF's types by layer, for the tier when they differ */
     VktFmt *lgu=g_q38_gguf?(VktFmt*)malloc((size_t)c->layers*sizeof(VktFmt)):NULL,
            *ldn=g_q38_gguf?(VktFmt*)malloc((size_t)c->layers*sizeof(VktFmt)):NULL;
+    if(m->x4&&m->x4->lb&&m->x4->lb->vq==2){
+        fprintf(stderr,"[VK] tier qwen38: the vq1 experts have no device form yet; they stay on the CPU\n");
+        free(lgu);free(ldn);return;
+    }
     if(m->x4&&m->x4->lb&&m->x4->lb->vq&&coli_vk_set_vq2_books(&m->x4->vqb->a[0][0],&m->x4->vqb->b[0][0])){
         fprintf(stderr,"[VK] tier qwen38: the device's block table already holds other vq2 codebooks; the experts stay on the CPU\n");
         free(lgu);free(ldn);return;

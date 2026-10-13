@@ -251,7 +251,7 @@ class Int2Convert(unittest.TestCase):
         w = (self.rng.standard_normal((48, 256)) * 0.02).astype(np.float32)
         c, q, d = cv.quantize_lowbit(w, None, fmt)
         self.assertEqual((c.shape, q.shape, d.shape), ((48, 32, 2), (48, 8), (48,)))
-        self.assertEqual((c.dtype, q.dtype, d.dtype), (np.uint8, np.uint8, np.float32))
+        self.assertEqual((c.dtype, q.dtype, d.dtype), (np.uint16, np.uint8, np.float32))
         self.assertTrue(1 <= int(q.min()) and int(q.max()) == 15)
         deq = cv.dequantize_lowbit(c, q, d, fmt)
         err = cv.rel_l2(w, deq)
@@ -276,6 +276,40 @@ class Int2Convert(unittest.TestCase):
         self.assertEqual(geo.record_bytes, 1320960)
         self.assertEqual([t[0].rsplit(".", 1)[-1] for t in geo.tensors("m", 0, 0)][3:6], ["q4"] * 3)
         self.assertEqual(geo.tensors("m", 0, 0)[3][2], [640, 40])
+
+    def test_vq1(self):
+        # vq1_g64.h: 16-vectors of two 1024-entry int8 books, 10-bit indices (a0 b0 .. a3 b3 of four
+        # vectors in 10 bytes, LSB first), a nibble scale per 64; the release's record 821,760 bytes
+        fmt = cv.VQ1G64
+        a8, b8, k = cv.train_vq_books(self.rng.standard_normal((30000, 16)), iters=6, book=1024)
+        self.assertEqual(a8.shape, (1024, 16))
+        self.assertLessEqual(int((np.abs(a8).max(axis=0) + np.abs(b8).max(axis=0)).max()), 127)
+        fmt.set_books(a8, b8, k)
+        w = (self.rng.standard_normal((32, 256)) * 0.02).astype(np.float32)
+        c, q, d = cv.quantize_lowbit(w, None, fmt)
+        self.assertEqual((c.shape, q.shape, d.shape), ((32, 16, 2), (32, 4), (32,)))
+        self.assertLess(int(c.max()), 1024)
+        deq = cv.dequantize_lowbit(c, q, d, fmt)
+        err = cv.rel_l2(w, deq)
+        self.assertTrue(0.35 < err < 0.6, err)   # 1.31 bits a weight on a Gaussian
+        packed, ps = cv.pack_lowbit(c, fmt), cv.pack_scales(q, fmt)
+        self.assertEqual((packed.shape, ps.shape), ((32, 40), (32, 2)))
+        self.assertTrue(np.array_equal(cv.unpack_lowbit(packed, 256, fmt), c))
+        self.assertTrue(np.array_equal(cv.unpack_scales(ps, fmt), q))
+        # the kernel's reading, element by element: group of 64 = 10 bytes, index k at bits 10k
+        r = 7
+        bits = [int.from_bytes(bytes(packed[r, 10 * g:10 * g + 10]), "little") for g in range(4)]
+        idx = lambda v, k: (bits[v // 4] >> (10 * (2 * (v % 4) + k))) & 1023
+        vals = [a8[idx(i // 16, 0), i % 16] + b8[idx(i // 16, 1), i % 16] for i in range(256)]
+        sc = [(ps[r, i // 128] >> (4 * ((i // 64) % 2))) & 15 for i in range(256)]
+        np.testing.assert_allclose(deq[r], np.float64(d[r]) * np.array(sc) * np.array(vals), rtol=1e-12)
+        a = self.rng.standard_normal((256, 16))
+        h = a @ a.T + 0.5 * np.eye(256)
+        g = cv.quantize_lowbit_gptq(w, np.diag(h).astype(np.float32), cv._upper_inv(h), fmt)
+        plain = cv.dequantize_lowbit(*cv.quantize_lowbit(w, np.diag(h).astype(np.float32), fmt), fmt)
+        self.assertLess(out_err(w.astype(np.float64), cv.dequantize_lowbit(*g, fmt), h),
+                        0.8 * out_err(w.astype(np.float64), plain, h))
+        self.assertEqual(cv.Geometry(48, 512, 2560, 640, fmt=fmt).record_bytes, 821760)
 
 
 if __name__ == "__main__":

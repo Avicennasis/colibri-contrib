@@ -148,33 +148,43 @@ class Lowbit:
     vq = False
 
 
-VQ_BOOK, VQ_DIM, VQ_BEAM = 256, 8, 4
+VQ_BEAM = 4
 
 
 class VqFormat(Lowbit):
-    """vq2_g32.h: a row's 8-vectors as a[i] + b[j] of two 256 x 8 int8 codebooks (one index
-    byte each: a0 b0 a1 b1 ..., cols/4 bytes a row), a 4-bit scale per 32 inputs (two to a
-    byte) under one f32 per row. `books` (set_books) holds the codebooks as float64 integers
-    and the factor K they were scaled by: a weight is d * q * (a + b), d = the row scale the
-    quantizer fits over K."""
+    """Vector codes: a row's `vdim`-vectors as a[i] + b[j] of two `book` x `vdim` int8
+    codebooks, a 4-bit scale per `gs` inputs (two to a byte) under one f32 per row.
+    vq2g32 (vq2_g32.h): 8-vectors, 256-entry books, an index byte each (a0 b0 a1 b1 ...,
+    cols/4 bytes a row), a scale per 32. vq1g64 (vq1_g64.h): 16-vectors, 1024-entry books,
+    10-bit indices, the eight of four vectors (a0 b0 .. a3 b3) in 10 bytes, LSB first
+    (cols/64 x 10 bytes a row), a scale per 64. `books` (set_books) holds the codebooks as
+    float64 integers and the factor K they were scaled by: a weight is d * q * (a + b), d =
+    the row scale the quantizer fits over K."""
     vq = True
 
-    def __init__(self):
-        super().__init__("vq2g32", 2, (-1.0, 1.0), 32, 15, "vq2-2x256x8-int8")
+    def __init__(self, name, vdim, book, gs, codes):
+        super().__init__(name, 2, (-1.0, 1.0), gs, 15, codes)
+        self.vdim, self.book = vdim, book
+        self.ibits = int(book - 1).bit_length()
         self.books = None
 
+    def row_code_bytes(self, cols):
+        return cols // self.vdim * 2 * self.ibits // 8
+
     def set_books(self, a8, b8, k):
-        a8, b8 = np.asarray(a8, np.int64).reshape(VQ_BOOK, VQ_DIM), np.asarray(b8, np.int64).reshape(VQ_BOOK, VQ_DIM)
+        shape = (self.book, self.vdim)
+        a8, b8 = np.asarray(a8, np.int64).reshape(shape), np.asarray(b8, np.int64).reshape(shape)
         if int((np.abs(a8).max(axis=0) + np.abs(b8).max(axis=0)).max()) > 127:
-            raise ValueError("vq2 codebooks: some a + b leaves int8")
+            raise ValueError(f"{self.name} codebooks: some a + b leaves int8")
         self.books = (a8.astype(np.float64), b8.astype(np.float64), float(k))
 
 
 INT2G32 = Lowbit("int2g32", 2, (-10, -3, 3, 10), 32, 255, CODES2)
 INT2G16 = Lowbit("int2g16", 2, (-10, -3, 3, 10), 16, 15, CODES2)
 INT3G16 = Lowbit("int3g16", 3, (-26, -16, -9, -3, 3, 9, 16, 26), 16, 15, "planar128-3bit-lv26")
-VQ2G32 = VqFormat()
-LOWBIT = {f.name: f for f in (INT2G32, INT2G16, INT3G16, VQ2G32)}
+VQ2G32 = VqFormat("vq2g32", 8, 256, 32, "vq2-2x256x8-int8")
+VQ1G64 = VqFormat("vq1g64", 16, 1024, 64, "vq1-2x1024x16-int8")
+LOWBIT = {f.name: f for f in (INT2G32, INT2G16, INT3G16, VQ2G32, VQ1G64)}
 FP8_BLOCK = 128
 
 _FLOAT_DTYPES = {"BF16": 2, "F16": 2, "F32": 4}
@@ -398,11 +408,11 @@ def quantize_lowbit_gptq(w, imp, U, fmt=INT2G32, iters=6, batch=128, margin=1.4)
 
 
 def _vq_search(xw, aw, bw, beam):
-    """xw [R, 8] targets and aw, bw [256, 8] the codebooks, all in whitened coordinates: the
+    """xw [R, D] targets and aw, bw [K, D] the codebooks, all in whitened coordinates: the
     pair (i, j) with the least |xw - aw[i] - bw[j]|^2 among the `beam` nearest aw[i]."""
     d0 = (aw * aw).sum(1)[None, :] - 2 * xw @ aw.T
     top = np.argpartition(d0, beam, axis=1)[:, :beam] if beam < len(aw) else np.broadcast_to(np.arange(len(aw)), d0.shape)
-    res = xw[:, None, :] - aw[top]                                           # [R, beam, 8]
+    res = xw[:, None, :] - aw[top]                                           # [R, beam, D]
     d1 = (bw * bw).sum(1)[None, None, :] - 2 * res @ bw.T                     # + |res|^2, per (row, candidate)
     d1 += (res * res).sum(2)[:, :, None]
     flat = d1.reshape(len(xw), -1).argmin(1)
@@ -411,8 +421,8 @@ def _vq_search(xw, aw, bw, beam):
 
 
 def quantize_vq_gptq(w, U, fmt=VQ2G32, beam=VQ_BEAM, batch=128):
-    """w f32 [R, C] (C % 32 == 0) -> (codes u8 [R, C/8, 2], q u8 [R, C/32], d f32 [R]) with
-    w ~ d[r] * q[r, g] * (A[a] + B[b]): GPTQ over blocks of 8 columns. U is the upper
+    """w f32 [R, C] (C % gs == 0) -> (codes u16 [R, C/D, 2], q u8 [R, C/gs], d f32 [R]) with
+    w ~ d[r] * q[r, g] * (A[a] + B[b]): GPTQ over blocks of D columns (fmt.vdim). U is the upper
     Cholesky factor of H^-1; a block's vectors are searched in the coordinates U_BB^-1
     whitens (|(w - s c) U_BB^-1|, the block's cost once the later columns absorb its error),
     and the error is carried on as W[:, after] -= (delta U_BB^-1) U[B, after], lazily per
@@ -420,32 +430,33 @@ def quantize_vq_gptq(w, U, fmt=VQ2G32, beam=VQ_BEAM, batch=128):
     weights' RMS over d K, fixed when its first block comes up; d = the row's largest group
     RMS / (15 K), K the codebooks' scale (fmt.books)."""
     A, B, K = fmt.books
+    D, G = fmt.vdim, fmt.gs
     W = w.astype(np.float64).copy()
     rows, cols = W.shape
     top = float(fmt.smax)
-    rms = np.sqrt((W.reshape(rows, cols // 32, 32) ** 2).mean(axis=2))
+    rms = np.sqrt((W.reshape(rows, cols // G, G) ** 2).mean(axis=2))
     d = np.maximum(rms.max(axis=1) / (top * K), 1e-30).astype(np.float32).astype(np.float64)   # the stored f32
-    codes = np.zeros((rows, cols // VQ_DIM, 2), np.uint8)
-    qs = np.zeros((rows, cols // 32), np.uint8)
+    codes = np.zeros((rows, cols // D, 2), np.uint16)
+    qs = np.zeros((rows, cols // G), np.uint8)
     s = np.ones((rows, 1))
     for b0 in range(0, cols, batch):
         b1 = min(b0 + batch, cols)
         W1 = W[:, b0:b1].copy()
         E1 = np.zeros_like(W1)
-        for c0 in range(b0, b1, VQ_DIM):
+        for c0 in range(b0, b1, D):
             i = c0 - b0
-            if c0 % 32 == 0:
-                q = np.clip(np.rint(np.sqrt((W1[:, i:i + 32] ** 2).mean(axis=1)) / (d * K)), 1, top)
-                qs[:, c0 // 32] = q
+            if c0 % G == 0:
+                q = np.clip(np.rint(np.sqrt((W1[:, i:i + G] ** 2).mean(axis=1)) / (d * K)), 1, top)
+                qs[:, c0 // G] = q
                 s = (d * q)[:, None]
-            ubb = U[c0:c0 + VQ_DIM, c0:c0 + VQ_DIM]
+            ubb = U[c0:c0 + D, c0:c0 + D]
             m = np.linalg.inv(ubb)
-            ia, ib = _vq_search((W1[:, i:i + VQ_DIM] / s) @ m, A @ m, B @ m, beam)
-            codes[:, c0 // VQ_DIM, 0], codes[:, c0 // VQ_DIM, 1] = ia, ib
-            e = (W1[:, i:i + VQ_DIM] - (A[ia] + B[ib]) * s) @ m
-            E1[:, i:i + VQ_DIM] = e
-            if i + VQ_DIM < b1 - b0:
-                W1[:, i + VQ_DIM:] -= e @ U[c0:c0 + VQ_DIM, c0 + VQ_DIM:b1]
+            ia, ib = _vq_search((W1[:, i:i + D] / s) @ m, A @ m, B @ m, beam)
+            codes[:, c0 // D, 0], codes[:, c0 // D, 1] = ia, ib
+            e = (W1[:, i:i + D] - (A[ia] + B[ib]) * s) @ m
+            E1[:, i:i + D] = e
+            if i + D < b1 - b0:
+                W1[:, i + D:] -= e @ U[c0:c0 + D, c0 + D:b1]
         if b1 < cols:
             W[:, b1:] -= E1 @ U[b0:b1, b1:]
     return codes, qs, d.astype(np.float32)
@@ -454,15 +465,15 @@ def quantize_vq_gptq(w, U, fmt=VQ2G32, beam=VQ_BEAM, batch=128):
 def dequantize_vq(codes, q, d, fmt=VQ2G32):
     A, B, _ = fmt.books
     rows = codes.shape[0]
-    v = (A[codes[:, :, 0]] + B[codes[:, :, 1]]).reshape(rows, -1, 32)
+    v = (A[codes[:, :, 0]] + B[codes[:, :, 1]]).reshape(rows, -1, fmt.gs)
     return (v * (d[:, None].astype(np.float64) * q.astype(np.float64))[..., None]).reshape(rows, -1)
 
 
-def _vq_vectors(w):
-    """a matrix's 8-vectors over the RMS of their group of 32 (what the codebooks code)"""
+def _vq_vectors(w, fmt=VQ2G32):
+    """a matrix's D-vectors over the RMS of their scale group (what the codebooks code)"""
     rows, cols = w.shape
-    g = w.reshape(rows, cols // 32, 32).astype(np.float64)
-    return (g / (np.sqrt((g * g).mean(axis=2, keepdims=True)) + 1e-12)).reshape(-1, VQ_DIM)
+    g = w.reshape(rows, cols // fmt.gs, fmt.gs).astype(np.float64)
+    return (g / (np.sqrt((g * g).mean(axis=2, keepdims=True)) + 1e-12)).reshape(-1, fmt.vdim)
 
 
 def _vq_nearest(x, c):
@@ -486,13 +497,13 @@ def _vq_kmeans(x, k, rng, iters=25):
     return c
 
 
-def train_vq_books(sample, seed=38, iters=25):
-    """sample [N, 8] normalized vectors -> (a8, b8 int64 [256, 8], K): k-means for A, then
+def train_vq_books(sample, seed=38, iters=25, book=256):
+    """sample [N, D] normalized vectors -> (a8, b8 int64 [book, D], K): k-means for A, then
     for what A leaves; both times K = 127 / max over coordinates of (max|A| + max|B|), rounded,
     so any a + b is an int8 (K lowered until the rounding keeps that too)."""
     rng = np.random.default_rng(seed)
-    a = _vq_kmeans(sample, VQ_BOOK, rng, iters)
-    b = _vq_kmeans(sample - a[_vq_nearest(sample, a)], VQ_BOOK, rng, iters)
+    a = _vq_kmeans(sample, book, rng, iters)
+    b = _vq_kmeans(sample - a[_vq_nearest(sample, a)], book, rng, iters)
     k = 127.0 / float((np.abs(a).max(axis=0) + np.abs(b).max(axis=0)).max())
     while True:
         a8, b8 = np.rint(a * k).astype(np.int64), np.rint(b * k).astype(np.int64)
@@ -501,7 +512,7 @@ def train_vq_books(sample, seed=38, iters=25):
         k *= 0.999
 
 
-def vq_book_sample(src, experts_per_layer=4, layer_step=4, vectors=400000, seed=38):
+def vq_book_sample(src, experts_per_layer=4, layer_step=4, vectors=400000, seed=38, fmt=VQ2G32):
     """the codebooks' training vectors: `experts_per_layer` experts of every `layer_step`-th
     layer, chosen with `seed`, their three matrices, an equal share of vectors from each"""
     rng = np.random.default_rng(seed)
@@ -512,7 +523,7 @@ def vq_book_sample(src, experts_per_layer=4, layer_step=4, vectors=400000, seed=
     out = []
     for layer, expert in picks:
         for k in range(3):
-            v = _vq_vectors(src.matrix(layer, expert, k))
+            v = _vq_vectors(src.matrix(layer, expert, k), fmt)
             out.append(v[rng.choice(len(v), min(share, len(v)), replace=False)])
     return np.concatenate(out), picks
 
@@ -704,8 +715,16 @@ def pack_lowbit(codes, fmt):
     pack_int2 does (32 bytes), then for 3 bits the high bits (16 bytes: byte k holds
     elements k, k+16, ..., k+112 in bits 0..7, lowbit_g16.h)."""
     rows, cols = codes.shape[0], codes.shape[1]
-    if fmt.vq:   # a0 b0 a1 b1 ...
-        return np.ascontiguousarray(codes.reshape(rows, -1))
+    if fmt.vq:   # a0 b0 a1 b1 ...: a byte each, or 10 bits each, eight to 10 bytes, LSB first
+        flat = codes.reshape(rows, -1)
+        if fmt.ibits == 8:
+            return np.ascontiguousarray(flat.astype(np.uint8))
+        e = flat.reshape(rows, -1, 8).astype(np.uint64)
+        lo = sum(e[:, :, k] << np.uint64(10 * k) for k in range(6)) | ((e[:, :, 6] & np.uint64(15)) << np.uint64(60))
+        hi = ((e[:, :, 6] >> np.uint64(4)) | (e[:, :, 7] << np.uint64(6))).astype(np.uint16)
+        out = np.concatenate([lo.astype("<u8").view(np.uint8).reshape(rows, -1, 8),
+                              hi.astype("<u2").view(np.uint8).reshape(rows, -1, 2)], axis=2)
+        return np.ascontiguousarray(out.reshape(rows, -1))
     low = pack_int2(codes & 3)
     if fmt.bits == 2:
         return low
@@ -734,7 +753,16 @@ def dequantize_lowbit(codes, q, d, fmt):
 def unpack_lowbit(packed, cols, fmt):
     """pack_lowbit's inverse: u8 [R, row_code_bytes] -> codes [R, C] ([R, C/8, 2] for vq)"""
     if fmt.vq:
-        return packed.reshape(packed.shape[0], cols // VQ_DIM, 2).astype(np.uint8)
+        rows = packed.shape[0]
+        if fmt.ibits == 8:
+            return packed.reshape(rows, cols // fmt.vdim, 2).astype(np.uint16)
+        g = packed.reshape(rows, -1, 10)
+        lo = np.ascontiguousarray(g[:, :, :8]).view("<u8")[..., 0]
+        hi = np.ascontiguousarray(g[:, :, 8:]).view("<u2")[..., 0].astype(np.uint64)
+        idx = [(lo >> np.uint64(10 * k)) & np.uint64(1023) for k in range(6)]
+        idx.append(((lo >> np.uint64(60)) | (hi << np.uint64(4))) & np.uint64(1023))
+        idx.append((hi >> np.uint64(6)) & np.uint64(1023))
+        return np.stack(idx, axis=2).reshape(rows, cols // fmt.vdim, 2).astype(np.uint16)
     rows, nb = packed.shape[0], cols // 128
     blk = packed.reshape(rows, nb, 48 if fmt.bits == 3 else 32)
     low = blk[:, :, :32]
@@ -1011,7 +1039,7 @@ def _init_worker(model_dir, act_path=None, bits=4, cov_path=None, dump_path=None
                  rescale=False, target_path=None, dump_tokens=None, books=None):
     global _SOURCE, _ACT, _BITS, _COV, _DUMP, _FMT, _ALPHA, _RESCALE, _TARGET
     if books is not None:
-        VQ2G32.set_books(*books)
+        LOWBIT[fmt_name].set_books(*books)
     _SOURCE = Source(model_dir)
     _ACT = ActStats(act_path) if act_path else None
     _BITS = bits
@@ -1144,8 +1172,10 @@ def new_index(src):
             "source": src.fingerprint(),
         }
         if g.fmt.vq:
-            out["quantizer"] = (f"per 8 inputs one vector of two 256 x 8 int8 codebooks, the pair searched with a beam "
-                                f"of {VQ_BEAM}; a 4-bit scale per 32 (the group's RMS) under the row's largest (uniform weights)")
+            f = g.fmt
+            out["quantizer"] = (f"per {f.vdim} inputs one vector of two {f.book} x {f.vdim} int8 codebooks, the pair searched "
+                                f"with a beam of {VQ_BEAM}; a 4-bit scale per {f.gs} (the group's RMS) under the row's largest "
+                                f"(uniform weights)")
         return out
     return {
         "format": FORMAT, "version": VERSION, "complete": False,
@@ -1255,7 +1285,7 @@ def rescale_sidecar(model_dir, out_dir, dump_path, fmt_name, workers=1, layers=N
         index = json.load(f)
     if index.get("format") != g.fmt.format or index.get("record_bytes") != g.record_bytes or not index.get("complete"):
         sys.exit(f"{out_dir}: not a complete {fmt_name} sidecar of this snapshot")
-    books = index_books(index) if g.fmt.vq else None
+    books = index_books(index, g.fmt) if g.fmt.vq else None
     done = set(index.get("output_rescale", []))
     todo = [i for i in parse_layers(layers, g.layers) if i not in done]
     pool = None
@@ -1298,14 +1328,14 @@ def rescale_sidecar(model_dir, out_dir, dump_path, fmt_name, workers=1, layers=N
     print(f"{out_dir}: output rescale on {len(done)}/{g.layers} layers")
 
 
-def index_books(index):
+def index_books(index, fmt=VQ2G32):
     """(a8, b8, K) from a vq sidecar's index.json"""
     cb = index.get("codebooks") or {}
+    shape = (fmt.book, fmt.vdim)
     try:
-        return (np.array(cb["a"], np.int64).reshape(VQ_BOOK, VQ_DIM), np.array(cb["b"], np.int64).reshape(VQ_BOOK, VQ_DIM),
-                float(cb["scale"]))
+        return (np.array(cb["a"], np.int64).reshape(shape), np.array(cb["b"], np.int64).reshape(shape), float(cb["scale"]))
     except (KeyError, ValueError, TypeError):
-        sys.exit("index.json: no vq codebooks (a, b: 256 x 8, scale)")
+        sys.exit(f"index.json: no vq codebooks (a, b: {fmt.book} x {fmt.vdim}, scale)")
 
 
 def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_path=None, bits=4, cov_path=None,
@@ -1367,8 +1397,8 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
                      f"activation-weighted squared error (Q38_ACT_STATS {os.path.basename(act_path)}, "
                      f"{act.rows} expert rows)") if act else None
     if quantizer and g.fmt and g.fmt.vq:
-        quantizer = quantizer.replace(f"{g.fmt.name}, ", f"{g.fmt.name} (8-vectors of two int8 codebooks, beam "
-                                                         f"{VQ_BEAM}, GPTQ over blocks of 8 columns), ", 1)
+        quantizer = quantizer.replace(f"{g.fmt.name}, ", f"{g.fmt.name} ({g.fmt.vdim}-vectors of two int8 codebooks, beam "
+                                                         f"{VQ_BEAM}, GPTQ over blocks of {g.fmt.vdim} columns), ", 1)
     if quantizer and index["done"] and index.get("quantizer") != quantizer:
         sys.exit(f"{out_dir}: started with another quantizer; give a new --out")
     if quantizer:
@@ -1376,13 +1406,13 @@ def convert(model_dir, out_dir=None, workers=1, layers=None, plan=False, act_pat
     books = None
     if g.fmt and g.fmt.vq:
         if "codebooks" in index:   # a resumed run keeps the books its layers were coded with
-            books = index_books(index)
+            books = index_books(index, g.fmt)
         else:
             started = time.time()
-            sample, picks = vq_book_sample(src)
-            books = train_vq_books(sample)
+            sample, picks = vq_book_sample(src, fmt=g.fmt)
+            books = train_vq_books(sample, book=g.fmt.book)
             index["codebooks"] = {"a": books[0].ravel().tolist(), "b": books[1].ravel().tolist(), "scale": books[2],
-                                  "fitted_on": f"{len(sample)} 8-vectors of {len(picks)} experts "
+                                  "fitted_on": f"{len(sample)} {g.fmt.vdim}-vectors of {len(picks)} experts "
                                                f"(layers {picks[0][0]}..{picks[-1][0]})"}
             print(f"  vq codebooks: k-means on {len(sample)} vectors of {len(picks)} experts in "
                   f"{time.time() - started:.0f}s, int8 scale {books[2]:.2f}", flush=True)
