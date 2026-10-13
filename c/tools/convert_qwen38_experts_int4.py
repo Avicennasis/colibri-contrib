@@ -409,7 +409,9 @@ def quantize_lowbit_gptq(w, imp, U, fmt=INT2G32, iters=6, batch=128, margin=1.4)
 
 def _vq_search(xw, aw, bw, beam):
     """xw [R, D] targets and aw, bw [K, D] the codebooks, all in whitened coordinates: the
-    pair (i, j) with the least |xw - aw[i] - bw[j]|^2 among the `beam` nearest aw[i]."""
+    pair (i, j) with the least |xw - aw[i] - bw[j]|^2 among the `beam` nearest aw[i]. In
+    float32: only the choice comes out of here, the caller rebuilds the vectors exactly."""
+    xw, aw, bw = xw.astype(np.float32), aw.astype(np.float32), bw.astype(np.float32)
     d0 = (aw * aw).sum(1)[None, :] - 2 * xw @ aw.T
     top = np.argpartition(d0, beam, axis=1)[:, :beam] if beam < len(aw) else np.broadcast_to(np.arange(len(aw)), d0.shape)
     res = xw[:, None, :] - aw[top]                                           # [R, beam, D]
