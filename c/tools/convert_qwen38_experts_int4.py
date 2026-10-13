@@ -578,12 +578,17 @@ class Dump:
     def _load(self, layer):
         if self._layer == layer:
             return
-        raw = np.fromfile(os.path.join(self.dir, f"layer-{layer:03d}.bin"), np.uint8)
-        if raw[:8].tobytes() != b"Q38DMP1\0":
-            raise ValueError(f"{self.dir}: layer {layer} is not a Q38_ACT_DUMP file")
-        h, k = struct.unpack("<2i", raw[8:16].tobytes())
-        width = 8 * k + 4 * h
-        rec = raw[16:16 + (len(raw) - 16) // width * width].reshape(-1, width)   # whole records only
+        recs = []   # several dumps (comma-separated directories, e.g. two calibration sets): their records in turn
+        for d in self.dir.split(","):
+            raw = np.fromfile(os.path.join(d, f"layer-{layer:03d}.bin"), np.uint8)
+            if raw[:8].tobytes() != b"Q38DMP1\0":
+                raise ValueError(f"{d}: layer {layer} is not a Q38_ACT_DUMP file")
+            h, k = struct.unpack("<2i", raw[8:16].tobytes())
+            width = 8 * k + 4 * h
+            if recs and recs[0].shape[1] != width:
+                raise ValueError(f"{d}: layer {layer} has another geometry than {self.dir.split(',')[0]}'s")
+            recs.append(raw[16:16 + (len(raw) - 16) // width * width].reshape(-1, width))   # whole records only
+        rec = recs[0] if len(recs) == 1 else np.concatenate(recs)
         if self.max_tokens:
             rec = rec[:self.max_tokens]
         self.ids = np.ascontiguousarray(rec[:, :4 * k]).view(np.int32)
@@ -1470,7 +1475,7 @@ def main():
                                                         "instead (qwen38: Q38_EXPERT_INT2=1)")
     ap.add_argument("--cov", help="the engine's Q38_ACT_COV file (with --int2): gate and up quantized with the "
                                   "error carried column by column under the layer's input correlations")
-    ap.add_argument("--dump", help="the engine's Q38_ACT_DUMP directory (with --int2): every expert fitted with GPTQ "
+    ap.add_argument("--dump", help="the engine's Q38_ACT_DUMP directory, or several comma-separated (with --int2): every expert fitted with GPTQ "
                                    "to the inputs it really received, down to the SwiGLU outputs of its quantized gate/up")
     ap.add_argument("--lowbit", choices=sorted(LOWBIT), help="a low-bit format: int2g32 (= --int2), int2g16 or int3g16 "
                                                             "(groups of 16 with 4-bit scales), vq2g32 (8-vectors of two "
