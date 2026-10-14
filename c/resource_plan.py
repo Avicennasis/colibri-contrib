@@ -1709,7 +1709,7 @@ def analyze_model(model):
 
 QWEN38_INT4_SIDECAR = "experts-int4g64"
 QWEN38_INT2_SIDECAR = "experts-int2g32"
-QWEN38_LOWBIT = ("int2g32", "int2g16", "int3g16")   # Q38_EXPERT_LOWBIT: experts-<name>/ (qwen38_core.h)
+QWEN38_LOWBIT = ("int2g32", "int2g16", "int3g16", "vq2g32", "vq1g64")   # Q38_EXPERT_LOWBIT: experts-<name>/ (qwen38_core.h)
 
 
 def qwen38_int4_sidecar(info):
@@ -1724,13 +1724,15 @@ def qwen38_int4_sidecar(info):
     sidecar that disagrees with it. Returns the analysis unchanged when the
     sidecar does not apply, otherwise a copy priced with its records and
     marked `qwen38_int4_experts`: no FP8 scale bank is built either.
-    Q38_EXPERT_LOWBIT=int2g32|int2g16|int3g16 (Q38_EXPERT_INT2=1: int2g32) makes the
-    engine load experts-<name>/ instead (1.40 MB a record at 2 bits, 2.01 MB at 3 on the
-    release), priced the same way.
+    Q38_EXPERT_LOWBIT=<name> (int2g32, int2g16, int3g16, vq2g32, vq1g64; Q38_EXPERT_INT2=1:
+    int2g32) makes the engine load experts-<name>/ instead (1.40 MB a record at 2 bits,
+    2.01 MB at 3, 1.32 MB vq2, 0.82 MB vq1 on the release), priced the same way: by the
+    record its index states, whatever the name, so a format this list does not know yet is
+    never priced with the FP8 bytes (a 188-expert cap where RAM held 512, 2026-10-14).
     """
     resolved = info["resolved_family"]
     lowbit = (os.environ.get("Q38_EXPERT_LOWBIT") or "").strip()
-    if lowbit not in QWEN38_LOWBIT:
+    if not re.fullmatch(r"[a-z0-9]+", lowbit):   # a sidecar name; its index is checked below
         lowbit = "int2g32" if os.environ.get("Q38_EXPERT_INT2") == "1" else ""
     if resolved.descriptor.id != "qwen38" or (os.environ.get("Q38_EXPERT_INT4") == "0" and not lowbit):
         return info

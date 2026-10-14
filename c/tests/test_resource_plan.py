@@ -1463,6 +1463,18 @@ memInfo.free:                     23.50 GB (97%)
             with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": "int3g16"}):
                 plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
             self.assertEqual(plan["model"]["per_cap_bytes"], 86)
+            # the vector formats, and any name with a complete index of its own: priced by its
+            # record, never by the FP8 bytes (vq2 on the release once got a cap for 4.9 MB experts)
+            for name, record in (("vq2g32", 53), ("vq1g64", 33), ("newfmt7", 41)):
+                (self.model / f"experts-{name}").mkdir()
+                (self.model / f"experts-{name}" / "index.json").write_text(
+                    json.dumps(dict(geometry, format=f"colibri.qwen38.experts-{name}", record_bytes=record)))
+                with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": name}):
+                    plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+                self.assertEqual((name, plan["model"]["per_cap_bytes"]), (name, record))
+            with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": "nosidecar"}):   # no index: not priced as one (the engine refuses it)
+                plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertNotIn("qwen38_int4_experts", plan["model"])
             os.environ["Q38_EXPERT_INT2"] = "1"
             # the int2 index of another format or still being written is not priced
             (self.model / "experts-int2g32" / "index.json").write_text(
