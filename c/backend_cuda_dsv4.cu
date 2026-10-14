@@ -1296,9 +1296,18 @@ extern "C" int dsv4_cuda_graph_end_pair(int primary,int peer,Dsv4CudaGraph **pg,
 }
 extern "C" int dsv4_cuda_graph_launch(Dsv4CudaGraph*g){Dev*c=g?ctx(g->device):nullptr;return c&&ok(cudaSetDevice(g->device),"select graph device")&&ok(cudaGraphLaunch(g->exec,c->stream),"launch graph");}
 extern "C" void dsv4_cuda_graph_free(Dsv4CudaGraph*g){if(!g)return;cudaSetDevice(g->device);if(g->exec)cudaGraphExecDestroy(g->exec);if(g->graph)cudaGraphDestroy(g->graph);free(g);}
+/* Host->device copy ordered on the device's compute stream, then drained.
+ * A plain cudaMemcpy runs on the legacy stream, which the non-blocking
+ * c->stream does not wait for, and from pageable memory it may return before
+ * the DMA has landed: a kernel queued on c->stream right after could read a
+ * half-written decode mirror, and decode output then drifted with the mirror
+ * cache's recycling timing (expert slabs past the 20 GiB page-lock cap,
+ * or with DSV4_CUDA_PIN_HOST=0, are pageable). Same blocking contract for the caller as cudaMemcpy. */
+static int h2d(Dev*c,void*dst,const void*src,size_t n,const char*what){
+    return ok(cudaMemcpyAsync(dst,src,n,cudaMemcpyHostToDevice,c->stream),what)&&ok(cudaStreamSynchronize(c->stream),what);}
 static int upload(Dsv4CudaTensor **pt,const void *w,size_t wb,const uint8_t *sc,size_t sb,int O,int I,int d,int fmt){if(*pt)return 1;Dev *c=ctx(d);if(!c||!ok(cudaSetDevice(d),"select upload device"))return 0;Dsv4CudaTensor *t=(Dsv4CudaTensor*)calloc(1,sizeof(*t));t->O=O;t->I=I;t->device=d;t->fmt=fmt;t->bytes=wb+sb;
-    if(!ok(cudaMalloc(&t->w,wb),"weight allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_w=1;if(!ok(cudaMemcpy(t->w,w,wb,cudaMemcpyHostToDevice),"weight upload")){dsv4_cuda_tensor_free(t);return 0;}
-    if(sb){if(!ok(cudaMalloc(&t->scale,sb),"scale allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_scale=1;if(!ok(cudaMemcpy(t->scale,sc,sb,cudaMemcpyHostToDevice),"scale upload")){dsv4_cuda_tensor_free(t);return 0;}}
+    if(!ok(cudaMalloc(&t->w,wb),"weight allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_w=1;if(!h2d(c,t->w,w,wb,"weight upload")){dsv4_cuda_tensor_free(t);return 0;}
+    if(sb){if(!ok(cudaMalloc(&t->scale,sb),"scale allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_scale=1;if(!h2d(c,t->scale,sc,sb,"scale upload")){dsv4_cuda_tensor_free(t);return 0;}}
 #ifdef COLI_DSV4_DEEPGEMM
     if((fmt==8||fmt==9)&&O%128==0&&I%128==0){size_t db=(size_t)O*(I/128/4)*sizeof(int);if(!ok(cudaMalloc(&t->dg_scale,db),"dense DeepGEMM scale allocation")){dsv4_cuda_tensor_free(t);return 0;}t->own_dg_scale=1;
         if(fmt==9){int groups=O/1024;dg_pack_batched_scale<<<(O*(I/128/4)+255)/256,256,0,c->stream>>>(t->dg_scale,t->scale,O/groups,I/128,groups);}
@@ -1312,21 +1321,19 @@ extern "C" int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t,const uint8_t*w,const uin
     return 1;}
 /* In-place refill of an existing fp4 mirror with a same-shape expert: no
  * cudaFree/cudaMalloc churn, DMA from page-locked slabs when possible. The
- * copies are stream-ordered; sync=1 drains before returning (needed when the
- * host slab may be released before the next stream sync). */
+ * copies are ordered on c->stream from pinned AND pageable slabs (a pageable
+ * cudaMemcpyAsync stages the source before it returns, so the slab may be
+ * released at once); sync=1 drains before returning. A legacy-stream
+ * cudaMemcpy here was not ordered against the kernels on c->stream (see h2d). */
 static bool host_pinned(const void*p,size_t len);
 extern "C" int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t,const uint8_t*w,const uint8_t*s,int O,int I,int sync){
     if(!t||!w||!s||t->fmt!=4||t->O!=O||t->I!=I||!t->own_w||!t->own_scale||!t->w||!t->scale)return 0;
     Dev*c=ctx(t->device);if(!c||!ok(cudaSetDevice(t->device),"select refill device"))return 0;
     size_t wb=(size_t)O*I/2,sb=(size_t)O*I/32;
-    if(host_pinned(w,wb)&&host_pinned(s,sb)){
-        if(!ok(cudaMemcpyAsync(t->w,w,wb,cudaMemcpyHostToDevice,c->stream),"refill weight upload")||
-           !ok(cudaMemcpyAsync(t->scale,s,sb,cudaMemcpyHostToDevice,c->stream),"refill scale upload"))return 0;
-        if(sync&&!ok(cudaStreamSynchronize(c->stream),"refill drain"))return 0;
-    }else{
-        if(!ok(cudaMemcpy(t->w,w,wb,cudaMemcpyHostToDevice),"refill weight upload")||
-           !ok(cudaMemcpy(t->scale,s,sb,cudaMemcpyHostToDevice),"refill scale upload"))return 0;
-    }
+    if(host_pinned(w,wb))host_pinned(s,sb);   /* page-lock the slab when the cap allows: pure DMA then */
+    if(!ok(cudaMemcpyAsync(t->w,w,wb,cudaMemcpyHostToDevice,c->stream),"refill weight upload")||
+       !ok(cudaMemcpyAsync(t->scale,s,sb,cudaMemcpyHostToDevice,c->stream),"refill scale upload"))return 0;
+    if(sync&&!ok(cudaStreamSynchronize(c->stream),"refill drain"))return 0;
     return 1;
 }
 extern "C" int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t*w,int O,int I,int d){return upload(t,w,(size_t)O*I*2,nullptr,0,O,I,d,16);}
@@ -1398,10 +1405,10 @@ extern "C" Dsv4CudaKvCache *dsv4_cuda_kv_create(int device, int window, int dim,
                 !ok(cudaMalloc(&k->rope_sin, rb), "RoPE sin allocation") ||
                 !ok(cudaMalloc(&k->comp_cos, rb), "compress RoPE cos allocation") ||
                 !ok(cudaMalloc(&k->comp_sin, rb), "compress RoPE sin allocation") ||
-                !ok(cudaMemcpy(k->rope_cos, cosv, rb, cudaMemcpyHostToDevice), "RoPE cos upload") ||
-                !ok(cudaMemcpy(k->rope_sin, sinv, rb, cudaMemcpyHostToDevice), "RoPE sin upload") ||
-                !ok(cudaMemcpy(k->comp_cos, ccos, rb, cudaMemcpyHostToDevice), "compress RoPE cos upload") ||
-                !ok(cudaMemcpy(k->comp_sin, csin, rb, cudaMemcpyHostToDevice), "compress RoPE sin upload")))) {
+                !h2d(c, k->rope_cos, cosv, rb, "RoPE cos upload") ||
+                !h2d(c, k->rope_sin, sinv, rb, "RoPE sin upload") ||
+                !h2d(c, k->comp_cos, ccos, rb, "compress RoPE cos upload") ||
+                !h2d(c, k->comp_sin, csin, rb, "compress RoPE sin upload")))) {
         dsv4_cuda_kv_free(k);
         return nullptr;
     }
@@ -1892,8 +1899,8 @@ extern "C" Dsv4CudaExpertSet *dsv4_cuda_expert_set_create(Dsv4CudaTensor *const 
     }
     Dsv4CudaExpertSet *set=(Dsv4CudaExpertSet*)calloc(1,sizeof(*set));if(!set){free(host);return nullptr;}
     set->count=count;set->device=device;set->H=H;set->I=I;set->sg=sg;set->su=su;set->sd=sd;
-    size_t bytes=(size_t)3*count*sizeof(*host);if(!ok(cudaMalloc(&set->table,bytes),"expert table allocation")||
-       !ok(cudaMemcpy(set->table,host,bytes,cudaMemcpyHostToDevice),"expert table upload")){free(host);dsv4_cuda_expert_set_free(set);return nullptr;}
+    size_t bytes=(size_t)3*count*sizeof(*host);Dev*tc=ctx(device);if(!tc||!ok(cudaMalloc(&set->table,bytes),"expert table allocation")||
+       !h2d(tc,set->table,host,bytes,"expert table upload")){free(host);dsv4_cuda_expert_set_free(set);return nullptr;}
     free(host);return set;
 }
 static Dsv4CudaTensor *expert_view(uint8_t*w,uint8_t*scale,int O,int I,int device){
@@ -2046,12 +2053,14 @@ extern "C" int dsv4_cuda_expert_bank_upload_tp2(Dsv4CudaExpertSet*set,int e,int 
     size_t w1=(size_t)J*row_w,s1=(size_t)J*row_s,w2=(size_t)H*(J/2),s2=(size_t)H*(J/32);
     uint8_t*fc1=set->bank_fc1+(size_t)e*2*w1,*fc1s=set->bank_fc1_scale+(size_t)e*2*s1;
     uint8_t*fc2=set->bank_fc2+(size_t)e*w2,*fc2s=set->bank_fc2_scale+(size_t)e*s2;
-    if(!ok(cudaMemcpy(fc1,gw+(size_t)rank*w1,w1,cudaMemcpyHostToDevice),"TP2 expert gate upload")||
-       !ok(cudaMemcpy(fc1+w1,uw+(size_t)rank*w1,w1,cudaMemcpyHostToDevice),"TP2 expert up upload")||
-       !ok(cudaMemcpy(fc1s,gs+(size_t)rank*s1,s1,cudaMemcpyHostToDevice),"TP2 expert gate scale upload")||
-       !ok(cudaMemcpy(fc1s+s1,us+(size_t)rank*s1,s1,cudaMemcpyHostToDevice),"TP2 expert up scale upload")||
-       !ok(cudaMemcpy2D(fc2,J/2,dw+(size_t)rank*(J/2),I/2,J/2,H,cudaMemcpyHostToDevice),"TP2 expert down upload")||
-       !ok(cudaMemcpy2D(fc2s,J/32,ds+(size_t)rank*(J/32),I/32,J/32,H,cudaMemcpyHostToDevice),"TP2 expert down scale upload"))return 0;
+    Dev*tc=ctx(set->device);if(!tc)return 0;cudaStream_t ts=tc->stream;   /* ordered on the compute stream, see h2d */
+    if(!ok(cudaMemcpyAsync(fc1,gw+(size_t)rank*w1,w1,cudaMemcpyHostToDevice,ts),"TP2 expert gate upload")||
+       !ok(cudaMemcpyAsync(fc1+w1,uw+(size_t)rank*w1,w1,cudaMemcpyHostToDevice,ts),"TP2 expert up upload")||
+       !ok(cudaMemcpyAsync(fc1s,gs+(size_t)rank*s1,s1,cudaMemcpyHostToDevice,ts),"TP2 expert gate scale upload")||
+       !ok(cudaMemcpyAsync(fc1s+s1,us+(size_t)rank*s1,s1,cudaMemcpyHostToDevice,ts),"TP2 expert up scale upload")||
+       !ok(cudaMemcpy2DAsync(fc2,J/2,dw+(size_t)rank*(J/2),I/2,J/2,H,cudaMemcpyHostToDevice,ts),"TP2 expert down upload")||
+       !ok(cudaMemcpy2DAsync(fc2s,J/32,ds+(size_t)rank*(J/32),I/32,J/32,H,cudaMemcpyHostToDevice,ts),"TP2 expert down scale upload")||
+       !ok(cudaStreamSynchronize(ts),"TP2 expert upload drain"))return 0;
 #ifdef COLI_DSV4_DEEPGEMM
     dg_pack_weight_scale<<<(2*J*(H/32/4)+255)/256,256>>>(set->bank_fc1_dg_scale,fc1s,e,2*J,H/32);
     dg_pack_weight_scale<<<(H*(J/32/4)+255)/256,256>>>(set->bank_fc2_dg_scale,fc2s,e,H,J/32);
@@ -2076,7 +2085,7 @@ extern "C" int dsv4_cuda_expert_bank_set_shared(Dsv4CudaExpertSet*set,Dsv4CudaTe
 extern "C" int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet*set,const int64_t*map,int vocab,int topk){
     if(!set||!map||vocab<1||topk!=6||!ok(cudaSetDevice(set->device),"select hash router device"))return 0;
     size_t bytes=(size_t)vocab*topk*sizeof(*map);if(set->hash)cudaFree(set->hash);set->hash=nullptr;set->vocab=0;set->topk=0;
-    if(!ok(cudaMalloc(&set->hash,bytes),"hash router allocation")||!ok(cudaMemcpy(set->hash,map,bytes,cudaMemcpyHostToDevice),"hash router upload"))return 0;
+    Dev*hc=ctx(set->device);if(!hc||!ok(cudaMalloc(&set->hash,bytes),"hash router allocation")||!h2d(hc,set->hash,map,bytes,"hash router upload"))return 0;
     set->vocab=vocab;set->topk=topk;return 1;
 }
 extern "C" int dsv4_cuda_route_moe(const Dsv4CudaActivation*input,Dsv4CudaTensor*gate,Dsv4CudaTensor*bias,
