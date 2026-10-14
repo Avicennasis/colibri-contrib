@@ -1926,6 +1926,10 @@ extern "C" Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int H,int I
        !ok(cudaMalloc(&set->bank_fc2_dg_scale,fc2_s),"expert FC2 DeepGEMM scale allocation")||
 #endif
        !ok(cudaMalloc(&set->table,(size_t)3*count*sizeof(ExpertPtr)),"expert table allocation")){
+        /* A failed cudaMalloc is also the runtime's last error: clear it, or
+         * the next launch check (cudaGetLastError) reports this OOM and fails
+         * a chunk that never touched the missing bank. */
+        (void)cudaGetLastError();
         dsv4_cuda_expert_set_free(set);return nullptr;
     }
     return set;
