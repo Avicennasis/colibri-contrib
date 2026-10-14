@@ -11445,6 +11445,12 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
 
 void coli_v4_gpu_engine_close(ColiV4Engine *engine) {
     if (!engine || !engine->gpu.enabled) return;
+    /* First, while the store, the shared-expert mirrors and the backend are
+     * all still alive: join a COLI_CUDA_MOE_DOUBLE prefetch worker (it holds
+     * a store lease and uploads over the aux stream) and free the prefill
+     * banks. Callers outside generate() (oracle, teacher forcing, Segment
+     * runs) never release them themselves. */
+    coli_v4_gpu_moe_batch_release();
     for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS; layer++) {
         if (!engine->gpu.layer_ready[layer]) continue;
         ColiDeepSeekV4LayerWeights *weights =
@@ -15549,12 +15555,12 @@ static void v4_ckpt_store(ColiV4Session *session, int len, int kind) {
     }
 }
 
-int coli_v4_session_generate(ColiV4Session *session,
-                             const char *prompt, size_t prompt_length,
-                             const ColiV4SessionGenerateOptions *options,
-                             ColiV4SessionTokenFn on_token, void *user_data,
-                             ColiV4SessionGenerateStats *stats_out,
-                             char *error, size_t error_size) {
+static int session_generate_impl(ColiV4Session *session,
+                                 const char *prompt, size_t prompt_length,
+                                 const ColiV4SessionGenerateOptions *options,
+                                 ColiV4SessionTokenFn on_token, void *user_data,
+                                 ColiV4SessionGenerateStats *stats_out,
+                                 char *error, size_t error_size) {
     if (!session || !session->engine || !prompt || !options ||
         (options->max_new_tokens < 1 &&
          !(options->max_new_tokens == 0 && options->logprobs > 0))) {
@@ -16194,6 +16200,28 @@ int coli_v4_session_generate(ColiV4Session *session,
                     : 0.0,
                 session->spec_disabled);
     return 0;
+}
+
+/* The GPU prefill bank is released on EVERY exit, not just after a finished
+ * prefill loop: a CANCELLED or failed request would otherwise keep the bank
+ * (or the pair) on the card while the server idles and carry a bank
+ * allocation failure into the next request, and a layer that failed mid-way
+ * can leave the COLI_CUDA_MOE_DOUBLE prefetch worker running with a store
+ * lease that engine teardown would free under it. A no-op when the prefill
+ * already released it or never made one. */
+int coli_v4_session_generate(ColiV4Session *session,
+                             const char *prompt, size_t prompt_length,
+                             const ColiV4SessionGenerateOptions *options,
+                             ColiV4SessionTokenFn on_token, void *user_data,
+                             ColiV4SessionGenerateStats *stats_out,
+                             char *error, size_t error_size) {
+    int result = session_generate_impl(session, prompt, prompt_length, options,
+                                       on_token, user_data, stats_out,
+                                       error, error_size);
+#ifdef COLI_V4_GPU_TIER
+    coli_v4_gpu_moe_batch_release();
+#endif
+    return result;
 }
 
 /* Every head score of several hidden rows, [batch][vocab]: the batch's rows of
