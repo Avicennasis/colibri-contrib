@@ -10380,6 +10380,24 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
                     memcpy(coli_kv_row(sc->kv.Ic[l],from,cc->index_hd),
                            coli_kv_row(dn->kv.Ic[l],from,cc->index_hd),
                            (size_t)n*cc->index_hd*sizeof(float));
+                /* #2096: under KV8/KV_TQ the f32 Lc/Rc row arrays are NULL and
+                 * the cache lives in the byte rows Lc8/Rc8 plus the per-row
+                 * scales Lsc/Rsc. Copy both here so the adopted range is not
+                 * left uninitialized. Same guard style as the f32 paths above. */
+                if((g_kv8||g_tq)&&sc->kv.Lc8[l]&&dn->kv.Lc8[l]){
+                    int lb=g_tq?coli_kvq_row_bytes(cc->kv_lora,g_tq_bits,g_tq_codec):cc->kv_lora;
+                    memcpy(coli_kv_row8(sc->kv.Lc8[l],from,lb),
+                           coli_kv_row8(dn->kv.Lc8[l],from,lb),(size_t)n*lb);
+                    int nsl=g_kv8?coli_kv8_nscale(cc->kv_lora,g_kv8_gs):1;
+                    memcpy(sc->kv.Lsc[l]+(int64_t)from*nsl,
+                           dn->kv.Lsc[l]+(int64_t)from*nsl,(size_t)n*nsl*sizeof(float));
+                }
+                if((g_kv8||g_tq)&&sc->kv.Rc8[l]&&dn->kv.Rc8[l]){
+                    int rb=g_tq?coli_kvq_row_bytes(cc->qk_rope,g_tq_bits,g_tq_codec):cc->qk_rope;
+                    memcpy(coli_kv_row8(sc->kv.Rc8[l],from,rb),
+                           coli_kv_row8(dn->kv.Rc8[l],from,rb),(size_t)n*rb);
+                    memcpy(sc->kv.Rsc[l]+from,dn->kv.Rsc[l]+from,(size_t)n*sizeof(float));
+                }
             }
             memcpy(sc->hist+from,tmp+from,(size_t)n*sizeof(int));
 #ifdef COLI_VULKAN
