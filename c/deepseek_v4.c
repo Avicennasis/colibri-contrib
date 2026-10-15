@@ -12222,6 +12222,20 @@ void coli_v4_gpu_moe_batch_hint(int total_fresh_tokens) {
     v4_gpu_moe_batch_hint_tokens = total_fresh_tokens;
 }
 
+/* Whether the batch in flight is a prefill, set by target_batch from its
+ * use_prefill_pool for the length of the call: 1 = a prefill (generate()'s
+ * prompt segments, the oracle, teacher forcing), 0 = speculative verify or
+ * replay during decode, -1 = no caller said (Segment runs): allowed, like an
+ * unknown hint. Decode batches keep the CPU union: a few rows per layer would
+ * re-create the bank mid-decode, re-upload every layer's routed experts and,
+ * with COLI_CUDA_MOE_DOUBLE, prefetch a whole layer per layer, while the
+ * stale hint from the prompt still said "large prefill". */
+static int v4_gpu_moe_batch_in_prefill = -1;
+
+void coli_v4_gpu_moe_batch_prefill(int prefill) {
+    v4_gpu_moe_batch_in_prefill = prefill;
+}
+
 int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        const uint16_t *gate, const float *bias,
                        const int *forced_indices, int experts, int dimension,
@@ -12378,6 +12392,9 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
         return -1; \
     } while (0)
     if (!coli_v4_gpu_moe_batch_wanted() || bank_failed) return -1;
+    /* Decode never touches the bank (and so never starts a second-bank
+     * prefetch either): see v4_gpu_moe_batch_in_prefill. */
+    if (!v4_gpu_moe_batch_in_prefill) return -1;
     {
         static int minimum = -1;
         if (minimum < 0) {
@@ -14592,9 +14609,17 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
                         ColiV4SessionAbortFn should_abort, void *abort_ctx,
                         char *error, size_t error_size) {
     double t0 = spec_now();
+#ifdef COLI_V4_GPU_TIER
+    /* use_prefill_pool is the prefill/decode distinction (speculative decode
+     * passes 0); the batched GPU MoE serves prefills only. */
+    coli_v4_gpu_moe_batch_prefill(use_prefill_pool ? 1 : 0);
+#endif
     int result = target_batch_impl(engine, state_ptr, next_ptr, attention, index, config,
                                    experts, tokens, start, batch, use_prefill_pool,
                                    should_abort, abort_ctx, error, error_size);
+#ifdef COLI_V4_GPU_TIER
+    coli_v4_gpu_moe_batch_prefill(-1);
+#endif
     g_v4_prof_block_s += spec_now() - t0;
     if (batch > 0) g_v4_prof_forwards += batch;
     return result;
