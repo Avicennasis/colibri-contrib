@@ -11947,7 +11947,9 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
     int found = -1;
     for (int i = 0; i < cache->count; i++) {
         if (cache->entries[i].layer == view->key.layer &&
-            cache->entries[i].expert == view->key.expert) {
+            cache->entries[i].expert == view->key.expert &&
+            cache->entries[i].gate && cache->entries[i].up &&
+            cache->entries[i].down) {
             found = i;
             break;
         }
@@ -11988,11 +11990,16 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
                                 "card's); capacity %d bounds the cache\n",
                         cache->capacity);
         }
-        if (grow && cache->count > 0 && !unified) {
-            static long long last_free_mb = -1;
-            static unsigned probes;
-            if (last_free_mb < 0 || (probes++ & 63) == 0)
+        /* After a failed upload (upload_failed) last_free_mb is 0 until the
+         * next probe: the card counts as full, also for an empty cache. */
+        static long long last_free_mb = -1;
+        static unsigned probes;
+        static int upload_failed;
+        if (grow && !unified && (cache->count > 0 || upload_failed)) {
+            if (last_free_mb < 0 || (probes++ & 63) == 0) {
                 last_free_mb = dsv4_cuda_mem_free_mb(cache->device);
+                upload_failed = 0;
+            }
             if (last_free_mb >= 0 && last_free_mb < reserve_mb) grow = 0;
         }
         if (!grow && cache->count == 0) {
@@ -12003,10 +12010,12 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
          * configured capacity: a cache frozen by the reserve with two or
          * three mirrors would recycle in place a slot the current token's
          * earlier view still references, and the output is garbage with no
-         * error (#1538). Stay on the CPU for this expert until it can grow. */
+         * error (#1538). Stay on the CPU for this expert until it can grow.
+         * After a failed upload the reserve is not the cause (the backend has
+         * reported the CUDA error), so only a probe below the reserve warns. */
         if (!grow && cache->count < 8) {
             static int warned;
-            if (!warned) {
+            if (!warned && !upload_failed) {
                 warned = 1;
                 fprintf(stderr, "v4_gpu mirror-cache: frozen below the VRAM reserve "
                                 "with %d live entries; a layer attaches up to 8 "
@@ -12094,6 +12103,20 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
             if (gate) dsv4_cuda_tensor_free(gate);
             if (up) dsv4_cuda_tensor_free(up);
             if (down) dsv4_cuda_tensor_free(down);
+            /* Roll the slot back, so that every entry in [0, count) holds a
+             * live mirror: an appended slot is dropped, a recycled one (its
+             * tensors are already freed) takes the last entry. Left in
+             * place, an entry keyed to this expert without tensors would
+             * answer its later attaches with no mirror (so it is never
+             * uploaded again), or win the LRU pick and make the recycle
+             * allocate on the full card again. The card counts as full
+             * until the next probe. */
+            if (found == cache->count - 1)
+                cache->count--;
+            else
+                cache->entries[found] = cache->entries[--cache->count];
+            last_free_mb = 0;
+            upload_failed = 1;
             pthread_mutex_unlock(&cache->mutex);
             return -1;
         }
