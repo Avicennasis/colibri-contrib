@@ -5571,6 +5571,22 @@ static void v4_vk_token_free(V4VkToken *vk) {
 }
 #endif
 
+#ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+/* Finish every lane still reading and give back what it leased. Every exit of
+ * a fetch pass runs this, errors included: a lane left running would write
+ * its result into the caller's jobs[] after that frame is gone. */
+static void v4_lanes_finish(ColiExpertStore *store, ExpertLoadJob *jobs,
+                            ExpertLoadHandle *loaders, int *loader_active) {
+    for (int slot = 0; slot < dual_loader_lanes(); slot++)
+        if (loader_active[slot]) {
+            profiled_expert_load_finish(&loaders[slot]);
+            loader_active[slot] = 0;
+            if (!jobs[slot].result)
+                coli_expert_release(store, &jobs[slot].view);
+        }
+}
+#endif
+
 static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4LayerWeights *weights,
                               const ColiDeepSeekV4Config *config,
@@ -5735,14 +5751,15 @@ static int moe_token_pipeline(float *output,
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
-    ColiExpertView *views = malloc((size_t)(selected ? selected : 1) * sizeof(*views));
+    /* Zeroed up front: every exit releases the views below, and one that
+     * fails before the fetch pass fills them must find no lease there. */
+    ColiExpertView *views = calloc((size_t)(selected ? selected : 1), sizeof(*views));
 #ifdef COLI_V4_GPU_TIER
     int gpu_compute = 0;
 #endif
     if (!views) result = moe_fail("layer %d: out of memory for %d expert views",
                                   weights->plan.layer, selected);
     if (!result) {
-        memset(views, 0, (size_t)selected * sizeof(*views));
 #ifdef COLI_V4_GPU_TIER
         gpu_compute = 1;
 #endif
@@ -5792,13 +5809,8 @@ static int moe_token_pipeline(float *output,
                     loader_active[slot] = 1;
             }
         }
-        for (int slot = 0; slot < dual_loader_lanes(); slot++)
-            if (loader_active[slot]) {
-                profiled_expert_load_finish(&loaders[slot]);
-                if (!jobs[slot].result)
-                    coli_expert_release(store, &jobs[slot].view);
-            }
     }
+    v4_lanes_finish(store, jobs, loaders, loader_active);
 #ifdef COLI_V4_GPU_TIER
     int hybrid_gpu_count = 0;
     int hybrid_pending_drain = 0;   /* async DMA enqueued, not yet drained */
@@ -6043,7 +6055,7 @@ static int moe_token_pipeline(float *output,
      * ever a wait on already-finished work — never a correctness gamble.) */
     if (hybrid_pending_drain) coli_v4_gpu_expert_drain(store);
 #endif
-    for (int current = 0; current < selected; current++)
+    for (int current = 0; views && current < selected; current++)
         coli_expert_release(store, &views[current]);
     free(views);
 #if defined(COLI_VULKAN)
