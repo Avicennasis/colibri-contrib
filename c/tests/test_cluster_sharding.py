@@ -39,6 +39,7 @@ bound (Q8_MAX_MISMATCHES, measured) and a byte-cut floor instead of a seat at
 the token-exact gate above. The f32 gate is untouched: the default stays exact.
 """
 
+import array
 import contextlib
 import json
 import os
@@ -369,6 +370,83 @@ class ClusterQ8DriftTest(unittest.TestCase):
     def test_fmt4_q8_drift(self):
         """fmt=4 routed experts: the no-rotation control."""
         self._run_q8(FMT4)
+
+
+# Worker count must not move a logits byte. The local loop adds a row's experts
+# in uniq[] order; a cluster of n workers computes them wherever (eid+layer)%n
+# says, and the coordinator must add the replies back in that same order. One
+# worker cannot show an order bug (its replies ARE in uniq[] order); two and
+# three can, whenever a row's experts sit on different workers and the one that
+# comes first in uniq[] is not on the first worker.
+@unittest.skipUnless(_available(), _skip_reason())
+class ClusterWorkerCountParityTest(unittest.TestCase):
+    """Baseline logits bytes == delegated logits bytes, for 1, 2 and 3 workers."""
+
+    def _run_n_workers(self, fixture_dir: Path, n: int):
+        with tempfile.TemporaryDirectory(prefix="coli_nworkers_") as scratch, \
+                contextlib.ExitStack() as stack:
+            ports = [stack.enter_context(_expert_worker(fixture_dir, self.fail)) for _ in range(n)]
+            workers = ",".join(f"127.0.0.1:{port}" for port in ports)
+            dump_base = Path(scratch) / "baseline.logits"
+            dump_del = Path(scratch) / f"delegated-{n}.logits"
+            baseline = _coordinator(fixture_dir, DUMP=str(dump_base))
+            delegated = _coordinator(fixture_dir, CLUSTER_WORKERS=workers, DUMP=str(dump_del))
+            base_bytes = dump_base.read_bytes() if dump_base.exists() else b""
+            del_bytes = dump_del.read_bytes() if dump_del.exists() else b""
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        self.assertEqual(delegated.returncode, 0, delegated.stderr)
+        self.assertIn(
+            f"[CLUSTER] coordinator connected to {n} expert worker(s)", delegated.stderr,
+            "the coordinator did not take the cluster path with every worker",
+        )
+        base_sig, del_sig = _tf_signature(baseline), _tf_signature(delegated)
+        self.assertIsNotNone(
+            base_sig[0],
+            f"baseline produced no teacher-forcing signature:\n{baseline.stdout}\n{baseline.stderr}",
+        )
+        self.assertEqual(base_sig[1], (), f"baseline mismatched the oracle ({base_sig[0]}): {base_sig[1]}")
+        self.assertEqual(del_sig[1], (), f"{n} workers mismatched the oracle ({del_sig[0]}): {del_sig[1]}")
+        self.assertEqual(base_sig, del_sig, f"{n} workers changed teacher-forced token predictions")
+        self.assertGreater(len(base_bytes), 0, "DUMP wrote no logits")
+        self.assertEqual(len(base_bytes), len(del_bytes), f"{n} workers dumped a different number of logits")
+        base_f, del_f = array.array("f", base_bytes), array.array("f", del_bytes)
+        moved = [abs(a - b) for a, b in zip(base_f, del_f) if a != b]
+        print(
+            f"\n[workers] {fixture_dir.name}: {n} worker(s), {base_sig[0][1]} positions, "
+            f"{len(base_f)} logits, {len(moved)} differ"
+            + (f" (max |delta| {max(moved):.3e})" if moved else ""),
+            flush=True,
+        )
+        self.assertEqual(
+            len(moved), 0,
+            f"{n} workers changed {len(moved)} of {len(base_f)} logits (max |delta| "
+            f"{max(moved) if moved else 0:.3e}) while every token matched: the replies were "
+            f"added worker by worker, not in uniq[] order",
+        )
+
+    def test_fmt6_one_worker(self):
+        """The control: one worker's replies are already in uniq[] order."""
+        self._run_n_workers(FMT6, 1)
+
+    def test_fmt6_two_workers(self):
+        self._run_n_workers(FMT6, 2)
+
+    def test_fmt6_three_workers(self):
+        self._run_n_workers(FMT6, 3)
+
+    @unittest.skipUnless(
+        _fixture_ok(FMT4),
+        "glm_tiny_fmt4 fixture absent (run: python3 tools/make_glm_oracle.py --fmt4)",
+    )
+    def test_fmt4_two_workers(self):
+        self._run_n_workers(FMT4, 2)
+
+    @unittest.skipUnless(
+        _fixture_ok(FMT4),
+        "glm_tiny_fmt4 fixture absent (run: python3 tools/make_glm_oracle.py --fmt4)",
+    )
+    def test_fmt4_three_workers(self):
+        self._run_n_workers(FMT4, 3)
 
 
 if __name__ == "__main__":

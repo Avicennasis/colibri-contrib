@@ -676,10 +676,10 @@ static void test_failed_link_refuses_later_exchanges_without_io(void)
         ClusterItem items[1];
         memset(items, 0, sizeof(items));
         assert(cluster_item(idxs, ws, keff, 1, 2, 42, &items[0], 3, x, 1) == 1);
-        float out[6] = {0};
-        assert(cluster_exchange(&w, COLI_CLUSTER_VERSION, 7, 3, 5, x, 2, items, 1, out, NULL) == -1);
+        assert(cluster_exchange(&w, COLI_CLUSTER_VERSION, 7, 3, 5, x, 2, items, 1, NULL) == -1);
         assert(w.failed == 1);
-        for (int z = 0; z < 6; z++) assert(out[z] == 0.0f);   /* nothing of a failed reply lands */
+        assert(items[0].y == NULL);                            /* nothing of a failed reply lands */
+        cluster_item_free(&items[0]);
 
         /* In FAIL_STALE the worker's well-formed 52-byte reply is queued on
          * the link before the second exchange begins (wait for it, so the
@@ -698,13 +698,12 @@ static void test_failed_link_refuses_later_exchanges_without_io(void)
          * well-formed 52-byte reply the worker queued is still there, unread. */
         memset(items, 0, sizeof(items));
         assert(cluster_item(idxs, ws, keff, 1, 2, 42, &items[0], 3, x, 1) == 1);
-        float out2[6] = {0};
         alarm(5);
-        int rc = cluster_exchange(&w, COLI_CLUSTER_VERSION, 7, 3, 5, x, 2, items, 1, out2, NULL);
+        int rc = cluster_exchange(&w, COLI_CLUSTER_VERSION, 7, 3, 5, x, 2, items, 1, NULL);
         alarm(0);
         assert(rc == -1);
         assert(w.failed == 1);
-        for (int z = 0; z < 6; z++) assert(out2[z] == 0.0f);
+        assert(items[0].y == NULL);
         cluster_item_free(&items[0]);
         pending = recv(sockets[0], peek, sizeof(peek), MSG_PEEK | MSG_DONTWAIT);
         if (mode == FAIL_STALE) {
@@ -822,6 +821,62 @@ static void test_fanout_puts_every_request_on_the_wire_first(void)
     assert(elapsed < 1.5 * hold_ms);             /* toward max(), not sum() */
     close(s0[0]); close(s0[1]); close(s1[0]); close(s1[1]);
 }
+/* One row routed to three experts of layer 7 -- 42, 43 and 45 -- across two
+ * workers: (eid+layer)%2 puts 43 and 45 on worker 0 and 42 on worker 1. The
+ * local loop adds a row's experts in uniq[] order, 42 then 43 then 45; with
+ * every expert answering 1.0 and the gates 1, 2^-24, 2^-24 that sum is 1.0
+ * (each 2^-24 rounds away against 1.0), whereas worker 0's pair first makes
+ * 2^-23, and 2^-23 + 1.0 is 1 + 2^-23. The coordinator must reproduce the
+ * local loop's bytes whichever worker computed each expert, so it has to hold
+ * every reply until the last worker has answered and add them in uniq[] order. */
+static void test_two_workers_sum_in_union_order(void)
+{
+    static Model m;
+    memset(&m, 0, sizeof(m));
+    m.c.hidden = 3;
+    m.c.moe_inter = 5;
+    float x[3] = {0.5f, 0.5f, 0.5f};                    /* every routed expert answers 2x = 1.0 */
+    const float tiny = 1.0f / 16777216.0f;               /* 2^-24 */
+    int idxs[3] = {42, 43, 45}, keff[1] = {3}, uniq[3] = {42, 43, 45};
+    float ws[3] = {1.0f, tiny, tiny};
+    float expect = 0.0f, worker_major = 0.0f;
+    for (int j = 0; j < 3; j++) expect += ws[j] * 1.0f;                   /* the local loop's order */
+    worker_major += ws[1] * 1.0f; worker_major += ws[2] * 1.0f; worker_major += ws[0] * 1.0f;
+    assert(expect == 1.0f && worker_major != expect);   /* the numbers tell the two orders apart */
+    assert(g_cluster_act == COLI_ACT_F32);
+    int s0[2], s1[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s0) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, s1) == 0);
+    g_cluster_n = 2;
+    g_cluster_workers[0].fd = s0[0];
+    g_cluster_workers[0].failed = 0;
+    snprintf(g_cluster_workers[0].host, sizeof(g_cluster_workers[0].host), "mac-a");
+    g_cluster_workers[0].port = 9100;
+    g_cluster_workers[1].fd = s1[0];
+    g_cluster_workers[1].failed = 0;
+    snprintf(g_cluster_workers[1].host, sizeof(g_cluster_workers[1].host), "mac-b");
+    g_cluster_workers[1].port = 9101;
+    FakeV2Worker w0 = {s0[1], 0, 0, 0, {0}, {0}}, w1 = {s1[1], 0, 0, 0, {0}, {0}};
+    pthread_t t0, t1;
+    assert(pthread_create(&t0, NULL, fake_v2_worker, &w0) == 0);
+    assert(pthread_create(&t1, NULL, fake_v2_worker, &w1) == 0);
+    float out[3] = {0};
+    int delivered = cluster_moe_batch(&m, 7, x, 1, out, idxs, ws, keff, 3, uniq, 0, 3, NULL);
+    assert(pthread_join(t0, NULL) == 0);
+    assert(pthread_join(t1, NULL) == 0);
+    g_cluster_n = 0;
+    assert(w0.failed == 0 && w1.failed == 0);
+    assert(delivered == 0);
+    assert(w0.ver == COLI_CLUSTER_VERSION && w1.ver == COLI_CLUSTER_VERSION);   /* f32, no shared item: v1 */
+    assert(w0.n == 2 && w0.eid[0] == 43 && w0.eid[1] == 45 && w0.nr[0] == 1 && w0.nr[1] == 1);
+    assert(w1.n == 1 && w1.eid[0] == 42 && w1.nr[0] == 1);
+    for (int d = 0; d < 3; d++) assert(out[d] == expect);
+    close(s0[0]);
+    close(s0[1]);
+    close(s1[0]);
+    close(s1[1]);
+}
+
 #endif
 
 int main(void)
@@ -839,6 +894,7 @@ int main(void)
     test_shared_expert_rides_the_routed_batch();
     test_failed_link_refuses_later_exchanges_without_io();
     test_fanout_puts_every_request_on_the_wire_first();
+    test_two_workers_sum_in_union_order();
     puts("cluster protocol tests: ok");
 #else
     puts("cluster protocol tests: skipped on Windows");

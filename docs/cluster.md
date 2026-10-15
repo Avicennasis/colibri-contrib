@@ -86,6 +86,13 @@ coordinator speaks v2 only when it needs one of:
   nor a logits byte moves: `c/tests/test_cluster_sharding.py` holds that run to
   the local run's logits bytes. Off by default.
 
+Whatever the worker count, the coordinator adds the workers' replies into a
+row in the order the local loop adds that row's experts (`uniq[]` order), and
+only after the last worker has answered, so a run on one, two or three
+workers gives the local run's logits bytes; `c/tests/test_cluster_sharding.py`
+holds all three to it. Added worker by worker instead, the tokens were the
+same and the logits were off in the last bits from two workers on.
+
 Whenever the coordinator will speak v2 it first sends every worker an empty v2
 request, a hello. A worker built from an older engine closes on it instead of
 answering, and the coordinator refuses that worker by name (`expert worker

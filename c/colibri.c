@@ -3572,7 +3572,7 @@ static void cluster_init(void){
             cluster_act_name(g_cluster_act),g_cluster_act==COLI_ACT_Q8?" (protocol v2, not token-exact)":"");
     if(cluster_shared_on()) fprintf(stderr,"[CLUSTER] shared experts computed on the workers (CLUSTER_SHARED=1, protocol v2)\n");
 }
-typedef struct { int eid,nr; int *rows; float *weights,*inputs; } ClusterItem;
+typedef struct { int eid,nr; int *rows; float *weights,*inputs,*y; } ClusterItem;
 /* The rows expert `eid` serves, their weights, and -- for v1, copy_inputs -- a
  * copy of each; v2 names them by index and sends the batch once. */
 static int cluster_item(const int *idxs,const float *ws,const int *keff,int K,int S,
@@ -3591,7 +3591,7 @@ static int cluster_item(const int *idxs,const float *ws,const int *keff,int K,in
     }
     return 1;
 }
-static void cluster_item_free(ClusterItem *it){ free(it->rows); free(it->weights); free(it->inputs); memset(it,0,sizeof(*it)); }
+static void cluster_item_free(ClusterItem *it){ free(it->rows); free(it->weights); free(it->inputs); free(it->y); memset(it,0,sizeof(*it)); }
 /* The request half of an exchange on one worker's own link: the header, (v2)
  * the batch rows once, then the n items. 0 on success; -1 on a transport
  * failure, which marks the link failed (see cluster_exchange). */
@@ -3625,11 +3625,12 @@ fail:
     w->failed=1;
     return -1;
 }
-/* The reply half: the header, then each item's rows -- a routed item's weighted
- * into out, the shared item's (if any) copied into sh_out. 1 when sh_out was
- * filled, 0 when the reply carried no shared item, -1 on a transport or
- * protocol failure, which marks the link failed (see cluster_exchange). */
-static int cluster_recv(ClusterWorker *w,uint32_t ver,int D,ClusterItem *items,int n,float *out,float *sh_out){
+/* The reply half: the header, then each item's rows -- a routed item's kept in
+ * items[j].y, unweighted, for the caller to add once every worker has answered;
+ * the shared item's (if any) copied into sh_out. 1 when sh_out was filled, 0
+ * when the reply carried no shared item, -1 on a transport or protocol failure,
+ * which marks the link failed (see cluster_exchange). */
+static int cluster_recv(ClusterWorker *w,uint32_t ver,int D,ClusterItem *items,int n,float *sh_out){
     char magic[8]; uint32_t v; int delivered=0, v2=ver==COLI_CLUSTER_VERSION_ACT;
     if(w->failed) return -1;
     if(cluster_xfer(w->fd,magic,8,0)||memcmp(magic,COLI_CLUSTER_MAGIC,8)) goto fail;
@@ -3643,10 +3644,8 @@ static int cluster_recv(ClusterWorker *w,uint32_t ver,int D,ClusterItem *items,i
            eid!=want || nr!=(uint32_t)items[j].nr) goto fail;
         float *y=falloc((int64_t)nr*D);
         if(cluster_xfer_act_recv(w->fd,g_cluster_act,y,nr,(uint32_t)D)){ free(y); goto fail; }
-        if(items[j].eid<0){ if(sh_out){ memcpy(sh_out,y,(size_t)nr*D*sizeof(float)); delivered=1; } }
-        else for(uint32_t r=0;r<nr;r++){ float *dst=out+(int64_t)items[j].rows[r]*D;
-            float wt=items[j].weights[r]; for(int d=0;d<D;d++) dst[d]+=wt*y[(int64_t)r*D+d]; }
-        free(y);
+        if(items[j].eid<0){ if(sh_out){ memcpy(sh_out,y,(size_t)nr*D*sizeof(float)); delivered=1; } free(y); }
+        else items[j].y=y;
     }
     return delivered;
 fail:
@@ -3654,8 +3653,10 @@ fail:
     return -1;
 }
 /* One request to one worker and its reply, on that worker's own link: the
- * header, the n items, then the reply's header and items, each routed row
- * weighted into out and the shared item's rows (if any) copied into sh_out.
+ * header, the n items, then the reply's header and items. Each routed item's
+ * rows are kept in items[j].y, unweighted, for the caller to add once every
+ * worker has answered (cluster_moe_batch adds them in uniq[] order, as the
+ * local loop does); the shared item's rows (if any) are copied into sh_out.
  * Returns 1 when sh_out was filled, 0 when the exchange completed without a
  * shared item, -1 on any transport or protocol failure: a short read, EOF
  * mid-reply, a magic, version, act, status, item id or row count that is not
@@ -3664,54 +3665,65 @@ fail:
  * the worker still sends after a failed exchange -- the rest of a reply the
  * coordinator stopped reading, or a well-formed reply that followed it -- is
  * never read as the answer to a later request. The link comes back only by
- * reconnecting (ds4 f0962e3's rule after a one-sided transport failure).
+ * reconnecting (ds4 f0962e3's rule after a one-sided transport failure). A
+ * failed exchange leaves no reply rows behind: items[j].y stays NULL.
  * cluster_moe_batch runs the two halves itself, every worker's request before
  * any reply; this is the one-worker form the tests drive. */
 static int cluster_exchange(ClusterWorker *w,uint32_t ver,int layer,int D,int I,const float *x,int S,
-                            ClusterItem *items,int n,float *out,float *sh_out){
+                            ClusterItem *items,int n,float *sh_out){
     if(cluster_send(w,ver,layer,D,I,x,S,items,n)) return -1;
-    return cluster_recv(w,ver,D,items,n,out,sh_out);
+    return cluster_recv(w,ver,D,items,n,sh_out);
 }
-/* One layer's routed batch-union to the workers: every worker's request goes on
- * the wire first, then every reply is read, in worker order -- the order the
- * routed rows were summed in when each worker was served in turn, so the f32
- * sum does not move and the gate stays token-exact. The bytes per worker are
- * the same; what changes is that the workers compute at the same time, so a
- * layer waits for its slowest worker instead of for each of them in turn.
- * With sh_out (v2, CLUSTER_SHARED=1) the first block (base==0) also carries the
- * shared expert, as one item of S rows on the worker layer%n picks; its
- * unweighted output lands in sh_out, and the caller adds it where FASE E adds
- * its own so the f32 order of the sum does not move. Returns 1 when sh_out was
- * filled, else 0. */
+/* One layer's routed batch-union to the workers. The items are built once, in
+ * uniq[base+j] order; each worker is sent the ones (eid+layer)%n assigns it --
+ * every worker's request goes on the wire before any reply is read, so the
+ * workers compute at the same time and a layer waits for its slowest worker
+ * instead of for each of them in turn -- and every reply is held in its item
+ * until the last worker has answered. Only then are the rows weighted into
+ * out, item by item in that same uniq[] order -- the order the local loop adds
+ * a row's experts in -- so the f32 sum is the local loop's bit for bit
+ * whatever the worker count. Adding each worker's replies as they arrived gave
+ * one worker exact and two or more the same tokens with logits off in the
+ * last bits, float addition not being associative. With sh_out (v2,
+ * CLUSTER_SHARED=1) the first block (base==0) also carries the shared expert,
+ * as one item of S rows on the worker layer%n picks; its unweighted output
+ * lands in sh_out, and the caller adds it where FASE E adds its own so the f32
+ * order of the sum does not move. Returns 1 when sh_out was filled, else 0. */
 static int cluster_moe_batch(Model *m,int layer,float *x,int S,float *out,
                              const int *idxs,const float *ws,const int *keff,int K,
                              const int *uniq,int base,int nb,float *sh_out){
     int D=m->c.hidden, delivered=0, wfail=-1;
     uint32_t ver=cluster_version_for(sh_out!=NULL); int v2=ver==COLI_CLUSTER_VERSION_ACT;
+    ClusterItem all[COLI_CLUSTER_ITEMS_MAX]; memset(all,0,sizeof(all)); int na=nb;   /* all[j] is uniq[base+j]'s */
+    for(int j=0;j<nb;j++) cluster_item(idxs,ws,keff,K,S,uniq[base+j],&all[j],D,x,!v2);
+    if(sh_out && base==0){                              /* v2 only: every row, by index */
+        ClusterItem *it=&all[na++]; it->eid=-1; it->nr=S;
+        it->rows=malloc((size_t)S*sizeof(int)); for(int s=0;s<S;s++) it->rows[s]=s;
+    }
+    /* Each worker's items are shallow copies of all[]'s; which[] keeps their index. */
     ClusterItem (*items)[COLI_CLUSTER_ITEMS_MAX]=calloc((size_t)g_cluster_n,sizeof(*items));
+    int (*which)[COLI_CLUSTER_ITEMS_MAX]=calloc((size_t)g_cluster_n,sizeof(*which));
     int *n=calloc((size_t)g_cluster_n,sizeof(int));
-    if(!items||!n){ fprintf(stderr,"OOM cluster batch\n"); exit(1); }
+    if(!items||!which||!n){ fprintf(stderr,"OOM cluster batch\n"); exit(1); }
     for(int wi=0;wi<g_cluster_n&&wfail<0;wi++){           /* 1) every request out */
         for(int j=0;j<nb;j++){
-            int eid=uniq[base+j];
-            if((eid+layer)%g_cluster_n!=wi) continue;
-            if(n[wi]<64 && cluster_item(idxs,ws,keff,K,S,eid,&items[wi][n[wi]],D,x,!v2)) n[wi]++;
+            if(!all[j].nr || (all[j].eid+layer)%g_cluster_n!=wi) continue;
+            which[wi][n[wi]]=j; items[wi][n[wi]++]=all[j];
         }
-        if(sh_out && base==0 && layer%g_cluster_n==wi){   /* v2 only: every row, by index */
-            ClusterItem *it=&items[wi][n[wi]++]; it->eid=-1; it->nr=S;
-            it->rows=malloc((size_t)S*sizeof(int)); for(int s=0;s<S;s++) it->rows[s]=s;
-        }
+        if(na>nb && layer%g_cluster_n==wi){ which[wi][n[wi]]=nb; items[wi][n[wi]++]=all[nb]; }
         if(!n[wi]) continue;
         if(cluster_send(&g_cluster_workers[wi],ver,layer,D,m->c.moe_inter,x,S,items[wi],n[wi])) wfail=wi;
     }
     for(int wi=0;wi<g_cluster_n&&wfail<0;wi++){           /* 2) every reply in, in worker order */
         if(!n[wi]) continue;
-        int rc=cluster_recv(&g_cluster_workers[wi],ver,D,items[wi],n[wi],out,sh_out);
-        if(rc<0) wfail=wi; else if(rc) delivered=1;
+        int rc=cluster_recv(&g_cluster_workers[wi],ver,D,items[wi],n[wi],sh_out);
+        if(rc<0){ wfail=wi; break; }
+        for(int k=0;k<n[wi];k++) all[which[wi][k]].y=items[wi][k].y;   /* each reply back under its uniq[] index */
+        if(rc) delivered=1;
     }
-    for(int wi=0;wi<g_cluster_n;wi++) for(int j=0;j<n[wi];j++) cluster_item_free(&items[wi][j]);
-    free(items); free(n);
+    free(items); free(which); free(n);
     if(wfail>=0){
+        for(int j=0;j<na;j++) cluster_item_free(&all[j]);
         ClusterWorker *w=&g_cluster_workers[wfail];
         fprintf(stderr,"[CLUSTER] expert worker %s:%d failed during layer %d batch (protocol v%u, activations %s)\n",
                 w->host,w->port,layer,ver,cluster_act_name(g_cluster_act));
@@ -3720,6 +3732,12 @@ static int cluster_moe_batch(Model *m,int layer,float *x,int S,float *out,
                     "rebuild it, or run this coordinator with COLI_CLUSTER_ACT=f32\n",w->host,w->port,COLI_CLUSTER_VERSION,ver);
         exit(1);
     }
+    for(int j=0;j<nb;j++){                                  /* 3) the local loop's order: uniq[base+j] */
+        const ClusterItem *it=&all[j]; if(!it->y) continue;
+        for(int r=0;r<it->nr;r++){ float *dst=out+(int64_t)it->rows[r]*D, wt=it->weights[r], *yr=it->y+(int64_t)r*D;
+            for(int d=0;d<D;d++) dst[d]+=wt*yr[d]; }
+    }
+    for(int j=0;j<na;j++) cluster_item_free(&all[j]);
     return delivered;
 }
 typedef struct { int eid,nr; float *inputs; } ClusterRequestItem;
