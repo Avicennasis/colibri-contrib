@@ -111,6 +111,10 @@ MINIMAX_M3_FIXTURE = FamilyDescriptor(
 
 
 class FamilyRegistryTest(unittest.TestCase):
+    def test_qwen36_public_metadata_advertises_gateway_tool_support(self):
+        family = next(family for family in FAMILIES if family.id == "qwen36")
+        self.assertTrue(public_metadata(family)["capabilities"]["tools"])
+
     def test_production_descriptors_are_complete_unique_and_serializable(self):
         self.assertGreaterEqual(len(FAMILIES), 5)
         by_id, by_type = _build_registry(FAMILIES)

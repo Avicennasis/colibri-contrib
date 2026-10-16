@@ -17,7 +17,9 @@ PIN=<model>/.coli_usage PIN_GB=0 COLI_NO_OMP_TUNE=1 \
 Requirements: a Vulkan **1.2** driver with
 `GL_KHR_shader_subgroup_arithmetic` (any Mesa RADV, AMDVLK, NVIDIA or Intel
 ANV driver from the last several years), plus the Vulkan headers and `glslc`
-at build time. The
+at build time. On Debian and Ubuntu that is `sudo apt install libvulkan-dev glslc`
+(`glslc` is its own package there, not part of `libvulkan-dev` or `vulkan-tools`;
+without it `make VK=1` stops at `glslc not found`). The
 backend picks the most capable physical device (discrete > integrated) and
 degrades to the CPU path on any failure — a wedged GPU can slow a run, never
 corrupt it.
@@ -165,6 +167,15 @@ them by f32 activations.
     expert makes ([DeepSeek V4's activation](#deepseek-v4s-activation)).
   - inkling leaves its bf16 matrices on the CPU when the build has the AVX512-BF16
     dot (Zen 4/5, Sapphire Rapids), because that dot rounds activations to bf16.
+
+**Run to run.** The dense chain alone gives the same tokens on every run. With the
+routed-expert tier on, a run is not bit-reproducible by default: which experts a step
+finds on the device depends on when the uploader finished, and the balancer moves rows
+between the device and the CPU on measured times. The device's experts compute as
+above, so a different split changes the last bits, and over many layers of routing
+near-ties that can change a greedy token. `COLI_VK_TIER_SYNC=1
+COLI_VK_TIER_BALANCE=0` make the residency and the split follow the routing alone
+(each step waits for its uploads, so it is slower): the runs then repeat (#2081).
 
 **Memory.** The host copy stays as the CPU fallback. On an integrated GPU or APU,
 which shares RAM with the CPU, the resident set is therefore held twice: size
@@ -487,6 +498,7 @@ the device, since no Vulkan tier runs.
 | `COLI_VK_TIER_RATE` | `16` | Promotions per token at most (a prompt's forward gets this many per prompt token): each copies one expert on the engine thread. |
 | `COLI_VK_TIER_BALANCE` | on | `0`: the device takes every resident expert of a step even when it is the slower side (see below). |
 | `COLI_VK_TIER_WARM` | on | `0`: no warm start; the tier fills as experts pass by. |
+| `COLI_VK_TIER_FILL` | on | The warm start fills the device: the history's experts first (hottest first), then the room left with the experts no history named, one of each layer in turn. A first run used to start with an empty device and fill it at the promotion rate (Qwen3.6 on a 3090 Ti: 16.5% of the routed experts on the device and the CPU's speed, then 97% and three times it from the second run, #2081). A model whose experts all fit now goes up whole at start. `0`: the history's experts only. |
 | `COLI_VK_TIER_SYNC` | `0` | `1`: each layer step first waits for the uploads staged so far: residency then follows the routing alone (with `COLI_VK_TIER_BALANCE=0`, the run is reproducible). A promotion that displaces a resident while a batch is in flight waits for the join to free it. For tests and debugging. |
 | `COLI_VK_TIER_GEMM_ROWS` | `16` | Rows from which an expert of a step takes the tiled GEMM instead of the per-row GEMV; `0` never. |
 | `COLI_VK_XB_GROUPED` | on where supported | `0`: a step's experts keep their own dispatches where the grouped GEMM would take them (cooperative matrices at subgroup size 64, `bufferDeviceAddress`, widths multiples of 128, int8/int4, SwiGLU). |
@@ -1121,6 +1133,7 @@ f32 throughout, as the CPU's f32 path.
 | `COLI_VK_CHAIN_LAYERS` | what fits | The engines on [the partial chain](#a-partial-chain): the first N layers on the device, the CPU the rest and the head. Unset or `auto`: the most layers the device's free memory holds (every layer when they fit, the chain as before); `n`: n layers; `0`: the chain off. |
 | `COLI_VK_CHAIN_FLASH` | `16` | Rows from which a forward's plain causal attention runs on the matrix units (`chain_attn_flash.comp`: query heads of one kv head folded into 16-row tiles, K/V staged once per block as f16, two passes); `0` never. Needs cooperative matrices at subgroup size 64; otherwise, and for a selection list, a window, a ring or a sink, the blocked shader or `chain_attn.comp`. On a Radeon 8060S (Qwen3.6, 1011-token prompt) the attention went from 186 ms (`chain_attnb`) to 22 ms, the first token from 2.08 to 1.85 s, perplexity unchanged (7.65). |
 | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
+| `COLI_VK_CHAIN_MOE` | on where supported | A decode step's (or a short verify's) MoE layer whose experts the tier holds all of runs its routing and experts in the frame, with no host step ([below](#the-routed-experts-in-the-frame-vk_dmoeh)); `0`: the host routes as before. |
 | `COLI_VK_SUBGROUP` | on where the size varies | Every chain pipeline requires the subgroup size the device reports (`VK_EXT_subgroup_size_control`), where the device has more than one. Without it an Intel Iris Xe (Windows driver 101.7076) compiled the chain's GEMVs at another size than the shaders read: Qwen3.6 answered garbage with the chain on and correctly with it off. `0`: the driver's choice. |
 | `COLI_VK_CHAIN_GEMV2` | on where supported | `0`: the int8 decode matrices keep `chain_gemv.comp` instead of `chain_gemv2.comp` (rows a workgroup by the matrix's length). On a Radeon 8060S (Qwen3.6, a 256-token answer, int8 trunk) decode went from 36.8 to 39.0 tok/s; at int4 (`COLI_DENSE_BITS=4`) it measured slower, so it takes int8 only. It stages x in the device's shared memory, up to 64 KiB (#1998). |
 | `COLI_VK_CHAIN_SPIN_US` | `2000` | How long a wait on a chain frame polls the fence before blocking. |
@@ -1133,7 +1146,8 @@ f32 throughout, as the CPU's f32 path.
 
 Each run and serve turn prints `[VK] <engine> chain: N forwards, F frames (ops,
 matmuls, tiled GEMM), the time spent waiting for the device, the routed experts' host
-time and the device memory the chain holds`.
+time, the layer steps whose routed experts ran in the frame and the device memory the
+chain holds`.
 
 ### The chain on a Radeon 780M
 
@@ -1899,6 +1913,60 @@ and the tests prove the tokens on the tiny fixture, on Lavapipe and on the 780M:
 [VK] kimi_k3: dense chain off (an integrated GPU with the expert tier: not measured; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
 ```
 
+### The routed experts in the frame (`vk_dmoe.h`)
+
+A chain stops its frame at every MoE layer: the router's logits go down, the host routes,
+the tier's batch and the CPU compute the experts, the sum comes back up. When the tier
+holds every expert of a layer on the chain's device (the model fits: the warm start's
+fill puts it there before the first token), that round trip buys nothing: the device
+can route and compute the layer itself. For a step of up to 8 rows (decode, an MTP or
+lookup verify) such a layer runs in the frame and the frame goes on; with every layer
+so, a token is one frame.
+
+- `vkc_route` (`chain_route.comp`): the router's softmax, sigmoid or sqrt(softplus), a
+  correction bias for the pick (or, qwen36's, into the logits), group-limited top-k, the
+  weights normalized in rank order and scaled; every engine's kind, checked against each
+  engine's CPU routing in `tests/test_vk_chain.c` (ids exact, the lower expert on a tie).
+- `vkc_moe` (`chain_moe.comp`): the experts by device address from a table the tier
+  gives (`vkt_dev_table`, one entry per expert: its gate, up and down rows and scales),
+  in three passes: gate and up with the activation per (row, rank), down per (row, rank),
+  the rank-order sum. A row's 16-byte weight steps are spread over a power-of-two group
+  of lanes with clustered adds, one compiled body per weight format, so every format of
+  the tier (int8, int4, MXFP4, int3, f32, bf16, FP8, int8 in groups) takes it. Each row
+  is computed alone: a verify's rows have a decode step's bits.
+- The books follow at the frame's end, from the ids that come down with it: the history
+  (`.coli_usage`), the HITS bitmap, the tier's heat (`vkt_dev_count`); the tier's line
+  counts them as `in the dense chain: N routed experts with no host step`.
+
+A layer the tier holds only part of keeps the host's step, in the same forward: the frame
+ends there as before. The table follows the tier: an eviction or an upload changes its
+epoch (`vkt_epoch`), and the next step writes the table again. It is off for PILOT (its
+prefetch and the routing momentum it reads want every row's logits on the host),
+`ROUTE_TRACE`, qwen36's cache routing and agreement meter, the CUDA tier or a qpack
+container, the second device (the tier's experts are the primary's), and a device
+without `bufferDeviceAddress` or clustered subgroup adds. `COLI_VK_CHAIN_MOE=0` turns it
+off. Engines: olmoe, qwen36 (Qwen3.6, Qwen3-Coder), qwen38; the others' models do not
+fit a device whole, where their layers keep the tier's step.
+
+The device opens with `bufferDeviceAddress` wherever it has it now (before, only with
+the matrix units, for the grouped GEMM); `COLI_VK_BDA=0` still opens it without.
+
+Measured on a Radeon 780M (RADV, OLMoE-1B-7B int8, every expert on the device, a
+25-token prompt and 100 decode steps, warm, the same binary):
+
+| | decode |
+|---|---|
+| the routed experts in the frame | 33.2 tok/s (166 frames for 101 tokens) |
+| the host's routing and the tier's batch (`COLI_VK_CHAIN_MOE=0`) | 28.2 to 30.1 tok/s (1762 frames) |
+| the tier alone (`COLI_VK_CHAIN=0`) | 19.1 tok/s |
+| the CPU | 22.9 tok/s |
+
+The experts take 13.0 ms of device time a token in the frame against 14.4 ms in the
+tier's grouped GEMV; the rest is the dense chain's GEMVs (14.4 ms). The 101 tokens are
+the CPU's in all three. A first version of the shader (one 32-bit word a lane, a row a
+subgroup, the format chosen per word) ran at 13.6 tok/s: the per-format bodies and the
+16-byte steps are what made it faster than the host's step.
+
 ### Adding an engine to the chain
 
 The recipe qwen36_chain.h and qwen38_chain.h follow, for the engines still on the
@@ -2624,6 +2692,25 @@ so this says only that staging costs nothing here. **Not measured: a discrete ca
 Resizable BAR**, the case staging is for (none is available); there the copies cross PCIe
 once per upload and the device then reads VRAM instead of the window or system RAM. The
 contributor who reported the RTX 3070 offered to run it.
+
+## f32 matrices that came from bf16 or f16
+
+Several engines keep dense matrices as f32 on the host although the checkpoint stores
+them in two bytes a value (bf16, or f16 in some OLMoE releases): OLMoE's attention,
+routers and lm_head, Kimi K3's routers and KDA decay and beta projections (and its whole
+trunk at `K3_BITS=32`), Inkling's routers, GLM-5.3's f32 trunk. Every such float is a
+bf16 or an f16 widened, so the device copy goes up in two bytes a value, as bf16 (fmt 11)
+or f16 (fmt 14): the same values in half the bytes. On OLMoE-1B-7B the dense part takes
+0.75 GB instead of 1.5 GB, and the expert tier has the rest. The check is exact and runs
+once per matrix at upload (`coli_vk_f32_fmt`): bf16 when every float has a zero low half,
+else f16 when an f16 holds every float, else the matrix stays f32 (fmt 10). The chain's
+fit, the expert tier's dense budget and the dense-host decision count each matrix at the
+format it will take, and so does `coli plan`: a BF16 or F16 tensor from the checkpoint's
+header, an F32 one from its values (the one read of tensor values the planner makes).
+
+The values are the same, so the tokens are the CPU's; the logits can differ from an
+f32 upload in the last bits, because the shaders sum a 2-byte row in steps of 8 rather
+than 4.
 
 ## Dense weights on the device only
 

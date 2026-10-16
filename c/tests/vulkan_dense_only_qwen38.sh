@@ -55,7 +55,9 @@ dho_family_qwen38_sanitize() {
     case $tag in
       "int8 trunk") args=(Q38_TRUNK_MIN_KB=0 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json) ;;
       "MTP mixed") args=(Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp ./qwen38 2 8 qwen38_tiny_mtp/ref.json) ;;
-      "device lost") args=(COLI_VK_CHAIN_FAULT=40 Q38_TRUNK_MIN_KB=0 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json) ;;
+      # frame 40 of the host's routing (COLI_VK_CHAIN_MOE=0): with the routed experts in the
+      # frame a forward is one frame, and the run has nine
+      "device lost") args=(COLI_VK_CHAIN_MOE=0 COLI_VK_CHAIN_FAULT=40 Q38_TRUNK_MIN_KB=0 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json) ;;
     esac
     rm -f chain.usage
     env COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DENSE_HOST=0 "${args[@]}" > san.log 2>&1 || true

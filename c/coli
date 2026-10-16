@@ -492,6 +492,13 @@ def ngen_for(a, interactive=False, family=None):
         return limits.interactive_max_output if interactive else limits.default_max_output
     return 16384 if interactive else 1024
 
+# The ceiling a served session (serve, web, chat) gives the gateway: --ngen, or 0 when
+# it is not given, which the gateway reads as the context the engine holds. A reasoning
+# model's turn is its reasoning plus its answer: any fixed number below the context cut
+# some of them short (#382), and the engines stop at the end of the context anyway.
+def serve_max_tokens(a):
+    return getattr(a, "ngen", None) or 0
+
 _PROFILE_CAP_ENV = "COLI_PROFILE_CAP"
 _PLAN_CAP_ENV = "COLI_PLAN_CAP"
 
@@ -765,15 +772,18 @@ def dsv4_cuda_build_hint():
         return "make deepseek-v4 CUDA=1 (this binary is CPU-only)"
     return "the DeepSeek V4 CUDA tier is supported only on Linux and Windows"
 
-# Engines that implement EXPERT_WORKER / CLUSTER_WORKERS: colibri.c and glm53.c.
-WORKER_FAMILIES = ("glm", "glm53")
+# Engines that implement EXPERT_WORKER / CLUSTER_WORKERS: colibri.c, glm53.c and
+# deepseek_v41.c. A worker serves the family it was built for: a deepseek_v41
+# coordinator talks to deepseek_v41 workers (COLIEX01), a GLM one to GLM workers,
+# a GLM-5.3 one to GLM-5.3 workers (COLIG53X).
+WORKER_FAMILIES = ("glm", "glm53", "deepseek_v41")
 
 def need_worker_model(model):
     require_model(model, file="config.json")
     family = resolve_model(model).descriptor
     if family.id not in WORKER_FAMILIES:
-        sys.exit(f"{C.yel}cluster expert workers currently support the GLM and GLM-5.3 engines only;{C.r} "
-                 f"{family.display_name} models cannot serve experts")
+        sys.exit(f"{C.yel}cluster expert workers currently support the GLM, GLM-5.3 and DeepSeek V4.1 "
+                 f"engines only;{C.r} {family.display_name} models cannot serve experts")
     engine = engine_for(model)
     require_model(model, file="config.json", engine=engine, target=family.build_target,
                   build=f"make -C c {family.build_target}")
@@ -1156,7 +1166,7 @@ class MDStream:
             if ch=="`":
                 self.icode=not self.icode
                 out.append(C.org if self.icode else C.r); i+=1; continue
-            if ch=="*":
+            if ch=="*" and not self.icode:
                 j=i
                 while j<len(txt) and txt[j]=="*": j+=1
                 if j-i>=2:               # **/***: grassetto on/off, gli asterischi spariscono
@@ -2018,10 +2028,11 @@ def chat_attached(a, base, model_id):
         # motore che streamma gli esperti da disco, "max" vuol dire centinaia
         # di token di riflessione prima della prima parola di risposta.
         request = {"model":model_id,"messages":msgs,"stream":True,
-                   "max_tokens":ngen_for(a,interactive=True),
                    # a chat longer than the context goes on from a summary of its start
                    "context_compaction":"auto",
                    "stream_options":{"include_usage":True}}   # exact completion_tokens in the last chunk
+        # without --ngen the server's own ceiling: the context it holds (serve_max_tokens)
+        if getattr(a,"ngen",None): request["max_tokens"]=a.ngen
         if getattr(a,"effort",None): request["reasoning_effort"]=a.effort
         if getattr(a,"think",None) is not None: request["enable_thinking"]=a.think
         elif arch in CHAT_THINK_OFF:
@@ -2033,7 +2044,7 @@ def chat_attached(a, base, model_id):
         print(f"\n  {C.teal}◆ colibri{C.r}")
         sp=Spinner("thinking…"); sp.start()
         md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False; think_open=False
-        exact_tokens=None
+        exact_tokens=None; finish=None
         try:
             with urllib.request.urlopen(req) as r:
                 for raw in r:
@@ -2056,6 +2067,7 @@ def chat_attached(a, base, model_id):
                               f"model's context: the model now reads a summary of them{C.r}")
                         sp=Spinner("thinking…"); sp.start()
                     for ch in ev.get("choices",[]):
+                        if ch.get("finish_reason"): finish=ch["finish_reason"]
                         d=ch.get("delta",{})
                         rtxt=d.get("reasoning_content")
                         if rtxt and os.environ.get("COLI_SHOW_THINK","1")=="0":
@@ -2109,8 +2121,12 @@ def chat_attached(a, base, model_id):
         else: msgs.pop()                              # turno vuoto: non sporcare la history
         el=time.time()-t0
         footer=render_gen_stats(gen_stats("".join(reply), el, exact_tokens, interrupted), chat_stats_mode(a))
-        if footer: print(f"\r  {C.dgray}└─ {footer}{C.r}\n")
-        else: print()
+        if footer: print(f"\r  {C.dgray}└─ {footer}{C.r}")
+        if finish=="length" and not interrupted:
+            # the turn hit the ceiling (--ngen) or filled the context, not its own end
+            print(f"  {C.yel}…cut off: the response reached "
+                  f"{'--ngen ('+str(a.ngen)+' tokens)' if getattr(a,'ngen',None) else 'the end of the context'}{C.r}")
+        print()
     print(f"  {C.dim}goodbye — the engine keeps running for the next chat 🐦{C.r}")
 
 def kv_resume_notice(model_dir):
@@ -2153,8 +2169,13 @@ IMAGE_SUFFIXES = (".png",".jpg",".jpeg",".webp",".bmp",".gif",".tif",".tiff")
 # da shlex, che in modalita' POSIX mangia le barre rovesciate e va in errore su
 # un apostrofo -- cioe' su una frase italiana su due.
 _ESTENSIONI = "|".join(suffix[1:] for suffix in IMAGE_SUFFIXES)
+# a drive with either slash (Python on MSYS2 and many Windows tools write C:/...), never a
+# letter inside a word ("Nota:/tmp/x.png" is /tmp/x.png)
+_IMAGE_PATH_START = r"(?:(?<![A-Za-z0-9])[A-Za-z]:[\\/]|~?/|\./)"
 IMAGE_PATH = re.compile(
-    r"(?:[A-Za-z]:\\|~?/|\./)[^\"'<>|?*\n]*?\.(?:" + _ESTENSIONI + r")\b",
+    r'"' + _IMAGE_PATH_START + r'[^"\n]*\.(?:' + _ESTENSIONI + r')"'
+    + r"|'" + _IMAGE_PATH_START + r"[^'\n]*\.(?:" + _ESTENSIONI + r")'"
+    + r"|" + _IMAGE_PATH_START + r"[^\"'<>|?*\n]*?\.(?:" + _ESTENSIONI + r")\b",
     re.IGNORECASE)
 
 
@@ -2164,7 +2185,7 @@ def to_local_path(token):
     Un percorso Windows incollato da Esplora risorse dentro WSL indica un file
     che da qui si chiama /mnt/<lettera>/...: senza tradurlo non esiste."""
     token = token.strip().strip('"').strip("'")
-    if re.fullmatch(r"[A-Za-z]:\\.*", token, re.S):
+    if re.fullmatch(r"[A-Za-z]:[\\/].*", token, re.S):
         if sys.platform == "win32":
             return token
         return f"/mnt/{token[0].lower()}/" + token[2:].replace("\\", "/").lstrip("/")
@@ -2802,7 +2823,7 @@ def cmd_chat(a):
         cmd=[sys.executable,openai_server.__file__,"--model",a.model,
              "--engine",engine,"--arch",arch,"--model-id",model_id,
              "--host","127.0.0.1","--port","8000","--max-tokens",
-             str(ngen_for(a,interactive=True,family=family))]
+             str(serve_max_tokens(a))]
         if a.cap is not None: cmd+=["--cap",str(a.cap)]
         if a.api_key: cmd+=["--api-key",a.api_key]
         p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
@@ -2973,6 +2994,95 @@ def cmd_chat(a):
     print(f"  {C.teal}goodbye{C.r} {C.dim}— the hummingbird returns to its nest{C.r} 🐦\n")
 
 def serve_pidfile(port): return os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.pid")
+def serve_stopfile(port): return os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.stop")
+
+# A stop that needs no rights on the process (#2091). `coli stop` puts this file
+# next to the pidfile and the serve, which watches for it, ends itself the way
+# SIGTERM ends it (the engine drained, its heat saved). Ending a process from
+# outside needs rights on it: a serve started from an administrator console
+# cannot be ended from a normal prompt on Windows (TerminateProcess and taskkill
+# are both denied), and before this `coli stop` said "stopped" all the same.
+def _stop_file_is_ours(path):
+    """A stop request from this user. The temp folder is shared on POSIX, so a file
+    another user put there is not one (Windows gives every user a %TEMP% of its own)."""
+    try: st=os.stat(path)
+    except OSError: return False
+    return not hasattr(os,"getuid") or st.st_uid==os.getuid()
+
+def _stop_self():
+    """End this serve the way its signal handlers do (openai_server.serve): SIGBREAK on
+    Windows, where a SIGTERM sent with os.kill is TerminateProcess, SIGTERM elsewhere.
+    Before the handlers are in place the default action ends the process, a stop too."""
+    if sys.platform=="win32": signal.raise_signal(signal.SIGBREAK)
+    else: os.kill(os.getpid(),signal.SIGTERM)
+
+def _watch_stop_file(path, on_stop, interval=0.5, done=None):
+    """Thread body: when this user's stop request appears, consume it and stop; return
+    as soon as `done` (a threading.Event) is set, the serve having ended on its own."""
+    while not (done is not None and done.is_set()):
+        if os.path.exists(path) and _stop_file_is_ours(path):
+            try: os.unlink(path)
+            except OSError: pass
+            on_stop(); return
+        if done is not None: done.wait(interval)
+        else: time.sleep(interval)
+
+def _request_stop(port, wait=2.0):
+    """Ask the serve on `port` to stop itself; True once it took the request (the file
+    is gone), False when nothing consumed it within `wait` seconds (a serve from before
+    the request existed, or one that is hung)."""
+    path=serve_stopfile(port)
+    try:
+        with open(path,"w") as f: f.write(f"{os.getpid()}\n")
+    except OSError: return False
+    deadline=time.time()+wait
+    while time.time()<deadline:
+        if not os.path.exists(path): return True
+        time.sleep(0.1)
+    try: os.unlink(path)          # not taken: leave no request for a later serve
+    except OSError: pass
+    return False
+
+def _win_terminate(pid):
+    """TerminateProcess with the one right it needs. os.kill asks PROCESS_ALL_ACCESS,
+    which a process may refuse while it grants PROCESS_TERMINATE. None, or why not."""
+    import ctypes
+    from ctypes import wintypes
+    PROCESS_TERMINATE, ERROR_INVALID_PARAMETER = 0x0001, 87
+    k32=ctypes.WinDLL("kernel32",use_last_error=True)
+    k32.OpenProcess.restype=wintypes.HANDLE
+    k32.OpenProcess.argtypes=(wintypes.DWORD,wintypes.BOOL,wintypes.DWORD)
+    k32.TerminateProcess.argtypes=(wintypes.HANDLE,wintypes.UINT)
+    k32.CloseHandle.argtypes=(wintypes.HANDLE,)
+    handle=k32.OpenProcess(PROCESS_TERMINATE,False,pid)
+    if not handle:
+        err=ctypes.get_last_error()
+        return None if err==ERROR_INVALID_PARAMETER else f"{ctypes.FormatError(err).strip()} (WinError {err})"
+    try:
+        if k32.TerminateProcess(handle,1): return None
+        err=ctypes.get_last_error()
+        # an ended process whose object something still holds (a handle open
+        # anywhere) opens fine and then refuses the end with ERROR_ACCESS_DENIED
+        if not _pid_alive(pid): return None
+        return f"{ctypes.FormatError(err).strip()} (WinError {err})"
+    finally:
+        k32.CloseHandle(handle)
+
+def _terminate(pid):
+    """End `pid` now. None, or why it could not be ended. On Windows the least rights
+    first (_win_terminate), then taskkill, which ends the process tree."""
+    if sys.platform!="win32":
+        try: os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM)); return None
+        except ProcessLookupError: return None
+        except OSError as error: return str(error)
+    why=_win_terminate(pid)
+    if why is None: return None
+    try:
+        r=subprocess.run(["taskkill","/PID",str(pid),"/T","/F"],capture_output=True,text=True,timeout=30)
+    except (OSError,subprocess.SubprocessError) as error:
+        return f"{why}; taskkill: {error}"
+    if r.returncode==0: return None
+    return f"{why}; taskkill: {(r.stdout+r.stderr).strip() or f'exit {r.returncode}'}"
 
 def _serve_cmdline_matches_port(raw, port):
     argv=[part.decode("utf-8","replace") for part in raw.split(b"\0") if part]
@@ -3026,6 +3136,16 @@ def cmd_serve(a):
     try:
         with open(serve_pidfile(a.port),"w") as f: f.write(f"{os.getpid()} {a.model}\n")
     except OSError: pass
+    # and the stop request `coli stop` leaves when it cannot end this process itself.
+    # The watcher ends with the serve: left running in a process that goes on (a test
+    # runner calling cmd_serve), a later `coli stop` of the same port would end that.
+    stopfile=serve_stopfile(a.port)
+    if _stop_file_is_ours(stopfile):           # one left from a stop that found no serve
+        try: os.unlink(stopfile)
+        except OSError: pass
+    served=threading.Event()
+    threading.Thread(target=_watch_stop_file,args=(stopfile,_stop_self),kwargs={"done":served},
+                     daemon=True,name="coli-stop-request").start()
     import openai_server
     openai_server.ARCH=arch
     model_id=serve_model_id(a)
@@ -3043,13 +3163,30 @@ def cmd_serve(a):
             env["CLUSTER_WORKERS"] = ",".join(workers)
             print(f"  {C.dim}[CLUSTER] discovered {len(workers)} expert worker(s){C.r}", file=sys.stderr)
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
-              a.cap,ngen_for(a,interactive=True,family=family),engine,
+              a.cap,serve_max_tokens(a),engine,
               env,a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host,
               family=family)
     finally:
+        served.set()
         try: os.unlink(serve_pidfile(a.port))
         except OSError: pass
+
+def _proc_state(pid):
+    """The state letter of `pid` (R, S, Z, ...), None when it cannot be read.
+    Linux: /proc/<pid>/stat, after the command name. Elsewhere (macOS, the BSDs:
+    no /proc) the first letter of `ps -o stat=`."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f: stat = f.read()
+        return stat[stat.rindex(b")") + 2:stat.rindex(b")") + 3].decode()
+    except (OSError, ValueError):
+        if os.path.isdir("/proc/self"): return None
+    try:
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out[:1] or None
+
 
 def _pid_alive(pid):
     """Is `pid` a live process?
@@ -3062,8 +3199,12 @@ def _pid_alive(pid):
     were resident (#1049, reported with a reproduction on Windows 11 native).
     On win32 ask the OS directly instead."""
     if sys.platform != "win32":
-        try: os.kill(pid, 0); return True
+        try: os.kill(pid, 0)
         except OSError: return False
+        # A zombie answers kill(0) but is gone: it holds no memory, and only its
+        # parent can reap it, so cmd_stop's check that everything ended must not
+        # wait on it.
+        return _proc_state(pid) != "Z"
     import ctypes
     from ctypes import wintypes
     PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE = 0x1000, 259
@@ -3218,22 +3359,40 @@ def cmd_stop(a):
     launchers = [pid for pid, d in targets.items() if d.startswith("coli serve")]
     strays   = [pid for pid, d in targets.items() if not d.startswith("coli serve")]
     deadline = time.time() + 30.0
-    for pid in launchers:
-        try: os.kill(pid, signal.SIGTERM)
-        except OSError: pass
+    # The serve's own stop first (_request_stop): it needs no rights on the process.
+    # On Windows a SIGTERM is TerminateProcess, no drain, so it is sent only to a
+    # serve that did not take the request; elsewhere SIGTERM is the same graceful
+    # stop and goes along with it.
+    asked = bool(launchers) and _request_stop(a.port)
+    if sys.platform != "win32" or not asked:
+        for pid in launchers:
+            try: os.kill(pid, signal.SIGTERM)
+            except OSError: pass
     while time.time() < deadline and any(_pid_alive(p) for p in launchers):
         time.sleep(0.25)
     for pid in strays:
         try: os.kill(pid, signal.SIGTERM)   # normally already gone with the launcher
         except OSError: pass
     time.sleep(2.0)
+    why = {}
     for pid in targets:
-        # signal.SIGKILL does not exist on win32 and AttributeError is not OSError,
-        # so the bare `except OSError` let it escape and abort the command AFTER
-        # the SIGTERMs above (#1049). Line 752 in this file already uses the
-        # getattr form; os.kill(SIGTERM) is TerminateProcess on Windows anyway.
-        try: os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM)); print(f"  {pid}: forced")
-        except OSError: pass       # gia' morto: bene
+        if not _pid_alive(pid): continue   # gia' morto: bene
+        error = _terminate(pid)
+        if error is None: print(f"  {pid}: forced")
+        else: why[pid] = error
+    deadline = time.time() + 10.0
+    while time.time() < deadline and any(_pid_alive(p) for p in targets):
+        time.sleep(0.25)
+    left = [pid for pid in targets if _pid_alive(pid)]
+    if left:
+        # Saying "stopped" here left a multi-GB engine running behind a message that
+        # it was gone (#2091): the failure is the answer.
+        for pid in left:
+            print(f"  {C.yel}could not stop {pid}{C.r} ({targets[pid]}): {why.get(pid, 'still running')}")
+        if why and sys.platform == "win32":
+            print("  it runs with more rights than this prompt (started from an administrator console?): "
+                  "run coli stop from a prompt like the one that started it")
+        sys.exit(1)
     try: os.unlink(pf)
     except OSError: pass
     print(f"  {C.grn}✓ stopped{C.r} — RAM released")
@@ -3653,7 +3812,7 @@ def main():
     pset.add_argument("--no-gpu",action="store_true",help="same as --backend cpu")
     pset.add_argument("--host",default=None,help="address to serve on (default 127.0.0.1)")
     pset.add_argument("--port",type=int,default=None,help="port to serve on (default 8000)")
-    pset.add_argument("--ctx",type=int,default=0,metavar="TOKENS",
+    pset.add_argument("--ctx",type=int,default=None,metavar="TOKENS",
                       help="context the server starts with, kept for `coli start` (0: automatic, "
                       "from the memory there is)")
     pset.add_argument("--no-start",action="store_true",help="set up, but do not start the server")

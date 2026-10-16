@@ -24,11 +24,21 @@
 #ifdef COLI_CUDA
 
 /* Init after model load. Returns 1 when the tier is active.
- * cap_experts_per_layer must equal n_experts (full RAM residency): the tier
- * stores raw pointers into the expert slots, which must never be evicted. */
-/* expert_is_int4: 1 = pesi int4 impacchettati (fmt=4), 0 = int8 (fmt=1). Il
- * chiamante lo determina dalla TAGLIA SU DISCO, non da meta.ebits, che su
- * qualche container mente (cfr. il rilevamento in qwen36.c). */
+ * cap_experts_per_layer >= n_experts (full RAM residency): the tier keeps raw
+ * pointers into the expert slots, which are never evicted. Any smaller cap:
+ * copy mode, as for fp8 below -- the slots are recycled, so the tier copies an
+ * expert while the engine holds it (qt_note) and keeps no pointer
+ * (qt_streaming() says which). */
+/* expert_is_int4: 1 = pesi int4 impacchettati (fmt=4), 0 = int8 (fmt=1), -1 =
+ * no expert format the tier takes (the mixed layout): the devices hold the
+ * dense trunk only. Il chiamante lo determina dalla TAGLIA SU DISCO, non da
+ * meta.ebits, che su qualche container mente (cfr. il rilevamento in qwen36.c).
+ * The tier is also trunk-only for int8 experts with grouped scales and for
+ * COLI_PLACE experts=cpu; qt_experts_on() is 0 then. */
+/* Before qt_init: the int4 bytes qt_note hands over are expert_ffn.h's planar
+ * blocks (the engine's RAM layout when its shared kernel runs the CPU's
+ * experts), not the container's signed pairs; staging converts them. */
+void qt_source_planar(int on);
 /* R4 role split: park the dense-i8 lm_head on its own CUDA device
  * (COLI_LMHEAD_GPU=<dev>). One GEMV per token, at token end — outside the
  * per-layer latency chain — so a slower second card can host it without
@@ -130,13 +140,17 @@ int  qt_init(int n_layers, int n_experts, int hidden, int inter,
              int cap_experts_per_layer, int topk, int expert_gs,
              int expert_is_int4);
 int  qt_ready(void);
+int  qt_streaming(void);   /* copy mode: no pointer into the engine's slots is kept */
+int  qt_experts_on(void);  /* some device has room for experts (not trunk-only) */
 int  qt_is_resident(int layer, int eid);
 void qt_shutdown(void);
 
-/* Call once per routed expert per token (pointers to the RAM slot: packed
- * int4 or, on an int8 container, the live int8 weights -- tier fmt=1 is
- * accepted since #1334; see also #1391 for the decode-path offer). Updates
- * heat and may enqueue a background upload. */
+/* Call for each routed expert the CPU computes (pointers to the RAM slot:
+ * packed int4, planar int4 after qt_source_planar(1), or, on an int8
+ * container, the live int8 weights -- tier fmt=1 is accepted since #1334; see
+ * also #1391 for the decode-path offer). Counts its heat (qt_issue counts the
+ * hits') and may enqueue a background upload; in copy mode the bytes are
+ * copied before this returns. */
 void qt_note(int layer, int eid,
              const uint8_t *g4, const uint8_t *u4, const uint8_t *d4,
              const float *gs, const float *us, const float *ds);
@@ -216,6 +230,9 @@ static inline void *qt_dense_tensor(int a,int*b){(void)a;(void)b;return NULL;}
 static inline void *qt_dnproj_tensor(int a,int*b){(void)a;(void)b;return NULL;}
 static inline void *qt_lmhead_tensor(int*b){(void)b;return NULL;}
 static inline int  qt_ready(void){return 0;}
+static inline int  qt_streaming(void){return 0;}
+static inline int  qt_experts_on(void){return 0;}
+static inline void qt_source_planar(int a){(void)a;}
 static inline int  qt_is_resident(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}

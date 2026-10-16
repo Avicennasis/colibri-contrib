@@ -282,8 +282,10 @@ family_staged_faults() {
   done
   rm -f hist.usage
   # the chain: a failure before it starts declines it (or leaves one matrix behind), a
-  # lost device in the middle has the CPU rebuild the state
-  local C=(COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1)
+  # lost device in the middle has the CPU rebuild the state. The warm start fills no
+  # device here (COLI_VK_TIER_FILL=0): the fill's uploads would take the waits counted
+  # from the run's submits, and wait:S-2 would land before the chain's first step
+  local C=(COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_FILL=0)
   fault_run "faults: qwen36 chain, none" "" q.tok "${C[@]}" -- "${q[@]}"
   S=$(fault_num 's/.*copies (\([0-9]*\) submits).*/\1/p' vk.log)
   for f in stage:1 block:1 record:4 submit:4 commit:1 wait:4 wait:$((S - 2)); do
@@ -358,6 +360,7 @@ dense_where() {
 # can end before the uploader thread is first scheduled (it did in 5 of 40 runs with
 # the trunk on the CPU), so the gate waits for each staged upload at the next step.
 tier_gate() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local eng=$1 tag=$2; shift 2
   local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   rm -f tier.usage
@@ -974,6 +977,7 @@ family_deepseek() {
   # must also have evicted. COLI_USAGE points at a fresh history, COLI_VK_TIER_SYNC=1
   # awaits each staged upload at the next step (as in tier_gate).
   v41_tier() {  # <tag> <env and argv...>
+    if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
     local tag=$1; shift
     rm -f tier.usage
     env "$@" > v41-cpu.txt 2> v41-cpu.err || { cat v41-cpu.err; fail "deepseek_v41 tier $tag: CPU run"; }
@@ -1046,6 +1050,7 @@ sys.argv = ["make_deepseek_v4_tiny.py", "--output", sys.argv[2], "--force"]
 gen.main()
 PY
   v4_tier() {  # <tag> <fixture> <case> <env...>
+    if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
     local tag=$1 fx=$2 c=$3; shift 3
     local p mt
     p=$($PY -c 'import json,sys; c=json.load(open(sys.argv[1]+"/ref.json"))["cases"][sys.argv[2]]; print("".join("<t%03d>" % t for t in c["prompt_ids"]))' $fx $c)
@@ -1187,6 +1192,7 @@ family_kimi() {
   # k3_gate <tag> <env...>: the tokens of the CPU run, the tier served some experts,
   # the shared experts where they were asked to be (dense_where); EVICT=1: it evicted
   k3_gate() {
+    if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
     local tag=$1 c; shift
     for c in short chunk long; do
       rm -f k3.usage
@@ -1475,6 +1481,7 @@ glm_fixtures() {
 # greedy run (the warm start, and the device in a teacher-forced prefill). DEV2=1: the
 # second device's registry served experts ("+ N vk" in the hit-rate line).
 glm_tier() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local tag=$1 snap=$2 ref=$3; shift 3
   local envs=() pre=() e; while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   for e in "${envs[@]}"; do [ "${e%%=*}" = TF ] || pre+=("$e"); done
@@ -1502,6 +1509,7 @@ glm_tier() {
 # teacher_forcing and greedy lines; the history is a fresh COLI_USAGE file (HIST=1: one
 # greedy run writes it first).
 g53_tier() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local tag=$1 model=$2; shift 2
   local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   rm -f g53.usage
@@ -1687,6 +1695,23 @@ chain_gate() {  # <engine> <tag> <tol 0|1> <env...> -- <argv...>   (CPUENV: the 
   echo "OK $tag: tokens = CPU$lg, $(chain_count "$eng" vk.log) chain forwards"
 }
 
+# dmoe_gate <engine> <tag> all|some|none <env...> -- <argv...>: chain_gate, and how many layer
+# steps ran their routed experts in the frame (vk_dmoe.h): all (no routed expert on the
+# host), some (beside host steps: the tier holds every expert of some layers only), none
+dmoe_gate() {
+  local eng=$1 tag=$2 want=$3; shift 3
+  chain_gate "$eng" "$tag" 1 "$@"
+  local n h
+  n=$(sed -n "s/^\[VK\] $eng chain: .* \([0-9]*\) layer steps with the routed experts in the frame.*/\1/p" vk.log | tail -1)
+  h=$(sed -n "s/^\[VK\] $eng chain: .* \([0-9.]*\) ms of routed experts on the host.*/\1/p" vk.log | tail -1)
+  case $want in
+    all) [ "${n:-0}" -gt 0 ] && [ "$h" = 0.0 ] ;;
+    some) [ "${n:-0}" -gt 0 ] && [ "${h:-0.0}" != 0.0 ] ;;
+    *) [ "${n:-0}" = 0 ] ;;
+  esac || { cat vk.log; fail "$tag: ${n:-?} layer steps in the frame, ${h:-?} ms of routed experts on the host (wanted $want)"; }
+  echo "OK $tag: ${n:-0} layer steps with the routed experts in the frame, ${h:-?} ms of routed experts on the host"
+}
+
 # lost_gate <engine> <tag> <frame> <env...> -- <argv...>: the device "lost" at the given
 # chain frame (COLI_VK_CHAIN_FAULT); the engine rebuilds the recurrent state on the CPU
 # from the prefix record and continues there: the CPU run's tokens all the same.
@@ -1743,8 +1768,18 @@ family_qwen_chain() {
   chain_gate qwen36 "chain qwen36 vision" 1 COLI_DENSE_I8=0 SNAP=qwen38_27b_vl_tiny_c -- 8 8 qwen38_27b_vl_tiny/ref.json
   QWEN36_VL_TINY=qwen38_27b_vl_tiny_c QWEN36_VL_REF=qwen38_27b_vl_tiny/ref.json COLI_VULKAN=1 COLI_VK_CHAIN=1 \
     COLI_USAGE=$PWD/chain.usage $PY -m unittest tests.test_qwen36_vision_serve
-  # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there
+  # the routed experts in the frame (vk_dmoe.h): every layer's (the warm start fills the
+  # tier), some layers' (a budget of 60 experts of 64, filled round the layers: four whole,
+  # the rest on the host, an eviction that changes the table mid-run), none
+  dmoe_gate qwen36 "chain qwen36 the routed experts in the frame" all COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  dmoe_gate qwen36 "chain qwen36 the routed experts in the frame, some layers" some COLI_VK_TIER_GB=0.00077 COLI_DENSE_I8=0 \
+    SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  dmoe_gate qwen36 "chain qwen36 the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 COLI_DENSE_I8=0 \
+    SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there; in a
+  # step's frames on the host's routing, and in a step that is one frame
   lost_late qwen36 "chain qwen36 device lost" 20 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  DMOE=1 lost_late qwen36 "chain qwen36 device lost, the routed experts in the frame" 4 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   # the prefix-reuse contract with the state on the device, and a serve session
   QWEN36_TINY=$PWD/qwen36_tiny_c COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/test_qwen36_prefix_serve.py
   $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
@@ -1779,8 +1814,15 @@ family_qwen_chain() {
     chain_gate qwen38 "chain qwen38 MTP $fx ${f:-drafting}" 1 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=$f SNAP=$fx -- 2 8 $fx/ref.json
   done; done
   # the device lost mid-decode, once between steps and once inside an MTP verify
+  dmoe_gate qwen38 "chain qwen38 the routed experts in the frame" all OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  dmoe_gate qwen38 "chain qwen38 the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 OMP_NUM_THREADS=2 \
+    SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
   lost_late qwen38 "chain qwen38 device lost" 10 rebuild OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
-  lost_late qwen38 "chain qwen38 device lost in a verify" 15 rebuild OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  lost_late qwen38 "chain qwen38 device lost in a verify" 15 rebuild OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed \
+    SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  DMOE=1 lost_late qwen38 "chain qwen38 device lost, the routed experts in the frame" 3 rebuild OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  DMOE=1 lost_late qwen38 "chain qwen38 device lost in a verify, the routed experts in the frame" 3 rebuild OMP_NUM_THREADS=2 Q38_MTP=1 \
+    Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
   # the oracle targets with the chain on (COLI_VK_TIER_BALANCE=0: the int4 target wants
   # the same last logits from every expert path, and the balancer moves experts between
   # the device and the CPU by measured times); the MTP harness, whose prompt-cache and pin
@@ -1910,6 +1952,10 @@ family_qwen_spec() {
     Q38_MTP_DRAFTS=3 Q38_MTP_FORCE=cycle SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
   lost_late qwen36 "spec chain qwen36 device lost mid-decode, lookup verifies" 20 rebuild COLI_DENSE_I8=0 COLI_LOOKUP=1 \
     COLI_SPEC_GATE=0 COLI_LOOKUP_FORCE=cycle SNAP=qwen36_tiny_v128_c -- 8 8 qwen36_tiny_v128/ref_full.json
+  DMOE=1 lost_late qwen38 "spec chain qwen38 device lost mid-decode, verifies of 4 rows, the routed experts in the frame" 3 rebuild \
+    OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_DRAFTS=3 Q38_MTP_FORCE=cycle SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  DMOE=1 lost_late qwen36 "spec chain qwen36 device lost mid-decode, lookup verifies, the routed experts in the frame" 3 rebuild \
+    COLI_DENSE_I8=0 COLI_LOOKUP=1 COLI_SPEC_GATE=0 COLI_LOOKUP_FORCE=cycle SNAP=qwen36_tiny_v128_c -- 8 8 qwen36_tiny_v128/ref_full.json
 }
 # The same under ASan and UBSan: every run of the harness's quick subset (depth 3
 # rejected at rows 1 and 2 and cycling, lookup cycling and at row 3, a serve session
@@ -1981,6 +2027,31 @@ EOF
   mv tiny_inkling_q/dense-int4g64.safetensors tiny_inkling_q/dense-int4g64/dense.safetensors
   $PY tools/make_olmoe_tiny.py --output olmoe_tiny --force
   $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
+  # the dense part as OLMoE's own checkpoints have it, bf16 (allenai's base) or f16: every
+  # f32 the engine reads is a bf16 or an f16 widened
+  local half
+  for half in bf16 f16; do
+    rm -rf olmoe_tiny_${half}_c && cp -r olmoe_tiny_c olmoe_tiny_${half}_c
+    $PY - "olmoe_tiny_${half}_c/model-00000.safetensors" "$half" <<'EOF'
+import json, struct, sys, numpy as np
+p, half = sys.argv[1], sys.argv[2]
+raw = open(p, "rb").read(); n = struct.unpack("<Q", raw[:8])[0]; hdr = json.loads(raw[8:8 + n])
+out, blobs, off = {}, [], 0
+for k, v in hdr.items():
+    if k == "__metadata__": out[k] = v; continue
+    b, dt = raw[8 + n + v["data_offsets"][0]: 8 + n + v["data_offsets"][1]], v["dtype"]
+    if dt == "F32" and half == "bf16":
+        u = np.frombuffer(b, np.float32).view(np.uint32).astype(np.uint64)
+        b, dt = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16).tobytes(), "BF16"
+    elif dt == "F32":
+        b, dt = np.frombuffer(b, np.float32).astype(np.float16).tobytes(), "F16"
+    out[k] = {"dtype": dt, "shape": v["shape"], "data_offsets": [off, off + len(b)]}
+    blobs.append(b); off += len(b)
+h = json.dumps(out).encode(); h += b" " * (-len(h) % 8)
+with open(p, "wb") as f:
+    f.write(struct.pack("<Q", len(h))); f.write(h); [f.write(b) for b in blobs]
+EOF
+  done
   inkling_olmoe_tier_fixtures
 }
 
@@ -2016,10 +2087,12 @@ lost_gate_redo() {  # <engine> <tag> <frame> <env...> -- <argv...>
 
 # The device lost `back` frames before the end of a run (a probe run counts the frames,
 # so the fault lands mid-decode on any device, whatever its setup submits): lost_gate
-# (the state rebuilt on the CPU) or lost_gate_redo (the step redone there).
+# (the state rebuilt on the CPU) or lost_gate_redo (the step redone there). The frames
+# counted are a step's on the host's routing (COLI_VK_CHAIN_MOE=0); DMOE=1 keeps the
+# routed experts in the frame, a step one frame (vk_dmoe.h).
 lost_late() {  # <engine> <tag> <frames back> rebuild|redo <env...> -- <argv...>
   local eng=$1 tag=$2 back=$3 kind=$4; shift 4
-  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local envs=(COLI_VK_CHAIN_MOE=${DMOE:-0}); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   env "${envs[@]}" COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./"$eng" "$@" > vk.log 2>&1 || true
   local f; f=$(sed -n "s/^\[VK\] $eng chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p" vk.log | tail -1)
   { [ -n "$f" ] && [ "$f" -gt "$back" ]; } || { cat vk.log; fail "$tag: the probe run reports no frames"; }
@@ -2078,7 +2151,25 @@ family_inkling_olmoe_chain() {
   chain_gate olmoe "chain olmoe tiled GEMM" 1 COLI_VK_GEMM_MIN_S=2 SNAP=olmoe_tiny_c -- 8 8 $OR
   chain_gate olmoe "chain olmoe the per-row GEMV" 1 COLI_VK_CHAIN_GEMV=0 SNAP=olmoe_tiny_c -- 8 8 $OR
   CHAINMODE=2 chain_gate olmoe "chain olmoe prompts only" 1 SNAP=olmoe_tiny_c -- 8 8 $OR
+  dmoe_gate olmoe "chain olmoe the routed experts in the frame" all SNAP=olmoe_tiny_c -- 8 8 $OR
+  dmoe_gate olmoe "chain olmoe the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 SNAP=olmoe_tiny_c -- 8 8 $OR
   lost_late olmoe "chain olmoe device lost mid-decode" 7 redo SNAP=olmoe_tiny_c -- 8 8 $OR
+  DMOE=1 lost_late olmoe "chain olmoe device lost mid-decode, the routed experts in the frame" 3 redo SNAP=olmoe_tiny_c -- 8 8 $OR
+  # a bf16 or f16 checkpoint's dense matrices go up as bf16 (fmt 11) or f16 (fmt 14): the
+  # CPU's tokens in about half the device bytes of the f32 snapshot's, with the host
+  # copies kept or dropped
+  local mf mb
+  chain_gate olmoe "chain olmoe f32 dense, its bytes" 1 SNAP=olmoe_tiny_c -- 8 8 $OR
+  mf=$(sed -n 's/^\[VK\] olmoe: .* matrices resident, \([0-9.]*\) MiB).*/\1/p' vk.log | tail -1)
+  for half in bf16 f16; do
+    chain_gate olmoe "chain olmoe $half dense" 1 SNAP=olmoe_tiny_${half}_c -- 8 8 $OR
+    mb=$(sed -n 's/^\[VK\] olmoe: .* matrices resident, \([0-9.]*\) MiB).*/\1/p' vk.log | tail -1)
+    $PY -c "import sys; f, b = float(sys.argv[1]), float(sys.argv[2]); sys.exit(0 if 0 < b < f else 1)" "${mf:-0}" "${mb:-0}" ||
+      fail "chain olmoe $half dense: ${mb:-?} MiB resident, not below the f32 snapshot's ${mf:-?} MiB"
+    echo "OK chain olmoe $half dense: $mb MiB resident against $mf MiB as f32"
+    chain_gate olmoe "chain olmoe $half dense on the device only" 1 COLI_VK_DENSE_HOST=0 SNAP=olmoe_tiny_${half}_c -- 8 8 $OR
+  done
+  lost_late olmoe "chain olmoe bf16 dense on the device only, device lost mid-decode" 7 redo COLI_VK_DENSE_HOST=0 SNAP=olmoe_tiny_bf16_c -- 8 8 $OR
 
   # serve: a session of pins, prompt-cache extensions, a divergent prompt and logprobs
   # against the CPU's, frame by frame (and with prompts only); the prefix-reuse and
@@ -2376,6 +2467,7 @@ PY
 # forward), and the run must say so; REBUILD=1: and rebuild the KDA state of some
 # positions on the CPU.
 k3c_gate() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local tag=$1 c frames fault; shift
   for c in ${K3C_CASES:-short chunk long}; do
     rm -f k3c.usage cpu.f32 vk.f32
@@ -2633,6 +2725,7 @@ v4_chain_same() {
   echo "OK $tag (${c%%:*}): $A and $B: the same ids and the same logits bit for bit ($(($(wc -c < v4-a.f32) / 4)) values), $(chain_count deepseek_v4 v4-b.err) chain forwards"
 }
 v4_chain_gate() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local tag=$1 fx=$2 c=$3; shift 3
   local p mt lg frames fault=()
   p=$(v4_chain_prompt "$fx" "$c")
@@ -3041,9 +3134,9 @@ dho_gate() {
 # dho_lost <engine> <tag> <frames back> <env...> -- <argv...>: device only, the device lost
 # `back` frames before the end of a run (COLI_VK_CHAIN_FAULT, counted on a probe run): the
 # CPU's tokens, and the matrices the CPU then needed read back from disk.
-dho_lost() {
+dho_lost() {   # the host's routing, as lost_late (DMOE=1: the routed experts in the frame)
   local eng=$1 tag=$2 back=$3; shift 3
-  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local envs=(COLI_VK_CHAIN_MOE=${DMOE:-0}); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   local vk=(COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DENSE_HOST=0)
   rm -f chain.usage
   env "${envs[@]}" ./"$eng" "$@" > cpu.log 2>&1 || true
@@ -3200,7 +3293,9 @@ done
 #   off       COLI_VK_CHAIN_ROWS=512 COLI_VK_TIER_STREAM=0 COLI_VK_ATTN_BLOCK=0, the
 #             build before's behaviour: the CPU's tokens, nothing streamed.
 # <family>-sanitize runs the forced configurations under ASan and UBSan.
-PF_FORCE="COLI_VK_TIER_STREAM_ROWS=3 COLI_VK_TIER_STREAM_SLOTS=4 COLI_VK_TIER_STREAM_HALF=24"
+# (COLI_VK_TIER_FILL=0: the warm start takes the history alone, or a fixture's experts would
+# all be resident and nothing would be cold enough to stream)
+PF_FORCE="COLI_VK_TIER_FILL=0 COLI_VK_TIER_STREAM_ROWS=3 COLI_VK_TIER_STREAM_SLOTS=4 COLI_VK_TIER_STREAM_HALF=24"
 PF_OFF="COLI_VK_CHAIN_ROWS=512 COLI_VK_TIER_STREAM=0 COLI_VK_ATTN_BLOCK=0"
 stream_count() {   # <engine> <log>: cold experts streamed in the run (the last report)
   local n; n=$(sed -n "s/^\[VK\] tier $1 run: .* stream: [0-9]* steps, \([0-9]*\) cold experts.*/\1/p" "$2" | tail -1)

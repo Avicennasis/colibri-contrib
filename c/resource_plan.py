@@ -8,6 +8,7 @@ import platform
 import re
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import threading
@@ -391,6 +392,101 @@ def _vk_up(value, align=_VK_ALIGN):
     return (value + align - 1) // align * align
 
 
+_HALF_FMT = {}
+_SHARD_INDEX = {}
+
+
+def _shard_key(model_dir):
+    """A checkpoint's shards as they are now: a rewritten one is another key."""
+    shards = sorted(Path(model_dir).glob("*.safetensors"))
+    try:
+        return (str(model_dir),) + tuple((p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in shards)
+    except OSError:
+        return (str(model_dir),)
+
+
+def _shard_index(model_dir):
+    """{tensor name: (shard, first byte, last byte + 1)} over a checkpoint's shards, once."""
+    key = _shard_key(model_dir)
+    if key not in _SHARD_INDEX:
+        index = {}
+        for shard in sorted(Path(model_dir).glob("*.safetensors")):
+            try:
+                with shard.open("rb") as stream:
+                    length = int.from_bytes(stream.read(8), "little")
+                    header = json.loads(stream.read(length))
+            except (OSError, ValueError):
+                continue
+            for name, meta in header.items():
+                if name != "__metadata__" and isinstance(meta, dict):
+                    begin, stop = meta.get("data_offsets") or (0, 0)
+                    index.setdefault(name, (shard, 8 + length + begin, 8 + length + stop))
+        _SHARD_INDEX[key] = index
+    return _SHARD_INDEX[key]
+
+
+def _f32_is_f16(u):
+    """f32 bits an f16 holds exactly (backend_vulkan.c f32_is_f16)."""
+    a, e = u & 0x7FFFFFFF, ((u >> 23) & 0xFF) - 127
+    m = a & 0x7FFFFF
+    if not a:
+        return True
+    if e == 128:
+        return not m & 0x1FFF
+    if e > 15 or e < -24:
+        return False
+    if e >= -14:
+        return not m & 0x1FFF
+    return not (m | 0x800000) & ((1 << (-1 - e)) - 1)
+
+
+def _half_fmt(info, name):
+    """The 2-byte format an engine uploads its f32 copy of checkpoint tensor `name` in, or
+    None when it stays f32: the test backend_vulkan.c's coli_vk_f32_fmt makes, bf16 (fmt
+    11) when every value is a bf16 widened, f16 (fmt 14) when every value is one an f16
+    holds. A BF16 tensor is the first and an F16 one the second, from the header; an F32
+    one is read from its shard once (up to the first value that rules both out); any
+    other dtype (FP8 with its scales, a quantized container) is taken as neither. The one
+    read of tensor values the planner makes, and only for F32 matrices: the checkpoints
+    themselves are BF16 or F16."""
+    tensor = next((t for t in info.get("dense_tensors", []) if _text_weight_name(t["name"]) == name), None)
+    if tensor is None:
+        return None
+    if tensor["dtype"] in ("BF16", "F16"):
+        return 11 if tensor["dtype"] == "BF16" else 14
+    if tensor["dtype"] != "F32" or not info.get("path"):
+        return None
+    key = (_shard_key(info["path"]), tensor["name"])
+    if key not in _HALF_FMT:
+        where = _shard_index(info["path"]).get(tensor["name"])
+        bf16 = f16 = where is not None and (where[2] - where[1]) % 4 == 0
+        if bf16:
+            try:
+                with where[0].open("rb") as stream:
+                    stream.seek(where[1])
+                    left = where[2] - where[1]
+                    while left and (bf16 or f16):
+                        data = stream.read(min(left, 1 << 24))
+                        if not data:
+                            bf16 = f16 = False
+                            break
+                        words = len(data) // 4
+                        # little-endian floats: bytes 0 and 1 of every word are its low half
+                        bf16 = bf16 and data[0::4].count(0) == words and data[1::4].count(0) == words
+                        if f16:
+                            f16 = all(_f32_is_f16(u) for u in struct.unpack(f"<{words}I", data))
+                        left -= len(data)
+            except OSError:
+                bf16 = f16 = False
+        _HALF_FMT[key] = 11 if bf16 else 14 if f16 else None
+    return _HALF_FMT[key]
+
+
+def _f32_vk_fmt(info, name):
+    """The format an engine uploads its f32 copy of checkpoint tensor `name` in."""
+    return (_half_fmt(info, name) if name else None) or 10
+
+
 def vk_tensor_bytes(fmt, columns, rows, group=0):
     """vkc_fit_tensor: a resident tensor's rows at their padded stride and its scales,
     each range aligned (fmt as the backend numbers them: 10 f32, 11 bf16, 12 fp8 in
@@ -726,8 +822,9 @@ _VK_CHAIN_LAYOUT["qwen36"] = _q36_chain_layout
 
 
 def _olmoe_chain_layout(info, env, vulkan):
-    """olmoe_chain.h olc_fit_start: q, k, v, o and the router as f32 tensors, the K/V
-    mirror at the split's floor, the parameters; one chunk's scratch; lm_head the tail."""
+    """olmoe_chain.h olc_fit_start: q, k, v, o and the router as the engine uploads its f32
+    copies (bf16 or f16 where exact, _f32_vk_fmt), the K/V mirror at the split's floor, the
+    parameters; one chunk's scratch; lm_head the tail."""
     c = info.get("config") or {}
     try:
         L, D, H = int(c["num_hidden_layers"]), int(c["hidden_size"]), int(c["num_attention_heads"])
@@ -737,14 +834,18 @@ def _olmoe_chain_layout(info, env, vulkan):
     if L < 1 or H < 1 or D % H:
         return None
     hd = D // H
-    layer = (4 * vk_tensor_bytes(10, D, D) + vk_tensor_bytes(10, D, E) +
-             2 * vk_buf_bytes(H * 3 * _vk_kv_block(env) * hd * 4) + 4 * 4 * D)
+    layers = []
+    for i in range(L):
+        p = f"model.layers.{i}."
+        layers.append(sum(vk_tensor_bytes(_f32_vk_fmt(info, p + f"self_attn.{x}_proj.weight"), D, D) for x in "qkvo") +
+                      vk_tensor_bytes(_f32_vk_fmt(info, p + "mlp.gate.weight"), D, E) +
+                      2 * vk_buf_bytes(H * 3 * _vk_kv_block(env) * hd * 4) + 4 * 4 * D)
     r = _vk_chain_rows(env)
     counts = [r * D] * 8 + [r * E, D, r * D, r * E, 2 * r * D, vocab, r * D, r * hd, r * D]
     if (env.get("PILOT") or "").strip() not in ("", "0"):
         counts.append(r * D)   # PILOT's rows after attention
     fixed = sum(vk_buf_bytes(4 * max(n, 1)) for n in counts) + vk_buf_bytes(4 * D) + vk_buf_bytes(4)
-    return VkChainLayout([layer] * L, fixed, vk_tensor_bytes(10, D, vocab))
+    return VkChainLayout(layers, fixed, vk_tensor_bytes(_f32_vk_fmt(info, "lm_head.weight"), D, vocab))
 
 
 _VK_CHAIN_LAYOUT["olmoe"] = _olmoe_chain_layout
@@ -887,7 +988,8 @@ _VK_CHAIN_LAYOUT["qwen38"] = _q38_chain_layout
 
 def _glm53_chain_layout(info, env, vulkan):
     """glm53_chain.h g53c_fit_plan: each layer's device bytes (the mHC mixes in f32, its
-    matrices at GLM53_BITS as quantize_loaded leaves them, an int4 container's as it is,
+    matrices at GLM53_BITS as quantize_loaded leaves them (32: f32, uploaded as bf16 or f16 where
+    exact, _f32_vk_fmt), an int4 container's as it is,
     the absorbed kv_b halves, its share of the parameter arena, a KDA layer's state and
     window, an MLA layer's caches at their first 256 positions), the scratch of one prompt
     chunk at GLM53_MAXT and the head."""
@@ -919,11 +1021,13 @@ def _glm53_chain_layout(info, env, vulkan):
     packed = {_text_weight_name(t["name"]) for t in info.get("dense_tensors", []) if t.get("dtype") in ("U8", "I8")}
     P, nm, HD = kh * kd, (2 + H) * H, H * D
 
-    def mat(rows, columns, name=None):
+    def mat(rows, columns, name=None, source=None):
+        # source: the checkpoint tensor an f32 matrix's values come from (kv_b's absorbed
+        # halves are a reordering of kv_b): bf16 on the device where exact
         if name is not None and name in packed:
             return vk_tensor_bytes(4, columns, rows, 64)
         if bits == 32:
-            return vk_tensor_bytes(10, columns, rows)
+            return vk_tensor_bytes(_f32_vk_fmt(info, source or name), columns, rows)
         if bits == 4 and columns % 64 == 0:
             return vk_tensor_bytes(4, columns, rows, 64)
         return vk_tensor_bytes(1, columns, rows)
@@ -934,7 +1038,8 @@ def _glm53_chain_layout(info, env, vulkan):
         if full[i]:
             a = p + "self_attn."
             size += (mat(ql, D, a + "q_a_proj.weight") + mat(nh * (qn + qr), ql, a + "q_b_proj.weight") +
-                     mat(kvl + qr, D, a + "kv_a_proj_with_mqa.weight") + mat(nh * kvl, qn) + mat(nh * vh, kvl) +
+                     mat(kvl + qr, D, a + "kv_a_proj_with_mqa.weight") +
+                     mat(nh * kvl, qn, source=a + "kv_b_proj.weight") + mat(nh * vh, kvl, source=a + "kv_b_proj.weight") +
                      mat(D, nh * vh, a + "o_proj.weight") + mat(IH * ID, ql, a + "indexer.wq_b.weight") +
                      mat(ID, D, a + "indexer.wk.weight") + mat(IH, D, a + "indexer.weights_proj.weight") +
                      mat(ID, D, a + "indexer.index_kpool_compress_gate"))
@@ -1120,6 +1225,8 @@ def _k3_chain_layout(info, env, vulkan):
 
     def w(name, out, columns, b):
         fmt, group = _k3_vk_fmt(tensors, name, out, columns, b, explicit)
+        if fmt == 10:   # an f32 W goes up as bf16 or f16 where exact (k3_vk_ensure)
+            fmt = _f32_vk_fmt(info, name)
         return vk_tensor_bytes(fmt, columns, out, group)
     rows = _vk_rows(env, 256)
     layers = []
@@ -1130,7 +1237,10 @@ def _k3_chain_layout(info, env, vulkan):
             for part in ("q", "k", "v", "g"):
                 b += w(p + f"self_attn.{part}_proj.weight", P, D, bits)
             b += w(p + "self_attn.o_proj.weight", D, P, bits)
-            b += vk_tensor_bytes(10, D, hd) + vk_tensor_bytes(10, hd, P) + vk_tensor_bytes(10, D, heads)
+            a = p + "self_attn."
+            b += (vk_tensor_bytes(_f32_vk_fmt(info, a + "f_a_proj.weight"), D, hd) +
+                  vk_tensor_bytes(_f32_vk_fmt(info, a + "f_b_proj.weight"), hd, P) +
+                  vk_tensor_bytes(_f32_vk_fmt(info, a + "b_proj.weight"), D, heads))
             b += vk_buf_bytes(3 * P * conv * 4) + vk_buf_bytes(heads * hd * hd * 4)
             floats += 3 * P * conv + heads + P + hd
         else:
@@ -1144,7 +1254,7 @@ def _k3_chain_layout(info, env, vulkan):
             floats += QL + KL + rows * (KL + R)
         if i >= first_dense:
             moe, si = p + "block_sparse_moe.", inter * shared
-            b += vk_tensor_bytes(10, D, E)
+            b += vk_tensor_bytes(_f32_vk_fmt(info, moe + "gate.weight"), D, E)
             b += (w(moe + "routed_expert_down_proj.weight", LT, D, bits) + w(moe + "routed_expert_up_proj.weight", D, LT, bits) +
                   w(moe + "shared_experts.gate_proj.weight", si, D, bits) + w(moe + "shared_experts.up_proj.weight", si, D, bits) +
                   w(moe + "shared_experts.down_proj.weight", D, si, bits))
@@ -1272,7 +1382,7 @@ def _inkling_chain_layout(info, env, vulkan):
                 return None   # a form the shaders do not take: the chain declines, N = L as before
             total += vk_tensor_bytes(f[0], columns, rows, f[1])
         if sparse[i]:
-            total += vk_tensor_bytes(10, D, E + ns)   # the router's f32 copy
+            total += vk_tensor_bytes(_f32_vk_fmt(info, p + "mlp.gate.weight"), D, E + ns)   # the router's f32 copy
             for suffix, columns, rows in (("mlp.shared_experts.gate_proj", D, inter),
                                           ("mlp.shared_experts.up_proj", D, inter),
                                           ("mlp.shared_experts.down_proj", inter, D)):
@@ -3288,6 +3398,10 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                  "sockets": max(1, int(cpu_sockets)),
                  "thread_policy": "physical-cores"},
         "memory": {"unified": unified, "available_bytes": available_memory},
+        # the Vulkan device a COLI_VULKAN=1 run opens (its expert tier and dense chain
+        # size themselves from its free memory at start)
+        "vulkan": ({"name": vulkan.get("name"), "type": vulkan.get("type")}
+                   if vulkan and _vk_flag(env_now, "COLI_VULKAN") else None),
         "tiers": {
             "disk": {"role": "cold-backing", "model_bytes": info["model_bytes"],
                      "available_bytes": available_disk, "cold_expert_bytes": cold_bytes},
@@ -3446,6 +3560,10 @@ def format_plan(plan):
             lines.append("VRAM   " + (f"{format_bytes(trunk)} int8 trunk + " if trunk else "") +
                          f"{format_bytes(vram['budget_bytes'])} hot tier · "
                          f"~{vram['expert_capacity']} experts · {names}")
+    elif plan.get("vulkan"):
+        vk = plan["vulkan"]
+        lines.append(f"VRAM   Vulkan · {vk.get('name') or 'device'} ({vk.get('type') or '?'}) · the expert tier "
+                     "and the dense chain size themselves from its free memory at start")
     else:
         # Backend-neutral, matching the accelerator wording #903 settled on:
         # an AMD or Intel host that finds nothing is not "no NVIDIA device".

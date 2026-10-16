@@ -92,13 +92,50 @@ static QSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; 
  * 5.2 ms/token on two cards against 0.2 on one). */
 static int home2(int layer, int eid);
 
+/* Copy mode (G_stream): the fp8 experts (qt_init_fp8), and any format when the
+ * RAM holds fewer than every expert of a layer (cap < n_experts): its slots are
+ * recycled then, exactly the Qwen3.8 case, so the tier copies what it takes
+ * while the bytes pass by. Before, qwen36 refused the tier outright below full
+ * residency, and a 32 GB box with a 4 GB card ran the CPU alone (#2090). */
+static int G_stream;
+/* No expert format the tier takes (the mixed layout, int8 with grouped scales,
+ * experts=cpu): the devices still take the dense trunk, which is read on every
+ * token. Before, each of these switched the trunk off as well. */
+static int G_trunk_only;
+/* Where the engine's int4 bytes come from (qt_source_planar): 0 = the
+ * container's signed pairs, 1 = expert_ffn.h's planar blocks, the layout the
+ * engine keeps in RAM when its shared kernel computes the CPU's experts. */
+static int G_src_planar;
+void qt_source_planar(int on){ G_src_planar = on ? 1 : 0; }
+
+/* One planar block (64 elements in 32 bytes: byte k = element k low, k+32
+ * high, both v+8) as the backend's offset-binary pairs (byte j = element 2j
+ * low, 2j+1 high, both v+8): the same 32 bytes in pair order, no sign change.
+ * noinline: inlined three times into stage(), GCC 13 at -O3 -march=native took
+ * over 2 GB and 150 s to compile this file (0.76 s and 68 MB without). */
+__attribute__((noinline))
+static void planar_to_pairs(uint8_t *dst, const uint8_t *src, size_t bytes){
+    for(size_t b=0; b<bytes; b+=32){
+        const uint8_t *p=src+b; uint8_t *q=dst+b;
+        for(int j=0;j<16;j++){
+            q[j]    = (uint8_t)((p[2*j]&0x0F) | (p[2*j+1]<<4));
+            q[16+j] = (uint8_t)((p[2*j]>>4)   | (p[2*j+1]&0xF0));
+        }
+    }
+}
+
 /* Staging: packed int4 (g|u|d) two's-complement -> offset-binary (XOR 0x88,
- * the upload format of backend_cuda fmt=2) + copy the scales (gs|us|ds). */
+ * the upload format of backend_cuda fmt=2), or planar -> pairs, + copy the
+ * scales (gs|us|ds). */
 static void stage(uint8_t *dw, float *dsc,
                   const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
                   const float *gs,const float *us,const float *ds){
     size_t mb = (size_t)G.D*G.Ih/(G.wfmt==4?2:1);
-    if(G.wfmt==1 || G.wfmt==8){
+    if(G.wfmt==4 && G_src_planar){
+        planar_to_pairs(dw,      g4, mb);
+        planar_to_pairs(dw+mb,   u4, mb);
+        planar_to_pairs(dw+2*mb, d4, mb);
+    } else if(G.wfmt==1 || G.wfmt==8){
         /* int8: il formato del backend e' gia' quello in RAM, si copia e basta.
          * Niente XOR: quello serve a portare i nibble int4 da complemento a due
          * a binario sfalsato, e su byte interi sarebbe corruzione. */
@@ -426,9 +463,10 @@ static double auto_displaced_value(int di, size_t room, int k, size_t exp_bytes,
     size_t homed = 0;
     for(int l = 0; l < nl; l++) for(int e = 0; e < ne; e++) if(home2(l, e) == di) homed++;
     size_t fit = room / exp_bytes;
-    if(fit >= homed){ *p_marginal_out = 0; return 0; }   /* room to spare: displaces nothing */
+    if(fit >= homed || G_trunk_only){ *p_marginal_out = 0; return 0; }   /* room to spare: displaces nothing */
     if(k <= 0){ *p_marginal_out = 0; return 0; }
-    double cpu_factor = (G.wfmt == 1) ? 1.0 : 2.0;      /* CPU reads the int8 slot */
+    /* the CPU reads the int8 slot, or the int4 one when the engine keeps them planar */
+    double cpu_factor = (G.wfmt == 1 || G_src_planar) ? 1.0 : 2.0;
     if(!heat0){
         double p = (double)topk / ne;
         *p_marginal_out = p;
@@ -529,12 +567,12 @@ static void auto_place(int nl, int ne, int topk, const size_t *capacity, const u
 }
 
 
-/* ---- fp8 streaming mode (Qwen3.8) -----------------------------------------
- * qwen36 keeps every expert in RAM and lets the tier retain raw pointers into
- * slots that are never recycled; that is what `cap == n_experts` guards. A
- * model whose experts do not fit in RAM (Qwen3.8: 24 576 x 4.7 MiB) streams
- * them through an LRU whose slots ARE recycled, so a retained pointer would
- * dangle by the next token. In this mode the tier owns what it uploads: the
+/* ---- copy ("streaming") mode: fp8 (Qwen3.8), and qwen36 below full residency --
+ * With every expert in RAM (cap == n_experts) qwen36 lets the tier retain raw
+ * pointers into slots that are never recycled. A model whose experts do not
+ * fit in RAM (Qwen3.8: 24 576 x 4.7 MiB; Qwen3.6 on a 32 GB box) streams them
+ * through an LRU whose slots ARE recycled, so a retained pointer would dangle
+ * by the next token (G_stream). In this mode the tier owns what it uploads: the
  * bytes are copied into the staging buffer inside the qt_note call, while the
  * engine's slot is still live, and the pointers are dropped right after. A
  * promotion can therefore only happen when the bytes pass by -- the LFRU
@@ -575,11 +613,13 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     if(G.on) return 0;
     const char *e=getenv("COLI_CUDA");
     if(!(e && *e=='1')) return 0;
-    if(cap != ne && !G_fp8_stream){
-        fprintf(stderr,"[qtier] cap=%d != n_experts=%d -> tier disabled (needs full RAM residency)\n",cap,ne);
-        return 0;
-    }
     if(topk>QT_MAX_ROWS){ fprintf(stderr,"[qtier] topk>%d unsupported\n",QT_MAX_ROWS); return 0; }
+    /* cap > n_experts holds every expert too (a slot per expert, never recycled):
+     * it used to be refused along with the smaller caps */
+    G_stream = G_fp8_stream || cap < ne;
+    G_trunk_only = expert_is_int4 < 0;
+    if(G_stream && !G_fp8_stream && !G_trunk_only)
+        fprintf(stderr,"[qtier] RAM holds %d of %d experts a layer: the tier copies each expert it takes as it passes\n",cap,ne);
     memset(&G,0,sizeof G);
     { const char *e=getenv("QT_UPLOAD_SYNC"); G_upload_sync=e&&*e&&*e!='0'; }
     G.nl=nl; G.ne=ne; G.D=D; G.Ih=Ih; G.topk=topk;
@@ -637,12 +677,13 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
 
     /* Weight format and bytes per expert come first now: the automatic
      * placement below needs them to price the experts a trunk item displaces. */
-    G.wfmt = G_fp8_stream ? 8 : (expert_is_int4 ? 4 : 1);
-    if(G.wfmt==1 && expert_gs>0){
+    G.wfmt = G_fp8_stream ? 8 : (expert_is_int4 > 0 ? 4 : 1);
+    if(G.wfmt==1 && expert_gs>0 && !G_trunk_only){
         fprintf(stderr,"[qtier] int8 experts with grouped scales (gs=%d) cannot be "
-                       "expressed on the GPU (fmt=1 is per-row only) -> CPU path\n", expert_gs);
-        return 0;
+                       "expressed on the GPU (fmt=1 is per-row only)\n", expert_gs);
+        G_trunk_only = 1;
     }
+    if(G.wfmt!=4) G_src_planar = 0;   /* planar is an int4 layout */
     G.egs = expert_gs;
     if(G.wfmt==8){
         /* one f32 scale per 128x128 block of [O,I]: gate/up are [Ih,D], down is
@@ -820,8 +861,8 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
                 fprintf(stderr,"[place] Experten auf Device %d festgelegt\n",ed);
             } else fprintf(stderr,"[place] experts=%d nicht verfuegbar -> COLI_GPUS bleibt\n",ed);
         } else if(!G_auto_on && G_place_n && qt_place_named("experts")){
-            fprintf(stderr,"[place] experts=cpu -> VRAM-Tier aus\n");
-            goto fail_storage;
+            fprintf(stderr,"[place] experts=cpu: no experts in VRAM, the placed trunk stays\n");
+            G_trunk_only = 1;
         } else if(nres && !G_auto_on){
             int w=0;
             for(int i=0;i<G.ndev;i++){
@@ -849,7 +890,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         size_t cap_i = 0;
         for(int j=0;j<ncap;j++) if(capdev[j]==G.dev[i]) cap_i = capacity[j];
         G_trunk_bytes[i] = trunk;                 /* by expert-device index, for qt_stats */
-        G.budget[i] = cap_i > trunk ? cap_i - trunk : 0;
+        G.budget[i] = G_trunk_only ? 0 : cap_i > trunk ? cap_i - trunk : 0;
         fprintf(stderr,"[qtier] dev %d: budget %.2f GB for experts (~%zu experts)%s\n",
                 G.dev[i], G.budget[i]/1073741824.0, G.budget[i]/G.exp_bytes,
                 trunk ? " after trunk" : "");
@@ -869,8 +910,11 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     qt_aff_restore(&aff);
     if(!th_ok) goto fail_cv_take;
     G.on=1;
-    fprintf(stderr,"[qtier] CUDA VRAM expert tier active: %d device(s), %.2f MB/expert\n",
-            G.ndev, G.exp_bytes/1048576.0);
+    if(G_trunk_only)
+        fprintf(stderr,"[qtier] CUDA: the dense trunk only, the experts of this container stay on the CPU\n");
+    else
+        fprintf(stderr,"[qtier] CUDA VRAM expert tier active: %d device(s), %.2f MB/expert%s\n",
+                G.ndev, G.exp_bytes/1048576.0, G_stream ? ", copied as they pass" : "");
     /* The launcher and coli doctor recognise a Windows CUDA_DLL build by this
      * literal in the binary (they cannot read an import table for a DLL
      * loaded at run time); without it a working GPU build of this engine read
@@ -894,6 +938,12 @@ fail_storage:
 }
 
 int qt_ready(void){ return G.on; }
+int qt_streaming(void){ return G.on && G_stream; }
+int qt_experts_on(void){
+    if(!G.on || G_trunk_only) return 0;
+    for(int i=0;i<G.ndev;i++) if(G.budget[i]>=G.exp_bytes) return 1;
+    return 0;
+}
 
 int qt_lmhead_init(const int8_t *q, const float *sc, int I, int O){
     if(!G_lmh.dev_ok||!G.on||!q||!sc) return 0;
@@ -1115,10 +1165,10 @@ static void stream_promote_locked(int layer,int eid){
 void qt_note(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on || !g4) return;
+    if(!G.on || !g4 || G_trunk_only) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
-    if(G_fp8_stream){
+    if(G_stream){
         if(s->heat<0xFFFFFFFFu) s->heat++;
         stream_point(s,g4,u4,d4,gs,us,ds);
         stream_promote_locked(layer,eid);
@@ -1136,14 +1186,14 @@ void qt_note(int layer,int eid,
 void qt_note_block(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on || !g4) return;
+    if(!G.on || !g4 || G_trunk_only) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
-    if(G_fp8_stream) stream_point(s,g4,u4,d4,gs,us,ds);
+    if(G_stream) stream_point(s,g4,u4,d4,gs,us,ds);
     else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
     enqueue_locked(layer,eid,-1,-1,0);
-    if(G_fp8_stream) stream_forget(s);
+    if(G_stream) stream_forget(s);
     pthread_mutex_unlock(&G.mx);
 }
 
@@ -1232,7 +1282,7 @@ void qt_note_planned(int layer,int eid,
         pthread_mutex_unlock(&G.mx);
         return;
     }
-    if(G_fp8_stream) stream_point(s,g4,u4,d4,gs,us,ds);
+    if(G_stream) stream_point(s,g4,u4,d4,gs,us,ds);
     else if(!s->g4){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
     while(G.qn>=QT_QCAP && !G.th_stop) wait_take_locked();
     if(!enqueue_locked(layer,eid,-1,-1,1)){
@@ -1240,7 +1290,7 @@ void qt_note_planned(int layer,int eid,
         if(s->planned) G.used[home2(layer,eid)]-=G.exp_bytes;
     }
     s->planned=0;
-    if(G_fp8_stream) stream_forget(s);
+    if(G_stream) stream_forget(s);
     pthread_mutex_unlock(&G.mx);
 }
 
@@ -1315,7 +1365,7 @@ static int cmp_rp_vict(const void *a,const void *b){          /* count asc, heat
     return ia<ib ? -1 : ia>ib ? 1 : 0;
 }
 int qt_replan(int layer,const uint32_t *counts,int max_swaps){
-    if(!G.on||!counts||G_fp8_stream||max_swaps<=0||layer>=G.nl) return 0;
+    if(!G.on||!counts||G_stream||max_swaps<=0||layer>=G.nl) return 0;
     size_t lo = layer>=0 ? (size_t)layer*G.ne : 0, hi = layer>=0 ? lo+G.ne : (size_t)G.nl*G.ne;
     size_t n=hi-lo;
     int *cand=malloc(n*sizeof(int)), *vict=malloc(n*sizeof(int));
@@ -1407,6 +1457,10 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     for(int k=0;k<K;k++){
         QSlot *s=qs(layer,eids[k]);
         if(s->resident){
+            /* a hit is routed heat too: the engine notes (qt_note) only what the
+             * CPU computes, so without this a resident in copy mode never warmed
+             * again and the coldest-resident test let any newcomer evict it */
+            if(s->heat<0xFFFFFFFFu) s->heat++;
             int di=home2(layer,eids[k]); int c=G.is_cnt[di];
             tg[di][c]=s->tg; tu[di][c]=s->tu; td[di][c]=s->td;
             G.is_k[di][c]=k; G.is_cnt[di]=c+1;
@@ -1545,7 +1599,7 @@ void qt_shutdown(void){
     G.issue_open=0;
     memset(G.is_cnt,0,sizeof G.is_cnt);
     G.on=0;
-    G_fp8_stream=0;
+    G_fp8_stream=0; G_stream=0; G_trunk_only=0; G_src_planar=0;
     coli_cuda_shutdown();
 }
 

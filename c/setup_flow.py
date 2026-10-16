@@ -497,6 +497,12 @@ def cuda_make_args(family, tc, cards):
     return args
 
 
+def nvidia_name(card):
+    """The card as a reason names it: nvidia-smi's names start with NVIDIA already."""
+    name = card.get("name") or ""
+    return name if name.upper().startswith("NVIDIA") else f"NVIDIA {name}"
+
+
 def choose_backend(hw, family, tc, requested="auto", exclude=()):
     """Which build to run the model with, and why.
 
@@ -523,15 +529,19 @@ def choose_backend(hw, family, tc, requested="auto", exclude=()):
     win_cuda = host_os() == "win32" and family.id in WINDOWS_CUDA_ENGINES
     blocked = None
     if nvidia and requested in ("auto", "cuda") and "cuda" not in exclude:
-        if win_cuda and prebuilt_runs(family, "cuda"):
+        here = win_cuda and prebuilt_runs(family, "cuda")
+        if here or (win_cuda and release_cuda(family, tc)):
             card = nvidia[0]
             sm = setup_hw.compute_cap_sm(card.get("compute_cap"))
             if requested == "cuda" or (sm is not None and sm >= WINDOWS_CUDA_FLOOR):
                 detail = f" (compute {card['compute_cap']})" if card.get("compute_cap") else ""
+                where = "coli_cuda.dll beside the engine" if here else \
+                    f"the release's CUDA backend ({RELEASE_CUDA_WIN32})"
                 decision.update(backend="cuda", gpu=card["name"],
-                                reason=f"NVIDIA {card['name']}{detail} with coli_cuda.dll beside the engine")
+                                reason=f"{nvidia_name(card)}{detail} with {where}")
                 return decision
-            blocked = {"why": f"the coli_cuda.dll here runs on compute {WINDOWS_CUDA_FLOOR / 10:.1f} and "
+            dll = "the coli_cuda.dll here" if here else "the release's coli_cuda.dll"
+            blocked = {"why": f"{dll} runs on compute {WINDOWS_CUDA_FLOOR / 10:.1f} and "
                               f"newer, and the {card['name']} is "
                               + (f"compute {card['compute_cap']}" if sm is not None else "of unknown compute"),
                        "fix": ""}
@@ -544,7 +554,7 @@ def choose_backend(hw, family, tc, requested="auto", exclude=()):
                 detail = f" (compute {card['compute_cap']})" if card.get("compute_cap") else ""
                 toolkit = f"CUDA {tc['cuda_version']}" if tc.get("cuda_version") else "CUDA"
                 decision.update(backend="cuda", gpu=card["name"],
-                                reason=f"NVIDIA {card['name']}{detail} with the {toolkit} toolkit",
+                                reason=f"{nvidia_name(card)}{detail} with the {toolkit} toolkit",
                                 make_args=cuda_make_args(family, tc, nvidia))
                 return decision
             if requested == "cuda":
@@ -650,11 +660,12 @@ def prebuilt_runs(family, backend, directory=None):
 
 #: The release archives whose engines are built with Vulkan (release.yml, VK=1).
 RELEASE_VULKAN = ("linux-x86_64.tar.gz", "windows-x86_64.zip")
-#: The engines the release's windows-x86_64-cuda.zip carries, built against
+#: The engines the release's windows-x86_64-cuda.zip (RELEASE_CUDA_WIN32) carries, built against
 #: coli_cuda.dll (release.yml, the cuda-windows job), and the oldest card its DLL
 #: runs on: CUDA_ARCH=portable is SASS for sm_80 and newer plus compute_120 PTX.
 WINDOWS_CUDA_ENGINES = ("glm", "qwen36", "kimi")
 WINDOWS_CUDA_FLOOR = 80
+RELEASE_CUDA_WIN32 = "windows-x86_64-cuda.zip"
 
 
 def prebuilt_vulkan(family, tc):
@@ -664,6 +675,16 @@ def prebuilt_vulkan(family, tc):
     if os.path.isfile(engine_path(HERE, family)):
         return prebuilt_runs(family, "vulkan")
     return not tc.get("can_build") and release_asset_suffix() in RELEASE_VULKAN
+
+
+def release_cuda(family, tc):
+    """Whether resolve_engine takes this engine from the Windows release, where the
+    CUDA backend comes with it (fetch_release_cuda): no engine here and nothing here
+    builds one. Before, the setup fetched only the main archive, whose engines run
+    Vulkan, and an NVIDIA card ran Vulkan with no word that CUDA was one zip away (#2091)."""
+    return (host_os() == "win32" and family.id in WINDOWS_CUDA_ENGINES
+            and not os.path.isfile(engine_path(HERE, family)) and not tc.get("can_build")
+            and release_asset_suffix() == "windows-x86_64.zip")
 
 
 def engine_path(directory, family):
@@ -824,24 +845,12 @@ def extract_archive(archive, dest, only_prefix=None):
                 os.chmod(path, 0o755)
 
 
-def fetch_release_archive(version, out=print, getter=None):
-    """Download (once) and unpack the release for this OS into runtime/.
-    Returns (directory, tag)."""
-    suffix = release_asset_suffix()
-    if suffix is None:
-        raise SetupError("no prebuilt release exists for this system; build from source")
-    release = find_release(version, getter=getter)
-    if release is None:
-        raise SetupError("cannot reach the GitHub releases to fetch a prebuilt engine")
-    tag = release["tag"]
-    name = f"colibri-{tag}-{suffix}"
+def _download_asset(release, name, folder):
+    """Download one asset of `release` (find_release) into `folder`, checked against
+    the release's SHA256SUMS.txt when it has one. Returns the file's path."""
     url = release["assets"].get(name)
     if not url:
-        raise SetupError(f"release {tag} has no {name}")
-    runtime = os.path.join(setup_home(), "runtime")
-    dest = os.path.join(runtime, f"colibri-{tag}")
-    if os.path.isfile(os.path.join(dest, "coli")):
-        return dest, tag
+        raise SetupError(f"release {release['tag']} has no {name}")
     sums = {}
     if release["assets"].get("SHA256SUMS.txt"):
         try:
@@ -851,9 +860,8 @@ def fetch_release_archive(version, out=print, getter=None):
                 sums = parse_sha256sums(response.read().decode("utf-8", "replace"))
         except (urllib.error.URLError, OSError):
             sums = {}
-    os.makedirs(runtime, exist_ok=True)
-    archive = os.path.join(runtime, name)
-    out(f"  downloading the prebuilt engine {tag} ({name})")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, name)
     # The asset size is not in the listing we keep; HEAD-less: let the server tell.
     request = urllib.request.Request(url, headers={"User-Agent": "colibri-setup"})
     try:
@@ -865,14 +873,61 @@ def fetch_release_archive(version, out=print, getter=None):
         import hashlib
         if hashlib.sha256(data).hexdigest() != sums[name]:
             raise SetupError(f"{name}: checksum does not match SHA256SUMS.txt")
-    with open(archive, "wb") as handle:
+    with open(path, "wb") as handle:
         handle.write(data)
+    return path
+
+
+def fetch_release_archive(version, out=print, getter=None):
+    """Download (once) and unpack the release for this OS into runtime/.
+    Returns (directory, tag)."""
+    suffix = release_asset_suffix()
+    if suffix is None:
+        raise SetupError("no prebuilt release exists for this system; build from source")
+    release = find_release(version, getter=getter)
+    if release is None:
+        raise SetupError("cannot reach the GitHub releases to fetch a prebuilt engine")
+    tag = release["tag"]
+    name = f"colibri-{tag}-{suffix}"
+    if not release["assets"].get(name):
+        raise SetupError(f"release {tag} has no {name}")
+    runtime = os.path.join(setup_home(), "runtime")
+    dest = os.path.join(runtime, f"colibri-{tag}")
+    if os.path.isfile(os.path.join(dest, "coli")):
+        return dest, tag
+    out(f"  downloading the prebuilt engine {tag} ({name})")
+    archive = _download_asset(release, name, runtime)
     staging = dest + ".partial"
     shutil.rmtree(staging, ignore_errors=True)
     extract_archive(archive, staging)
     shutil.rmtree(dest, ignore_errors=True)
     os.replace(staging, dest)
     return dest, tag
+
+
+def fetch_release_cuda(directory, tag, out=print, getter=None):
+    """Unpack the CUDA backend of release `tag` for Windows (RELEASE_CUDA_WIN32) over
+    `directory`, the folder its main archive went into (fetch_release_archive), once.
+    The engines it carries are the same builds with CUDA added, so they replace the
+    ones there; coli_cuda.dll goes in last, so with it there the rest is too. False
+    when the release has none (one from before the backend was built)."""
+    if os.path.isfile(os.path.join(directory, "coli_cuda.dll")):
+        return True
+    release = find_release(tag[1:] if tag.startswith("v") else tag, getter=getter)
+    if release is None or release["tag"] != tag:
+        raise SetupError(f"cannot reach release {tag} to fetch its CUDA backend")
+    name = f"colibri-{tag}-{RELEASE_CUDA_WIN32}"
+    if not release["assets"].get(name):
+        return False
+    out(f"  downloading the CUDA backend of {tag} ({name})")
+    archive = _download_asset(release, name, os.path.dirname(directory))
+    staging = directory + ".cuda"
+    shutil.rmtree(staging, ignore_errors=True)
+    extract_archive(archive, staging)
+    for entry in sorted(os.listdir(staging), key=lambda entry: entry == "coli_cuda.dll"):
+        os.replace(os.path.join(staging, entry), os.path.join(directory, entry))
+    shutil.rmtree(staging, ignore_errors=True)
+    return True
 
 
 def web_dist_dir(launcher_dir):
@@ -962,6 +1017,13 @@ def resolve_engine(family, entry, decision, tc, out=print, allow_prebuilt=True):
     if not os.path.exists(engine):
         raise SetupError(f"release {tag} has no {family.engine_artifact} engine for this system")
     backend = decision["backend"]
+    if backend == "cuda" and host_os() == "win32":
+        try:
+            if not fetch_release_cuda(runtime, tag, out=out):
+                raise SetupError(f"release {tag} has no {RELEASE_CUDA_WIN32}")
+        except SetupError as error:
+            out(f"  {error}: using Vulkan")
+            backend = "vulkan"
     if backend != "cpu" and not prebuilt_runs(family, backend, runtime):
         out(f"  the prebuilt engine has no {backend} build; it needs a source checkout and a "
             f"compiler: {package_hint(['build', backend])}")
@@ -1150,6 +1212,18 @@ def check_ctx(ctx, family):
                          f"({family.limits.max_context} tokens)")
 
 
+def saved_ctx(cfg):
+    """Read the chosen context from a pending or older ready configuration."""
+    if not cfg:
+        return 0
+    if "ctx" in cfg:
+        return cfg["ctx"]
+    args = cfg.get("args") or []
+    if "--ctx" in args:
+        return int(args[args.index("--ctx") + 1])
+    return 0
+
+
 def make_config(*, model_dir, family, entry, engine_info, hw, host, port, status="ready", ctx=0):
     backend = engine_info["backend"]
     return {
@@ -1167,6 +1241,7 @@ def make_config(*, model_dir, family, entry, engine_info, hw, host, port, status
         "gpu": engine_info.get("gpu"),
         "env": run_environment(backend, engine_info["engine"], family, hw),
         "args": launcher_args(backend, model_dir, host, port, ctx, family),
+        "ctx": ctx,
         "host": host,
         "port": port,
         "urls": urls(host, port),
@@ -1197,7 +1272,7 @@ def equivalent_command(cfg):
 
 def _quote(value):
     value = str(value)
-    return value if re.match(r"^[A-Za-z0-9_./:=,+-]+$", value) else json.dumps(value)
+    return value if re.match(r"^[A-Za-z0-9_./:=,+-]+$", value) else json.dumps(value, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------- server control
@@ -1461,11 +1536,13 @@ def stop_server(cfg, out=print):
     text = (result.stdout + result.stderr).strip()
     lines = [re.sub(r"\x1b\[[0-9;]*m", "", line).strip() for line in text.splitlines()]
     # Keep what `coli stop` reports, not its banner.
-    keep = ("stopping", "stopped", "nothing running", "forced", "would stop")
+    keep = ("stopping", "stopped", "nothing running", "forced", "would stop", "could not stop",
+            "more rights")
     lines = [line for line in lines if any(word in line for word in keep)]
     for line in lines:
         out(f"  {line}")
-    return {"stopped": "nothing running" not in text, "output": "\n".join(lines)}
+    return {"stopped": result.returncode == 0 and "nothing running" not in text,
+            "output": "\n".join(lines)}
 
 
 def tail_file(path, lines=100):
@@ -1621,15 +1698,17 @@ def models_root_for(entry, explicit=None):
     return root
 
 
-def download_model(ui, entry, model_dir, *, via_windows="auto", verify=True):
-    """List, check space, pick the transport, download with progress."""
+def download_model(ui, entry, model_dir, *, via_windows="auto", verify=True, extra_dirs=()):
+    """List, check space, pick the transport, download with progress. Shards already
+    whole in extra_dirs (a model split across drives) are neither counted as missing
+    nor fetched again."""
     token = setup_download.hf_token()
     files = setup_download.list_repo_files(entry.repo, entry.revision, include=entry.include,
                                            exclude=entry.exclude, token=token)
     if not files:
         raise SetupError(f"{entry.repo}: the repository lists no files")
     total = sum(f["size"] for f in files)
-    have = setup_download.bytes_present(model_dir, files) if os.path.isdir(model_dir) else 0
+    have = setup_download.bytes_present(model_dir, files, extra_dirs) if os.path.isdir(model_dir) else 0
     free = setup_hw.disk_free(model_dir)
     if free is not None and free < (total - have) + 1 * GB:
         raise SetupError(f"{model_dir}: {(total - have) / GB:.0f} GB still to download, "
@@ -1661,7 +1740,7 @@ def download_model(ui, entry, model_dir, *, via_windows="auto", verify=True):
 
     write_state("download", model=entry.id, done=have, total=total, model_dir=model_dir)
     setup_download.download_repo(entry.repo, entry.revision, model_dir, files, token=token,
-                                 progress=progress, curl=curl, verify=verify)
+                                 progress=progress, curl=curl, verify=verify, extra_dirs=extra_dirs)
     ui.progress(f"  [{'#' * 24}] 100.0%  {human_size(total)}  done", force=True)
     ui.say("")
     return total
@@ -1758,12 +1837,146 @@ def gpu_now_buildable(cfg, tc=None):
     return False
 
 
+def cuda_unused(cfg):
+    """Why a saved run configuration that is not on CUDA should be, or None. The
+    backend was the setup's own choice (requested auto), the setup found NVIDIA cards
+    this engine's CUDA path runs on, and the configured engine runs CUDA now: the
+    release's windows-x86_64-cuda.zip unpacked beside it, or a CUDA build put in its
+    place. The saved choice kept COLI_VULKAN=1 and ran Vulkan on such a box without a
+    word (#2091). Looks at the configuration and the engine file only: no hardware
+    probe, so a plain rerun stays a fast start."""
+    if cfg.get("backend") == "cuda" or (cfg.get("requested_backend") or "auto") != "auto":
+        return None
+    cards = cfg.get("nvidia") or []
+    engine = cfg.get("engine") or ""
+    try:
+        family = family_by_id(cfg.get("family"))
+    except Exception:
+        return None
+    if not cards or not os.path.isfile(engine) or \
+            not prebuilt_runs(family, "cuda", os.path.dirname(engine)):
+        return None
+    sms = [setup_hw.compute_cap_sm(card.get("compute_cap")) for card in cards]
+    if host_os() == "win32":
+        if family.id not in WINDOWS_CUDA_ENGINES or sms[0] is None or sms[0] < WINDOWS_CUDA_FLOOR:
+            return None
+        where = "coli_cuda.dll beside the engine"
+    else:
+        floor = CUDA_ENGINES.get(family.id, {}).get("min_compute")
+        if family.id not in CUDA_ENGINES or any(floor and sm is not None and sm < floor for sm in sms):
+            return None
+        where = "a CUDA build of the engine"
+    card = cards[0]
+    detail = f" (compute {card['compute_cap']})" if card.get("compute_cap") else ""
+    return f"{nvidia_name(card)}{detail} with {where}"
+
+
+def use_cuda(cfg, reason, out=print):
+    """The run configuration moved to CUDA (cuda_unused) and saved: same engine and
+    launcher, without the variables run_environment set for Vulkan, with the GPU's
+    arguments (launcher_args). Returns it."""
+    family = family_by_id(cfg["family"])
+    vulkan = set(run_environment("vulkan", cfg["engine"], family,
+                                 {"gpu": {"vulkan_icd": "-"}, "cpu": {"physical_cores": 1}}))
+    vulkan.add("COLI_VK_SHADERS")
+    env = {k: v for k, v in (cfg.get("env") or {}).items() if k not in vulkan}
+    args = list(cfg.get("args") or [])
+    if "--gpu" not in args:
+        args += ["--gpu", "auto"]
+    if "--auto-tier" not in args:
+        args.append("--auto-tier")
+    out(f"CUDA from now on: {reason}; the last setup saved {USING.get(cfg.get('backend'), cfg.get('backend'))}.")
+    return save_config(dict(cfg, backend="cuda", gpu=cfg["nvidia"][0].get("name"), env=env,
+                            args=args, gpu_pending=[]))
+
+
+def release_cuda_missing(cfg):
+    """The release tag whose CUDA backend the configured engine is missing, or None:
+    the engine is the Windows release's (fetch_release_archive, in runtime/colibri-<tag>)
+    without coli_cuda.dll, on a card that backend runs on, with the backend left to the
+    setup. A setup from before the backend came with the release left it so (#2091)."""
+    if host_os() != "win32" or cfg.get("backend") == "cuda" or \
+            (cfg.get("requested_backend") or "auto") != "auto":
+        return None
+    folder = os.path.dirname(os.path.abspath(cfg.get("engine") or ""))
+    tag = os.path.basename(folder)[len("colibri-"):]
+    if (os.path.dirname(folder) != os.path.abspath(os.path.join(setup_home(), "runtime"))
+            or not os.path.basename(folder).startswith("colibri-") or cfg.get("no_release_cuda") == tag
+            or os.path.isfile(os.path.join(folder, "coli_cuda.dll"))):
+        return None
+    cards = cfg.get("nvidia") or []
+    sm = setup_hw.compute_cap_sm(cards[0].get("compute_cap")) if cards else None
+    if cfg.get("family") not in WINDOWS_CUDA_ENGINES or sm is None or sm < WINDOWS_CUDA_FLOOR:
+        return None
+    return tag
+
+
+def add_release_cuda(cfg, tag, out=print):
+    """The CUDA backend fetched beside a configured release engine (release_cuda_missing),
+    for cuda_unused to take. A release that has none is noted in the configuration and
+    not asked again; one that cannot be reached now is asked again at the next setup."""
+    out(f"Release {tag} has a CUDA backend for the NVIDIA card: fetching it.")
+    try:
+        if fetch_release_cuda(os.path.dirname(cfg["engine"]), tag, out=out):
+            return cfg
+        out(f"  release {tag} has no {RELEASE_CUDA_WIN32}: keeping {USING.get(cfg.get('backend'), 'Vulkan')}")
+        return save_config(dict(cfg, no_release_cuda=tag))
+    except SetupError as error:
+        out(f"  {error}; the next setup tries again")
+    return cfg
+
+
+def split_dirs_name(family_id):
+    """The variable the family's engine reads extra shard folders from, or ""."""
+    try:
+        return family_by_id(family_id).split_dirs_env
+    except Exception:
+        return ""
+
+
+def extra_shard_dirs(family_id, saved_env=None):
+    """The folders besides model_dir the engine will read shards from (a model split
+    across drives): its family's split variable as start_server hands it over, the
+    environment's value over the saved configuration's. Before, the launcher looked
+    in model_dir only: shards moved to a second drive with K3_DIRS made `coli start`
+    refuse a working setup, `coli status` call it unfinished, and a rerun of
+    `coli setup` would have downloaded them again (#2091)."""
+    name = split_dirs_name(family_id)
+    if not name:
+        return []
+    value = os.environ.get(name)
+    if value is None:
+        value = (saved_env or {}).get(name, "")
+    return setup_download.split_dirs(value)
+
+
+def remember_split_dirs(cfg, out=print):
+    """The split variable set in this environment, kept in the run configuration, so
+    `coli start` from any shell reads the same folders. Returns the configuration
+    (saved when it changed)."""
+    name = split_dirs_name(cfg.get("family"))
+    value = os.environ.get(name) if name else None
+    if not value or (cfg.get("env") or {}).get(name) == value:
+        return cfg
+    out(f"  shards also read from: {', '.join(setup_download.split_dirs(value))} ({name}, kept for coli start)")
+    return save_config(dict(cfg, env=dict(cfg.get("env") or {}, **{name: value})))
+
+
 def config_ready(cfg):
     if not cfg or cfg.get("status") != "ready":
         return False
     if not os.path.isdir(cfg.get("model_dir") or ""):
         return False
-    if (cfg.get("model") or {}).get("repo") and not setup_download.is_complete(cfg["model_dir"]):
+    model = cfg.get("model") or {}
+    if model.get("repo") and not setup_download.is_complete(
+            cfg["model_dir"], extra_shard_dirs(cfg.get("family"), cfg.get("env"))):
+        return False
+    try:
+        entry = setup_catalog.by_id(model["id"]) if model.get("id") else None
+    except KeyError:
+        entry = None  # a local folder or a catalog entry no longer listed
+    if entry and any(not os.path.isfile(os.path.join(cfg["model_dir"], creates))
+                     for _, creates in entry.post_install):
         return False
     return os.path.isfile(cfg.get("engine") or "") and os.path.isfile(cfg.get("launcher") or "")
 
@@ -1774,6 +1987,7 @@ def cmd_setup(a, ui=None):
     ui.say("colibri setup\n")
     cfg = load_config()
     picking = bool(a.pick or a.model_dir or a.reconfigure)
+    requested_ctx = getattr(a, "ctx", None)
 
     if a.list:
         hw = setup_hw.detect(models_root_for(None, a.dir), probe_gpu=False)
@@ -1787,7 +2001,15 @@ def cmd_setup(a, ui=None):
                 ui.say(f" {mark} {entry.id:<24} {entry.disk_gb:>7.0f} GB  {row['status']:<10} {row['reason']}")
         return 0
 
-    if cfg and not picking and config_ready(cfg):
+    overriding = bool(a.backend or a.no_gpu or a.host is not None or a.port is not None)
+    if cfg and not picking and not overriding and config_ready(cfg):
+        cfg = remember_split_dirs(cfg, out=ui.say)
+        tag = release_cuda_missing(cfg)
+        if tag:
+            cfg = add_release_cuda(cfg, tag, out=ui.say)
+        reason = cuda_unused(cfg)
+        if reason:
+            cfg = use_cuda(cfg, reason, out=ui.say)
         if gpu_now_buildable(cfg):
             ui.say("The GPU packages are installed now: rebuilding the engine for the GPU.\n")
         else:
@@ -1797,17 +2019,23 @@ def cmd_setup(a, ui=None):
             except KeyError:
                 seeded = None      # a model given by folder: no catalog entry, no profile
             seed_expert_profile(seeded, cfg.get("model_dir"), out=ui.say)
-            ctx = getattr(a, "ctx", 0)
-            if ctx:
-                check_ctx(ctx, family_by_id(cfg.get("family")))
-                cfg = dict(cfg, args=_replace_arg(cfg["args"], "--ctx", str(ctx)))
+            if requested_ctx is not None:
+                check_ctx(requested_ctx, family_by_id(cfg.get("family")))
+                args = list(cfg["args"])
+                if "--ctx" in args:
+                    index = args.index("--ctx")
+                    del args[index:index + 2]
+                if requested_ctx:
+                    args += ["--ctx", str(requested_ctx)]
+                cfg = dict(cfg, args=args, ctx=requested_ctx)
                 save_config(cfg)
-                ui.say(f"  context: {ctx} tokens from now on")
+                ui.say(f"  context: {requested_ctx or 'automatic'} from now on")
             refresh_configured(cfg, out=ui.say)
             return _finish(ui, cfg, a)
     # A setup that stopped half way (pending), or a finished one whose engine or
     # files went missing (ready, but not runnable): continue with the same choice.
     resume = cfg if (cfg and cfg.get("status") in ("pending", "ready") and not picking) else None
+    ctx = requested_ctx if requested_ctx is not None else saved_ctx(resume)
 
     ui.say("Your machine")
     probe_root = models_root_for(None, a.dir or (resume or {}).get("models_root"))
@@ -1850,6 +2078,7 @@ def cmd_setup(a, ui=None):
                 raise SetupError("pass --dir with a folder on the Linux disk")
         ui.say(f"\nModel: {entry.name} ({entry.repo}) -> {model_dir}")
 
+    check_ctx(ctx, family)
     host = a.host or (resume or {}).get("host") or DEFAULT_HOST
     port = int(a.port or (resume or {}).get("port") or DEFAULT_PORT)
     requested = "cpu" if a.no_gpu else (a.backend or (resume or {}).get("requested_backend") or "auto")
@@ -1858,9 +2087,12 @@ def cmd_setup(a, ui=None):
                                               "repo": entry.repo if entry else None,
                                               "revision": entry.revision if entry else None},
                "model_dir": model_dir, "models_root": os.path.dirname(model_dir),
-               "family": family.id, "host": host, "port": port, "requested_backend": requested}
+               "family": family.id, "host": host, "port": port, "requested_backend": requested,
+               "ctx": ctx}
     if not resume or picking:
         save_config(pending)
+    elif requested_ctx is not None:
+        save_config(dict(resume, status="pending", ctx=ctx))
 
     tc = toolchain()
     # A build that failed in the run this one resumes is not tried again; a new
@@ -1889,20 +2121,20 @@ def cmd_setup(a, ui=None):
     ui.say(f"  engine ready: {engine_info['engine']} ({engine_info['backend']}, {engine_info['source']})")
 
     if entry is not None:
-        if setup_download.is_complete(model_dir):
+        extra = extra_shard_dirs(family.id, (resume or {}).get("env"))
+        if setup_download.is_complete(model_dir, extra):
             ui.say("\nDownload: already complete")
         else:
             ui.say(f"\nDownload: {entry.repo} ({human_size(entry.disk_gb * GB)}); safe to "
                    "interrupt, rerun to continue")
-            download_model(ui, entry, model_dir, via_windows=a.via_windows, verify=not a.no_verify)
+            download_model(ui, entry, model_dir, via_windows=a.via_windows, verify=not a.no_verify,
+                           extra_dirs=extra)
         run_post_install(entry, engine_info["launcher_dir"], model_dir, ui)
         seed_expert_profile(entry, model_dir, out=ui.say)
 
     if not web_dist_dir(engine_info["launcher_dir"]):
         ensure_web_dist(engine_info["launcher_dir"], current_version(), out=ui.say)
 
-    ctx = getattr(a, "ctx", 0)
-    check_ctx(ctx, family)
     line, warnings = plan_summary(model_dir, ctx)
     ui.say(f"\nPlan: {line}")
     for warning in warnings:
@@ -1920,7 +2152,12 @@ def cmd_setup(a, ui=None):
     cfg["nvidia"] = [{"name": card.get("name"), "compute_cap": card.get("compute_cap")}
                      for card in (hw.get("gpu") or {}).get("nvidia") or []]
     cfg["failed_builds"] = failed
+    # the shard folders of a split model: the last run's, unless this environment names others
+    split = split_dirs_name(family.id)
+    if split and ((resume or {}).get("env") or {}).get(split):
+        cfg["env"].setdefault(split, resume["env"][split])
     cfg = save_config(cfg)
+    cfg = remember_split_dirs(cfg, out=ui.say)
     write_state("ready", model=cfg["model"].get("id"), model_dir=model_dir)
     ui.say(f"\nSaved the run configuration: {config_path()}")
     ui.say(f"  same as: {equivalent_command(cfg)}")
@@ -1935,7 +2172,8 @@ def _recommend_for(hw, explicit_dir):
         manifest = setup_download.read_manifest(os.path.join(root, entry.id))
         if manifest:
             downloaded[entry.id] = setup_download.bytes_present(os.path.join(root, entry.id),
-                                                                manifest.get("files", []))
+                                                                manifest.get("files", []),
+                                                                extra_shard_dirs(entry.family))
     return setup_catalog.recommend(hw["memory"].get("total"), free, os_name=host_os(),
                                    machine=hw["os"].get("machine"), downloaded=downloaded)
 
@@ -1966,7 +2204,11 @@ def cmd_start(a):
     cfg = load_config()
     if not cfg or not config_ready(cfg):
         raise SetupError("nothing is set up yet (or the setup did not finish): run `coli setup`")
-    refresh_configured(cfg, out=(lambda *_: None) if getattr(a, "json", False) else print)
+    say = (lambda *_: None) if getattr(a, "json", False) else print
+    reason = cuda_unused(cfg)
+    if reason:
+        cfg = use_cuda(cfg, reason, out=say)
+    refresh_configured(cfg, out=say)
     if getattr(a, "json", False):
         print(json.dumps(start_server(cfg, background=True, open_browser=not a.no_browser,
                                       out=lambda *_: None), indent=2))

@@ -119,8 +119,58 @@ static void test_layer(int S, int K, int H, int F, int NE, int mode) {
     CHECK(bad == 0, "layer S=%d K=%d H=%d F=%d mode=%d: %d of %d outputs differ when cut into pairs", S, K, H, F, mode, bad, S * H);
     printf("layer S=%2d K=%d H=%4d F=%4d mode=%d: bit-identical when cut into pairs\n", S, K, H, F, mode);
     free(o3); free(sc1);
+    /* ... and cut into the runs a cache of cap experts allows (xf_rows_fit): each
+     * run holds at most cap distinct experts, takes every row that fits, and the
+     * sum is again the whole run's. */
+    for (int cap = K; ; cap = cap + 5 < NE ? cap + 5 : NE) {
+        float *o4 = calloc((size_t)S * H, sizeof(float)); int runs = 0;
+        for (int s0 = 0, per; s0 < S; s0 += per, runs++) {
+            per = xf_rows_fit(idx, s0, S, K, cap, S);
+            int seen[XF_FIT_IDS] = {0}, distinct = 0, more = 0;
+            for (int i = s0 * K; i < (s0 + per) * K; i++) if (idx[i] >= 0 && !seen[idx[i]]++) distinct++;
+            if (s0 + per < S) for (int k = 0; k < K; k++) { int e = idx[(s0 + per) * K + k]; if (e >= 0 && !seen[e]++) more++; }
+            CHECK(per >= 1 && s0 + per <= S, "cap=%d: run of %d rows at row %d of %d", cap, per, s0, S);
+            CHECK(distinct <= cap, "cap=%d: the run at row %d holds %d distinct experts", cap, s0, distinct);
+            CHECK(s0 + per == S || distinct + more > cap, "cap=%d: the run at row %d stops at %d experts with room for the next row's %d", cap, s0, distinct, more);
+            xf_moe_add(o4 + (size_t)s0 * H, x + (size_t)s0 * H, per, K, H, F, idx + s0 * K, val + s0 * K, ex + s0 * K, mode, scratch);
+        }
+        bad = 0; for (int i = 0; i < S * H; i++) if (o4[i] != o2[i]) { if (!bad) printf("  first diff at %d: %.9g vs %.9g\n", i, o4[i], o2[i]); bad++; }
+        CHECK(bad == 0, "layer S=%d K=%d mode=%d: %d of %d outputs differ when cut for a cache of %d", S, K, mode, bad, S * H, cap);
+        printf("layer S=%2d K=%d H=%4d F=%4d mode=%d: bit-identical in %d runs for a cache of %d\n", S, K, H, F, mode, runs, cap);
+        free(o4);
+        if (cap >= NE) break;
+    }
     for (int e = 0; e < NE; e++) { free((void *)E[e].g4); free((void *)E[e].u4); free((void *)E[e].d4); free((void *)E[e].gs); free((void *)E[e].us); free((void *)E[e].ds); }
     free(E); free(tmp); free(vals); free(x); free(idx); free(val); free(ex); free(o1); free(o2); free(scratch);
+}
+
+/* The repack against its definition, with every byte value in every position
+ * of a block: the SIMD paths must give exactly the scalar bytes. */
+static void test_repack_bytes(void) {
+    uint8_t src[XF_BLOCK_BYTES], dst[XF_BLOCK_BYTES];
+    int bad = 0;
+    for (int v = 0; v < 256; v++)
+        for (int p = 0; p < XF_BLOCK_BYTES; p++) {
+            for (int j = 0; j < XF_BLOCK_BYTES; j++) src[j] = (uint8_t)rnd();
+            src[p] = (uint8_t)v;
+            xf_repack_pairs_signed(dst, src, 1, XF_BLOCK);
+            for (int k = 0; k < 32; k++) {
+                unsigned lo = (src[k >> 1] >> ((k & 1) * 4)) & 0xF, hi = (src[16 + (k >> 1)] >> ((k & 1) * 4)) & 0xF;
+                bad += dst[k] != (uint8_t)((lo ^ 8u) | ((hi ^ 8u) << 4));
+            }
+        }
+    CHECK(!bad, "repack: %d bytes differ from the definition", bad);
+#if defined(__AVX2__)
+    const char *path = "AVX2";
+#elif defined(XF_REPACK_NEON)
+    const char *path = "NEON";
+#else
+    const char *path = "scalar";
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__) && !defined(XF_REPACK_NEON)
+    CHECK(0, "repack: an AArch64 build that does not compile the NEON path");
+#endif
+    if (!bad) printf("repack path: %s, every byte value in every block position as defined\n", path);
 }
 
 int main(void) {
@@ -142,10 +192,23 @@ int main(void) {
       CHECK(nz == 0, "unrouted token left %d non-zero outputs", nz); free(sc); }
     test_layer(1, 8, 2048, 512, 16, 0);
     test_layer(1, 8, 2048, 512, 16, 1);
+    /* the cut by hand: K=2, rows {0,1} {1,2} {3,4} {0,-1} */
+    { int r[8] = {0, 1, 1, 2, 3, 4, 0, -1};
+      CHECK(xf_rows_fit(r, 0, 4, 2, 3, 4) == 2, "cap 3 takes 2 rows, got %d", xf_rows_fit(r, 0, 4, 2, 3, 4));
+      CHECK(xf_rows_fit(r, 0, 4, 2, 2, 4) == 1, "cap 2 takes 1 row, got %d", xf_rows_fit(r, 0, 4, 2, 2, 4));
+      CHECK(xf_rows_fit(r, 0, 4, 2, 5, 4) == 4, "cap 5 takes all 4 rows, got %d", xf_rows_fit(r, 0, 4, 2, 5, 4));
+      CHECK(xf_rows_fit(r, 0, 4, 2, 5, 3) == 3, "max 3 stops at 3 rows, got %d", xf_rows_fit(r, 0, 4, 2, 5, 3));
+      CHECK(xf_rows_fit(r, 2, 4, 2, 3, 4) == 2, "from row 2, cap 3 takes the last 2 rows, got %d", xf_rows_fit(r, 2, 4, 2, 3, 4));
+      CHECK(xf_rows_fit(r, 0, 4, 2, 1, 4) == 1, "a cap below one row's experts still takes that row, got %d", xf_rows_fit(r, 0, 4, 2, 1, 4));
+      int big[4] = {0, 1, XF_FIT_IDS, 2};
+      CHECK(xf_rows_fit(big, 0, 2, 2, 8, 2) == 1, "an id past the table ends the run before its row, got %d", xf_rows_fit(big, 0, 2, 2, 8, 2)); }
     test_layer(7, 8, 2048, 512, 12, 0);   /* prompt rows sharing experts */
     test_layer(7, 8, 2048, 512, 12, 1);
+    test_layer(40, 8, 2048, 512, 24, 0);  /* a prompt cut by what a cache holds */
+    test_layer(40, 8, 2048, 512, 24, 1);
     test_layer(5, 4, 128, 192, 6, 0);
     test_layer(3, 2, 64, 64, 2, 1);
+    test_repack_bytes();   /* last: the tests above keep their random inputs */
     if (fails) { printf("%d failure(s)\n", fails); return 1; }
     printf("all passed\n"); return 0;
 }

@@ -54,6 +54,7 @@
  * before (nothing to rebuild, and the CPU's layers have not run that step yet). */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
+#include "vk_dmoe.h"
 
 /* COLI_VK_CHAIN unset on an integrated GPU with the expert tier (coli_vk_chain_decide):
  * on. Measured on a Radeon 780M with OLMoE-1B-7B (docs/vulkan.md, "OLMoE and Inkling"):
@@ -81,17 +82,19 @@ typedef struct {
     float *host_routed, *xpost;
     unsigned long long forwards;
     double host_ms;
+    VkcDmoe dm;                                /* the routed experts in the frame (vk_dmoe.h) */
+    VkcBuf *kvl;                               /* their layers' K/V rows, down at the frame's end */
 } OlmChain;
 
 
-/* A resident f32 matrix [O x I] on the device: the copy the per-matrix path uses
- * (matmul_res), uploaded here if it has not been yet. NULL: refused (it stays so). */
+/* A resident f32 matrix [O x I] on the device (bf16 or f16 where that holds it exactly): the
+ * copy the per-matrix path uses (matmul_res), uploaded here if it has not been yet.
+ * NULL: refused (it stays so). */
 static ColiVkTensor *olc_tensor(int d, void **vk, const float *w, int I, int O) {
     if (*vk == (void *)&g_vk_refused) return NULL;
     if (*vk) return (ColiVkTensor *)*vk;   /* with the dense weights on the device only, w is NULL */
     if (!w) return NULL;
-    if (!(d ? coli_vk_tensor_ensure2((ColiVkTensor **)vk, w, NULL, 10, I, O, 0)
-            : coli_vk_tensor_ensure((ColiVkTensor **)vk, w, NULL, 10, I, O, 0))) { *vk = &g_vk_refused; return NULL; }
+    if (!coli_vk_tensor_ensure_f32((ColiVkTensor **)vk, w, I, O, d)) { *vk = &g_vk_refused; return NULL; }
     return (ColiVkTensor *)*vk;
 }
 
@@ -239,10 +242,10 @@ static int olc_bufs(OlmChain *ch, Model *m, int rows);
 /* ---- the fit: how many layers the chain places (vk_chain.h, vkc_fit) -------------- */
 /* In model_init, before olm_dho_start and the tier: the chain decided as olm_dho_start
  * and olc_start decide it (silently: olc_start prints it after the tier), its pipelines
- * up, and N from each layer's bytes (q, k, v, o and the router as f32 tensors, the K/V
- * mirror at the split's floor of three blocks, its share of the parameter arena), the
- * fixed bytes (one prompt chunk's scratch from the reservations themselves, its rows'
- * read-back, PILOT's) and lm_head as the tail. The CPU's layers and (unless the fit puts
+ * up, and N from each layer's bytes (q, k, v, o and the router as the device will hold
+ * them, bf16 or f16 where exact, the K/V mirror at the split's floor of three blocks, its share
+ * of the parameter arena), the fixed bytes (one prompt chunk's scratch from the
+ * reservations themselves, its rows' read-back, PILOT's) and lm_head as the tail. The CPU's layers and (unless the fit puts
  * it up) the head are marked refused. N = 0: the chain off, its blocks released. Not run
  * for a geometry the shaders do not take (the chain declines at its first forward, as
  * before). */
@@ -256,9 +259,13 @@ static void olc_fit_start(Model *m) {
     int B = e && *e ? atoi(e) : 64;
     if (B < 1) B = 1;
     for (int i = 0; i < L; i++) {
-        per[i] = 4 * vkc_fit_tensor(10, D, D, 0) + vkc_fit_tensor(10, D, E, 0) +
-                 2 * vkc_fit_buf((size_t)H * 3 * B * hd * sizeof(float)) + 4 * (size_t)D * sizeof(float);
-        mat[i] = 4 * coli_vk_tensor_payload(10, D, D, 0) + coli_vk_tensor_payload(10, D, E, 0);
+        const Layer *l = &m->L[i];
+        const float *w[5] = {l->q, l->k, l->v, l->o, l->gate};
+        for (int j = 0; j < 5; j++) {
+            int O = j < 4 ? D : E, f = w[j] ? coli_vk_f32_fmt(w[j], (size_t)D * O) : 10;
+            per[i] += vkc_fit_tensor(f, D, O, 0); mat[i] += coli_vk_tensor_payload(f, D, O, 0);
+        }
+        per[i] += 2 * vkc_fit_buf((size_t)H * 3 * B * hd * sizeof(float)) + 4 * (size_t)D * sizeof(float);
     }
     OlmChain cnt; memset(&cnt, 0, sizeof cnt);
     int rows = vkc_fit_rows(256);
@@ -268,7 +275,7 @@ static void olc_fit_start(Model *m) {
     olc_res(&cnt.xd, (size_t)rows * D, VKC_DOWN);
     if (g_pilot) olc_res(&cnt.xpd, (size_t)rows * D, VKC_DOWN);
     g_olc_fitsum = NULL;
-    size_t tail = m->lm_head ? vkc_fit_tensor(10, D, c->vocab, 0) : 0;
+    size_t tail = m->lm_head ? vkc_fit_tensor(coli_vk_f32_fmt(m->lm_head, (size_t)D * c->vocab), D, c->vocab, 0) : 0;
     int n = vkc_fit("olmoe", L, per, mat, fixed, tail, &g_olc_fit);
     /* the chain's pipelines now, after the fit read the free memory */
     if (n > 0 && !vkc_init()) { free(per); free(mat); return; }   /* no chain after all (olc_start finds it so too): no fit */
@@ -405,8 +412,9 @@ static int olc_push_kv(OlmChain *ch, Model *m, int pos_base, int n_rows) {
     return ok;
 }
 
-/* One layer's attention for n rows from pb: nrm in, the o_proj rows in tmp. */
-static int olc_attention(OlmChain *ch, Model *m, Layer *l, int i, int n, int pb) {
+/* One layer's attention for n rows from pb: nrm in, the o_proj rows in tmp; the new K
+ * rows down into kv at ko, the V rows at ko + kvs. */
+static int olc_attention(OlmChain *ch, Model *m, Layer *l, int i, int n, int pb, VkcBuf *kv, size_t ko, size_t kvs) {
     Cfg *c = &m->c;
     int D = c->hidden, H = c->n_heads, hd = c->head_dim, half = hd / 2;
     int ok = vkc_matmul((ColiVkTensor *)l->vk_q, ch->nrm, 0, ch->q, 0, n) &&
@@ -426,7 +434,7 @@ static int olc_attention(OlmChain *ch, Model *m, Layer *l, int i, int n, int pb)
                       m->K[i], m->V[i], (size_t)m->max_t * hd, (size_t)hd, (size_t)m->max_t * hd, (size_t)hd};
         return vkc_kv_store(&ch->ks, i - ch->lo, &pk, ch->k, 0, (size_t)D, (size_t)hd, pb, n) &&
                vkc_kv_store(&ch->ks, i - ch->lo, &pv, ch->v, 0, (size_t)D, (size_t)hd, pb, n) &&
-               vkc_copy(ch->kvd, 0, ch->k, 0, (size_t)n * D) && vkc_copy(ch->kvd, (size_t)ch->rows * D, ch->v, 0, (size_t)n * D) &&
+               vkc_copy(kv, ko, ch->k, 0, (size_t)n * D) && vkc_copy(kv, ko + kvs, ch->v, 0, (size_t)n * D) &&
                vkc_kv_gqa(&a) && vkc_matmul((ColiVkTensor *)l->vk_o, ch->ctx, 0, ch->tmp, 0, n);
     }
     /* the new rows into the device cache, and down for the host's */
@@ -435,7 +443,7 @@ static int olc_attention(OlmChain *ch, Model *m, Layer *l, int i, int n, int pb)
     for (int s = 0; s < n; s++) for (int h = 0; h < H; h++)
         rg[s * H + h] = (VkcRegion){((size_t)h * ch->dev_rows + pb + s) * hd, (size_t)s * D + (size_t)h * hd, (size_t)hd};
     ok = vkc_copy_regions(ch->kc[i], ch->k, rg, n * H) && vkc_copy_regions(ch->vc[i], ch->v, rg, n * H) &&
-         vkc_copy(ch->kvd, 0, ch->k, 0, (size_t)n * D) && vkc_copy(ch->kvd, (size_t)ch->rows * D, ch->v, 0, (size_t)n * D);
+         vkc_copy(kv, ko, ch->k, 0, (size_t)n * D) && vkc_copy(kv, ko + kvs, ch->v, 0, (size_t)n * D);
     free(rg);
     VkcAttn a = {n, H, H, hd, pb, ch->dev_rows, 0, D, hd, 0, 0, 0, 0, 0, D, 0, 0, 1.f / sqrtf((float)hd), 0, 0};
     return ok && vkc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, NULL, NULL, &a) &&
@@ -444,6 +452,41 @@ static int olc_attention(OlmChain *ch, Model *m, Layer *l, int i, int n, int pb)
 static int olc_norm(VkcBuf *x, size_t xo, VkcBuf *w, size_t wo, VkcBuf *y, size_t yo, int rows, int D, float eps) {
     VkcNorm p = {rows, D, 1, (int)xo, D, D, (int)yo, D, D, (int)wo, 0, 0, eps, 1.f};
     return vkc_norm(x, w, y, &p);
+}
+
+/* ---- the routed experts in the frame (vk_dmoe.h) ---------------------------------------
+ * A decode-sized step runs a layer's routing and experts in the frame when the tier holds
+ * all of that layer's experts here: moe_routed's softmax, top-k (the lower expert on a
+ * tie), normalization when the config asks, SwiGLU experts and rank-order sum, with no
+ * wait and no host step. The books follow at the frame's end from the ids: the history
+ * (rt_count), the HITS bitmap and the tier's heat. Off with PILOT (its prefetch and the
+ * routing momentum it reads want every row's logits on the host), ROUTE_TRACE, and the
+ * second device (the tier's experts are the primary's). */
+static int olc_dmoe(OlmChain *ch, Model *m, int rows) {
+    Cfg *c = &m->c;
+    if (ch->d || g_pilot >= 1 || rt_fp ||
+        !vkc_dmoe_prepare(&ch->dm, ch->lo, ch->n, c->n_experts, c->topk, c->hidden, c->inter, rows)) return 0;
+    return vkc_reserve(&ch->kvl, (size_t)ch->n * 2 * VKC_DMOE_ROWS * c->hidden * sizeof(float), VKC_DOWN);
+}
+/* After the frame that ran layers [from, to) for n rows from pb: the K/V rows of those
+ * that ran their experts in it into the host's cache, and their books. */
+static void olc_dmoe_done(OlmChain *ch, Model *m, int from, int to, int n, int pb) {
+    Cfg *c = &m->c; int D = c->hidden, H = c->n_heads, hd = c->head_dim, K = c->topk, r = VKC_DMOE_ROWS;
+    for (int i = from; i < to; i++) {
+        if (!vkc_dmoe_on(&ch->dm, i)) continue;
+        const float *kv = (const float *)vkc_ptr(ch->kvl) + (size_t)(i - ch->lo) * 2 * r * D;
+        for (int s = 0; s < n; s++) for (int h = 0; h < H; h++) {
+            size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
+            memcpy(m->K[i] + dst, kv + src, hd * sizeof(float));
+            memcpy(m->V[i] + dst, kv + (size_t)r * D + src, hd * sizeof(float));
+        }
+        const int *ids = vkc_dmoe_ids(&ch->dm, i);
+        if (!m->hot_pinned) for (int s = 0; s < n; s++) rt_count(i, ids + s * K, K);
+        pthread_mutex_lock(&g_pilot_mx);
+        for (int j = 0; j < n * K; j++) ehit_mark(m, i, ids[j]);
+        pthread_mutex_unlock(&g_pilot_mx);
+        vkt_dev_count(i, n, K, ids);
+    }
 }
 
 /* The device was lost in a frame of the step from pos_base. */
@@ -481,11 +524,13 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
     }
     float *xfin = want_x ? malloc((size_t)S * D * sizeof(float)) : NULL;
     if (want_x && !xfin) return 0;
+    int dmoe = olc_dmoe(ch, m, rows);
     vkc_gemm_rows(-1);
     for (int c0 = 0; c0 < S; c0 += rows) {
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
         if (!vkc_begin() || !vkc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
             !olc_push_kv(ch, m, pb, n)) goto lost;
+        if (dmoe && !vkc_dmoe_upload(&ch->dm)) goto lost;   /* the tier's residents changed: the table again */
         float *cs = (float *)vkc_ptr(ch->cs);   /* rope_head's angles, cosines and sines */
         for (int s = 0; s < n; s++)
             for (int j = 0; j < half; j++) {
@@ -493,20 +538,30 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
                 float ang = (pb + s) * inv;
                 cs[(s * half + j) * 2] = cosf(ang); cs[(s * half + j) * 2 + 1] = sinf(ang);
             }
-        int ok = 1;
+        int ok = 1, prev_dev = 0, from = lo;   /* prev_dev: the layer before ran its experts here; from: this frame's first layer */
         for (int i = lo; i < hi && ok; i++) {
             Layer *l = &m->L[i];
+            int dl = dmoe && vkc_dmoe_on(&ch->dm, i);
             VkcEw add = {VKC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
             if (i > lo) {   /* x += routed: the layer before's MoE output (the rows come in with it) */
                 VkcEw cb = {VKC_EW_COMBINE, n * D, D, 1, 1, 1, 0, 0, 0, 0, 0, 1.f};
-                ok = vkc_ew(ch->x, ch->x, ch->routed, NULL, NULL, &cb);
+                ok = vkc_ew(ch->x, ch->x, prev_dev ? ch->dm.y : ch->routed, NULL, NULL, &cb);
             }
+            size_t r2 = dl ? (size_t)VKC_DMOE_ROWS : (size_t)ch->rows;   /* a device layer's K/V rows stay until the frame ends */
             ok = ok && olc_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps) &&
-                 olc_attention(ch, m, l, i, n, pb) && vkc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
-            if (ok && pilot) ok = vkc_copy(ch->xpd, 0, ch->x, 0, (size_t)n * D);
+                 olc_attention(ch, m, l, i, n, pb, dl ? ch->kvl : ch->kvd, dl ? (size_t)(i - lo) * 2 * r2 * D : 0, r2 * D) &&
+                 vkc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
+            if (ok && pilot && !dl) ok = vkc_copy(ch->xpd, 0, ch->x, 0, (size_t)n * D);
             ok = ok && olc_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps) &&
-                 vkc_matmul((ColiVkTensor *)l->vk_gate, ch->h2, 0, ch->lg, 0, n) &&
-                 vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
+                 vkc_matmul((ColiVkTensor *)l->vk_gate, ch->h2, 0, ch->lg, 0, n);
+            if (dl) {   /* the routing and the experts here, and on to the next layer */
+                VkcRoute rp = {.kind = 0, .n_group = 1, .topk_group = 1, .norm = c->norm_topk ? 1 : 0, .temp = 1.f, .scale = 1.f};
+                VkcMoe mp = {.D = D, .I = c->inter, .act = 0};
+                ok = ok && vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->h2, &rp, &mp);
+                prev_dev = 1;
+                continue;
+            }
+            ok = ok && vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
             double t0 = now_s();
             /* while the frame runs, the tier loads the experts this layer will likely
              * stream (a big prompt chunk only) */
@@ -515,6 +570,8 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
             ok = ok && vkc_finish();
             g_prof_attn_s += now_s() - t0;
             if (!ok) break;
+            if (dmoe) olc_dmoe_done(ch, m, from, i, n, pb);
+            from = i + 1; prev_dev = 0;
             const float *kv = (const float *)vkc_ptr(ch->kvd);   /* the rows into the host's cache */
             for (int s = 0; s < n; s++) for (int h = 0; h < H; h++) {
                 size_t dst = ((size_t)h * m->max_t + pb + s) * hd, src = (size_t)s * D + (size_t)h * hd;
@@ -534,17 +591,22 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
                 if (g_pilot >= 3 && i + 3 < c->n_layers) pilot_prefetch(m, i + 3, ch->xpost, n);
             }
             ok = vkc_begin();
+            /* the host's step ran the tier: the table again before a layer reads it */
+            if (ok && dmoe) ok = vkc_dmoe_upload(&ch->dm);
         }
         if (ok) { VkcEw cb = {VKC_EW_COMBINE, n * D, D, 1, 1, 1, 0, 0, 0, 0, 0, 1.f};
-                  ok = vkc_ew(ch->x, ch->x, ch->routed, NULL, NULL, &cb); }
+                  ok = vkc_ew(ch->x, ch->x, prev_dev ? ch->dm.y : ch->routed, NULL, NULL, &cb); }
         if (ok && want_x) ok = vkc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
         int last = c0 + n == S;
         if (ok && last && !part) ok = olc_norm(ch->x, (size_t)(n - 1) * D, ch->prm, ch->o_final, ch->fin, 0, 1, D, c->eps) &&
                                       vkc_matmul((ColiVkTensor *)m->vk_lm_head, ch->fin, 0, ch->outd, 0, 1);
         double t0 = now_s();
         ok = ok && vkc_submit(1);
-        g_prof_head_s += now_s() - t0;
+        /* a frame that ran layers too counts as attention: the host cannot split the
+         * device's time between them, the routed experts and the head */
+        if (from < hi) g_prof_attn_s += now_s() - t0; else g_prof_head_s += now_s() - t0;
         if (!ok) goto lost;
+        if (dmoe) olc_dmoe_done(ch, m, from, hi, n, pb);
         if (want_x) memcpy(xfin + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
         for (int i = lo; i < hi; i++) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, i - lo, pb + n); }
         if (last && !part) memcpy(logit, vkc_ptr(ch->outd), (size_t)c->vocab * sizeof(float));
@@ -594,9 +656,10 @@ static void olc_report(Model *m) {
         int was = vkc_device(d);
         VkcStats st; vkc_stats(&st);
         fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
-                        "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
+                        "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %llu layer steps with "
+                        "the routed experts in the frame, %.1f MiB on the device\n",
                 olc_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
-                st.dev_bytes / 1048576.0);
+                ch->dm.steps, st.dev_bytes / 1048576.0);
         vkc_kv_report(&ch->ks);
         vkc_prof_print();
         vkc_device(was);

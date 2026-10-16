@@ -115,8 +115,14 @@ static struct {
     /* the balance: the share of a step's resident experts the device takes, moved by
      * what each join waited (the device was the slower side) or did not */
     int balance, can_balance; float share; unsigned long long handed;
+    unsigned epoch;                      /* bumps when a resident comes or goes (vkt_epoch) */
+    unsigned long long chain_served;     /* pairs the dense chain computed (vkt_dev_count) */
     /* accounting */
     unsigned long long routed, served, steps, uploads, upload_bytes, evictions, qfull, rated, refused, failed, warm;
+    /* failed, by what: the pool refused the expert (no room as it is laid out), the copy
+     * to the device failed, or the batch could not take the uploaded expert's sets */
+    unsigned long long f_pool, f_copy, f_sets;
+    int plan_hist;                        /* the last plan's experts from the history (vkt_plan) */
     double dev_ms, cpu_ms, wait_ms;
     unsigned long long rep_routed, rep_served;
     /* streaming (big prefill steps; see "streaming" below) */
@@ -384,6 +390,7 @@ static void quiesce(void) {
         if (v->ex) { coli_vk_xb_expert_free(v->ex); v->ex = NULL; freed = 1; }
         v->state = VS_NONE;
     }
+    if (had) T.epoch++;
     T.nevict = 0;
     if (had) {   /* room made: an upload may be waiting for it */
         pthread_mutex_lock(&T.mx);
@@ -400,14 +407,21 @@ static void quiesce(void) {
     int n = T.ndone; VDone *d = n ? malloc((size_t)n * sizeof(*d)) : NULL;
     if (d) { memcpy(d, T.done, (size_t)n * sizeof(*d)); T.ndone = 0; } else n = 0;
     pthread_mutex_unlock(&T.mx);
+    /* a device whose batch is still in flight cannot take an expert's sets now: what was
+     * uploaded there waits for the next quiet point, rather than being freed and counted
+     * failed (#2081) */
+    const int busy[2] = {coli_vk_xb_busy_dev(0), T.d2 ? coli_vk_xb_busy_dev(1) : 0};
+    int kept = 0;
     for (int i = 0; i < n; i++) {
         VSlot *v = slot(d[i].layer, d[i].eid);
         int dv = v->dev, kd = kind_of(d[i].layer);
+        if (d[i].ok && (dv == 0 || T.d2) && busy[dv ? 1 : 0]) { d[kept++] = d[i]; continue; }
         T.queued--; if (kd) T.xque--; else T.dque[dv]--;
         /* an upload to a second device that has stopped meanwhile (d2_stop) is dropped */
         ColiVkExpert *e = d[i].ok && (dv == 0 || T.d2) ? coli_vk_xb_expert(d[i].g, d[i].u, d[i].d) : NULL;
         if (e) {
             v->ex = e; v->state = VS_RESIDENT; T.resident++; if (kd) T.xres++; else T.dres[dv]++;
+            T.epoch++;
             T.uploads++; T.upload_bytes += coli_vk_tensor_bytes(d[i].g) + coli_vk_tensor_bytes(d[i].u) + coli_vk_tensor_bytes(d[i].d);
             if (dv) T.d2_uploads++;
         } else {
@@ -415,6 +429,7 @@ static void quiesce(void) {
             v->state = VS_NONE; v->dev = 0;
             if (dv && !T.d2) continue;
             T.failed++;
+            if (d[i].ok) T.f_sets++; else if (d[i].copy_failed) T.f_copy++; else T.f_pool++;
             /* refused: the budget holds fewer than the count said (fragmentation, or the
              * device ran out first): stop planning past what is there. A failed copy gave
              * its room back: the budget stands, the expert may come again. */
@@ -423,6 +438,27 @@ static void quiesce(void) {
                 T.max_resident -= T.dmax[dv] - (T.dres[dv] + T.dque[dv]);
                 T.dmax[dv] = T.dres[dv] + T.dque[dv];
             }
+        }
+    }
+    if (kept) {   /* back in front of what finished meanwhile, in the order they finished */
+        pthread_mutex_lock(&T.mx);
+        if (T.ndone + kept > T.cdone) {
+            VDone *g = realloc(T.done, (size_t)(T.ndone + kept) * sizeof(*g));
+            if (g) { T.done = g; T.cdone = T.ndone + kept; }
+        }
+        if (T.ndone + kept <= T.cdone) {
+            memmove(T.done + kept, T.done, (size_t)T.ndone * sizeof(*T.done));
+            memcpy(T.done, d, (size_t)kept * sizeof(*d));
+            T.ndone += kept;
+            kept = 0;
+        }
+        pthread_mutex_unlock(&T.mx);
+        for (int i = 0; i < kept; i++) {   /* no memory to keep them: as before, freed and counted */
+            for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].g : k == 1 ? d[i].u : d[i].d; if (t) coli_vk_tensor_free(t); }
+            VSlot *v = slot(d[i].layer, d[i].eid);
+            int kd = kind_of(d[i].layer);
+            T.queued--; if (kd) T.xque--; else T.dque[v->dev]--;
+            v->state = VS_NONE; v->dev = 0; T.failed++; T.f_sets++;
         }
     }
     free(d);
@@ -442,7 +478,7 @@ static void d2_stop(const char *why) {
         if (v->ex) { coli_vk_xb_expert_free(v->ex); v->ex = NULL; }
         v->state = VS_NONE; v->dev = 0; T.resident--; T.dres[1]--;
     }
-    T.max_resident -= T.dmax[1]; T.dmax[1] = 0;
+    T.max_resident -= T.dmax[1]; T.dmax[1] = 0; T.epoch++;
     fprintf(stderr, "[VK] tier %s: %s, its experts go back to the CPU and the tier goes on with %s\n",
             T.engine, why, coli_vk_device_name());
 }
@@ -577,25 +613,58 @@ static int plan_cmp(const void *a, const void *b) {
     return hx < hy ? 1 : hx > hy ? -1 : (x > y) - (x < y);
 }
 static uint32_t *const *g_heat_hist;
+/* The experts the warm start puts on the device: the history's, hottest first, then
+ * (COLI_VK_TIER_FILL, on by default) whatever room is left with the experts no history
+ * named, one of each layer in turn. A first run with no history used to start with an
+ * empty device and fill it at the promotion rate: on a 3090 Ti, Qwen3.6's first run
+ * had 16.5% of its routed experts there and decoded at the CPU's speed, the second 97%
+ * at three times it (#2081). A model whose experts all fit goes up whole now; one that
+ * does not starts with the device full, and the promotions trade cold residents for
+ * hot ones as before. */
 int vkt_plan(int *layers, int *eids, int max) {
-    if (!T.on || !g_heat_hist) return 0;
-    int L = T.main_layers, E = T.c.experts, n = 0;   /* the history: the main layers' */
-    int *order = malloc((size_t)L * E * sizeof(int));
-    if (!order) return 0;
-    for (int l = 0; l < L; l++)
-        if (g_heat_hist[l]) for (int e = 0; e < E; e++) if (g_heat_hist[l][e]) order[n++] = l * E + e;
-    g_plan_heat = (const uint32_t *const *)g_heat_hist; g_plan_E = E;
-    qsort(order, (size_t)n, sizeof(int), plan_cmp);
-    int k = 0;
-    for (int i = 0; i < n && k < max && room_dev(0) >= 0; i++) {
-        VSlot *v = &T.s[order[i]];
-        if (v->state != VS_NONE) continue;
-        int dev = room_dev(0);   /* the hottest fill the primary device, the next ones the second */
-        v->state = VS_QUEUED; v->dev = (uint8_t)dev; T.queued++; T.dque[dev]++;
-        layers[k] = order[i] / E; eids[k] = order[i] % E; k++;
+    T.plan_hist = 0;
+    if (!T.on) return 0;
+    int L = T.main_layers, E = T.c.experts, n = 0, k = 0;   /* the main layers' */
+    if (g_heat_hist) {
+        int *order = malloc((size_t)L * E * sizeof(int));
+        if (!order) return 0;
+        for (int l = 0; l < L; l++)
+            if (g_heat_hist[l]) for (int e = 0; e < E; e++) if (g_heat_hist[l][e]) order[n++] = l * E + e;
+        g_plan_heat = (const uint32_t *const *)g_heat_hist; g_plan_E = E;
+        qsort(order, (size_t)n, sizeof(int), plan_cmp);
+        for (int i = 0; i < n && k < max && room_dev(0) >= 0; i++) {
+            VSlot *v = &T.s[order[i]];
+            if (v->state != VS_NONE) continue;
+            int dev = room_dev(0);   /* the hottest fill the primary device, the next ones the second */
+            v->state = VS_QUEUED; v->dev = (uint8_t)dev; T.queued++; T.dque[dev]++;
+            layers[k] = order[i] / E; eids[k] = order[i] % E; k++;
+        }
+        free(order);
     }
-    free(order);
+    T.plan_hist = k;
+    /* only the layers the heat table has a row for: a NULL row is a layer without
+     * experts (route_trace.h's rt_drop_row), and with no table at all nothing is known */
+    const char *fill = getenv("COLI_VK_TIER_FILL");
+    if ((fill && *fill == '0') || !g_heat_hist) return k;
+    for (int e = 0; e < E && k < max && room_dev(0) >= 0; e++)
+        for (int l = 0; l < L && k < max && room_dev(0) >= 0; l++) {
+            if (!g_heat_hist[l]) continue;
+            VSlot *v = &T.s[(size_t)l * E + e];
+            if (v->state != VS_NONE) continue;
+            int dev = room_dev(0);
+            v->state = VS_QUEUED; v->dev = (uint8_t)dev; T.queued++; T.dque[dev]++;
+            layers[k] = l; eids[k] = e; k++;
+        }
     return k;
+}
+/* The warm start's line, for every engine: "warm start, N experts" stays its head. */
+void vkt_warm_report(const char *engine, int n, double seconds) {
+    if (!T.on || n <= 0) return;
+    int all = 0;   /* the experts of the layers that have them */
+    for (int l = 0; l < T.main_layers; l++) if (g_heat_hist && g_heat_hist[l]) all += T.c.experts;
+    fprintf(stderr, "[VK] tier %s: warm start, %d experts in %.1fs (%d from the history, %d more to fill the device%s)\n",
+            engine, n, seconds, T.plan_hist < n ? T.plan_hist : n, n > T.plan_hist ? n - T.plan_hist : 0,
+            all && n >= all ? ": every expert of the model" : "");
 }
 int vkt_put(int layer, int eid, const VktExpertSrc *src) {
     if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return 0;
@@ -1697,7 +1766,11 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
             human((double)T.budget, hb, sizeof hb), ps.blocks, ps.frag, T.uploads,
             human((double)T.upload_bytes, hl, sizeof hl), T.warm, T.evictions, T.qfull, T.rated, T.failed,
             T.dev_ms, T.cpu_ms, T.wait_ms, T.dev_ms > 0 ? 100.0 * hidden / T.dev_ms : 0.0);
+    if (T.failed)
+        fprintf(stderr, " | failed: %llu refused by the pool, %llu copies to the device, %llu not taken by the batch",
+                T.f_pool, T.f_copy, T.f_sets);
     if (T.balance) fprintf(stderr, " | balance: device share %.2f, %llu rows handed to the CPU", T.share, T.handed);
+    if (T.chain_served) fprintf(stderr, " | in the dense chain: %llu routed experts with no host step", T.chain_served);
     if (T.c.extra_layers)
         fprintf(stderr, " | extra layers (%d): %llu of %llu routed experts on the device, resident %d (budget %d)",
                 T.c.extra_layers, T.extra_served, T.extra_routed, T.xres, T.xmax);
@@ -1727,6 +1800,51 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
 }
 
 int vkt_devices(void) { return !T.on ? 0 : T.d2 ? 2 : 1; }
+
+unsigned vkt_epoch(void) { return T.epoch; }
+int vkt_dev_table(int layer, uint32_t *ent) {
+    if (!T.on || layer < 0 || layer >= T.c.layers || !ent) return -1;
+    int n = 0;
+    for (int e = 0; e < T.c.experts; e++) {
+        VSlot *v = slot(layer, e);
+        uint32_t *o = ent + (size_t)e * COLI_VK_XB_ENTRY;
+        memset(o, 0, COLI_VK_XB_ENTRY * sizeof *o);
+        if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex) continue;
+        if (!coli_vk_xb_expert_entry(v->ex, o)) return -1;
+        n++;
+    }
+    return n;
+}
+/* issue()'s books for pairs it never saw: a forward's start, the tick, heat, routed and
+ * served (the device took every resident one) */
+void vkt_dev_count(int layer, int S, int K, const int *idx) {
+    if (!T.on || layer < 0 || layer >= T.c.layers || S < 1 || K < 1 || !idx) return;
+    if (layer < T.last_layer || T.begin) { T.begin = 0; T.first_layer = layer; new_forward(); }
+    if (T.routed_at) {
+        uint32_t q = ++T.seq;
+        for (int i = 0; i < S * K; i++)
+            if (idx[i] >= 0 && idx[i] < T.c.experts) __atomic_store_n(&T.routed_at[(size_t)layer * T.c.experts + idx[i]], q, __ATOMIC_RELAXED);
+        __atomic_store_n(&T.layer_seq[layer], q, __ATOMIC_RELEASE);
+    }
+    if (layer == T.first_layer) {
+        T.tick += (uint32_t)S;
+        long cap = (long)T.promo_cap + (long)T.rate * S;
+        T.promo_cap = cap > (1 << 30) ? 1 << 30 : (int)cap;
+    }
+    T.last_layer = layer;
+    for (int i = 0; i < S * K; i++) {
+        int e = idx[i];
+        if (e < 0 || e >= T.c.experts) continue;
+        T.routed++;
+        if (layer >= T.main_layers) T.extra_routed++;
+        VSlot *v = slot(layer, e);
+        if (v->heat < 0xFFFFFFFFu) v->heat++;
+        v->last = T.tick;
+        if (v->state != VS_RESIDENT || v->dev != 0) continue;
+        T.served++; T.chain_served++;
+        if (layer >= T.main_layers) T.extra_served++;
+    }
+}
 int vkt_layers(void) { return T.on ? T.c.layers : 0; }
 static VSlot *g_old_slots;   /* the slot table of the tier shut down last (vkt_shutdown) */
 static uint32_t *g_old_routed, *g_old_seq;

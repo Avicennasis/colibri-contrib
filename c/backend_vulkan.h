@@ -225,6 +225,17 @@ size_t coli_vk_tensor_row_bytes(int fmt, int I);
 /* What coli_vk_tensor_ensure(fmt, I, O, gs) adds to coli_vk_mem_info's bytes: the rows
  * at their padded stride and the scales (0 for a grouped format without a group size). */
 size_t coli_vk_tensor_payload(int fmt, int I, int O, int gs);
+/* An f32 matrix [O x I] on the device in 2 bytes a value when that holds it exactly: bf16
+ * (fmt 11) when every float is a bf16 widened, as a bf16 checkpoint read into f32 gives;
+ * f16 (fmt 14) when every float is one an f16 holds, as an f16 checkpoint gives; f32
+ * (fmt 10) otherwise. coli_vk_f32_fmt is the format it takes, coli_vk_f32_payload its
+ * bytes (fmt 10's without w). ensure_f32: an existing tensor is fine at any of the three;
+ * dev2 = on the second device. matmul_f32: coli_vk_matmul for such a matrix, w NULL once
+ * it is up. */
+int    coli_vk_f32_fmt(const float *w, size_t n);
+size_t coli_vk_f32_payload(const float *w, int I, int O);
+int    coli_vk_tensor_ensure_f32(ColiVkTensor **tensor, const float *w, int I, int O, int dev2);
+int    coli_vk_matmul_f32(ColiVkTensor **tensor, float *y, const float *x, const float *w, int S, int I, int O);
 size_t coli_vk_buffer_alignment(void);   /* where a weight range may start (bytes) */
 size_t coli_vk_tensor_scale_count(int fmt, int I, int O, int gs);
 
@@ -255,6 +266,13 @@ int  coli_vk_xb_queue_shared(void);   /* 1 = the batch shares the main queue */
 ColiVkExpert *coli_vk_xb_expert(ColiVkTensor *gate, ColiVkTensor *up, ColiVkTensor *down);
 /* Its sets and its three tensors. Not while a batch is in flight. */
 void coli_vk_xb_expert_free(ColiVkExpert *e);
+/* Its entry in the expert table the dense chain reads (vk_chain.h, vkc_moe), the
+ * COLI_VK_XB_ENTRY words of chain_moe.comp: [0..1] gate's rows by device address, [2..3]
+ * its scales, [4..7] up's, [8..11] down's, [12..14] gate and up's fmt, row words and gs,
+ * [15..17] down's, [18] 1, the rest 0. 0 (nothing written) when the device cannot read
+ * them by address: bufferDeviceAddress off, the second device, a tensor outside a pool. */
+#define COLI_VK_XB_ENTRY 32
+int coli_vk_xb_expert_entry(const ColiVkExpert *e, uint32_t *entry);
 /* Submit and return: count experts, rows[c] activation rows each, the rows given as
  * sum(rows) pointers to D floats, expert by expert. 0 = nothing was submitted (the
  * caller computes those experts itself). One batch in flight at a time. */
@@ -324,7 +342,7 @@ int  coli_vk_tensor_refill(ColiVkTensor *t, uint8_t **rows, size_t *stride, floa
  *   coli_vk_dev_info       what the tier sizes itself by, for either device
  *   coli_vk_tier_tensor_dev  coli_vk_tier_tensor in that device's tier pool
  *   coli_vk_xb_*_dev       coli_vk_xb_init/_ready/_issue_w/_join/_stats on that device;
- *                          _busy_dev: a batch in flight there */
+ *                          _busy_dev: a batch (or a sub-batch) in flight there */
 typedef struct {
     const char *name;
     int integrated, shares_ram;       /* shares_ram: an integrated GPU or a CPU device */
@@ -425,6 +443,7 @@ typedef struct {
     int has_prio, integrated, shares_ram;
     int coop_sg;                          /* subgroup size the cooperative-matrix shaders run at; 0 = none */
     int pin_sg;                           /* the subgroup size every chain pipeline requires; 0 = the driver's */
+    int bda;                              /* bufferDeviceAddress on: the chain reads the tier's experts by address */
 } ColiVkCore;
 int  coli_vk_core(ColiVkCore *out);
 /* A resident tensor's buffers (VkBuffer as void *) and layout; 0 for a COLI_VK_DEV2 one. */

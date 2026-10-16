@@ -244,6 +244,13 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(self.cli.ngen_for(explicit), 300)
         self.assertEqual(self.cli.ngen_for(explicit, interactive=True), 300)
 
+    def test_served_sessions_leave_the_ceiling_to_the_context(self):
+        """#382: coli serve, web and chat hand the gateway 0 without --ngen, which it
+        reads as the context the engine holds; a reasoning model's turn is its reasoning
+        plus its answer, and the family's fixed 16384 (8192 for Qwen) cut some short."""
+        self.assertEqual(self.cli.serve_max_tokens(argparse.Namespace(ngen=None)), 0)
+        self.assertEqual(self.cli.serve_max_tokens(argparse.Namespace(ngen=300)), 300)
+
     def test_one_shot_env_still_carries_the_historic_ngen(self):
         """The default moved to None so the two cases can be told apart. These
         sites must not become "unset": before, NGEN was always exported."""

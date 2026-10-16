@@ -26,16 +26,34 @@ more GPUs and computed there through the existing shared CUDA backend
   (`HEAT_FILE`) when present, so a second run starts fully placed.
 - **Decode:** per (token, layer) the resident experts are issued as async
   groups on all devices (`coli_cuda_expert_group_issue/take`); VRAM misses
-  fall back to the CPU int8 path and overlap with the in-flight groups, as
-  does the shared expert. Placement never changes routing or precision.
-- **Memory:** on an **int4 container** the warmstart frees the RAM int8 copies
-  of VRAM-resident experts (rematerialized from the packed int4 copy on LFRU
-  eviction; no container access). Peak RSS for the 35B int4 container: ~29 GB
-  with two 8 GB GPUs. The RSS saving is a property of packed containers only:
-  on an **int8 container** there is no second copy to rematerialize from, so
-  since #1341 nothing is freed and every resident keeps its full RAM weights —
-  such a run gets the tier's VRAM speed at full residency cost, and the 29 GB
-  figure below does not apply to it.
+  fall back to the CPU and overlap with the in-flight groups, as does the
+  shared expert. Placement never changes routing or precision.
+- **Memory:** on an **int4 gs64 container** the experts stay planar int4 in
+  RAM (`expert_ffn.h`, the CPU's kernel for the misses), one copy at the size
+  on disk; the tier converts the planar bytes to its pairs when it stages an
+  upload. Before #2090 the CUDA build unpacked every expert to int8 and kept
+  the packed int4 beside it for the uploads, three times the bytes on disk,
+  while the planner (`--auto-tier`) priced the bytes on disk.
+  `QWEN_EXPERT_KERNEL=0` keeps that historical layout (int8 for the CPU, the
+  int8 copy of VRAM residents dropped at the warmstart). On an **int8
+  container** every expert keeps its int8 weights in RAM (#1341).
+- **Any RAM size:** with every expert of a layer in RAM (`cap` >= `n_experts`)
+  the tier keeps pointers into the slots and swaps residents on its own
+  (LFRU ticks, `QT_PREFILL_REPLAN`). With fewer, it copies an expert while the
+  engine holds it for the CPU and decides then whether it earns a place in
+  VRAM (the coldest resident of its device makes way when the newcomer is
+  hotter); VRAM residents are never read into RAM, so the two caches add up.
+  The warmstart then loads only the experts it places in VRAM, and the RAM
+  cache fills as the CPU's experts are routed. Before #2090 a `cap` below
+  `n_experts` switched the tier off, trunk included.
+- **Heat:** every routed expert counts once per token, a hit in `qt_issue`,
+  a miss when the engine hands its bytes over (`qt_note`). Hits used to count
+  only through that note, which in copy mode (and on Qwen3.8) never comes for
+  a resident: residents stayed at the heat they arrived with, and any
+  newcomer warmer than that evicted them.
+- **No experts, still the trunk:** the mixed layout (int4 gate/up, int8
+  down), int8 experts with grouped scales and `COLI_PLACE` `experts=cpu` keep
+  the experts on the CPU, and the devices take the dense trunk below.
 
 ## Usage
 
@@ -68,9 +86,10 @@ the CUDA toolkit's `bin` directory on `PATH` for `cudart`. A startup line
 `[gpu] MoE experts -> CUDA VRAM tier` confirms the tier is active; without it
 the run is CPU-only.
 
-`cap` (argv[1]) must equal `n_experts` (full RAM residency). int4 containers
-only (the int8 container keeps the CPU path). `COLI_TIMERS=1` prints
-per-phase timings and tier telemetry.
+`cap` (argv[1]) is the RAM cache per layer as for the CPU build, any size
+(see "Any RAM size" above; before #2090 any `cap` but `n_experts` switched the
+tier off, a larger one included); `--auto-tier` sizes it from the RAM. `COLI_TIMERS=1`
+prints per-phase timings and tier telemetry.
 
 ## Placement: where the dense trunk goes (`COLI_PLACE`)
 

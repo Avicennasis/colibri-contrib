@@ -30,7 +30,63 @@ static int walk(GrState *S, const char *bytes){
     return n;
 }
 
+/* Finite numbers outside the integer formatting fast path must reach the
+ * compiler and PDA without an out-of-range float-to-integer conversion.
+ * Run this suite with -fsanitize=undefined,float-cast-overflow as well. */
+static void number_literals(void){
+    static const struct { const char *source, *literal; } cases[] = {
+        {"1e100", "1e+100"}, {"-1e100", "-1e+100"},
+        {"1.7976931348623157e308", "1.7976931348623157e+308"},
+        {"-1.7976931348623157e308", "-1.7976931348623157e+308"},
+        {"9223372036854775808", "9.2233720368547758e+18"},
+        {"-9223372036854775808", "-9.2233720368547758e+18"},
+        {"1e15", "1000000000000000"}, {"-1e15", "-1000000000000000"},
+        {"999999999999999", "999999999999999"},
+        {"-999999999999999", "-999999999999999"},
+        {"1e-100", "1e-100"}, {"-1e-100", "-1e-100"},
+        {"0", "0"}, {"-0", "0"}, {"42.0", "42"}, {"-42", "-42"},
+        {"0.5", "0.5"}, {"-0.5", "-0.5"}
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++){
+        /* Both numeric callers share the formatter. Keep a mixed enum so the
+         * numeric path does not disturb its existing boolean/string members. */
+        for (int en = 0; en < 2; en++){
+            char schema[192];
+            if (en) snprintf(schema, sizeof schema,
+                "{\"enum\":[%s,false,\"control\"]}", cases[i].source);
+            else snprintf(schema, sizeof schema, "{\"const\":%s}", cases[i].source);
+            Grammar G; GrState S;
+            int ok = compile(schema, &G, NULL, 0) == 0;
+            CHECK(ok);
+            if (!ok) continue;
+            gr_state_init(&S, &G);
+            CHECK(walk(&S, cases[i].literal) == (int)strlen(cases[i].literal));
+            unsigned char mask[32]; int can_end = 0;
+            gr_admissible(&S, mask, &can_end);
+            CHECK(can_end == 1);
+            /* A different number must not be admitted as this literal. */
+            const char *wrong = !strcmp(cases[i].literal, "0") ? "1" : "0";
+            gr_state_init(&S, &G);
+            int consumed = walk(&S, wrong);
+            gr_admissible(&S, mask, &can_end);
+            CHECK(consumed != (int)strlen(wrong) || can_end == 0);
+            if (en){
+                gr_state_init(&S, &G);
+                CHECK(walk(&S, "false") == 5);
+                gr_admissible(&S, mask, &can_end);
+                CHECK(can_end == 1);
+                gr_state_init(&S, &G);
+                CHECK(walk(&S, "\"control\"") == 9);
+                gr_admissible(&S, mask, &can_end);
+                CHECK(can_end == 1);
+            }
+            gr_free(&G);
+        }
+    }
+}
+
 int main(void){
+    number_literals();
     /* 1. simple strict object: forced spans resume inside literals (jws points
      *    themselves are not forced), compact AND sloppy instances both walk */
     {
@@ -207,6 +263,49 @@ int main(void){
             CHECK(walk(&S, tail) == (int)strlen(tail));
             gr_admissible(&S, mask, &can_end);
             CHECK(can_end == 1);
+            gr_free(&G);
+        }
+    }
+
+    /* Decoded JSON controls in enums, consts and property names must draft
+     * their escaped JSON spelling, never an invalid raw control byte. */
+    for (int ch = 1; ch < 32; ch++){
+        char escaped[8];
+        switch (ch){
+        case '\b': strcpy(escaped, "\\b"); break;
+        case '\f': strcpy(escaped, "\\f"); break;
+        case '\n': strcpy(escaped, "\\n"); break;
+        case '\r': strcpy(escaped, "\\r"); break;
+        case '\t': strcpy(escaped, "\\t"); break;
+        default: snprintf(escaped, sizeof escaped, "\\u%04x", ch); break;
+        }
+        for (int kind = 0; kind < 3; kind++){
+            char schema[256], instance[64], raw[64];
+            if (kind == 0)
+                snprintf(schema, sizeof schema, "{\"enum\":[\"p%sq\"]}", escaped);
+            else if (kind == 1)
+                snprintf(schema, sizeof schema, "{\"const\":\"p%sq\"}", escaped);
+            else
+                snprintf(schema, sizeof schema, "{\"type\":\"object\",\"properties\":{"
+                    "\"p%sq\":{\"type\":\"null\"}},\"required\":[\"p%sq\"]}", escaped, escaped);
+            snprintf(instance, sizeof instance, kind == 2 ? "{\"p%sq\":null}" : "\"p%sq\"", escaped);
+            snprintf(raw, sizeof raw, kind == 2 ? "{\"p%cq\":null}" : "\"p%cq\"", ch);
+            Grammar G; GrState S;
+            int ok = compile(schema, &G, NULL, 0) == 0;
+            CHECK(ok);
+            if (!ok) continue;
+            gr_state_init(&S, &G);
+            CHECK(walk(&S, instance) == (int)strlen(instance));
+            unsigned char mask[32]; int can_end = 0;
+            gr_admissible(&S, mask, &can_end);
+            CHECK(can_end == 1);
+            gr_state_init(&S, &G);
+            const char *prefix = kind == 2 ? "{\"p" : "\"p";
+            CHECK(walk(&S, prefix) == (int)strlen(prefix));
+            char forced[64]; int n = gr_forced(&S, forced, sizeof forced);
+            CHECK(n >= (int)strlen(escaped) && !strncmp(forced, escaped, strlen(escaped)));
+            gr_state_init(&S, &G);
+            CHECK(walk(&S, raw) < (int)strlen(raw));
             gr_free(&G);
         }
     }

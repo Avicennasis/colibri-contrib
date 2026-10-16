@@ -304,6 +304,42 @@ static void warm(void) {
     vkt_shutdown(); model_free();
 }
 
+/* #2081: the warm start fills the device whatever the history knows. No history: a
+ * budget of 7 takes 7 experts, one layer after the other; a history's experts go
+ * first; a budget that holds every expert plans every one; a layer without a row
+ * (no experts) is never planned. */
+static void fill(void) {
+    VktFmt f = {VKT_SRC_I4U_PAIRS_GS, 64};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    static const char *const what[4] = {"no history", "a history of two", "every expert", "a layer without experts"};
+    for (int c = 0; c < 4; c++) {
+        set_budget(c < 2 ? 7 : L * E, f, f);
+        uint32_t hist[L][E], *rows[L];
+        for (int l = 0; l < L; l++) {
+            for (int e = 0; e < E; e++) hist[l][e] = c == 1 && e == 0 ? (uint32_t)(50 - l) : 0;
+            rows[l] = c == 3 && l == 1 ? NULL : hist[l];
+        }
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+        CHECK(vkt_init(&vc, rows), "fill %s: the tier did not start", what[c]);
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        const int want = c < 2 ? 7 : c == 2 ? L * E : E;
+        CHECK(n == want, "fill %s: planned %d experts, not %d", what[c], n, want);
+        int per[L] = {0}, ok = 1;
+        for (int i = 0; i < n; i++) per[pl[i]]++;
+        if (c == 0) ok = per[0] - per[1] <= 1 && per[1] - per[0] <= 1;          /* one layer after the other */
+        if (c == 1) ok = n >= 2 && pl[0] == 0 && pe[0] == 0 && pl[1] == 1 && pe[1] == 0;   /* the history first */
+        if (c == 3) ok = per[1] == 0;                                                /* no row, no plan */
+        CHECK(ok, "fill %s: the plan's order or layers are wrong", what[c]);
+        for (int i = 0; i < n; i++) { VktExpertSrc src = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &src); }
+        vkt_put_done();
+        int res = 0; for (int i = 0; i < n; i++) res += vkt_resident(pl[i], pe[i]);
+        CHECK(res == n, "fill %s: %d of %d planned experts resident", what[c], res, n);
+        printf("  fill, %s: %d experts planned and resident\n", what[c], n);
+        vkt_shutdown();
+    }
+    model_free();
+}
+
 /* a third of the experts fit; the hot set moves halfway */
 static void adapt(void) {
     VktFmt f = {VKT_SRC_FP8_GS, 32};
@@ -693,6 +729,7 @@ static void stream(void) {
         setenv("COLI_VK_TIER_RATE", "0", 1);
         setenv("COLI_VK_TIER_STREAM_SLOTS", c % 2 ? "8" : "4", 1);
         setenv("COLI_VK_TIER_STREAM_ROWS", "3", 1);    /* a cold expert with 3 rows or more streams */
+        setenv("COLI_VK_TIER_FILL", "0", 1);           /* four warm, the rest cold: what streams */
         setenv("COLI_VK_TIER_STREAM_HALF", "40", 1);   /* sub-batches of 40 rows: several a step, experts in parts */
         VktConfig vc = cfg_of(cs[c].gu, cs[c].dn, cs[c].act, v4 ? 10.0f : 0.f);
         vc.load = load_cb; vc.release = release_cb;
@@ -733,7 +770,7 @@ static void stream(void) {
         CHECK(same, "stream %s: the resident set moved", cs[c].name);
         CHECK(worst < (v4 ? 2e-2 : 2e-3), "stream %s: device rows off the reference (%.3g)", cs[c].name, worst);
         vkt_shutdown(); model_free();
-        unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
+        unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_FILL");
     }
 }
 
@@ -960,6 +997,7 @@ int main(int argc, char **argv) {
     printf("partial:\n"); partial();
     printf("sync:\n"); sync_evict();
     printf("extra:\n"); extra();
+    printf("fill:\n"); fill();   /* after extra: its exact pool capacities assume no tier came before with more experts */
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
     ColiVkPoolStats ps, px; coli_vk_pool_stats(1, &ps); coli_vk_pool_stats(4, &px);

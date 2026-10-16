@@ -368,7 +368,9 @@ ptl_family_qwen36_olmoe_sanitize() {
   psan qwen36 "asan partial qwen36 lookup verifies" 4 COLI_VK_CHAIN_LAYERS=4 COLI_DENSE_I8=0 COLI_LOOKUP=1 COLI_SPEC_GATE=0 \
     COLI_LOOKUP_FORCE=cycle SNAP=qwen36_tiny_v128_c ./qwen36 8 8 qwen36_tiny_v128/ref_full.json
   psan qwen36 "asan partial qwen36 dense-only" 4 COLI_VK_CHAIN_LAYERS=4 COLI_VK_DENSE_HOST=0 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 $R
-  psan qwen36 "asan partial qwen36 device lost" 4 COLI_VK_CHAIN_LAYERS=4 COLI_VK_CHAIN_FAULT=60 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 $R
+  # the lost gates count the frames of the host's routing (COLI_VK_CHAIN_MOE=0): with the
+  # routed experts in the frame a forward is one frame, and frame 60 or 20 never comes
+  psan qwen36 "asan partial qwen36 device lost" 4 COLI_VK_CHAIN_MOE=0 COLI_VK_CHAIN_LAYERS=4 COLI_VK_CHAIN_FAULT=60 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 $R
   grep -q "rebuilding the state of [1-9]" san.log || { cat san.log; fail "asan partial qwen36 device lost: no state rebuilt"; }
   local cap f
   psan qwen36 "asan partial qwen36 cap probe" 8 COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=0.04 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c ./qwen36 8 8 $R
@@ -381,7 +383,7 @@ ptl_family_qwen36_olmoe_sanitize() {
   psan olmoe "asan partial olmoe KV split, chunks of 3" 2 COLI_VK_CHAIN_LAYERS=2 COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 COLI_VK_CHAIN_ROWS=3 \
     SNAP=olmoe_tiny_c ./olmoe 8 8 olmoe_tiny/ref_olmoe_long.json
   psan olmoe "asan partial olmoe dense-only" 1 COLI_VK_CHAIN_LAYERS=1 COLI_VK_DENSE_HOST=0 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR
-  psan olmoe "asan partial olmoe device lost" 3 COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_FAULT=20 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR
+  psan olmoe "asan partial olmoe device lost" 3 COLI_VK_CHAIN_MOE=0 COLI_VK_CHAIN_LAYERS=3 COLI_VK_CHAIN_FAULT=20 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR
   grep -q "the CPU redoes the step from position" san.log || { cat san.log; fail "asan partial olmoe device lost: no step redone"; }
   psan olmoe "asan partial olmoe cap probe" 4 COLI_VK_DEVICE_CAP_MB=256 COLI_VK_TIER_RESERVE_GB=0.04 SNAP=olmoe_tiny_c ./olmoe 8 8 $OR
   cap=$(PTL_PROBE_CAP_MB=256 ptl_calc cap olmoe san.log 1)

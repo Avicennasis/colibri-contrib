@@ -271,6 +271,8 @@ def main():
         sys.exit("error: need --repo or --model (or --selftest)")
     if not args.out:
         sys.exit("error: --out is required")
+    if args.model and not args.repo and os.path.realpath(args.model) == os.path.realpath(args.out):
+        ap.error("--model and --out must differ (in-place conversion would overwrite the source checkpoint)")
 
     if not 2 <= args.ebits <= 8:
         sys.exit(f"--ebits must be 2..8 (got {args.ebits})")

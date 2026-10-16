@@ -540,10 +540,12 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
-	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu \
+	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu test_qwen38_cuda_chain \
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
-	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
+	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3
 TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
+# takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
+TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
@@ -556,7 +558,8 @@ ifneq (,$(X86_64))
 TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) \
 	tests/test_olmoe_dot_i8_16_sse41$(EXE) tests/test_st_f16_bf16_simd_sse41$(EXE) \
 	tests/test_i4_grouped_sse41$(EXE) \
-	tests/test_i4_grouped_sse41_o1$(EXE) tests/test_i4_grouped_sse41_no_contract$(EXE)
+	tests/test_i4_grouped_sse41_o1$(EXE) tests/test_i4_grouped_sse41_no_contract$(EXE) \
+	tests/test_idot_ssse3$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
 TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
@@ -737,6 +740,10 @@ VK_SPV   += shaders/chain_gemv2.spv
 VK_SPV   += shaders/chain_dsv4.spv
 # Kimi K3's attention residuals and SiTU-GLU (vk_chain.h)
 VK_SPV   += shaders/chain_ares.spv
+# the router's pick on the device, every MoE engine's kind (vk_chain.h: vkc_route)
+VK_SPV   += shaders/chain_route.spv
+# the routed experts on the device, their weights by address (vk_chain.h: vkc_moe)
+VK_SPV   += shaders/chain_moe.spv
 # inkling's chain ops (made on first use): the short convolution and the attention
 # with its relative-position bias
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
@@ -1526,7 +1533,7 @@ qwen38-tiny-check: qwen38-tiny-generate qwen38$(EXE)
 # plus BF16 128x128 block scales, gate/up and down in separate shards. The
 # native slab path and the expanded path must both reproduce the reference;
 # then the engine runs on the fake CUDA tier (no toolkit, no GPU).
-.PHONY: qwen38-tiny-fp8-generate qwen38-tiny-fp8-check qwen38-tier-engine-check
+.PHONY: qwen38-tiny-fp8-generate qwen38-tiny-fp8-mtp-generate qwen38-tiny-fp8-check qwen38-tier-engine-check qwen38-cuda-chain-check
 qwen38-tiny-fp8-generate:
 	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_fp8 --fp8-experts
 
@@ -1542,6 +1549,12 @@ qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine
 
 qwen38-dn-gpu-check: qwen38-tiny-fp8-generate tests/test_qwen38_dn_gpu$(EXE)
 	./tests/test_qwen38_dn_gpu$(EXE)
+
+qwen38-cuda-chain-check: qwen38-tiny-fp8-generate qwen38-tiny-fp8-mtp-generate tests/test_qwen38_cuda_chain$(EXE)
+	./tests/test_qwen38_cuda_chain$(EXE)
+
+qwen38-tiny-fp8-mtp-generate:
+	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_fp8_mtp --fp8-experts --mtp
 
 # The routed experts as int4-g64: tools/convert_qwen38_experts_int4.py writes
 # the experts-int4g64/ sidecar next to the FP8 shards and qwen38 picks it up.
@@ -1744,6 +1757,10 @@ tests/test_qwen36_dense_idot$(EXE): tests/test_qwen36_dense_idot.c qwen36.c $(QW
 tests/test_qwen36_tokenizer$(EXE): tests/test_qwen36_tokenizer.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# The serve sampler draws the same tokens as a sort of the whole vocabulary.
+tests/test_qwen36_sample$(EXE): tests/test_qwen36_sample.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 # Reproducible local timing evidence; intentionally not a noisy CI perf gate.
 tests/bench_qwen36_dense_batch$(EXE): tests/bench_qwen36_dense_batch.c qwen36.c \
 		$(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
@@ -1817,6 +1834,11 @@ tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_cluster_protocol$(EXE): tests/test_cluster_protocol.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# The same wire contract as deepseek_v41.c carries it: each engine has its own
+# copy of the COLIEX01 protocol, so each is pinned on its own source.
+tests/test_dsv41_cluster_protocol$(EXE): tests/test_dsv41_cluster_protocol.c deepseek_v41.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_ue8m0$(EXE): tests/test_ue8m0.c
@@ -2137,11 +2159,41 @@ tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c $
 tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_olmoe_load_diagnostic$(EXE): tests/test_olmoe_load_diagnostic.c olmoe.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# The qwen36 embedding read in place (qwen36_embedding.h): rows, errors and the
+# mapping's lifetime, on synthetic files.
+tests/test_qwen36_embedding$(EXE): tests/test_qwen36_embedding.c
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+# canonical.qc without a model: synthetic source matrices through the tool's
+# writer (the test includes tools/qwen36_canonical.c, so check compiles the
+# tool's code) and back through the engine's reader, the quantizer pinned to
+# QDF_QUANTIZER, and every kind of wrong file refused with its reason.
+tests/test_qwen36_dense_file$(EXE): tests/test_qwen36_dense_file.c tools/qwen36_canonical.c qwen36.c $(VK_OBJ)
+	$(CC) $(filter-out -DCOLI_METAL,$(NOCUDA_CFLAGS)) $< $(VK_OBJ) -o $@ $(filter-out -framework Metal Foundation -lc++,$(NOCUDA_LDFLAGS))
+
+# canonical.qc: the INT8 dense weights of a Qwen3.6 model converted once; the
+# engine reads the file beside the model instead of converting them at every start.
+#   ./qwen36-canonical <model-dir>
+# The name has a dash, so the automatic dependencies below do not cover it: its
+# own .d (written by -MMD) is included here.
+qwen36-canonical$(EXE): tools/qwen36_canonical.c qwen36.c qwen36_dense_file.h $(VK_OBJ)
+	$(CC) $(filter-out -DCOLI_METAL,$(NOCUDA_CFLAGS)) $< $(VK_OBJ) -o $@ $(filter-out -framework Metal Foundation -lc++,$(NOCUDA_LDFLAGS))
+-include qwen36-canonical.d
+
 tests/test_idot$(EXE): tests/test_idot.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# Force the idot integer-dot kernels onto the SSSE3 tier even on an AVX2 host
+# (mirrors the forced-SSE4.1 grouped-int4 gates): pre-AVX2 x86-64 CPUs take
+# this branch instead of scalar, so it must remain a gate, not dead code.
+tests/test_idot_ssse3$(EXE): tests/test_idot.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -mssse3 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_HAVE_GROUPED_PAIR $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2303,6 +2355,12 @@ tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_compat_direct$(EXE): tests/test_compat_direct.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_compat_overlapped$(EXE): tests/test_compat_overlapped.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_st_shared_read$(EXE): tests/test_st_shared_read.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_compat_prefetch$(EXE): tests/test_compat_prefetch.c $(if $(IS_WIN),tests/compat_prefetch_module.dll)
@@ -2502,6 +2560,7 @@ V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_ST.o \
 	COLI_V4_UNIT_CONFIG.o \
 	COLI_V4_UNIT_MATH.o \
+	COLI_V4_UNIT_ROUTE_BF16.o \
 	COLI_V4_UNIT_SPARSE_ATTENTION.o \
 	COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_PROMPT.o \
@@ -2525,6 +2584,7 @@ tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c sse41_kernels.h deepseek_
 		Makefile.deepseek-v4.units Makefile.deepseek-v4
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
 		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
+		COLI_V4_UNIT_ROUTE_BF16.o \
 		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
 		COLI_V4_UNIT_NATIVE_QUANT_DUAL.o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
 		COLI_V4_UNIT_EXPERT_ROWS16.o \
@@ -2654,6 +2714,17 @@ tests/test_qwen36_tier_init_failure$(EXE): tests/test_qwen36_tier_init_failure.c
 tests/test_qwen36_tier_fp8$(EXE): tests/test_qwen36_tier_fp8.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# Same fake backend, qwen36 below full residency (#2090): cap < n_experts in copy
+# mode, the engine's planar int4 staged as the container's pairs, hits keeping
+# residents warm, the trunk-only cases, and cap == n_experts as before.
+tests/test_qwen36_tier_stream$(EXE): tests/test_qwen36_tier_stream.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
+# The qwen36 engine on the fake tier over the int4 gs64 fixture, at a cap below,
+# at and above n_experts: its last logits against the CPU build's (ci.yml).
+tests/test_qwen36_tier_stream_engine$(EXE): tests/test_qwen36_tier_stream_engine.c qwen36.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
 # Failed gate/up/down uploads must release every unpublished CUDA tensor.
 tests/test_qwen36_tier_rollback$(EXE): tests/test_qwen36_tier_rollback.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
@@ -2706,6 +2777,11 @@ tests/test_qwen38_tier_engine$(EXE): tests/test_qwen38_tier_engine.c qwen38.c qw
 
 # Q38_DN_GPU=1 on the tiny FP8 fixture (fake backend, oracle): runs from qwen38-dn-gpu-check.
 tests/test_qwen38_dn_gpu$(EXE): tests/test_qwen38_dn_gpu.c qwen38.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# Qwen3.8's layers as one chain on the card (COLI_CUDA_CHAIN=1): the tiny FP8 fixture's oracle
+# on the fake tier, the chain's ops from the fake's host-side table (qwen38_cuda_chain.h).
+tests/test_qwen38_cuda_chain$(EXE): tests/test_qwen38_cuda_chain.c qwen38.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_serve_poll$(EXE): tests/test_serve_poll.c
@@ -2806,6 +2882,9 @@ tests/bench_attn_f32$(EXE): tests/bench_attn_f32.c
 tests/test_matmul_f32$(EXE): tests/test_matmul_f32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_matmul_f16$(EXE): tests/test_matmul_f16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 # bench_mla_simd: microbenchmark (scalar vs AVX2/NEON MLA-absorb reductions, #442),
 # NOT a test gate. Build on demand: make tests/bench_mla_simd
 tests/bench_mla_simd$(EXE): tests/bench_mla_simd.c colibri.c $(VK_OBJ)
@@ -2889,6 +2968,10 @@ tests/test_e8x4g64_loader$(EXE): tests/test_e8x4g64_loader.c $(VK_OBJ)
 # test_qwen38_tier_engine below.
 .PHONY: e8x4g64-loader-check
 e8x4g64-loader-check: tests/test_e8x4g64_loader$(EXE)
+
+# CPU-only synthetic merged-int4 loader data contract (no model or GPU).
+tests/test_qwen36_loader$(EXE): tests/test_qwen36_loader.c qwen36.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 test-c: $(TEST_BINS)
 	$(PYTHON) tools/run_tests.py $(TEST_BINS)

@@ -370,6 +370,47 @@ int  vkc_relattn_ready(void);
 int  vkc_relattn(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *kvs, VkcBuf *r, VkcBuf *relp, VkcBuf *tau,
                  const VkcRelAttn *p);
 
+/* ---- the router's pick (chain_route.comp) -------------------------------------------
+ * Every MoE engine's routing on the device, for S rows of E logits (l_off + s*l_row):
+ * kind 0 softmax, 1 sigmoid, 2 sqrt(softplus), of logit / temp; the bias (b_off) added
+ * for the pick only with has_bias 1 (noaux_tc), to the logit with 2 (qwen36's gate bias,
+ * before the softmax); with n_group > 1 the topk_group best
+ * groups (a group's value: its two best picks) and their experts only; the K best picks,
+ * the lower expert on a tie, in rank order into ids (i_off + s*i_row, -1 for a slot no
+ * finite pick fills); their scores into w (w_off + s*w_row), divided by their sum plus
+ * norm_eps with norm 1 (when that is above 0) or norm 2 (the same from K > 1 only), then
+ * times scale. E <= VKC_ROUTE_EMAX, K <= VKC_ROUTE_KMAX; 0 when the shader is missing or
+ * a parameter is out of range. ids holds ints. */
+#define VKC_ROUTE_EMAX 1024
+#define VKC_ROUTE_KMAX 32
+typedef struct {
+    int S, E, K, kind;
+    int l_off, l_row, b_off, has_bias;
+    int i_off, i_row, w_off, w_row;
+    int n_group, topk_group, norm;
+    float temp, scale, norm_eps;
+} VkcRoute;
+int vkc_route_ready(void);
+int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRoute *p);
+
+/* ---- the routed experts (chain_moe.comp) --------------------------------------------
+ * A layer's routed experts on the device for S rows: x (x_off + s*x_row, D floats) routed
+ * to ids/w as vkc_route writes them (i_off + s*i_row, w_off + s*w_row, K each); expert e's
+ * weights by address from table (backend_vulkan.h: coli_vk_xb_expert_entry), entry
+ * t_off + e, a zero entry (not resident) skipped. hid holds S*K rows of I floats
+ * (gate and up's output, act 0 SwiGLU clamped by limit > 0, 1 SiTU-GLU with a and b),
+ * then S*K rows of D (down's output per slot): S*K*(I + D) floats at least; y (y_off +
+ * s*y_row) gets each row's sum over its slots in rank order of w * down's output, from 0.
+ * Needs bufferDeviceAddress and clustered subgroup adds (vkc_moe_ready); 0 when a
+ * parameter is out of range. */
+typedef struct {
+    int S, K, D, I, act;
+    float limit, a, b;
+    int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row;
+} VkcMoe;
+int vkc_moe_ready(void);
+int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p);
+
 /* ---- attention residuals and SiTU-GLU (chain_ares.comp) ----------------------------
  * Kimi K3's residual stream (AttnRes) and its activation, for S rows:
  *   vkc_ares_mix  kimi_k3.c's res_mix: row s mixes the nb block snapshots ([nb][D] at

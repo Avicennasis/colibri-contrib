@@ -116,6 +116,11 @@ class FamilyDescriptor:
     has_gateway_adapter: bool = False
     has_cli_adapter: bool = False
     tune_prompt_template: str = "{prompt}"
+    # The environment variable the engine reads for extra shard folders, a model
+    # split across drives (st_init_multi: the shards of every listed folder, by
+    # file name). The launcher looks there too before it calls a model incomplete
+    # or downloads a shard again (#2091). Empty: the engine reads one folder.
+    split_dirs_env: str = ""
     supports_accelerator: bool = True
     # Size-keyed names for families whose model_type spans several checkpoint
     # sizes. Empty: display_name/display_scale name every checkpoint.
@@ -1313,6 +1318,7 @@ FAMILIES = (
         converter_mtp_pass=True,
         display_scale="744B",
         engine_artifact="colibri",
+        split_dirs_env="COLI_MODEL_DIRS",
         engine_aliases=("glm",),
         engine_group="colibri-core",
         internal_arch="glm",
@@ -1372,6 +1378,7 @@ FAMILIES = (
         display_name="Kimi K3",
         display_scale="2.8T",
         engine_artifact="kimi_k3",
+        split_dirs_env="K3_DIRS",
         engine_aliases=(),
         engine_group="kimi_k3",
         internal_arch="kimi_k3",
@@ -1488,7 +1495,7 @@ FAMILIES = (
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="text_config",
         limits=FamilyLimits(8192, 262144, 1024, 8192, 16, 8, "Q36_MAXT"),
-        capabilities=FamilyCapabilities(False, False, False, True, image=True),
+        capabilities=FamilyCapabilities(True, False, False, True, image=True),
         has_gateway_adapter=True,
         # coli run stays unwired on purpose: cmd_run dispatches per arch after
         # this gate, and without a qwen36 branch the engine would inherit GLM's
@@ -1548,6 +1555,7 @@ FAMILIES = (
         # layer: e' quello che fa scattare la geometria misurata nel banner.
         reference_experts=256,
         engine_artifact="deepseek_v4",
+        split_dirs_env="COLI_MODEL_DIRS",
         engine_aliases=(),
         engine_group="deepseek_v4",
         internal_arch="deepseek_v4",
@@ -1575,6 +1583,7 @@ FAMILIES = (
         # two 384M-row engram tables that never enter RAM.
         reference_experts=384,
         engine_artifact="deepseek_v41",
+        split_dirs_env="COLI_MODEL_DIRS",
         engine_aliases=(),
         engine_group="deepseek_v41",
         internal_arch="deepseek_v41",
@@ -1628,6 +1637,7 @@ FAMILIES = (
                            "MiMo-V2.6 Pro", "1.02T", model_id="mimo-v2.6-pro"),
         ),
         engine_artifact="mimo",
+        split_dirs_env="MIMO_DIRS",
         engine_aliases=(),
         engine_group="mimo",
         internal_arch="mimo",

@@ -362,10 +362,16 @@ static void test_issue_geometry(int ndev, int seeds) {
 
     for (int s = 1; s <= seeds; s++) {
         rng_state = 0x9E3779B9u * (uint32_t)s + 1u;
-        /* random resident set: knock out a random subset for this round */
+        /* random resident set: knock out a random subset for this round. The
+         * heat goes back to zero as well: qt_issue counts a hit as heat (#2090),
+         * and an expert hot from earlier rounds, knocked out in this one, would
+         * be promoted by the LFRU tick in the middle of the checks below */
         int knocked[NE]; memset(knocked, 0, sizeof knocked);
         pthread_mutex_lock(&G.mx);
-        for (int e = 0; e < NE; e++) if ((rng() & 3) == 0) { knocked[e] = 1; qs(0, e)->resident = 0; }
+        for (int e = 0; e < NE; e++) {
+            qs(0, e)->heat = 0;
+            if ((rng() & 3) == 0) { knocked[e] = 1; qs(0, e)->resident = 0; }
+        }
         pthread_mutex_unlock(&G.mx);
         /* random K distinct experts, random failing device on some rounds */
         int K = 1 + (int)(rng() % (uint32_t)ROWS);
