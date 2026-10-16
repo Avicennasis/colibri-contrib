@@ -161,9 +161,14 @@ static inline int xl_matmul(float *y, const float *x, const uint8_t *codes, cons
  * of the bytes (gq_quant_act's xs). */
 static inline size_t xl16_gblock(int bits) { return bits == 3 ? 208 : 144; }
 static inline size_t xl16_group_bytes(int bits, int I) { return 64 + (size_t)(I / 32) * xl16_gblock(bits); }
-/* rows (whole groups) of codes [rows][xl_code_bytes], q [rows][I/32], d [rows] into dst */
+static inline uint32_t xl16_rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+/* rows (whole groups) of codes [rows][xl_code_bytes], q [rows][I/32], d [rows] into dst. Word
+ * by word: group h of a block of 128 is bits 2h of its 32 low bytes (byte e = element e of
+ * the group) and bits 2h, 2h+1 of its 16 high bytes, so the group's two transposes are a few
+ * shifts and masks on 32-bit words (this runs at every expert read). */
 static void xl16_pack(uint8_t *dst, const uint8_t *codes, const uint8_t *q, const float *d, int rows, int bits, int I) {
     const size_t cb = xl_code_bytes(bits, I), qb = xl_scale_bytes(I), gbk = xl16_gblock(bits), gb = xl16_group_bytes(bits, I);
+    const size_t bb = xl_block_bytes(bits);
     for (int g = 0; g < rows / 16; g++) {
         uint8_t *grp = dst + (size_t)g * gb;
         memcpy(grp, d + 16 * g, 64);
@@ -171,16 +176,17 @@ static void xl16_pack(uint8_t *dst, const uint8_t *codes, const uint8_t *q, cons
             const uint8_t *row = codes + (size_t)(16 * g + r) * cb, *qr = q + (size_t)(16 * g + r) * qb;
             for (int gi = 0; gi < I / 32; gi++) {
                 uint8_t *o = grp + 64 + (size_t)gi * gbk;
+                const uint8_t *blk = row + (size_t)(gi / 4) * bb; const int h = gi % 4;
                 o[r] = qr[gi];
-                for (int W = 0; W < 2; W++) for (int k = 0; k < 4; k++) {
-                    int v = 0;
-                    for (int i = 0; i < 4; i++) v |= (xl_code(row, bits, 32 * gi + 16 * W + 4 * i + k) & 3) << (2 * i);
-                    o[16 + 64 * W + 4 * r + k] = (uint8_t)v;
+                for (int W = 0; W < 2; W++) {   /* byte k, bits 2i: element 16W + 4i + k = low byte 16W + 4i + k, bits 2h */
+                    uint32_t t = 0;
+                    for (int i = 0; i < 4; i++) t |= ((xl16_rd32(blk + 16 * W + 4 * i) >> (2 * h)) & 0x03030303u) << (2 * i);
+                    memcpy(o + 16 + 64 * W + 4 * r, &t, 4);
                 }
-                if (bits == 3) for (int k = 0; k < 4; k++) {
-                    int v = 0;
-                    for (int i = 0; i < 8; i++) v |= (xl_code(row, bits, 32 * gi + 4 * i + k) >> 2) << i;
-                    o[144 + 4 * r + k] = (uint8_t)v;
+                if (bits == 3) {   /* byte k, bit i: element 4i + k = high byte (4i + k) % 16, bit 2h + i / 4 */
+                    uint32_t t = 0;
+                    for (int i = 0; i < 8; i++) t |= ((xl16_rd32(blk + 32 + 4 * (i % 4)) >> (2 * h + i / 4)) & 0x01010101u) << i;
+                    memcpy(o + 144 + 4 * r, &t, 4);
                 }
             }
         }

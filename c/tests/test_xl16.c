@@ -75,6 +75,8 @@ int main(int argc, char **argv) {
         int8_t *xq = malloc((size_t)S * I); int32_t *xs = malloc((size_t)S * (I / 16) * 4);
         for (size_t i = 0; i < (size_t)S * I; i++) x[i] = sinf(i * 0.37f);
         act(x, S, I, xq, dx, xs);
+        double pk = 1e9;   /* packing, one thread (a loader thread packs an expert) */
+        for (int rep = 0; rep < 3; rep++) { double t0 = now(); xl16_pack(g[rep], c[rep], q[rep], d[rep], O, bits, I); double dt = now() - t0; if (dt < pk) pk = dt; }
         double best[2] = { 1e9, 1e9 };
         for (int rep = 0; rep < 5; rep++) for (int k = 0; k < 2; k++) {
             double t0 = now();
@@ -93,8 +95,8 @@ int main(int argc, char **argv) {
             double dt = now() - t0; if (rep && dt < best[k]) best[k] = dt;
         }
         const double bytes = (double)M * O * (cb + qb + 4);
-        printf("int%d-g16 S=%-3d rows %.2f ms (%.1f GB/s)   interleaved %.2f ms (%.1f GB/s)   %.2fx\n", bits, S, best[0] * 1e3, bytes / best[0] / 1e9,
-               best[1] * 1e3, bytes / best[1] / 1e9, best[0] / best[1]);
+        printf("int%d-g16 S=%-3d rows %.2f ms (%.1f GB/s)   interleaved %.2f ms (%.1f GB/s)   %.2fx   packing %.2f GB/s\n", bits, S, best[0] * 1e3, bytes / best[0] / 1e9,
+               best[1] * 1e3, bytes / best[1] / 1e9, best[0] / best[1], (double)O * (cb + qb + 4) / pk / 1e9);
     }
     return 0;
 }
