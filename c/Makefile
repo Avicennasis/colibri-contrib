@@ -2913,14 +2913,17 @@ test-asan:
 
 # Local validation: one portable CPU build and dependency-free tests.
 # ---- fork-local tests (kv_anchor.h / serve RAM rebalance; not in upstream) ----
-tests/test_ram_rebalance$(EXE): tests/test_ram_rebalance.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h $(METAL_OBJ)
-	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
+# Headers come from the autodep .d files (upstream lint forbids hand lists);
+# $(VK_OBJ) on the link because both tests compile colibri.c, which calls
+# coli_vk_attention_absorb under VK=1 (upstream Makefile lint contract).
+tests/test_ram_rebalance$(EXE): tests/test_ram_rebalance.c colibri.c $(VK_OBJ) $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
 
-tests/test_kv_anchor$(EXE): tests/test_kv_anchor.c kv_anchor.h
+tests/test_kv_anchor$(EXE): tests/test_kv_anchor.c
 	$(CC) $(CFLAGS) tests/test_kv_anchor.c -o tests/test_kv_anchor$(EXE) $(LDFLAGS)
 
-tests/test_kv_anchor_serve$(EXE): tests/test_kv_anchor_serve.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h kv_anchor.h telemetry.h $(METAL_OBJ)
-	$(CC) $(CFLAGS) $< $(METAL_OBJ) -o $@ $(LDFLAGS)
+tests/test_kv_anchor_serve$(EXE): tests/test_kv_anchor_serve.c colibri.c $(VK_OBJ) $(METAL_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 
 check:

@@ -1476,7 +1476,13 @@ class ServerControl(HomeTestCase):
             cfg = dict(self.cfg, port=server.server_port)
             self.assertFalse(os.path.exists(setup_flow.serve_pidfile(server.server_port)))
             code, health = setup_flow._get_json(f"http://127.0.0.1:{server.server_port}/health")
-            self.assertEqual((code, health), (200, {"status": "ok"}))
+            self.assertEqual(code, 200)
+            self.assertEqual(health["status"], "ok")
+            # Fork contract (#50404, c/coli's attach probe): /health carries
+            # `engine` — "loading" with no engine attached yet, "dead" (+
+            # engine_reason) after a crash, absent for authed-only fields.
+            # Upstream pins the bare payload; this fork reports the state word.
+            self.assertEqual(health.get("engine"), "loading")
             self.assertEqual(setup_flow.server_status(cfg)["state"], "ready")
         finally:
             server.shutdown()
