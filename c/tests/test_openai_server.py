@@ -2288,6 +2288,56 @@ class DispatcherTest(unittest.TestCase):
             "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
         }])
 
+    def test_records_cluster_transfer_from_the_prof_tail(self):
+        # CLUSTER_WORKERS set: PROF continues " <cluster_s> <tx_bytes> <rx_bytes>"
+        # after n_fw -- the coordinator's time on the wire and the bytes each way.
+        # The plain DONE line of the same turn carries no cluster_ keys.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(
+                b"PROF 2.500 7 12 0.400 0.100 0.900 0.600 0.200 15 0.350 1536000 2048000\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 12 4.8 0 1.0 7 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        stats = engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+        engine.close()
+        [turn] = engine.profile
+        self.assertEqual(turn["forwards"], 15)
+        self.assertEqual(turn["cluster_transfer_s"], 0.35)
+        self.assertEqual(turn["cluster_tx_bytes"], 1536000)
+        self.assertEqual(turn["cluster_rx_bytes"], 2048000)
+        self.assertEqual([k for k in stats if k.startswith("cluster_")], [])
+
+    def test_done_stat_cluster_suffix_lands_in_the_stats(self):
+        # The per-token G/I/T/S/R summary a clustered coordinator appends to STAT as
+        # key=value after length_limited; a bare positional tail (deepseek's 8th
+        # field) stays ignored, and the positional fields parse as before.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(
+                b"DONE " + request_id + b" STAT 12 4.8 0 1.0 7 0 17"
+                b" cluster_g_ms=208.3 cluster_i_ms=179.2 cluster_t_ms=29.1"
+                b" cluster_tx_kb=128.0 cluster_rx_kb=170.7\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        stats = engine.generate("hello", 16, 0.7, 0.9, lambda _: None)
+        engine.close()
+        self.assertEqual(stats["completion_tokens"], 12)
+        self.assertEqual(stats["prompt_tokens"], 7)
+        self.assertEqual(stats["length_limited"], False)
+        self.assertEqual(stats["cluster_g_ms"], 208.3)
+        self.assertEqual(stats["cluster_i_ms"], 179.2)
+        self.assertEqual(stats["cluster_t_ms"], 29.1)
+        self.assertEqual(stats["cluster_tx_kb"], 128.0)
+        self.assertEqual(stats["cluster_rx_kb"], 170.7)
+        self.assertNotIn("17", stats)
+
     def test_accepts_u7a_echo_and_extended_data_frames(self):
         # U7a forward-compat: the engine's opt-in per-token numeric channel --
         # ECHO frames for echoed prompt positions and DATA frames extended
@@ -2513,6 +2563,15 @@ class BaseWireContractTest(unittest.TestCase):
 
 
 class OpenAIHonestySetTest(unittest.TestCase):
+    def test_rejects_non_integer_count_fields(self):
+        for field in ("n", "best_of"):
+            for value in (True, 1.0, "1"):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(APIError) as caught:
+                        generation_options({field: value}, 16)
+                    self.assertEqual((caught.exception.status, caught.exception.param,
+                                      caught.exception.code), (400, field, "invalid_value"))
+
     def test_refuses_unsupported_result_shaping_fields(self):
         cases = (
             ({"best_of": 2}, "best_of", "unsupported_value"),
@@ -2903,6 +2962,74 @@ class HTTPTest(unittest.TestCase):
         with self.request("/v1/models/test-model") as response:
             self.assertEqual(json.load(response)["context_length"], 65536)
 
+    def test_large_integer_temperature_is_a_named_client_error(self):
+        self._assert_large_sampler_integer_is_client_error("temperature")
+
+    def test_large_integer_top_p_is_a_named_client_error(self):
+        self._assert_large_sampler_integer_is_client_error("top_p")
+
+    def _assert_large_sampler_integer_is_client_error(self, field):
+        for path, input_fields in (
+                ("/v1/completions", {"prompt": "hi"}),
+                ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})):
+            for sign in (1, -1):
+                with self.subTest(path=path, field=field, sign=sign):
+                    value = sign * 10 ** 400
+                    body = {"model": "test-model", **input_fields, field: value}
+                    # A bounded, valid JSON integer survives the actual producer.
+                    encoded = json.dumps(body).encode()
+                    self.assertLess(len(encoded), 1024)
+                    self.assertEqual(json.loads(encoded)[field], value)
+                    calls_before = len(self.engine.calls)
+                    with self.assertRaises(HTTPError) as caught:
+                        self.request(path, body)
+                    self.addCleanup(caught.exception.close)
+                    error = json.load(caught.exception)["error"]
+                    self.assertEqual(len(self.engine.calls), calls_before)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(error["param"], field)
+                    self.assertEqual(error["type"], "invalid_request_error")
+
+    def test_integer_sampler_boundary_controls(self):
+        for path, input_fields in (
+                ("/v1/completions", {"prompt": "hi"}),
+                ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]})):
+            with self.subTest(path=path, kind="valid-boundaries"):
+                calls_before = len(self.engine.calls)
+                with self.request(path, {"model": "test-model", **input_fields,
+                                         "temperature": 0, "top_p": 1}) as response:
+                    payload = json.load(response)
+                    self.assertEqual(response.status, 200)
+                self.assertEqual(len(self.engine.calls), calls_before + 1)
+                self.assertEqual(self.engine.calls[-1][2:4], (0.0, 1.0))
+                self.assertEqual(payload["choices"][0]["finish_reason"], "stop")
+            for field, value in (("temperature", 3), ("top_p", 0)):
+                with self.subTest(path=path, kind="small-out-of-range", field=field):
+                    calls_before = len(self.engine.calls)
+                    with self.assertRaises(HTTPError) as caught:
+                        self.request(path, {"model": "test-model", **input_fields, field: value})
+                    self.addCleanup(caught.exception.close)
+                    error = json.load(caught.exception)["error"]
+                    self.assertEqual(len(self.engine.calls), calls_before)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(error["param"], field)
+
+    def test_non_integer_count_fields_return_400_before_engine_work(self):
+        cases = (("/v1/completions", {"prompt": "hi"}, "n", True),
+                 ("/v1/completions", {"prompt": "hi"}, "best_of", 1.0),
+                 ("/v1/chat/completions",
+                  {"messages": [{"role": "user", "content": "hi"}]}, "n", 1.0))
+        for path, fields, field, value in cases:
+            with self.subTest(path=path, field=field, value=value):
+                calls_before = len(self.engine.calls)
+                with self.assertRaises(HTTPError) as caught:
+                    self.request(path, {"model": "test-model", **fields, field: value})
+                with caught.exception as response:
+                    self.assertEqual(response.code, 400)
+                    error = json.load(response)["error"]
+                self.assertEqual((error["param"], error["code"]), (field, "invalid_value"))
+                self.assertEqual(len(self.engine.calls), calls_before)
+
     def test_unsupported_modalities_fail_before_engine_work(self):
         cases = (
             ("/v1/completions", {"prompt": "hi", "modalities": ["video"]},
@@ -2958,6 +3085,52 @@ class HTTPTest(unittest.TestCase):
                     self.addCleanup(caught.exception.close)
                     self.assertEqual(caught.exception.code, 400)
                     self.assertEqual(json.loads(caught.exception.read())["error"]["param"], param)
+
+    def test_falsey_non_array_tools_are_named_client_errors(self):
+        # JSON's falsey non-array values must not disappear as absent tools.
+        # Truthy values of the same four JSON types are rejection controls.
+        for value in (False, 0, "", {}, True, 1, "x", {"x": 1}):
+            with self.subTest(value=value):
+                body = {"model": "test-model", "max_tokens": 1,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "tools": value}
+                calls_before = len(self.engine.calls)
+                with patch("openai_server.ARCH", "glm"):
+                    try:
+                        response = self.request("/v1/chat/completions", body)
+                    except HTTPError as error:
+                        response = error
+                    with response:
+                        status = response.status
+                        payload = json.load(response)
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"]["type"], "invalid_request_error")
+                self.assertEqual(payload["error"]["param"], "tools")
+                self.assertEqual(payload["error"]["code"], "invalid_value")
+                self.assertEqual(len(self.engine.calls), calls_before)
+
+    def test_absent_null_empty_tools_keep_legacy_function_fallback(self):
+        legacy = [{"name": "frozen_legacy_lookup",
+                   "parameters": {"type": "object", "properties": {}}}]
+        for extra in ({}, {"tools": None}, {"tools": []}):
+            for functions in (None, legacy):
+                with self.subTest(extra=extra, legacy=functions is not None):
+                    body = {"model": "test-model", "max_tokens": 1,
+                            "messages": [{"role": "user", "content": "hi"}], **extra}
+                    if functions is not None:
+                        body["functions"] = functions
+                    calls_before = len(self.engine.calls)
+                    with patch("openai_server.ARCH", "glm"):
+                        with self.request("/v1/chat/completions", body) as response:
+                            self.assertEqual(response.status, 200)
+                            self.assertEqual(json.load(response)["choices"][0]
+                                             ["message"]["content"], "Héllo")
+                    self.assertEqual(len(self.engine.calls), calls_before + 1)
+                    prompt = self.engine.calls[-1][0]
+                    if functions is not None:
+                        self.assertIn("frozen_legacy_lookup", prompt)
+                    else:
+                        self.assertNotIn("frozen_legacy_lookup", prompt)
 
     def test_metrics_counts_http_engine_failure_without_success(self):
         before = self.server.scheduler.snapshot()
@@ -3208,6 +3381,108 @@ class HTTPTest(unittest.TestCase):
             })
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
+
+    def _request_with_raw_metadata(self, path, fields, metadata):
+        # Build the wire bytes directly: constructing a Python integer first
+        # would trip the caller's digit guard before the HTTP request existed.
+        head = json.dumps({"model": "test-model", **fields})[:-1].encode()
+        data = head + b',"metadata":' + metadata + b'}'
+        self.assertLess(len(data), openai_server.MAX_BODY)
+        return urlopen(Request(self.base + path, data=data,
+                               headers={"Authorization": "Bearer secret",
+                                        "Content-Type": "application/json"}), timeout=2)
+
+    @staticmethod
+    def _json_limit_routes():
+        return (("/v1/completions", {"prompt": "Hi"}),
+                ("/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}]}),
+                ("/v1/messages", {"max_tokens": 4,
+                                  "messages": [{"role": "user", "content": "Hi"}]}))
+
+    def test_json_integer_limit_is_a_client_error(self):
+        limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
+        if not limit or limit > 65536:
+            self.skipTest("No bounded integer-string limit is enabled on this runtime")
+        for path, fields in self._json_limit_routes():
+            for sign in (b"", b"-"):
+                with self.subTest(path=path, sign=sign):
+                    before = len(self.engine.calls)
+                    with self.assertRaises(HTTPError) as caught:
+                        self._request_with_raw_metadata(path, fields,
+                                                        sign + b"1" * (limit + 1))
+                    with caught.exception as response:
+                        error = json.load(response)["error"]
+                        self.assertEqual(len(self.engine.calls), before)
+                        self.assertEqual(response.code, 400)
+                        self.assertEqual(error["type"], "invalid_request_error")
+                        self.assertIn("parsing limits", error["message"])
+
+    def test_json_nesting_guard_never_becomes_an_engine_error(self):
+        # Python releases differ in which nesting depths their JSON parser can
+        # accept. Preserve a successful parse, or classify its refusal as 400;
+        # do not change global recursion limits to manufacture a guard failure.
+        metadata = b"[" * 100000 + b"0" + b"]" * 100000
+        for path, fields in self._json_limit_routes():
+            with self.subTest(path=path):
+                before = len(self.engine.calls)
+                try:
+                    response = self._request_with_raw_metadata(path, fields, metadata)
+                except HTTPError as response:
+                    with response:
+                        error = json.load(response)["error"]
+                        self.assertEqual(len(self.engine.calls), before)
+                        self.assertEqual(response.code, 400)
+                        self.assertEqual(error["type"], "invalid_request_error")
+                        self.assertIn("parsing limits", error["message"])
+                else:
+                    with response:
+                        json.load(response)
+                        self.assertEqual(response.status, 200)
+                    self.assertEqual(len(self.engine.calls), before + 1)
+
+    def test_json_limits_preserve_unicode_nested_and_boundary_metadata(self):
+        values = [json.dumps("healthy 🌿", ensure_ascii=False).encode(),
+                  b"[" * 64 + b"0" + b"]" * 64]
+        limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
+        if 0 < limit <= 65536:
+            values.append(b"1" * limit)
+        for path, fields in self._json_limit_routes():
+            for metadata in values:
+                with self.subTest(path=path, metadata_bytes=len(metadata)):
+                    before = len(self.engine.calls)
+                    with self._request_with_raw_metadata(path, fields, metadata) as response:
+                        json.load(response)
+                        self.assertEqual(response.status, 200)
+                    self.assertEqual(len(self.engine.calls), before + 1)
+            before = len(self.engine.calls)
+            with self.assertRaises(HTTPError) as caught:
+                self._request_with_raw_metadata(path, fields, b'{"unfinished":')
+            with caught.exception as response:
+                self.assertEqual(response.code, 400)
+                self.assertEqual(json.load(response)["error"]["type"], "invalid_request_error")
+            self.assertEqual(len(self.engine.calls), before)
+
+    def test_existing_json_error_envelopes_remain_exact(self):
+        cases = ((b'{"unfinished":', "Request body must be valid JSON."),
+                 (b'"\xff"', "Request body must be valid JSON."),
+                 (b'"\\ud83d"', "Request body contains an unpaired UTF-16 surrogate "
+                                  "escape; strings must be valid Unicode."))
+        for path, fields in self._json_limit_routes():
+            for metadata, message in cases:
+                with self.subTest(path=path, metadata=metadata):
+                    before = len(self.engine.calls)
+                    with self.assertRaises(HTTPError) as caught:
+                        self._request_with_raw_metadata(path, fields, metadata)
+                    with caught.exception as response:
+                        actual = json.load(response)
+                        self.assertEqual(response.code, 400)
+                    expected = ({"type": "error", "error": {
+                        "type": "invalid_request_error", "message": message}}
+                        if path == "/v1/messages" else {"error": {
+                            "message": message, "type": "invalid_request_error",
+                            "param": None, "code": None}})
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(len(self.engine.calls), before)
 
     def test_unpaired_surrogate_is_a_client_error(self):
         """JSON can spell a lone UTF-16 surrogate ("\\ud83d": a client that cut a

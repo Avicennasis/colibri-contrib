@@ -1212,6 +1212,18 @@ def check_ctx(ctx, family):
                          f"({family.limits.max_context} tokens)")
 
 
+def saved_ctx(cfg):
+    """Read the chosen context from a pending or older ready configuration."""
+    if not cfg:
+        return 0
+    if "ctx" in cfg:
+        return cfg["ctx"]
+    args = cfg.get("args") or []
+    if "--ctx" in args:
+        return int(args[args.index("--ctx") + 1])
+    return 0
+
+
 def make_config(*, model_dir, family, entry, engine_info, hw, host, port, status="ready", ctx=0):
     backend = engine_info["backend"]
     return {
@@ -1229,6 +1241,7 @@ def make_config(*, model_dir, family, entry, engine_info, hw, host, port, status
         "gpu": engine_info.get("gpu"),
         "env": run_environment(backend, engine_info["engine"], family, hw),
         "args": launcher_args(backend, model_dir, host, port, ctx, family),
+        "ctx": ctx,
         "host": host,
         "port": port,
         "urls": urls(host, port),
@@ -1259,7 +1272,7 @@ def equivalent_command(cfg):
 
 def _quote(value):
     value = str(value)
-    return value if re.match(r"^[A-Za-z0-9_./:=,+-]+$", value) else json.dumps(value)
+    return value if re.match(r"^[A-Za-z0-9_./:=,+-]+$", value) else json.dumps(value, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------- server control
@@ -1954,8 +1967,16 @@ def config_ready(cfg):
         return False
     if not os.path.isdir(cfg.get("model_dir") or ""):
         return False
-    if (cfg.get("model") or {}).get("repo") and not setup_download.is_complete(
+    model = cfg.get("model") or {}
+    if model.get("repo") and not setup_download.is_complete(
             cfg["model_dir"], extra_shard_dirs(cfg.get("family"), cfg.get("env"))):
+        return False
+    try:
+        entry = setup_catalog.by_id(model["id"]) if model.get("id") else None
+    except KeyError:
+        entry = None  # a local folder or a catalog entry no longer listed
+    if entry and any(not os.path.isfile(os.path.join(cfg["model_dir"], creates))
+                     for _, creates in entry.post_install):
         return False
     return os.path.isfile(cfg.get("engine") or "") and os.path.isfile(cfg.get("launcher") or "")
 
@@ -1966,6 +1987,7 @@ def cmd_setup(a, ui=None):
     ui.say("colibri setup\n")
     cfg = load_config()
     picking = bool(a.pick or a.model_dir or a.reconfigure)
+    requested_ctx = getattr(a, "ctx", None)
 
     if a.list:
         hw = setup_hw.detect(models_root_for(None, a.dir), probe_gpu=False)
@@ -1979,7 +2001,8 @@ def cmd_setup(a, ui=None):
                 ui.say(f" {mark} {entry.id:<24} {entry.disk_gb:>7.0f} GB  {row['status']:<10} {row['reason']}")
         return 0
 
-    if cfg and not picking and config_ready(cfg):
+    overriding = bool(a.backend or a.no_gpu or a.host is not None or a.port is not None)
+    if cfg and not picking and not overriding and config_ready(cfg):
         cfg = remember_split_dirs(cfg, out=ui.say)
         tag = release_cuda_missing(cfg)
         if tag:
@@ -1996,17 +2019,23 @@ def cmd_setup(a, ui=None):
             except KeyError:
                 seeded = None      # a model given by folder: no catalog entry, no profile
             seed_expert_profile(seeded, cfg.get("model_dir"), out=ui.say)
-            ctx = getattr(a, "ctx", 0)
-            if ctx:
-                check_ctx(ctx, family_by_id(cfg.get("family")))
-                cfg = dict(cfg, args=_replace_arg(cfg["args"], "--ctx", str(ctx)))
+            if requested_ctx is not None:
+                check_ctx(requested_ctx, family_by_id(cfg.get("family")))
+                args = list(cfg["args"])
+                if "--ctx" in args:
+                    index = args.index("--ctx")
+                    del args[index:index + 2]
+                if requested_ctx:
+                    args += ["--ctx", str(requested_ctx)]
+                cfg = dict(cfg, args=args, ctx=requested_ctx)
                 save_config(cfg)
-                ui.say(f"  context: {ctx} tokens from now on")
+                ui.say(f"  context: {requested_ctx or 'automatic'} from now on")
             refresh_configured(cfg, out=ui.say)
             return _finish(ui, cfg, a)
     # A setup that stopped half way (pending), or a finished one whose engine or
     # files went missing (ready, but not runnable): continue with the same choice.
     resume = cfg if (cfg and cfg.get("status") in ("pending", "ready") and not picking) else None
+    ctx = requested_ctx if requested_ctx is not None else saved_ctx(resume)
 
     ui.say("Your machine")
     probe_root = models_root_for(None, a.dir or (resume or {}).get("models_root"))
@@ -2049,6 +2078,7 @@ def cmd_setup(a, ui=None):
                 raise SetupError("pass --dir with a folder on the Linux disk")
         ui.say(f"\nModel: {entry.name} ({entry.repo}) -> {model_dir}")
 
+    check_ctx(ctx, family)
     host = a.host or (resume or {}).get("host") or DEFAULT_HOST
     port = int(a.port or (resume or {}).get("port") or DEFAULT_PORT)
     requested = "cpu" if a.no_gpu else (a.backend or (resume or {}).get("requested_backend") or "auto")
@@ -2057,9 +2087,12 @@ def cmd_setup(a, ui=None):
                                               "repo": entry.repo if entry else None,
                                               "revision": entry.revision if entry else None},
                "model_dir": model_dir, "models_root": os.path.dirname(model_dir),
-               "family": family.id, "host": host, "port": port, "requested_backend": requested}
+               "family": family.id, "host": host, "port": port, "requested_backend": requested,
+               "ctx": ctx}
     if not resume or picking:
         save_config(pending)
+    elif requested_ctx is not None:
+        save_config(dict(resume, status="pending", ctx=ctx))
 
     tc = toolchain()
     # A build that failed in the run this one resumes is not tried again; a new
@@ -2102,8 +2135,6 @@ def cmd_setup(a, ui=None):
     if not web_dist_dir(engine_info["launcher_dir"]):
         ensure_web_dist(engine_info["launcher_dir"], current_version(), out=ui.say)
 
-    ctx = getattr(a, "ctx", 0)
-    check_ctx(ctx, family)
     line, warnings = plan_summary(model_dir, ctx)
     ui.say(f"\nPlan: {line}")
     for warning in warnings:

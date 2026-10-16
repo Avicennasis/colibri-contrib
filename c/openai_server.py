@@ -437,6 +437,9 @@ def _fallback_tool_calls(tool_calls, index):
             except (json.JSONDecodeError, TypeError, ValueError):
                 raise APIError(400, "`function.arguments` must be a JSON object.",
                                f"messages.{index}.tool_calls.{position}.function.arguments")
+        if args and not isinstance(args, dict):
+            raise APIError(400, "`function.arguments` must be a JSON object.",
+                           f"messages.{index}.tool_calls.{position}.function.arguments")
         out.append(BOX_START + name)
         for key, value in (args or {}).items():
             rendered = value if isinstance(value, str) else json.dumps(
@@ -1302,8 +1305,12 @@ def decode_wav_mono16k(data, param):
     pos, fmt, raw = 12, None, None
     while pos + 8 <= len(data):
         cid, size = data[pos:pos + 4], _struct.unpack_from("<I", data, pos + 4)[0]
+        if pos + 8 + size > len(data):
+            raise APIError(400, "WAV file has a truncated chunk.", param, "invalid_value")
         body = data[pos + 8:pos + 8 + size]
         if cid == b"fmt ":
+            if len(body) < 16:
+                raise APIError(400, "WAV fmt chunk is too short.", param, "invalid_value")
             fmt = _struct.unpack_from("<HHIIHH", body, 0)
         elif cid == b"data":
             raw = body
@@ -1311,20 +1318,25 @@ def decode_wav_mono16k(data, param):
     if fmt is None or raw is None:
         raise APIError(400, "WAV file is missing fmt/data chunks.", param, "invalid_value")
     audio_format, channels, rate, _, _, bits = fmt
+    if channels == 0:
+        raise APIError(400, "WAV channel count must be positive.", param, "invalid_value")
     if audio_format == 0xFFFE:      # WAVE_FORMAT_EXTENSIBLE: trust the bit width
         audio_format = 3 if bits == 32 else 1
     if rate != AUDIO_SAMPLE_RATE:
         raise APIError(400, f"Audio must be {AUDIO_SAMPLE_RATE} Hz (got {rate}). "
                             "Resample at the capture edge.", param, "invalid_value")
     if audio_format == 1 and bits == 16:
+        if len(raw) % (channels * 2):
+            raise APIError(400, "WAV data must contain complete PCM16 frames.", param, "invalid_value")
         samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
     elif audio_format == 3 and bits == 32:
+        if len(raw) % (channels * 4):
+            raise APIError(400, "WAV data must contain complete float32 frames.", param, "invalid_value")
         samples = np.frombuffer(raw, dtype="<f4").astype(np.float32)
     else:
         raise APIError(400, f"Unsupported WAV encoding (format {audio_format}, {bits}-bit); "
                             "use PCM16 or float32.", param, "invalid_value")
     if channels > 1:
-        samples = samples[:len(samples) - len(samples) % channels]
         samples = samples.reshape(-1, channels).mean(axis=1)
     return samples
 
@@ -2138,10 +2150,43 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
 
 QWEN_CALL_RE = re.compile(
     r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)</function>\s*</tool_call>", re.S)
+QWEN_FUNCTION_RE = re.compile(r"<function=([^>\n]+)>\s*(.*?)</function>", re.S)
 QWEN_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
 
 
-def parse_qwen_tool_calls(reply, tools=None):
+def _qwen_argument(raw, declared):
+    """Restore declared JSON types, including the template's True/False/None.
+
+    This checks the declared top-level type, not every JSON Schema constraint.
+    An untyped parameter stays text, as it did before tool-call recovery.
+    """
+    kind = declared.get("type") if isinstance(declared, dict) else None
+    kinds = kind if isinstance(kind, list) else [kind]
+    if kind is None:
+        return raw
+    value = raw.strip()
+    if "null" in kinds and value in ("null", "None"):
+        return None
+    if "string" in kinds:
+        return raw
+    if "boolean" in kinds and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    parsed = json.loads(raw)
+    numeric = type(parsed) in (int, float)
+    finite = numeric and (type(parsed) is int or math.isfinite(parsed))
+    if (("array" in kinds and isinstance(parsed, list)) or
+            ("object" in kinds and isinstance(parsed, dict)) or
+            ("boolean" in kinds and type(parsed) is bool) or
+            ("null" in kinds and parsed is None) or
+            ("number" in kinds and finite) or
+            ("integer" in kinds and finite and (type(parsed) is int or parsed.is_integer()))):
+        # NaN/Infinity can also occur inside containers; these are not JSON.
+        json.dumps(parsed, allow_nan=False)
+        return parsed
+    raise ValueError("tool parameter does not match its declared type")
+
+
+def parse_qwen_tool_calls(reply, tools=None, *, strip_text=True):
     """Parse Qwen's XML-ish calls back into OpenAI `tool_calls`.
 
     Values are returned as strings, which is what the template feeds in: it
@@ -2150,6 +2195,8 @@ def parse_qwen_tool_calls(reply, tools=None):
     re-read it as JSON, which restores numbers and booleans without guessing at
     anything the schema did not promise."""
     schema = {}
+    required = {}
+    closed = set()
     for tool in (tools or []):
         fn = tool.get("function", tool) if isinstance(tool, dict) else {}
         name = fn.get("name")
@@ -2157,24 +2204,27 @@ def parse_qwen_tool_calls(reply, tools=None):
         if isinstance(name, str) and name:
             if isinstance(params, dict):
                 schema[name] = params
+                required[name] = set((fn.get("parameters") or {}).get("required") or [])
+                if (fn.get("parameters") or {}).get("additionalProperties") is False:
+                    closed.add(name)
 
     def make_call(name, body):
+        if tools and name not in schema:
+            return None
         args = {}
+        if QWEN_PARAM_RE.sub("", body).strip():
+            return None
         for key, raw in QWEN_PARAM_RE.findall(body):
             key = key.strip()
+            if key in args or (name in closed and key not in schema[name]):
+                return None
             declared = (schema.get(name) or {}).get(key) or {}
-            kind = declared.get("type") if isinstance(declared, dict) else None
-            if kind in (None, "string"):
-                args[key] = raw
-            elif kind == "boolean" and raw.strip().lower() in ("true", "false"):
-                # The templates print a bool through jinja's `string`, so the model
-                # writes `True`; Qwen's own parser reads it case-insensitively.
-                args[key] = raw.strip().lower() == "true"
-            else:
-                try:
-                    args[key] = json.loads(raw)
-                except (TypeError, ValueError):
-                    args[key] = raw
+            try:
+                args[key] = _qwen_argument(raw, declared)
+            except (TypeError, ValueError):
+                return None
+        if required.get(name, set()) - set(args):
+            return None
         return {
             "id": f"call_{uuid.uuid4().hex[:24]}",
             "type": "function",
@@ -2184,12 +2234,33 @@ def parse_qwen_tool_calls(reply, tools=None):
             },
         }
 
+    reply = reply or ""
+    matches = list(QWEN_CALL_RE.finditer(reply))
+    recovered = False
+    if not matches and tools and "<tool_call>" not in reply:
+        # Some quantized checkpoints omit just the outer wrapper. Recover only a
+        # reply made entirely of complete function blocks: quoted examples or a
+        # marker mentioned in prose must never turn into an executable call.
+        inner = list(QWEN_FUNCTION_RE.finditer(reply))
+        if inner and not QWEN_FUNCTION_RE.sub("", reply).strip():
+            matches = inner
+            recovered = True
     calls = []
-    for match in QWEN_CALL_RE.finditer(reply or ""):
-        name = match.group(1).strip()
-        calls.append(make_call(name, match.group(2)))
-
-    text = QWEN_CALL_RE.sub("", reply or "")
+    text_parts = []
+    end = 0
+    for match in matches:
+        call = make_call(match.group(1).strip(), match.group(2))
+        if call is not None:
+            calls.append(call)
+            text_parts.append(reply[end:match.start()])
+            end = match.end()
+        elif recovered:
+            # Recover only when the entire bare reply is unambiguous and valid.
+            calls = []
+            text_parts = []
+            end = 0
+            break
+    text = "".join(text_parts) + reply[end:]
 
     if not calls and tools and (
         "<tool_call>" in (reply or "") or "<function=" in (reply or "")
@@ -2200,11 +2271,47 @@ def parse_qwen_tool_calls(reply, tools=None):
         )
         sys.stderr.flush()
 
-    return text.strip(), calls
+    return (text.strip() if strip_text else text), calls
 
 
 # Backward compatibility for existing Qwen3.8 callers.
 parse_qwen38_tool_calls = parse_qwen_tool_calls
+
+
+class QwenToolStream:
+    """Hold ambiguous tool syntax until the final parser accepts or releases it.
+
+    Prose before a marker streams immediately. Bare function blocks are only
+    calls if the complete reply contains nothing else, so their suffix cannot
+    be discarded merely because a marker appeared in one engine chunk.
+    """
+    def __init__(self, emit, tools):
+        self.emit = emit
+        self.tools = tools
+        self.parts = []
+        self.pending = ""
+        self.held = False
+        self.emitted = 0
+
+    def feed(self, text):
+        self.parts.append(text)
+        if self.held:
+            return
+        self.pending += text
+        markers = ("<tool_call>", "<function=")
+        positions = [self.pending.find(marker) for marker in markers]
+        hits = [position for position in positions if position >= 0]
+        self.held = bool(hits)
+        n = min(hits) if hits else max(0, len(self.pending) - max(map(len, markers)) + 1)
+        if n:
+            self.emit(self.pending[:n])
+            self.emitted += n
+            self.pending = self.pending[n:]
+
+    def finish(self):
+        text, calls = parse_qwen_tool_calls("".join(self.parts), self.tools, strip_text=False)
+        self.emit(text[self.emitted:])
+        return calls
 
 
 # ---- MiMo-V2.6 (Xiaomi) -------------------------------------------------------------------
@@ -3876,6 +3983,7 @@ GENERIC_JSON_GBNF = (
 )
 
 DEFAULT_CHAT_STOP_SEQUENCES = ("<|user|>", "<|observation|>")
+DEFAULT_QWEN36_CHAT_STOP_SEQUENCES = ("<|im_end|>", "<|im_start|>")
 
 # Seconds to wait for the engine to exit on its own after stdin EOF (its
 # atexit teardown writes HEAT_FILE). EOF is only observed between turns,
@@ -4121,6 +4229,12 @@ def stop_policy(body, chat):
         # occasional leading GLM marker patiently; client-provided stops remain
         # strict unless the extension is explicitly requested.
         return DEFAULT_CHAT_STOP_SEQUENCES, True
+    if chat and ARCH == "qwen36" and not sequences:
+        # KAT normally ends with the special im_end token, which the native
+        # engine handles by token id. Quantized checkpoints can instead spell
+        # the marker as ordinary text pieces. Keep that template boundary out
+        # of OpenAI responses without overriding an explicit client stop.
+        return DEFAULT_QWEN36_CHAT_STOP_SEQUENCES, ignore_leading
     return sequences, ignore_leading
 
 
@@ -4238,7 +4352,9 @@ def validate_tools(body):
     iterate the list and parse_tool_calls reads each schema's `properties` and `required`, so
     this has to run before either: chat_completion() calls it ahead of rendering, and
     generation_options() calls it again for every other path."""
-    tools_raw = body.get("tools") or body.get("functions")
+    tools_raw = body.get("tools")
+    if tools_raw is None or (isinstance(tools_raw, list) and not tools_raw):
+        tools_raw = body.get("functions")
     if tools_raw is not None:
         if not isinstance(tools_raw, list):
             raise APIError(400, "`tools` must be a non-empty array.", "tools", "invalid_value")
@@ -4270,12 +4386,21 @@ def validate_tools(body):
             if params.get("required") is not None and not isinstance(params["required"], list):
                 raise APIError(400, f"Tool `parameters.required` must be an array at index {idx}.",
                                f"tools.{idx}.function.parameters.required", "invalid_value")
+            for position, name in enumerate(params.get("required") or []):
+                if not isinstance(name, str):
+                    raise APIError(400, "Tool `parameters.required` entries must be strings.",
+                                   f"tools.{idx}.function.parameters.required.{position}", "invalid_value")
 
 
 def generation_options(body, limit):
-    if body.get("n", 1) != 1:
+    n = body.get("n", 1)
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise APIError(400, "`n` must be an integer.", "n", "invalid_value")
+    if n != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
     best_of = body.get("best_of", 1)
+    if best_of is not None and (isinstance(best_of, bool) or not isinstance(best_of, int)):
+        raise APIError(400, "`best_of` must be an integer.", "best_of", "invalid_value")
     if best_of not in (None, 1):
         raise APIError(400, "Colibri currently supports `best_of` equal to 1 only.",
                        "best_of", "unsupported_value")
@@ -4389,10 +4514,10 @@ def generation_options(body, limit):
         maximum = limit   # clamp to the server's --max-tokens cap instead of 400 (#260): OpenAI
                           # clients (opencode/ai-sdk) default to large max_tokens; rejecting breaks them.
     if (isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or
-            not math.isfinite(temperature) or not 0 <= temperature <= 2):
+            not 0 <= temperature <= 2 or not math.isfinite(temperature)):
         raise APIError(400, "`temperature` must be between 0 and 2.", "temperature")
     if (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or
-            not math.isfinite(top_p) or not 0 < top_p <= 1):
+            not 0 < top_p <= 1 or not math.isfinite(top_p)):
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
     return maximum, float(temperature), float(top_p), grammar, stop_sequences
 
@@ -4952,6 +5077,21 @@ def parse_load_fail(data):
     return found
 
 
+def _cluster_stats(fields):
+    """The summary a coordinator with CLUSTER_WORKERS appends to its STAT line, as
+    key=value after length_limited -- per emitted token, in the shape distributed-llama
+    prints per token: cluster_g_ms (the whole decode step), cluster_i_ms (local
+    inference), cluster_t_ms (time on the wire), cluster_tx_kb / cluster_rx_kb (bytes
+    each way). Absent without a cluster; a bare positional tail has no '=' and is
+    left alone."""
+    out = {}
+    for entry in fields[7:]:
+        key, sep, value = entry.partition("=")
+        if sep and key.startswith("cluster_"):
+            out[key] = float(value)
+    return out
+
+
 def read_engine_turn(stream, sentinel, on_bytes, caps=None):
     pending = b""
     while True:
@@ -4992,6 +5132,7 @@ def read_engine_turn(stream, sentinel, on_bytes, caps=None):
         "rss_gb": float(fields[4]),
         "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
         "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
+        **_cluster_stats(fields),
     }
 
 
@@ -5622,6 +5763,7 @@ class Engine:
             "rss_gb": float(fields[4]),
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
+            **_cluster_stats(fields),
         }
 
     def _fail_pending(self, error):
@@ -5881,7 +6023,7 @@ class Engine:
                     self.hits_seq += 1
                 elif kind == "PROF" and len(fields) >= 10:
                     # per-turn phase timings: where the engine spent this turn's wall time
-                    self.profile.append({
+                    turn = {
                         "wall_s": float(fields[1]),
                         "prompt_tokens": int(fields[2]),
                         "completion_tokens": int(fields[3]),
@@ -5891,7 +6033,13 @@ class Engine:
                         "attention_s": float(fields[7]),
                         "lm_head_s": float(fields[8]),
                         "forwards": int(fields[9]),
-                    })
+                    }
+                    if len(fields) >= 13:
+                        # CLUSTER_WORKERS: the coordinator's time on the wire, bytes each way
+                        turn["cluster_transfer_s"] = float(fields[10])
+                        turn["cluster_tx_bytes"] = int(fields[11])
+                        turn["cluster_rx_bytes"] = int(fields[12])
+                    self.profile.append(turn)
                     self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
@@ -6814,6 +6962,10 @@ class APIHandler(BaseHTTPRequestHandler):
             body = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise APIError(400, "Request body must be valid JSON.")
+        except (ValueError, RecursionError):
+            # The runtime's integer and nesting guards reject client data,
+            # before an engine has received any request.
+            raise APIError(400, "Request body exceeds the supported JSON parsing limits.")
         try:
             # An escaped lone surrogate ("\ud83d") parses, but it is the same invalid
             # text as the undecodable bytes above: no UTF-8 can carry it, and the
@@ -6822,6 +6974,8 @@ class APIHandler(BaseHTTPRequestHandler):
         except UnicodeEncodeError:
             raise APIError(400, "Request body contains an unpaired UTF-16 surrogate "
                                 "escape; strings must be valid Unicode.")
+        except RecursionError:
+            raise APIError(400, "Request body exceeds the supported JSON parsing limits.")
         if not isinstance(body, dict):
             raise APIError(400, "Request body must be a JSON object.")
         return body
@@ -6885,6 +7039,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
+                self.send_cors_headers()
                 self.end_headers()
                 self.wfile.write(data)
                 return
@@ -7113,13 +7268,13 @@ class APIHandler(BaseHTTPRequestHandler):
                         raise ClientCancelled()
                     _, tail = score(prefix + " " + option, False)
                     rows = [e for e in tail if e["pos"] >= n_prefix and e["logprob"] is not None]
+                    if not rows:
+                        raise APIError(502, "The engine returned no log probabilities for an "
+                                            "option.", None, "engine_error", "server_error")
                     total = sum(e["logprob"] for e in rows)
                     count = max(len(rows), 1)
                     scored.append({"option": option, "logprob": total, "tokens": len(rows),
                                    "mean_logprob": total / count})
-                if not any(entry["tokens"] for entry in scored):
-                    raise APIError(502, "The engine returned no log probabilities for the "
-                                        "options.", None, "engine_error", "server_error")
                 key = "mean_logprob" if norm == "mean" else "logprob"
                 if norm == "mean":
                     token_counts = {entry["tokens"] for entry in scored if entry["tokens"]}
@@ -7935,9 +8090,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 raw = []
                 sideband = ToolSideband(ARCH == "kimi", stop_sequences,
                                         ignore_leading_stop)
+                qwen_stream = (QwenToolStream(emit, tools) if chat_flavor() in
+                               ("qwen36", "qwen38", "qwen3_coder") else None)
 
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
+                    if qwen_stream is not None:
+                        qwen_stream.feed(chunk)
+                        return
                     if sideband.seen:
                         emit(chunk)
                         return
@@ -7981,10 +8141,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 sideband.finish()
                 if think:
                     think.finish()
-                if not sp["tool"] and sp["buf"]:
-                    emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_arch_tool_calls("".join(raw), tools,
-                                                        sideband.reply())
+                if qwen_stream is not None:
+                    calls = qwen_stream.finish()
+                else:
+                    if not sp["tool"] and sp["buf"]:
+                        emit(sp["buf"])                 # no tool call happened: flush held tail
+                    _content, calls = parse_arch_tool_calls("".join(raw), tools,
+                                                            sideband.reply())
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -8541,6 +8704,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 if not tools:
                     emit_text(chunk)
                     return
+                if qwen_stream is not None:
+                    qwen_stream.feed(chunk)
+                    return
                 if sideband.seen:
                     emit_text(chunk)
                     return
@@ -8558,6 +8724,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 if flush:
                     emit_text(state["buf"][:flush])
                     state["buf"] = state["buf"][flush:]
+
+            qwen_stream = (QwenToolStream(emit_text, tools) if tools and chat_flavor() in
+                           ("qwen36", "qwen38", "qwen3_coder") else None)
 
             def emit_thinking(chunk):
                 if not enable_thinking:
@@ -8605,7 +8774,9 @@ class APIHandler(BaseHTTPRequestHandler):
             if split:
                 split.close()
                 close_thinking()               # budget exhaustion before </think>
-            if tools and not state["in_tool"] and state["buf"]:
+            if qwen_stream is not None:
+                qwen_stream.finish()
+            elif tools and not state["in_tool"] and state["buf"]:
                 emit_text(state["buf"])
             ka_stop.set()
             ka_thread.join(timeout=2)

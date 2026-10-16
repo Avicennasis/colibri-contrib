@@ -610,5 +610,55 @@ class MimoSystemOneEndToEnd(unittest.TestCase):
             self.assertEqual(len(entry["top_logprobs"]), 2)
 
 
+
+class MissingOptionScores(unittest.TestCase):
+    """A missing option score must not become a log-probability of zero."""
+    serve = SystemOneApi.serve
+    post = SystemOneApi.post
+    post_error = SystemOneApi.post_error
+    pins = SystemOneApi.pins
+    test_healthy_choice = SystemOneApi.test_choice_labels_probabilities_and_confidence
+    test_healthy_noul = SystemOneApi.test_noul_is_the_probability_of_yes
+
+    def test_missing_option_scores_are_a_gateway_error(self):
+        self.serve({"billing": -2.0, "technical": -3.0})
+        generate = self.engine.generate
+
+        def incomplete(*args, **kwargs):
+            on_echo = kwargs.get("on_echo")
+            if args[0].endswith(" technical") and on_echo is not None:
+                # The prefix still has valid scores. Only the option's ECHO
+                # records are absent, as after a truncated scoring response.
+                limit = len(args[0].split()) - 1
+                kwargs["on_echo"] = lambda row: on_echo(row) if row["pos"] < limit else None
+            return generate(*args, **kwargs)
+
+        self.engine.generate = incomplete
+        status, error = self.post_error({"state": STATE, "questions": {
+            "department": {"type": "choice", "criteria": {
+                "billing": "payments", "technical": "bugs"}}}})
+        self.assertEqual(status, 502)
+        self.assertEqual(error["error"]["code"], "engine_error")
+        self.assertIn("log probabilities", error["error"]["message"])
+
+    def test_null_option_scores_are_a_gateway_error(self):
+        self.serve({"yes": -2.0, "no": -3.0})
+        generate = self.engine.generate
+
+        def incomplete(*args, **kwargs):
+            on_echo = kwargs.get("on_echo")
+            if args[0].endswith(" no") and on_echo is not None:
+                limit = len(args[0].split()) - 1
+                kwargs["on_echo"] = lambda row: on_echo(
+                    dict(row, logprob=None) if row["pos"] >= limit else row)
+            return generate(*args, **kwargs)
+
+        self.engine.generate = incomplete
+        status, error = self.post_error({"state": STATE, "questions": {
+            "urgency": {"type": "noul", "instructions": "Urgent?"}}})
+        self.assertEqual(status, 502)
+        self.assertEqual(error["error"]["code"], "engine_error")
+
+
 if __name__ == "__main__":
     unittest.main()

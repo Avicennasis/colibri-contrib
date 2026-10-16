@@ -49,6 +49,9 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #include <immintrin.h>
 #endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -84,6 +87,23 @@ static inline void xf_repack_row_pairs_signed(uint8_t *dst, const uint8_t *src, 
         __m256i e1 = _mm256_set_m128i(_mm_unpackhi_epi8(cl, ch), _mm_unpacklo_epi8(cl, ch));   /* elements 32..63 */
         e0 = _mm256_xor_si256(e0, e8); e1 = _mm256_xor_si256(e1, e8);
         _mm256_storeu_si256((__m256i *)(dst + (size_t)b * XF_BLOCK_BYTES), _mm256_or_si256(e0, _mm256_slli_epi16(e1, 4)));
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+#define XF_REPACK_NEON 1   /* this path is compiled in: tests/test_expert_ffn.c checks it on AArch64 */
+    /* The same pairing, built directly: byte j of `even` is element 2j in the
+     * low nibble and element 32+2j in the high one, `odd` the same for 2j+1,
+     * so zipping them byte-wise gives elements k | k+32 in order; xor 0x88 is
+     * the xor 8 of both nibbles. Called on every expert read from disk.
+     * vzip1q/vzip2q are AArch64 instructions: 32-bit ARM takes the loop below. */
+    const uint8x16_t m4 = vdupq_n_u8(0x0F), mh = vdupq_n_u8(0xF0), e8 = vdupq_n_u8(0x88);
+    for (; b < I / XF_BLOCK; b++) {
+        const uint8_t *s = src + (size_t)b * XF_BLOCK_BYTES;
+        uint8_t *d = dst + (size_t)b * XF_BLOCK_BYTES;
+        uint8x16_t a = vld1q_u8(s), c = vld1q_u8(s + 16);
+        uint8x16_t even = vorrq_u8(vandq_u8(a, m4), vshlq_n_u8(c, 4));
+        uint8x16_t odd = vorrq_u8(vshrq_n_u8(a, 4), vandq_u8(c, mh));
+        vst1q_u8(d, veorq_u8(vzip1q_u8(even, odd), e8));
+        vst1q_u8(d + 16, veorq_u8(vzip2q_u8(even, odd), e8));
     }
 #endif
     for (; b < I / XF_BLOCK; b++) {
@@ -327,6 +347,32 @@ static inline size_t xf_moe_scratch_bytes(int S, int K, int H, int F) {
          + n * ((size_t)F + 64) + n * (size_t)(F / XF_BLOCK) * sizeof(float) /* hq, hsum (i8 mode) */
          + (size_t)S * ((size_t)H + 64) + (size_t)S * (size_t)(H / XF_BLOCK) * sizeof(float) /* xq, xsum */
          + n * sizeof(int) * 4 + 4096;
+}
+
+/* How many rows from s0 one run can take when the caller's cache holds `cap`
+ * experts at once: the longest stretch whose distinct experts number at most
+ * cap, at most `max` rows, never fewer than one (a caller whose cap is below K
+ * cuts that row into pairs itself). The rows of a run that share an expert read
+ * it once per chunk, so the cut decides how often a prompt reads its experts;
+ * the bits do not depend on it (xf_moe_add). An id of XF_FIT_IDS or more ends
+ * the run before its row. */
+#define XF_FIT_IDS 1024
+static inline int xf_rows_fit(const int *idx, int s0, int S, int K, int cap, int max) {
+    uint8_t seen[XF_FIT_IDS] = {0};
+    int distinct = 0, rows = 0;
+    for (; s0 + rows < S && rows < max; rows++) {
+        const int *r = idx + (size_t)(s0 + rows) * K;
+        int add = 0;
+        for (int k = 0; k < K; k++) {
+            int e = r[k];
+            if (e < 0) continue;
+            if (e >= XF_FIT_IDS) return rows > 0 ? rows : 1;
+            if (!seen[e]) { seen[e] = 1; add++; }
+        }
+        if (distinct + add > cap) break;
+        distinct += add;
+    }
+    return rows > 0 ? rows : 1;
 }
 
 /* The per-(s,k) expert outputs alone: ctb[(s*K+k)*H ..] = expert_k(x[s]) for every

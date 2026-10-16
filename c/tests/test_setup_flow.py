@@ -116,7 +116,7 @@ TC_ALL = {"source_checkout": True, "make": "/usr/bin/make", "cc": "/usr/bin/gcc"
 
 
 def setup_args(**overrides):
-    values = dict(yes=True, json=False, pick=None, model_dir=None, dir=None, backend=None,
+    values = dict(yes=True, json=False, pick=None, ctx=None, model_dir=None, dir=None, backend=None,
                   no_gpu=False, host=None, port=None, no_start=True, background=False,
                   no_browser=True, reconfigure=False, list=False, all=False, via_windows="no",
                   no_verify=False)
@@ -1079,6 +1079,52 @@ class WholeSetup(HomeTestCase):
                               setup_args(dir=self.models, **overrides))
         return code, out.getvalue()
 
+    def _assert_same_as_command_preserves_paths(self, model_name, engine_name=None):
+        self.models = os.path.join(self.tmp.name, model_name)
+        if engine_name:
+            new_engine_dir = os.path.join(self.tmp.name, engine_name)
+            os.rename(self.engines, new_engine_dir)
+            self.engines = new_engine_dir
+            patcher = mock.patch.object(setup_flow, "HERE", self.engines)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        cfg = setup_flow.load_config()
+        command = next(line for line in text.splitlines() if "same as:" in line).split("same as:", 1)[1].strip()
+        bindir = Path(self.tmp.name, "bin")
+        bindir.mkdir()
+        launcher = bindir / "coli"
+        launcher.write_text(
+            "#!" + sys.executable + "\nimport os, sys, json\n"
+            + "keys = " + repr(list(cfg["env"])) + "\n"
+            + "print(json.dumps({'args': sys.argv[1:], 'env': {key: os.environ.get(key) for key in keys}}))\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        # Native shell and argv consumer; no engine or model is invoked.
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            env={"PATH": str(bindir) + ":/usr/bin:/bin", "HOME": self.tmp.name},
+            capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        consumed = json.loads(result.stdout)
+        self.assertEqual(consumed["args"], cfg["args"])
+        self.assertEqual(consumed["env"], cfg["env"])
+
+    @unittest.skipIf(os.name == "nt", "requires a native POSIX shell")
+    def test_same_as_command_preserves_unicode_model_directory(self):
+        self._assert_same_as_command_preserves_paths("模型 é")
+
+    @unittest.skipIf(os.name == "nt", "requires a native POSIX shell")
+    def test_same_as_command_preserves_unicode_shader_directory(self):
+        self._assert_same_as_command_preserves_paths("models", "引擎 é")
+
+    @unittest.skipIf(os.name == "nt", "requires a native POSIX shell")
+    def test_same_as_command_preserves_ascii_space_directory(self):
+        self._assert_same_as_command_preserves_paths("local models")
+
     def test_install_then_rerun(self):
         code, text = self.run_setup(pick="tiny")
         self.assertEqual(code, 0, text)
@@ -1104,6 +1150,99 @@ class WholeSetup(HomeTestCase):
         self.assertEqual(len(self.hub.requests), before)
         build.assert_called_once()                       # make, with nothing to redo
         self.assertTrue(build.call_args.kwargs["update"])
+
+    def test_rerun_ctx_zero_restores_automatic_context(self):
+        code, text = self.run_setup(pick="tiny", ctx=8192)
+        self.assertEqual(code, 0, text)
+        self.assertEqual(setup_flow.load_config()["args"][-2:], ["--ctx", "8192"])
+        before = len(self.hub.requests)
+
+        code, text = self.run_setup(ctx=0)
+        self.assertEqual(code, 0, text)
+        cfg = setup_flow.load_config()
+        self.assertEqual(cfg["ctx"], 0)
+        self.assertNotIn("--ctx", cfg["args"])
+        self.assertEqual(len(self.hub.requests), before)
+
+    def test_invalid_ctx_is_rejected_before_engine_or_download(self):
+        with mock.patch.object(setup_flow, "resolve_with_fallback",
+                               side_effect=AssertionError("engine work started")):
+            code, text = self.run_setup(pick="tiny", ctx=-1)
+        self.assertEqual(code, 1, text)
+        self.assertIsNone(setup_flow.load_config())
+        self.assertFalse(self.hub.requests)
+
+    def test_ready_setup_honors_explicit_cpu_backend(self):
+        code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        previous = setup_flow.load_config()
+        self.assertEqual(previous["backend"], "vulkan")
+        self.assertEqual(previous["env"]["COLI_VULKAN"], "1")
+        build, _ = self.failing_build()
+        with mock.patch.object(setup_flow, "build_engine", side_effect=build):
+            code, text = self.run_setup(backend="cpu")
+        self.assertEqual(code, 0, text)
+        current = setup_flow.load_config()
+        self.assertEqual(current["backend"], "cpu")
+        self.assertNotIn("COLI_VULKAN", current["env"])
+        self.assertEqual(current["model_dir"], previous["model_dir"])
+        self.assertEqual(
+            Path(current["model_dir"], "model-00000.safetensors").read_bytes(),
+            self.shard,
+        )
+
+    def test_ready_setup_honors_no_gpu(self):
+        code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        previous = setup_flow.load_config()
+        self.assertEqual(previous["backend"], "vulkan")
+        self.assertEqual(previous["env"]["COLI_VULKAN"], "1")
+        build, _ = self.failing_build()
+        with mock.patch.object(setup_flow, "build_engine", side_effect=build):
+            code, text = self.run_setup(no_gpu=True)
+        self.assertEqual(code, 0, text)
+        current = setup_flow.load_config()
+        self.assertEqual(current["backend"], "cpu")
+        self.assertNotIn("COLI_VULKAN", current["env"])
+        self.assertEqual(current["model_dir"], previous["model_dir"])
+        self.assertEqual(
+            Path(current["model_dir"], "model-00000.safetensors").read_bytes(),
+            self.shard,
+        )
+
+    def test_ready_setup_honors_explicit_host(self):
+        code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        previous = setup_flow.load_config()
+        self.assertEqual(previous["host"], "127.0.0.1")
+        code, text = self.run_setup(host="127.0.0.2")
+        self.assertEqual(code, 0, text)
+        current = setup_flow.load_config()
+        self.assertEqual(current["host"], "127.0.0.2")
+        self.assertEqual(current["args"][current["args"].index("--host") + 1], "127.0.0.2")
+        self.assertEqual(current["urls"]["browser"], "http://127.0.0.2:8000/")
+        self.assertEqual(current["model_dir"], previous["model_dir"])
+        self.assertEqual(
+            Path(current["model_dir"], "model-00000.safetensors").read_bytes(),
+            self.shard,
+        )
+
+    def test_ready_setup_honors_explicit_port(self):
+        code, text = self.run_setup(pick="tiny")
+        self.assertEqual(code, 0, text)
+        previous = setup_flow.load_config()
+        self.assertEqual(previous["port"], 8000)
+        code, text = self.run_setup(port=8123)
+        self.assertEqual(code, 0, text)
+        current = setup_flow.load_config()
+        self.assertEqual(current["port"], 8123)
+        self.assertEqual(current["args"][current["args"].index("--port") + 1], "8123")
+        self.assertEqual(current["urls"]["browser"], "http://127.0.0.1:8123/")
+        self.assertEqual(current["model_dir"], previous["model_dir"])
+        self.assertEqual(
+            Path(current["model_dir"], "model-00000.safetensors").read_bytes(),
+            self.shard,
+        )
 
     def test_a_rerun_after_a_pull_rebuilds_the_engine_it_starts(self):
         code, text = self.run_setup(pick="tiny")
@@ -1154,9 +1293,10 @@ class WholeSetup(HomeTestCase):
         self.hub.cut_after["model-00000.safetensors"] = 150_000
         with mock.patch.object(setup_download, "download_repo",
                                side_effect=lambda *a, **k: real(*a, **dict(k, retries=0))):
-            code, text = self.run_setup(pick="tiny")
+            code, text = self.run_setup(pick="tiny", ctx=8192)
         self.assertEqual(code, 1)
         self.assertEqual(setup_flow.load_config()["status"], "pending")
+        self.assertEqual(setup_flow.load_config()["ctx"], 8192)
         self.assertEqual(setup_flow.read_state()["phase"], "error")
         part = Path(self.models, "tiny", "model-00000.safetensors.part")
         self.assertEqual(part.stat().st_size, 150_000)
@@ -1170,6 +1310,7 @@ class WholeSetup(HomeTestCase):
         self.assertEqual(ranges[-1], "bytes=150000-")
         self.assertEqual(Path(self.models, "tiny", "model-00000.safetensors").read_bytes(), self.shard)
         self.assertEqual(setup_flow.load_config()["status"], "ready")
+        self.assertEqual(setup_flow.load_config()["args"][-2:], ["--ctx", "8192"])
 
     def test_install_on_windows_names_the_exe_engine(self):
         os.remove(os.path.join(self.engines, "qwen36"))
