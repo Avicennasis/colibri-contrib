@@ -721,7 +721,7 @@ endif
 # vk_tier.o: the routed-expert tier the MoE engines share (vk_tier.h); an engine
 # that does not call it links nothing from it.
 VK_OBJ    = backend_vulkan.o vk_tier.o
-VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
+VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
             shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv shaders/expert_act.spv \
             shaders/expert_act_v4.spv shaders/qmatmul_grp.spv shaders/qmatmul_grp_gate_up.spv shaders/expert_sum.spv shaders/qmatmul_grp_gemv.spv shaders/qmatmul_grp_gemv_gate_up.spv
 # vk_chain.o: a layer's dense chain recorded into one submission (vk_chain.h), and
@@ -917,7 +917,7 @@ shaders/qmatmul_grp_gemv_gate_up.spv: shaders/qmatmul_grp_gemv.comp
 vk_chain.o: vk_chain.c .build-config
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@
 # the block formats' decoders (fmt >= 100), included by the two GEMV shaders
-shaders/qmatmul.spv shaders/qmatmul_gate_up.spv: shaders/blockdec.glsl shaders/blockdec_table.h
+shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv: shaders/blockdec.glsl shaders/blockdec_table.h
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
@@ -2073,18 +2073,18 @@ tests/test_grammar_cache$(EXE): tests/test_grammar_cache.c colibri.c $(VK_OBJ)
 # by their Python tests (stdin/argv), not run standalone: test_ggml_quants.py
 # checks every ggml type bit for bit against gguf-py, test_gguf_c.py the reader
 # against gguf-py's and against malformed files.
-tests/test_ggml_quants$(EXE): tests/test_ggml_quants.c ggml_quants.h ggml_grids.h
+tests/test_ggml_quants$(EXE): tests/test_ggml_quants.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-tests/test_gguf_c$(EXE): tests/test_gguf_c.c gguf.h ggml_quants.h ggml_grids.h
+tests/test_gguf_c$(EXE): tests/test_gguf_c.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-tests/test_gq_dot$(EXE): tests/test_gq_dot.c ggml_quants.h ggml_grids.h
+tests/test_gq_dot$(EXE): tests/test_gq_dot.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # The row-interleaved forms (GQ_*_R16) against their scalar reference, every type; a
 # no-op on a build without AVX2. `tests/test_gq_r16 bench S` times them.
-tests/test_gq_r16$(EXE): tests/test_gq_r16.c ggml_quants.h ggml_grids.h
+tests/test_gq_r16$(EXE): tests/test_gq_r16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # The trunk's int8 rows interleaved by 16 (idot.h) against matmul_q_idot, to the bit.
-tests/test_idot_r16$(EXE): tests/test_idot_r16.c idot.h
+tests/test_idot_r16$(EXE): tests/test_idot_r16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c $(VK_OBJ)
@@ -2278,21 +2278,21 @@ tests/test_sparse_attn$(EXE): tests/test_sparse_attn.c
 tests/test_expert_ffn$(EXE): tests/test_expert_ffn.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # int4-g64 rows interleaved by 16 (expert_ffn.h xf16_*) against their reference.
-tests/test_xf16$(EXE): tests/test_xf16.c expert_ffn.h
+tests/test_xf16$(EXE): tests/test_xf16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-tests/test_int2_g32$(EXE): tests/test_int2_g32.c int2_g32.h ggml_quants.h ggml_grids.h
+tests/test_int2_g32$(EXE): tests/test_int2_g32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-tests/test_lowbit_g16$(EXE): tests/test_lowbit_g16.c lowbit_g16.h int2_g32.h
+tests/test_lowbit_g16$(EXE): tests/test_lowbit_g16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # int2/int3-g16 rows interleaved by 16 (lowbit_g16.h xl16_*) against their reference.
-tests/test_xl16$(EXE): tests/test_xl16.c lowbit_g16.h int2_g32.h
+tests/test_xl16$(EXE): tests/test_xl16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-tests/test_vq2_g32$(EXE): tests/test_vq2_g32.c vq2_g32.h int2_g32.h
+tests/test_vq2_g32$(EXE): tests/test_vq2_g32.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # vq2 rows interleaved by 16 (vq2_g32.h vq2r16_*) against their reference.
-tests/test_vq2r16$(EXE): tests/test_vq2r16.c vq2_g32.h int2_g32.h
+tests/test_vq2r16$(EXE): tests/test_vq2r16.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
-tests/test_vq1_g64$(EXE): tests/test_vq1_g64.c vq1_g64.h int2_g32.h
+tests/test_vq1_g64$(EXE): tests/test_vq1_g64.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # The Vulkan weight pool's offset allocator (vk_alloc.h): bookkeeping only, no

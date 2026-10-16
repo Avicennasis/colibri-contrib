@@ -1808,9 +1808,10 @@ static void pool_destroy(VkWPool *P) {
  * a bigger format later (coli_vk_tensor_refill_as), and every tensor of a tier whose
  * layers mix formats the same size, so a freed one leaves a hole any other fits in. */
 static VkBuffer bdtab_buf(int dev);
+static int bd_shaders(void);
 static ColiVkTensor *tensor_alloc_pad(VkWPool *P, int fmt, int I, int O, int gs, size_t pad_w, size_t pad_s,
                                       void **wptr, void **sptr) {
-    if (bd_fmt(fmt) && !bdtab_buf(P->dev)) return NULL;   /* its decoder reads the table */
+    if (bd_fmt(fmt) && (!bd_shaders() || !bdtab_buf(P->dev))) return NULL;   /* its GEMVs and the table they read */
     ColiVkTensor *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->fmt = fmt; t->I = I; t->O = O; t->rowWords = rowwords(fmt, I);
@@ -1950,6 +1951,21 @@ static VkBuffer bdtab_buf(int dev) {
 }
 static void bdtab_free(int dev) {
     if (g_bdtab[dev]) { tensor_release(g_bdtab[dev]); g_bdtab[dev] = NULL; }
+}
+/* The block formats run in shaders of their own (qmatmul_bd.spv, qmatmul_gate_up_bd.spv
+ * beside the main shader, the expert batch's p_mv_bd / p_gu_bd): every other matrix keeps
+ * qmatmul.spv and qmatmul_gate_up.spv as they were. 1 when both files are there; without
+ * them no block-format tensor is made (the engines then give the tier int8). */
+static int bd_shaders(void) {
+    static int v = -1;
+    if (v >= 0 || !G.ready) return v > 0;
+    char a[1100], b[1100];
+    derive_sibling(G.spv_path, "_bd.spv", a, sizeof a); derive_sibling(G.spv_path, "_gate_up_bd.spv", b, sizeof b);
+    FILE *fa = fopen(a, "rb"), *fb = fopen(b, "rb");
+    v = fa && fb;
+    if (fa) fclose(fa);
+    if (fb) fclose(fb);
+    return v;
 }
 /* what a tensor's scales binding names: the table for a block format, else its scales */
 static VkBuffer sbuf_of(const ColiVkTensor *t) {
@@ -3822,10 +3838,11 @@ typedef struct XbCtx {
     int D, I, act; float limit, a, b;
     VkCommandPool cpool; VkCommandBuffer cmd; VkFence fence;
     VkQueryPool qpool; int has_ts;
-    VkShaderModule sh_act, sh_gu, sh_mv, sh_mm, sh_coop;
+    VkShaderModule sh_act, sh_gu, sh_mv, sh_mm, sh_coop, sh_gu_bd, sh_mv_bd;
     VkDescriptorSetLayout dsl6, dsl4, dsl3;
     VkPipelineLayout pl6, pl4, pl3;
     VkPipeline p_gu, p_mv, p_act, p_mm[VK_GEMM_SLOTS], p_coop[VK_COOP_SLOTS];
+    VkPipeline p_gu_bd, p_mv_bd;   /* the block formats' GEMVs (bd_shaders), NULL without them */
     VkDescriptorPool *dpools; int ndpools;
     VkDescriptorPool act_pool; VkDescriptorSet act_set;
     XbBuf x, g, u, h, y;          /* x host-written, g/u/h device-only, y host-read */
@@ -4220,6 +4237,13 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
     X->sh_mm = X->gemm_shader ? load_spv(X->dev, mm_path) : VK_NULL_HANDLE;
     if (!X->sh_gu || !X->sh_mv || (!X->d && X->gemm_shader && !X->sh_mm)) return 0;   /* the second device: GEMVs only */
     if (!xb_pipeline(X, X->sh_gu, X->pl6, NULL, &X->p_gu) || !xb_pipeline(X, X->sh_mv, X->pl4, NULL, &X->p_mv)) return 0;
+    if (bd_shaders()) {   /* a batch with a block-format expert and no pipeline for it fails (xb_record_submit) */
+        char gb[1100], mb[1100];
+        derive_sibling(X->spv, "_gate_up_bd.spv", gb, sizeof gb); derive_sibling(X->spv, "_bd.spv", mb, sizeof mb);
+        X->sh_gu_bd = load_spv(X->dev, gb); X->sh_mv_bd = load_spv(X->dev, mb);
+        if (!X->sh_gu_bd || !xb_pipeline(X, X->sh_gu_bd, X->pl6, NULL, &X->p_gu_bd)) X->p_gu_bd = VK_NULL_HANDLE;
+        if (!X->sh_mv_bd || !xb_pipeline(X, X->sh_mv_bd, X->pl4, NULL, &X->p_mv_bd)) X->p_mv_bd = VK_NULL_HANDLE;
+    }
     /* the GEMM route: the backend's tiles, and expert_act.spv beside the main shader */
     char act_path[1100];
     derive_dir_file(X->spv, "expert_act.spv", act_path, sizeof act_path);
@@ -4521,20 +4545,24 @@ static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQuer
     /* the route of each expert: its GEMM slot, or -1 for the GEMVs */
     int *route = malloc((size_t)count * sizeof(int));
     if (!route) { vkEndCommandBuffer(cmd); return 0; }
+    for (int c = 0; c < count; c++)
+        if ((bd_fmt(ex[c]->g->fmt) && !X->p_gu_bd) || (bd_fmt(ex[c]->d->fmt) && !X->p_mv_bd)) { vkEndCommandBuffer(cmd); free(route); return 0; }
     int ngemm = 0, cooperative = 0, grouped = !v4 && xb_grp_record(X, cmd, slot, ex, rows, count, off, x0, i0, y0, amap);
     if (grouped) ngemm = count;
     else {
         for (int c = 0; c < count; c++) {
             int k = X->gemm_rows && rows[c] >= X->gemm_rows ? xb_gemm_slot(X, rows[c]) : -1;
-            /* the block formats have the GEMVs only (blockdec.glsl in qmatmul*.comp) */
+            /* the block formats have the GEMVs only (blockdec.glsl in qmatmul*_bd.comp) */
             route[c] = k >= 0 && X->p_mm[k] && !bd_fmt(ex[c]->g->fmt) && !bd_fmt(ex[c]->d->fmt) ? k : -1;
             ngemm += route[c] >= 0;
         }
         /* phase 1: gate and up of every expert (fused GEMV, or two GEMMs) */
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->p_gu);
+        VkPipeline gv = VK_NULL_HANDLE;
         for (int c = 0; c < count; c++) {
             if (route[c] >= 0) continue;
             const ColiVkExpert *e = ex[c];
+            VkPipeline want = bd_fmt(e->g->fmt) ? X->p_gu_bd : X->p_gu;
+            if (want != gv) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, want); gv = want; }
             uint32_t dyn[2] = {(uint32_t)off[3 * c], (uint32_t)off[3 * c + 1]};
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl6, 0, 1, &e->s_gu, 2, dyn);
             struct PCGU pc = {e->g->fmt, rows[c], D, I, e->g->rowWords, e->g->gs, X->limit, X->act, X->a, X->b};
@@ -4592,7 +4620,7 @@ static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQuer
             const ColiVkExpert *e = ex[c];
             int k = route[c], gemm = k >= 0;
             int bm = 8, bn = 1;
-            VkPipeline pipe = gemm ? xb_mm_pipeline(X, e->d, rows[c], k, &bm, &bn, &cooperative) : X->p_mv;
+            VkPipeline pipe = gemm ? xb_mm_pipeline(X, e->d, rows[c], k, &bm, &bn, &cooperative) : bd_fmt(e->d->fmt) ? X->p_mv_bd : X->p_mv;
             if (pipe != bound) { vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe); bound = pipe; }
             uint32_t dyn[2] = {(uint32_t)off[3 * c + 1], (uint32_t)off[3 * c + 2]};
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl4, 0, 1, &e->s_dn, 2, dyn);
@@ -5052,6 +5080,10 @@ static void xb_shutdown(XbCtx *X) {
     if (X->sh_gu) vkDestroyShaderModule(X->dev, X->sh_gu, NULL);
     if (X->sh_mv) vkDestroyShaderModule(X->dev, X->sh_mv, NULL);
     if (X->sh_mm) vkDestroyShaderModule(X->dev, X->sh_mm, NULL);
+    if (X->p_gu_bd) vkDestroyPipeline(X->dev, X->p_gu_bd, NULL);
+    if (X->p_mv_bd) vkDestroyPipeline(X->dev, X->p_mv_bd, NULL);
+    if (X->sh_gu_bd) vkDestroyShaderModule(X->dev, X->sh_gu_bd, NULL);
+    if (X->sh_mv_bd) vkDestroyShaderModule(X->dev, X->sh_mv_bd, NULL);
     for (int k = 0; k < VK_COOP_SLOTS; k++) if (X->p_coop[k]) vkDestroyPipeline(X->dev, X->p_coop[k], NULL);
     if (X->sh_coop) vkDestroyShaderModule(X->dev, X->sh_coop, NULL);
     if (X->pl6) vkDestroyPipelineLayout(X->dev, X->pl6, NULL);
@@ -5171,7 +5203,7 @@ int coli_vk_tensor_refill_as(ColiVkTensor *t, int fmt, int I, int O, int gs,
 int coli_vk_staged(void) { return G.ready && g_up[0].on; }
 size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); }
 /* elements per block of a block format (shaders/blockdec.glsl), 0 for any other format */
-int coli_vk_block_elems(int fmt) { return !bd_fmt(fmt) ? 0 : fmt == 203 ? 64 : fmt >= 200 ? 128 : (int)BD_BLK[fmt - 100]; }
+int coli_vk_block_elems(int fmt) { return !bd_fmt(fmt) || !bd_shaders() ? 0 : fmt == 203 ? 64 : fmt >= 200 ? 128 : (int)BD_BLK[fmt - 100]; }
 /* vq2's codebooks (two 256 x 8 int8, row-major) into the table buffer. The table is built
  * once, at the first block-format tensor: call this before (the tier's start); -1 when a
  * table is already on a device with other books. */

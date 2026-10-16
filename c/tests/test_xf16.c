@@ -3,7 +3,7 @@
  *   test_xf16             pack then unpack gives the planar codes and the scales back; xf_act32
  *                         against xf_act32_ref to the byte; the kernel against xf16_ref (its
  *                         numerics) to the bit for 1..19 activation rows, each row from its own
- *                         pointer; its gap to xf_dot_f32 (f32 activations, the reference
+ *                         pointer, and xf_dot_a32 (the same numbers on a planar row) too; its gap to xf_dot_f32 (f32 activations, the reference
  *                         of the rows) no wider than xf_dot_i8's (one int8 scale a row, the
  *                         engines' default before), measured as the worst output over the
  *                         outputs' rms. Exit 0 on a build without AVX2.
@@ -25,7 +25,7 @@ static inline uint32_t rnd(void) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 int main(int argc, char **argv) {
     if (argc < 2 || strcmp(argv[1], "bench")) {
-        int bad = 0, n = 0, trip = 0, actbad = 0; double worst = 0, worst_i8 = 0;
+        int bad = 0, n = 0, trip = 0, actbad = 0, a32bad = 0; double worst = 0, worst_i8 = 0;
         for (int I = 64; I <= 2560; I += I < 512 ? 192 : 1536) for (int S = 1; S <= 19; S += S < 9 ? 1 : 5) {
             const int R = 48, nb = I / XF_BLOCK; const size_t rb = xf_row_bytes(I), gb = xf16_group_bytes(I);
             uint8_t *w = malloc(rb * R), *g = malloc(gb * (R / 16)), *w2 = malloc(rb * R);
@@ -63,15 +63,18 @@ int main(int argc, char **argv) {
                 double e = fabs((double)f32[s * R + r] - y[s][r]) / rms; if (e > worst) worst = e;
                 double e8 = fabs((double)f32[s * R + r] - i8[s * R + r]) / rms; if (e8 > worst_i8) worst_i8 = e8;
                 if (memcmp(&ref[s * R + r], &y[s][r], 4)) diff = 1;
+                const float a = xf_dot_a32(w + r * rb, sc + r * nb, xq[s], dx[s], xs[s], I);
+                if (memcmp(&ref[s * R + r], &a, 4)) a32bad++;
             }
             free(q1); free(xsum); free(i8);
             n++; if (diff) { bad++; if (bad < 3) printf("  I=%d S=%d: %.9g against %.9g\n", I, S, y[0][0], ref[0]); }
             for (int s = 0; s < S; s++) { free(x[s]); free(dx[s]); free(xq[s]); free(xs[s]); free(y[s]); }
             free(x); free(dx); free(xq); free(xs); free(y); free(ref); free(f32); free(w); free(g); free(w2); free(sc); free(sc2);
         }
-        printf("int4-g64 x16: %d of %d cases differ from xf16_ref; round trip %s; activations %s; worst gap to xf_dot_f32 %.2e of the rms (xf_dot_i8 %.2e)\n",
-               bad, n, trip ? "BROKEN" : "exact", actbad ? "DIFFER from xf_act32_ref" : "as xf_act32_ref", worst, worst_i8);
-        const int fails = bad + trip + actbad + (worst > worst_i8);
+        printf("int4-g64 x16: %d of %d cases differ from xf16_ref; planar rows (xf_dot_a32): %d outputs differ; round trip %s; activations %s; "
+               "worst gap to xf_dot_f32 %.2e of the rms (xf_dot_i8 %.2e)\n",
+               bad, n, a32bad, trip ? "BROKEN" : "exact", actbad ? "DIFFER from xf_act32_ref" : "as xf_act32_ref", worst, worst_i8);
+        const int fails = bad + a32bad + trip + actbad + (worst > worst_i8);
         printf("test_xf16: %s\n", fails ? "FAILED" : "ok");
         return fails != 0;
     }

@@ -829,14 +829,16 @@ static int st_alloc(void) {
  * parallel, each expert into its own slot. */
 static int st_put(int layer, int eid, VStage *v, const VktExpertSrc *src, int par) {
     const int H = T.c.hidden, F = T.c.inter;
-    const __typeof__(T.form[0]) *fm = &T.form[form_of(layer)];   /* a slot takes each layer's form in turn */
+    /* the slots hold form 0; with forms by layer a slot takes each layer's in turn */
+    const __typeof__(T.form[0]) *fm = &T.form[T.per_layer ? form_of(layer) : 0];
     if (!src->g || !src->u || !src->d || (fm->gu_scales && (!src->gs || !src->us || !src->ds))) return 0;
     const uint8_t *codes[3] = {src->g, src->u, src->d}; const void *scs[3] = {src->gs, src->us, src->ds};
     for (int k = 0; k < 3; k++) {
         uint8_t *rows; size_t stride; float *sc;
         int I = k < 2 ? H : F, O = k < 2 ? F : H;
-        if (!coli_vk_tensor_refill_as(v->t[k], k < 2 ? fm->gu_fmt : fm->dn_fmt, I, O, k < 2 ? fm->gu_gs : fm->dn_gs,
-                                      &rows, &stride, &sc)) return 0;
+        if (!(T.per_layer ? coli_vk_tensor_refill_as(v->t[k], k < 2 ? fm->gu_fmt : fm->dn_fmt, I, O, k < 2 ? fm->gu_gs : fm->dn_gs,
+                                                     &rows, &stride, &sc)
+                          : coli_vk_tensor_refill(v->t[k], &rows, &stride, &sc))) return 0;
         convert_par(k < 2 ? fm->gu : fm->dn, I, O, codes[k], scs[k], rows, stride, sc, par);
     }
     (void)eid;

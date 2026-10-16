@@ -62,7 +62,7 @@ static void test_row(int I, int O) {
 static void naive_moe(float *out, const float *x, int S, int K, int H, int F, const int *idx, const float *val, const XfExpert *const *ex, int mode) {
     float *g = malloc(sizeof(float) * F), *u = malloc(sizeof(float) * F), *h = malloc(sizeof(float) * F), *y = malloc(sizeof(float) * H);
     int8_t *xq = malloc(H), *hq = malloc(F); float *xs = malloc(sizeof(float) * (H / 64)), *hs = malloc(sizeof(float) * (F / 64));
-    if (mode == XF_MODE_R16) {   /* xf16_ref on the planar rows, activations per 32 (xf_act32_ref) */
+    if (mode == XF_MODE_R16 || mode == XF_MODE_A32) {   /* xf16_ref on the planar rows, activations per 32 (xf_act32_ref) */
         float *dx = malloc(sizeof(float) * (H / 32)), *hdx = malloc(sizeof(float) * (F / 32));
         int32_t *x16 = malloc(sizeof(int32_t) * (H / 16)), *h16 = malloc(sizeof(int32_t) * (F / 16));
         for (int s = 0; s < S; s++) {
@@ -250,6 +250,10 @@ int main(void) {
     test_layer(90, 8, 512, 128, 12, XF_MODE_R16);
     test_layer(5, 4, 128, 192, 6, XF_MODE_R16);
     test_layer(3, 2, 64, 64, 2, XF_MODE_R16);
+    test_layer(1, 8, 2048, 512, 16, XF_MODE_A32);   /* the same numbers on planar experts */
+    test_layer(7, 8, 2048, 512, 12, XF_MODE_A32);
+    test_layer(90, 8, 512, 128, 12, XF_MODE_A32);
+    test_layer(5, 4, 128, 192, 6, XF_MODE_A32);
 #endif
     test_repack_bytes();   /* last: the tests above keep their random inputs */
     if (fails) { printf("%d failure(s)\n", fails); return 1; }

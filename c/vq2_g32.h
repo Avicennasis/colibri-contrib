@@ -28,6 +28,8 @@
 #ifndef COLI_VQ2_G32_H
 #define COLI_VQ2_G32_H
 
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "int2_g32.h"   /* x2_quant_act, x2_hsum8_scalar, X2_MAX_ROWS */
 
@@ -312,10 +314,11 @@ static void vq2r16_rows(float *y, int ystride, const Vq2Books *bk, const uint8_t
 #else
     typedef __m256i vq2r16_v;
 #endif
-    static __thread vq2r16_v *buf; static __thread int cap;
+    static __thread vq2r16_v *buf; static __thread void *raw; static __thread int cap;
     const int many = S > VQ2R16_SMAX, need = I / 32 * 8;
-    if (many && cap < need) {
-        free(buf); buf = (vq2r16_v *)aligned_alloc(64, (size_t)need * sizeof(vq2r16_v)); cap = buf ? need : 0;
+    if (many && cap < need) {   /* aligned by hand: Windows' C library has no aligned_alloc */
+        free(raw); raw = malloc((size_t)need * sizeof(vq2r16_v) + 63);
+        buf = raw ? (vq2r16_v *)(((uintptr_t)raw + 63) & ~(uintptr_t)63) : NULL; cap = buf ? need : 0;
         if (!buf) { fprintf(stderr, "OOM vq2 rows\n"); exit(1); }
     }
 #if VQ2R16_SMAX == 8

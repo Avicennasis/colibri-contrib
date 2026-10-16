@@ -14,7 +14,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError as exc:   # the CI's Python tests run without numpy
+    raise unittest.SkipTest("numpy not installed: %s" % exc)
 
 HERE = Path(__file__).resolve().parent.parent
 # GQ_TEST_BIN_DIR / GQ_TEST_WRAP run the same checks on another build, e.g. an

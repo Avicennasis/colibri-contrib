@@ -480,6 +480,36 @@ static inline void xf_act32_block(const float *v, int8_t *q, float *d, int32_t *
 static inline void xf_act32(const float *x, int I, int8_t *xq, float *dx, int32_t *xs) {
     for (int b = 0; b < I / 32; b++) xf_act32_block(x + b * 32, xq + b * 32, dx + b, xs + 2 * b);
 }
+/* xf16_ref's numbers on a planar row (XF_MODE_A32, for slots a device reads as rows):
+ * against one activation row (xf_act32's codes, scales and sums per 16), the unsigned dot
+ * of each half on 8 int32 lanes, four blocks' eight sums reduced at once, then xf16_ref's
+ * float steps in its order */
+static inline float xf_dot_a32(const uint8_t *w, const float *sc, const int8_t *xq, const float *dx, const int32_t *xs, int I) {
+    const __m256i m4 = _mm256_set1_epi8(0x0F), z = _mm256_setzero_si256();
+    const int nb = I / XF_BLOCK;
+    float acc = 0.f;
+    for (int b0 = 0; b0 < nb; b0 += 4) {
+        const int nj = nb - b0 < 4 ? nb - b0 : 4;
+        __m256i v[8];
+        for (int j = 0; j < 4; j++) {
+            if (j >= nj) { v[2 * j] = v[2 * j + 1] = z; continue; }
+            const __m256i bb = _mm256_loadu_si256((const __m256i *)(w + (size_t)(b0 + j) * XF_BLOCK_BYTES));
+            const int8_t *xb = xq + (size_t)(b0 + j) * XF_BLOCK;
+            v[2 * j]     = xf_dpbusd(z, _mm256_and_si256(bb, m4), _mm256_loadu_si256((const __m256i *)xb));
+            v[2 * j + 1] = xf_dpbusd(z, _mm256_and_si256(_mm256_srli_epi16(bb, 4), m4), _mm256_loadu_si256((const __m256i *)(xb + 32)));
+        }
+        const __m256i h0 = _mm256_hadd_epi32(_mm256_hadd_epi32(v[0], v[1]), _mm256_hadd_epi32(v[2], v[3]));
+        const __m256i h1 = _mm256_hadd_epi32(_mm256_hadd_epi32(v[4], v[5]), _mm256_hadd_epi32(v[6], v[7]));
+        int32_t p[8];
+        _mm256_storeu_si256((__m256i *)p, _mm256_add_epi32(_mm256_permute2x128_si256(h0, h1, 0x20), _mm256_permute2x128_si256(h0, h1, 0x31)));
+        for (int j = 0; j < nj; j++) {
+            const int b = b0 + j; const int32_t *x16 = xs + 4 * (size_t)b;
+            const int32_t p0 = p[2 * j] - 8 * (x16[0] + x16[1]), p1 = p[2 * j + 1] - 8 * (x16[2] + x16[3]);
+            acc = fmaf(fmaf((float)p1, dx[2 * b + 1], (float)p0 * dx[2 * b]), sc[b], acc);
+        }
+    }
+    return acc;
+}
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
 /* the 16 rows of a group against S <= 8 activation rows: y[s][o .. o + 15] */
 static inline __attribute__((always_inline)) void xf16_body512(float *const *y, int o, const uint8_t *grp, const int8_t *const *xq,
@@ -665,13 +695,16 @@ static inline int xf_rows_fit(const int *idx, int s0, int S, int K, int cap, int
 }
 
 /* mode XF_MODE_R16: the experts' matrices in xf16 groups (XfExpert g4/u4/d4 the groups,
- * the scales inside them), the activations per 32 (xf_act32). Made only where XF16_ON. */
+ * the scales inside them), the activations per 32 (xf_act32). XF_MODE_A32: the same
+ * numbers on planar experts (xf_dot_a32), for slots a device reads as rows. Made only
+ * where XF16_ON. */
 #define XF_MODE_R16 2
+#define XF_MODE_A32 3
 #ifdef XF16_ON
 /* xf_moe_compute's work in that mode: the same (expert, row chunk) items, rows by 16, each
  * expert's routed rows handed to the kernel as pointers (no gather) */
 static inline float *xf_moe_compute_r16(float *ctb_out, const float *x, int S, int K, int H, int F,
-                                        const int *idx, const XfExpert *const *experts, void *scratch) {
+                                        const int *idx, const XfExpert *const *experts, void *scratch, int planar) {
     const size_t n = (size_t)S * K;
     char *p = (char *)scratch;
 #define XF_TAKE(T, count) ((T *)p); p += (((size_t)(count) * sizeof(T)) + 63) & ~(size_t)63
@@ -733,10 +766,17 @@ static inline float *xf_moe_compute_r16(float *ctb_out, const float *x, int S, i
                 yg[j] = g + (size_t)i * F; yu[j] = u + (size_t)i * F;
                 xp[j] = xq + (size_t)s * H; dp[j] = xdx + (size_t)s * (H / 32); sp[j] = xxs + (size_t)s * (H / 16);
             }
-            for (int o = r0; o < r1; o += 16) {
-                xf16_rows(yg, o, ex->g4 + (size_t)(o / 16) * gbH, xp, dp, sp, H, m);
-                xf16_rows(yu, o, ex->u4 + (size_t)(o / 16) * gbH, xp, dp, sp, H, m);
-            }
+            if (planar)
+                for (int o = r0; o < r1; o++) {
+                    const uint8_t *wg = ex->g4 + (size_t)o * xf_row_bytes(H), *wu = ex->u4 + (size_t)o * xf_row_bytes(H);
+                    const float *sg = ex->gs + (size_t)o * (H / XF_BLOCK), *su = ex->us + (size_t)o * (H / XF_BLOCK);
+                    for (int j = 0; j < m; j++) { yg[j][o] = xf_dot_a32(wg, sg, xp[j], dp[j], sp[j], H); yu[j][o] = xf_dot_a32(wu, su, xp[j], dp[j], sp[j], H); }
+                }
+            else
+                for (int o = r0; o < r1; o += 16) {
+                    xf16_rows(yg, o, ex->g4 + (size_t)(o / 16) * gbH, xp, dp, sp, H, m);
+                    xf16_rows(yu, o, ex->u4 + (size_t)(o / 16) * gbH, xp, dp, sp, H, m);
+                }
         }
     }
     /* hidden rows, quantized once per pair */
@@ -759,7 +799,13 @@ static inline float *xf_moe_compute_r16(float *ctb_out, const float *x, int S, i
                 const int i = ord[j0 + j];
                 yd[j] = ctb + (size_t)i * H; xp[j] = hq + (size_t)i * F; dp[j] = hdx + (size_t)i * (F / 32); sp[j] = hxs + (size_t)i * (F / 16);
             }
-            for (int o = r0; o < r1; o += 16) xf16_rows(yd, o, ex->d4 + (size_t)(o / 16) * gbF, xp, dp, sp, F, m);
+            if (planar)
+                for (int o = r0; o < r1; o++) {
+                    const uint8_t *wd = ex->d4 + (size_t)o * xf_row_bytes(F); const float *sd = ex->ds + (size_t)o * (F / XF_BLOCK);
+                    for (int j = 0; j < m; j++) yd[j][o] = xf_dot_a32(wd, sd, xp[j], dp[j], sp[j], F);
+                }
+            else
+                for (int o = r0; o < r1; o += 16) xf16_rows(yd, o, ex->d4 + (size_t)(o / 16) * gbF, xp, dp, sp, F, m);
         }
     }
 #undef XF16_PAIRS
@@ -775,7 +821,7 @@ static inline float *xf_moe_compute(float *ctb_out, const float *x, int S, int K
                                     const int *idx, const XfExpert *const *experts,
                                     int mode, void *scratch) {
 #ifdef XF16_ON
-    if (mode == XF_MODE_R16) return xf_moe_compute_r16(ctb_out, x, S, K, H, F, idx, experts, scratch);
+    if (mode == XF_MODE_R16 || mode == XF_MODE_A32) return xf_moe_compute_r16(ctb_out, x, S, K, H, F, idx, experts, scratch, mode == XF_MODE_A32);
 #endif
     const size_t n = (size_t)S * K;
     char *p = (char *)scratch;

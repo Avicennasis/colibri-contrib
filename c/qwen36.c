@@ -1381,24 +1381,32 @@ static int xf_mode(Model *m) {
     if (v) fprintf(stderr, "[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack\n");
     return v;
 }
-/* The int4 experts held as rows interleaved by 16 for the CPU (expert_ffn.h xf16_*,
- * XF_MODE_R16: activations per 32, exact integer sums per 32, one fma per 64): on an
- * AVX2 build with the shared kernel in its integer mode and no CUDA expert tier.
- * QWEN_EXPERT_ACT=f32 (the pair kernels' bits) and Q36_ILV16=0 keep the rows. */
-static int xf_r16(Model *m) {
+/* The int4 experts' numbers: activations per 32, exact integer sums per 32, one fma per
+ * 64 (expert_ffn.h xf16_ref), on an AVX2 build with the shared kernel in its integer
+ * mode. QWEN_EXPERT_ACT=f32 (the pair kernels' bits) and Q36_ILV16=0 keep the rows'
+ * per-row int8 numbers. */
+static int xf_a32(Model *m) {
 #ifdef XF16_ON
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("Q36_ILV16");
-        v = !(e && !strcmp(e, "0")) && xf_mode(m) && xf_act_mode() == 1 && m->c.hidden % 16 == 0 && m->c.inter % 16 == 0 &&
-            !(qt_ready() && qt_experts_on());   /* the CUDA expert tier uploads the planar slots (tier_offer_slot, tier_src); decided at the first expert, after qt_init */
+        v = !(e && !strcmp(e, "0")) && xf_mode(m) && xf_act_mode() == 1 && m->c.hidden % 16 == 0 && m->c.inter % 16 == 0;
     }
     return v;
 #else
     (void)m; return 0;
 #endif
 }
-static int xf_run_mode(Model *m) { return xf_r16(m) ? XF_MODE_R16 : xf_act_mode(); }
+/* Those numbers held as rows interleaved by 16 for the CPU (xf16_*, XF_MODE_R16), unless
+ * the CUDA expert tier reads the slots: it keeps pointers to their planar rows (qt_note,
+ * tier_src), and the CPU then takes the same numbers from them (XF_MODE_A32), so a CUDA
+ * build computes what a CPU build does. Decided at the first expert, after qt_init. */
+static int xf_r16(Model *m) {
+    static int v = -1;
+    if (v < 0) v = xf_a32(m) && !(qt_ready() && qt_experts_on());
+    return v;
+}
+static int xf_run_mode(Model *m) { return xf_r16(m) ? XF_MODE_R16 : xf_a32(m) ? XF_MODE_A32 : xf_act_mode(); }
 
 /* The single offer decision the decode path makes for a routed expert: offer
  * whichever format the container actually packed, exactly what tier_warmstart
@@ -4024,7 +4032,6 @@ static void qt_cpu_misses(Model *m, int layer, const float *xs, const int *idx, 
     Cfg *c = &m->c; int D = c->hidden, K = c->topk, I = c->inter;
     if (xf_mode(m)) {
         int per = m->cache[layer].cap >= K ? K : 1;
-        int64_t gp = (int64_t)I * D / 2;
         XfExpert ex[32]; const XfExpert *exp[32]; int ridx[32]; float rval[32]; Slot *held[32];
         void *scratch = malloc(xf_moe_scratch_bytes(1, per, D, I));
         if (!scratch) { fprintf(stderr, "OOM qt_cpu_misses\n"); exit(1); }
@@ -4036,10 +4043,10 @@ static void qt_cpu_misses(Model *m, int layer, const float *xs, const int *idx, 
                 if (idx[kk] < 0 || (mask & (1u << kk))) continue;
                 Slot *e = held[j] = expert_hold(m, layer, idx[kk]);
                 tier_offer_slot(layer, idx[kk], e);
-                ex[j] = (XfExpert){e->pw, e->pw + gp, e->pw + 2 * gp, e->gs, e->us, e->ds};
+                ex[j] = xf_slot_expert(m, e);
                 exp[j] = &ex[j]; ridx[j] = idx[kk]; rval[j] = val[kk]; any = 1;
             }
-            if (any) xf_moe_add(os, xs, 1, n, D, I, ridx, rval, exp, xf_act_mode(), scratch);
+            if (any) xf_moe_add(os, xs, 1, n, D, I, ridx, rval, exp, xf_run_mode(m), scratch);
             for (int j = 0; j < n; j++) if (held[j]) slot_release(held[j]);
         }
         free(scratch);

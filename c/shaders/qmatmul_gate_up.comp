@@ -19,13 +19,11 @@
 //      g * sigmoid(g) * u as its CPU computes it (act_v4 below); the route weight,
 //      bf16 and E4M3 rounding that follow run in expert_act_v4.comp
 #extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer X  { float x[]; };
 layout(std430, binding = 1) readonly buffer WG { uint  wg[]; };   // gate weights
 layout(std430, binding = 2) readonly buffer SG { float gscale[]; };
-layout(std430, binding = 2) readonly buffer SGT { uint bdtab[]; };   // a block format: blockdec_table.h's table (gate and up alike)
 layout(std430, binding = 3) readonly buffer WU { uint  wu[]; };   // up weights
 layout(std430, binding = 4) readonly buffer SU { float uscale[]; };
 layout(std430, binding = 5) writeonly buffer H { float hid[]; };
@@ -45,19 +43,6 @@ bool staged;
 int xoff;
 
 float xv(int i) { return staged ? xsh[i] : x[xoff + i]; }
-
-// block formats (fmt >= 100: ggml types, colibri's low-bit experts), shaders/blockdec.glsl:
-// one instance per weight buffer
-#define BD_X(i) xv(int(i))
-#define BD_G(i) bdtab[i]
-#define BD_P gg_
-#define BD_W(i) wg[i]
-#include "blockdec.glsl"
-#undef BD_P
-#undef BD_W
-#define BD_P gu_
-#define BD_W(i) wu[i]
-#include "blockdec.glsl"
 float i8(uint w, int l) { int b = int((w >> (uint(l) * 8u)) & 0xffu); if (b >= 128) b -= 256; return float(b); }
 float i4(uint w, int l) { return float(int((w >> (uint(l) * 4u)) & 0xfu) - 8); }
 float mx4(uint w, int l) {
@@ -186,12 +171,6 @@ void main() {
                     float b = xv(i0 + 1);
                     g += b * uintBitsToFloat(gp & 0xffff0000u); u += b * uintBitsToFloat(upk & 0xffff0000u);
                 }
-            }
-        } else if (p.fmt >= 100) { // block formats: the scales are in the rows (blockdec.glsl)
-            uint units = uint(p.I) >> 5;
-            for (uint un = uint(lane); un < units; un += uint(sgsize)) {
-                g += gg_unit(p.fmt, rb * 4u, un, uint(p.I));
-                u += gu_unit(p.fmt, rb * 4u, un, uint(p.I));
             }
         } else { // int4, per-row scale
             int words = (p.I + 7) / 8;
