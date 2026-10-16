@@ -898,7 +898,8 @@ typedef struct {
 typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng;
                  void *vk; int vk_off; uint16_t *h;
                  char *vk_name; const char *vk_tag; int vk_quant, vk_fmt, vk_gone, vk_imported;
-                 uint8_t *gq; int gq_type; float gs; } QW;
+                 uint8_t *gq; int gq_type; float gs;
+                 int q8r16; } QW;   /* q8r16: q's rows interleaved by 16 (idot.h i8r16_*, q36_trunk_q8_interleave) */
 static void qw_free(QW *w) {
 #ifdef COLI_VULKAN
     if (w->vk) coli_vk_tensor_free((ColiVkTensor *)w->vk);
@@ -1371,6 +1372,23 @@ static int xf_mode(Model *m) {
     if (v) fprintf(stderr, "[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack\n");
     return v;
 }
+/* The int4 experts held as rows interleaved by 16 for the CPU (expert_ffn.h xf16_*,
+ * XF_MODE_R16: activations per 32, exact integer sums per 32, one fma per 64): on an
+ * AVX2 build with the shared kernel in its integer mode. QWEN_EXPERT_ACT=f32 (the pair
+ * kernels' bits) and Q36_ILV16=0 keep the rows. */
+static int xf_r16(Model *m) {
+#ifdef XF16_ON
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("Q36_ILV16");
+        v = !(e && !strcmp(e, "0")) && xf_mode(m) && xf_act_mode() == 1 && m->c.hidden % 16 == 0 && m->c.inter % 16 == 0;
+    }
+    return v;
+#else
+    (void)m; return 0;
+#endif
+}
+static int xf_run_mode(Model *m) { return xf_r16(m) ? XF_MODE_R16 : xf_act_mode(); }
 
 /* The single offer decision the decode path makes for a routed expert: offer
  * whichever format the container actually packed, exactly what tier_warmstart
@@ -1779,11 +1797,21 @@ static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O)
                 for (int s = 0; s < S; s++)
                     sx[s] = dense_act_i8(x + (int64_t)s * I, I, xq + (int64_t)s * I, xsg ? xsg + (int64_t)s * ng : NULL);
                 if (w->q4) matmul_i4p_grouped_idot(y, xq, sx, xsg, w->q4, w->sg, S, I, O, 64);
+#ifdef IDOT_R16
+                else if (w->q8r16) {   /* interleaved rows: 128 * each activation row's sum comes off */
+                    int32_t xsum[64], *xs = S <= 64 ? xsum : malloc((size_t)S * sizeof(int32_t));
+                    if (!xs) { fprintf(stderr, "OOM activation quantization\n"); exit(1); }
+                    for (int s = 0; s < S; s++) { int32_t t = 0; const int8_t *r = xq + (int64_t)s * I; for (int i = 0; i < I; i++) t += r[i]; xs[s] = t; }
+                    matmul_q_idot_r16(y, xq, sx, xs, w->q, w->sc, S, I, O);
+                    if (xs != xsum) free(xs);
+                }
+#endif
                 else       matmul_q_idot(y, xq, sx, w->q, w->sc, S, I, O);
                 free(xq); free(sx); free(xsg);
                 return;
             }
             free(xq); free(sx); free(xsg);      /* out of memory: the f32 path below */
+            if (w->q8r16) { fprintf(stderr, "OOM activation quantization\n"); exit(1); }   /* the f32 kernels read rows */
             if (!w->q) { fprintf(stderr, "OOM in the int4 dense GEMV (no int8 copy to fall back on)\n"); exit(1); }
         }
         if (S > 1 && dense_batch_on())
@@ -1793,6 +1821,45 @@ static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O)
         return;
     }
     matmul(y, x, w->w, S, I, O);
+}
+/* The trunk's int8 rows interleaved by 16 for the CPU's kernel (idot.h matmul_q_idot_r16):
+ * the same bytes and the same bits, a prompt's rows about twice as fast. In place, a group
+ * of 16 rows at a time (a group's rows and its interleaved form are the same byte range).
+ * Only matrices the integer path reads from q (no int4 or f16 copy), and only when no
+ * device reads them: main() skips it under the CUDA tier or a Vulkan device. Q36_ILV16=0
+ * keeps the rows, as COLI_DENSE_IDOT=0 does (its f32 kernels read rows). */
+#ifdef IDOT_R16
+static int q36_q8_interleave_one(QW *w) {
+    if (!w->q || w->q8r16 || w->q4 || w->h || w->gq || w->O % 16 || w->I % 4) return 0;
+    const int I = w->I;
+    #pragma omp parallel
+    {
+        int8_t *t = malloc((size_t)16 * I);
+        if (!t) { fprintf(stderr, "OOM trunk interleave\n"); exit(1); }
+        #pragma omp for schedule(static)
+        for (int g = 0; g < w->O / 16; g++) {
+            int8_t *grp = w->q + (size_t)g * 16 * I;
+            i8r16_pack(t, grp, 16, I); memcpy(grp, t, (size_t)16 * I);
+        }
+        free(t);
+    }
+    w->q8r16 = 1;
+    return 1;
+}
+#endif
+static void q36_trunk_q8_interleave(Model *m) {
+    (void)m;
+#ifdef IDOT_R16
+    const char *e = getenv("Q36_ILV16"); if ((e && !strcmp(e, "0")) || !dense_idot_on()) return;
+    double t0 = now_s();
+    int n = q36_q8_interleave_one(&m->lm_head);
+    for (int i = 0; i < m->c.n_layers; i++) {
+        Layer *l = &m->L[i];
+        QW *ws[] = {&l->q, &l->k, &l->v, &l->o, &l->gate, &l->sh_g, &l->sh_u, &l->sh_d, &l->dn_qkv, &l->dn_z, &l->dn_out};
+        for (size_t k = 0; k < sizeof ws / sizeof ws[0]; k++) n += q36_q8_interleave_one(ws[k]);
+    }
+    if (n) fprintf(stderr, "[qwen36] trunk: %d int8 matrices interleaved by 16 for the CPU in %.2fs (Q36_ILV16=0 keeps the rows)\n", n, now_s() - t0);
+#endif
 }
 /* A dense matrix the tier placed in VRAM (handle+1 kept in the Layer, 0 = CPU):
  * a device matmul, or 0 and the caller runs matmul_d as before. The
@@ -3009,6 +3076,13 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
     int64_t nd = (int64_t)c->hidden * c->inter;
     if (xf_mode(m)) {
         /* half the bytes of the int8 block: the int4 stays packed */
+        if (xf_r16(m)) {   /* codes and scales together in xf16 groups: the same bytes, no scale arrays */
+            s->pw = malloc((size_t)(ng + ng + nd) / 2 + (size_t)(2 * scale_count_gu(c) + scale_count_d(c)) * sizeof(float));
+            if (!s->pw) { fprintf(stderr, "Error: OOM allocating slot weights\n"); exit(1); }
+            s->gs = s->us = s->ds = NULL;
+            s->pinned = 0; s->is_int4 = 1; s->g = s->u = s->d = NULL; s->g4 = s->u4 = s->d4 = NULL;
+            return;
+        }
         s->pw = malloc((size_t)(ng + ng + nd) / 2);
         if (!s->pw) { fprintf(stderr, "Error: OOM allocating slot weights\n"); exit(1); }
         float *s_block = falloc(2*scale_count_gu(c) + scale_count_d(c));
@@ -3172,10 +3246,41 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     }
     if (tw->nbytes == want_w / 2) {
         static int noted = 0;
-        if (!noted) { fprintf(stderr, "[qwen36] int4 packed weights detected — %s\n", s->pw ? "kept int4, repacked planar for expert_ffn.h" : "unpacking to int8 in slot"); noted = 1; }
+        if (!noted) { fprintf(stderr, "[qwen36] int4 packed weights detected — %s\n", s->pw ? (xf_r16(m) ? "kept int4, rows interleaved by 16 for expert_ffn.h (Q36_ILV16=0 keeps the rows)" : "kept int4, repacked planar for expert_ffn.h") : "unpacking to int8 in slot"); noted = 1; }
         uint8_t *raw = (uint8_t *)malloc((size_t)(want_w / 2));
         if (!raw) { fprintf(stderr, "OOM reading int4 expert %s\n", nm); exit(1); }
         st_read_raw(&m->S, nm, raw, 1);
+        if (s->pw && xf_r16(m)) {
+            /* shared kernel, rows interleaved by 16: pairs -> planar beside, then the slot's
+             * groups with the scales, on the threads unless the caller already runs on them */
+            const int H = cc->hidden, I = cc->inter, ngI = I / 16, ngH = H / 16;
+            const int64_t gp = ng / 2, scu = scale_count_gu(cc), nsc = 2 * scu + scale_count_d(cc);
+            const size_t gbH = xf16_group_bytes(H), gbI = xf16_group_bytes(I);
+            static __thread uint8_t *pl; static __thread float *scb; static __thread int64_t pcap;
+            if (pcap < 3 * gp + nsc) {
+                free(pl); free(scb); pl = malloc((size_t)(3 * gp)); scb = malloc((size_t)nsc * sizeof(float));
+                if (!pl || !scb) { fprintf(stderr, "OOM reading int4 expert %s\n", nm); exit(1); }
+                pcap = 3 * gp + nsc;
+            }
+            xf_repack_pairs_signed(pl,          raw,          I, H);
+            xf_repack_pairs_signed(pl + gp,     raw + gp,     I, H);
+            xf_repack_pairs_signed(pl + 2 * gp, raw + 2 * gp, H, I);
+            free(raw);
+            st_read_f32(&m->S, qsnm, scb, 0);
+            const uint8_t *plw = pl; const float *scw = scb; uint8_t *dst = s->pw;
+            #pragma omp parallel for schedule(static) if (!omp_in_parallel())
+            for (int j = 0; j < 2 * ngI + ngH; j++) {
+                if (j < 2 * ngI) {
+                    const int k = j / ngI, g = j % ngI;
+                    xf16_pack(dst + (size_t)(k * ngI + g) * gbH, plw + k * gp + (size_t)g * 16 * (H / 2), scw + k * scu + (size_t)g * 16 * (H / 64), 16, H);
+                } else {
+                    const int g = j - 2 * ngI;
+                    xf16_pack(dst + (size_t)2 * ngI * gbH + (size_t)g * gbI, plw + 2 * gp + (size_t)g * 16 * (I / 2), scw + 2 * scu + (size_t)g * 16 * (I / 64), 16, I);
+                }
+            }
+            s->is_int4 = 1;
+            return;
+        }
         if (s->pw) {
             /* shared kernel: pairs -> planar, never int8 */
             int64_t gp = ng / 2;
@@ -3668,13 +3773,34 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
 /* MoE: grouped top-k routing (+ optional router bias) + shared expert.
  * Mirrors HF Qwen3 MoE: softmax(gate), optional group-limited top-k, normalized
  * weights, sum routed experts, then add the un-gated shared expert. */
+/* Whether every distinct expert of n routed pairs (want[i] set, or all when want is
+ * NULL) fits the layer's cache at once: then the whole batch is one run, each expert
+ * read once for all its rows. expert_fetch always finds a slot while fewer than cap
+ * are held, and the run's bits do not depend on the cut. */
+static int xf_batch_fits(Model *m, int layer, const int *idx, const uint8_t *want, int n) {
+    const int cap = m->cache[layer].cap, E = m->c.n_experts;
+    if (cap >= n) return 1;
+    uint8_t *seen = calloc((size_t)E, 1); int u = 0;
+    if (!seen) return 0;
+    for (int i = 0; i < n; i++) if (idx[i] >= 0 && idx[i] < E && (!want || want[i]) && !seen[idx[i]]) { seen[idx[i]] = 1; u++; }
+    free(seen);
+    return u <= cap;
+}
+/* A slot's expert as the shared kernel takes it: planar rows and scale arrays, or the
+ * xf16 groups (xf_r16) */
+static XfExpert xf_slot_expert(Model *m, const Slot *e) {
+    const int H = m->c.hidden, I = m->c.inter;
+    if (xf_r16(m)) { const size_t gu = (size_t)(I / 16) * xf16_group_bytes(H); return (XfExpert){e->pw, e->pw + gu, e->pw + 2 * gu, NULL, NULL, NULL}; }
+    const int64_t gp = (int64_t)I * H / 2;
+    return (XfExpert){e->pw, e->pw + gp, e->pw + 2 * gp, e->gs, e->us, e->ds};
+}
 /* One MoE layer through expert_ffn.h. The experts a run holds must all be
  * resident at once: each is held (expert_hold) until the kernel is done with
  * it, so neither the run's next load nor the PILOT worker can evict it, and
  * the batch is cut to what the layer cache can hold:
- * the whole prompt chunk when cap covers S*K slots, one token when it covers
- * K, one (token, expert) pair otherwise (cap=1 in CI evicts on every routed
- * expert). out starts at zero (moe) and every cut adds into it through the
+ * the whole prompt chunk when the cache holds all its distinct experts
+ * (xf_batch_fits), one token when it holds K, one (token, expert) pair
+ * otherwise (cap=1 in CI evicts on every routed expert). out starts at zero (moe) and every cut adds into it through the
  * one xf_moe_add call below, val*expert in rank order, so the three cuts
  * produce the same bits. A pair run used to go through a zeroed buffer and a
  * second add: two roundings where the fused multiply-add of an FMA build
@@ -3682,8 +3808,7 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
 static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
     Cfg *c = &m->c; int D = c->hidden, K = c->topk, F = c->inter;
     int cap = m->cache[layer].cap;
-    int64_t gp = (int64_t)F * D / 2;
-    int per = cap >= S * K ? S : 1;           /* tokens per run */
+    int per = xf_batch_fits(m, layer, idx, NULL, S * K) ? S : 1;   /* tokens per run */
     int kper = cap >= K ? K : 1;              /* experts per run */
     int n = per * kper;
     XfExpert *ex = malloc(sizeof(XfExpert) * (size_t)n);
@@ -3701,12 +3826,11 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
                 ridx[dst] = idx[src]; rval[dst] = val[src]; exp[dst] = NULL; held[dst] = NULL;
                 if (idx[src] < 0) continue;
                 Slot *e = held[dst] = expert_hold(m, layer, idx[src]);
-                ex[dst].g4 = e->pw; ex[dst].u4 = e->pw + gp; ex[dst].d4 = e->pw + 2 * gp;
-                ex[dst].gs = e->gs; ex[dst].us = e->us; ex[dst].ds = e->ds;
+                ex[dst] = xf_slot_expert(m, e);
                 exp[dst] = &ex[dst];
             }
             double t1 = timed ? tm_now() : 0;
-            xf_moe_add(out + (int64_t)s0 * D, x + (int64_t)s0 * D, per, kper, D, F, ridx, rval, exp, xf_act_mode(), scratch);
+            xf_moe_add(out + (int64_t)s0 * D, x + (int64_t)s0 * D, per, kper, D, F, ridx, rval, exp, xf_run_mode(m), scratch);
             if (timed) { double t2 = tm_now(); g_xf_load += t1 - t0; g_xf_run += t2 - t1; }
             for (int i = 0; i < n; i++) if (held[i]) slot_release(held[i]);
         }
@@ -3863,6 +3987,20 @@ static VktExpertSrc vk_slot_src(Model *m, int layer, Slot *e) {
     }
     if (e->pw) {
         int64_t gp = (int64_t)m->c.inter * m->c.hidden / 2;
+        if (xf_r16(m)) {   /* the device reads planar rows and scale arrays: back from the groups, once per expert */
+            const int H = m->c.hidden, I = m->c.inter; const int64_t scu = scale_count_gu(&m->c), nsc = 2 * scu + scale_count_d(&m->c);
+            const size_t gu = (size_t)(I / 16) * xf16_group_bytes(H);
+            if (!e->t8 && !(e->t8 = malloc((size_t)(3 * gp)))) { fprintf(stderr, "OOM int4 expert for the Vulkan tier\n"); exit(1); }
+            if (!e->t8s && !(e->t8s = malloc((size_t)nsc * sizeof(float)))) { fprintf(stderr, "OOM int4 expert for the Vulkan tier\n"); exit(1); }
+            uint8_t *b = (uint8_t *)e->t8;
+            if (e->t8_eid != e->eid + 1) {
+                xf16_unpack(b,          e->t8s,           e->pw,          I, H);
+                xf16_unpack(b + gp,     e->t8s + scu,     e->pw + gu,     I, H);
+                xf16_unpack(b + 2 * gp, e->t8s + 2 * scu, e->pw + 2 * gu, H, I);
+                e->t8_eid = e->eid + 1;
+            }
+            return (VktExpertSrc){b, b + gp, b + 2 * gp, e->t8s, e->t8s + scu, e->t8s + 2 * scu};
+        }
         return (VktExpertSrc){e->pw, e->pw + gp, e->pw + 2 * gp, e->gs, e->us, e->ds};
     }
     return (VktExpertSrc){e->g, e->u, e->d, e->gs, e->us, e->ds};
@@ -3873,8 +4011,7 @@ static void moe_vk_xf_cpu(Model *m, int layer, const float *x, int S, const int 
                           const uint8_t *want, float *ctb) {
     Cfg *c = &m->c; int D = c->hidden, K = c->topk, F = c->inter;
     int cap = m->cache[layer].cap;
-    int64_t gp = (int64_t)F * D / 2;
-    int per = cap >= S * K ? S : 1, kper = cap >= K ? K : 1, n = per * kper;
+    int per = xf_batch_fits(m, layer, idx, want, S * K) ? S : 1, kper = cap >= K ? K : 1, n = per * kper;
     XfExpert *ex = malloc(sizeof(XfExpert) * (size_t)n);
     const XfExpert **exp = malloc(sizeof(XfExpert *) * (size_t)n);
     int *ridx = malloc(sizeof(int) * (size_t)n); Slot **held = malloc(sizeof(Slot *) * (size_t)n);
@@ -3889,10 +4026,10 @@ static void moe_vk_xf_cpu(Model *m, int layer, const float *x, int S, const int 
                 ridx[dst] = -1; exp[dst] = NULL; held[dst] = NULL;
                 if (idx[src] < 0 || !want[src]) continue;
                 Slot *e = held[dst] = expert_hold(m, layer, idx[src]);
-                ex[dst] = (XfExpert){e->pw, e->pw + gp, e->pw + 2 * gp, e->gs, e->us, e->ds};
+                ex[dst] = xf_slot_expert(m, e);
                 exp[dst] = &ex[dst]; ridx[dst] = idx[src]; any = 1;
             }
-            if (any) xf_moe_compute(lctb, x + (int64_t)s0 * D, per, kper, D, F, ridx, exp, xf_act_mode(), scratch);
+            if (any) xf_moe_compute(lctb, x + (int64_t)s0 * D, per, kper, D, F, ridx, exp, xf_run_mode(m), scratch);
             for (int s = 0; s < per; s++) for (int k = 0; k < kper; k++) {
                 int src = (s0 + s) * K + (k0 + k), dst = s * kper + k;
                 if (!held[dst]) continue;
@@ -7364,6 +7501,13 @@ int main(int argc, char **argv) {
     if (g_vk_chain || g_q36c_fit_on) atexit(vkc_shutdown_all);   /* registered after the tier's: runs before the device goes */
 #endif
 
+    {   /* the trunk's int8 rows interleaved for the CPU, when no device reads them */
+        int dev = qt_ready();
+#ifdef COLI_VULKAN
+        dev = dev || g_vk_ready;
+#endif
+        if (!dev) q36_trunk_q8_interleave(&m);
+    }
     /* coli serve mode: speak the gateway wire protocol instead of argv
      * generation. AFTER the tier init: serve sessions ride the VRAM experts
      * exactly like argv runs, and serve_loop never returns. */

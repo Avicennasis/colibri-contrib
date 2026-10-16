@@ -658,6 +658,22 @@ static void q38_vk_report(void) {
             g_q38_vk_placed[0],g_q38_vk_placed[1],g_q38_vk_placed[2]);
 }
 #endif
+#ifdef XF16_ON
+/* rows [r0,r1) (whole groups) of an int4-g64 matrix held in xf16 groups, for n activation
+ * rows of ga (gq_act: the codes, scales per 32 and sums per 16 xf16_rows takes): y[a*ys + o] */
+static void q38_xf16_rows(float *y,int ys,const Q38Weight *w,const gq_act *ga,int r0,int r1,int n) {
+    const int I=w->cols;const size_t gb=xf16_group_bytes(I);
+    for(int a0=0;a0<n;a0+=64){
+        const int k=n-a0<64?n-a0:64;
+        float *yp[64];const int8_t *xp[64];const float *dp[64];const int32_t *sp[64];
+        for(int a=0;a<k;a++){
+            const int64_t r=a0+a;
+            yp[a]=y+r*ys;xp[a]=ga->q+r*I;dp[a]=ga->d+r*(I/32);sp[a]=ga->s+r*(I/16);
+        }
+        for(int o=r0;o<r1;o+=16)xf16_rows(yp,o,(const uint8_t*)w->data+(size_t)(o/16)*gb,xp,dp,sp,I,k);
+    }
+}
+#endif
 static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
                               int S,int I,int O) {
     /* Every CPU kernel below computes a row the same way whatever S is, so an
@@ -742,6 +758,15 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
         q38_matmul_bf16(y,x,(const uint16_t*)weight->data,S,I,O);
     else if(weight->kind==Q38_WEIGHT_FP8&&weight->scales)
         q38_matmul_fp8(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
+#ifdef XF16_ON
+    else if(weight->kind==Q38_WEIGHT_INT4G64&&weight->r16){   /* xf16 groups: int8 activations per 32 */
+        gq_act a; memset(&a,0,sizeof a);
+        if(gq_act_set(&a,x,S,I)){fprintf(stderr,"OOM int4 activation\n");exit(1);}
+        #pragma omp parallel for schedule(static)
+        for(int g=0;g<O/16;g++)q38_xf16_rows(y,O,weight,&a,16*g,16*g+16,S);
+        gq_act_free(&a);
+    }
+#endif
     else if(weight->kind==Q38_WEIGHT_INT4G64&&weight->scales)
         q38_matmul_int4g64(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
     else if(weight->kind==Q38_WEIGHT_INT2G32&&weight->scales&&weight->x2q){
@@ -2357,15 +2382,19 @@ static void q38_bind_int4_record(Model *m,Slot *slot,uint8_t *record) {
     }
 }
 
-/* int2/int3-g16 and vq2 experts held interleaved by 16 for the CPU (lowbit_g16.h xl16_*,
- * vq2_g32.h vq2r16_*): 1 for int2/int3-g16, 2 for vq2, 0 for the rows. A read slot, not a
- * mapped one, and every matrix whole groups (the experts' shapes are). Q38_ILV16=0 keeps
- * the rows. */
+/* int2/int3-g16, vq2 and int4-g64 experts held interleaved by 16 for the CPU (lowbit_g16.h
+ * xl16_*, vq2_g32.h vq2r16_*, expert_ffn.h xf16_*): 1 for int2/int3-g16, 2 for vq2, 3 for
+ * int4-g64, 0 for the rows. A read slot, not a mapped one, and every matrix whole groups (the
+ * experts' shapes are). Q38_ILV16=0 keeps the rows. */
 static int q38_lb_r16(const Model *m) {
     static int on=-1;
     if(on<0){const char *e=getenv("Q38_ILV16");on=!(e&&!strcmp(e,"0"));}
     const Q38Int4Experts *x=m->x4; const int H=m->c.hidden,F=m->c.inter;
-    if(!on||!x||!x->lb||H%16||F%16)return 0;
+    if(!on||!x||H%16||F%16)return 0;
+#ifdef XF16_ON
+    if(!x->lb&&H%XF_BLOCK==0&&F%XF_BLOCK==0)return 3;   /* int8 activations per 32 where the rows take f32 */
+#endif
+    if(!x->lb)return 0;
 #ifdef XL16_ON
     if(!x->lb->vq&&x->lb->gs==16&&H%128==0&&F%128==0)return 1;
 #endif
@@ -2392,7 +2421,7 @@ static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
         slot->int4_slab=replacement;slot->int4_slab_bytes=x->record_bytes;
     }
     const int lr=q38_lb_r16(m);
-    if(lr){   /* int2/int3-g16, vq2: read beside, interleave into the slot (each loader thread its buffer) */
+    if(lr){   /* int2/int3-g16, vq2, int4-g64: read beside, interleave into the slot (each loader thread its buffer) */
         static __thread uint8_t *raw; static __thread int64_t cap;
         if(cap<x->record_bytes){free(raw);raw=(uint8_t*)malloc((size_t)x->record_bytes);cap=raw?x->record_bytes:0;
                                 if(!raw){fprintf(stderr,"OOM int4 expert record\n");exit(1);}}
@@ -2406,6 +2435,9 @@ static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
 #endif
 #ifdef VQ2R16_ON
             if(lr==2){vq2r16_pack(o,(const uint8_t*)w->data,w->x2q,w->scales,w->rows,w->cols);gb=vq2r16_group_bytes(w->cols);}
+#endif
+#ifdef XF16_ON
+            if(lr==3){xf16_pack(o,(const uint8_t*)w->data,w->scales,w->rows,w->cols);gb=xf16_group_bytes(w->cols);}
 #endif
             w->data=o;w->x2q=NULL;w->scales=NULL;w->r16=1;
             o+=(size_t)(w->rows/16)*gb;
@@ -3792,6 +3824,22 @@ static VktExpertSrc q38_vk_src(Slot *ex) {
         return (VktExpertSrc){cd[0],cd[1],cd[2],bl[0],bl[1],bl[2]};
     }
 #endif
+#ifdef XF16_ON
+    if(ex->gate.kind==Q38_WEIGHT_INT4G64&&ex->gate.r16){
+        /* the interleaved slot back to the planar rows and their scales the tier reads, per
+         * matrix its codes then its scales, in one copy q38_vk_src_done frees */
+        const Q38Weight *w[3]={&ex->gate,&ex->up,&ex->down};size_t tot=0;
+        for(int k=0;k<3;k++)tot+=(size_t)w[k]->rows*(xf_row_bytes(w[k]->cols)+(size_t)xf_groups(w[k]->cols)*sizeof(float));
+        if(!ex->t8&&!(ex->t8=(int8_t*)malloc(tot))){fprintf(stderr,"OOM int4 expert for the Vulkan tier\n");exit(1);}
+        uint8_t *b=(uint8_t*)ex->t8;const void *cd[3],*sc[3];
+        for(int k=0;k<3;k++){
+            const size_t cbk=(size_t)w[k]->rows*xf_row_bytes(w[k]->cols);
+            xf16_unpack(b,(float*)(b+cbk),(const uint8_t*)w[k]->data,w[k]->rows,w[k]->cols);
+            cd[k]=b;sc[k]=b+cbk;b+=cbk+(size_t)w[k]->rows*xf_groups(w[k]->cols)*sizeof(float);
+        }
+        return (VktExpertSrc){cd[0],cd[1],cd[2],sc[0],sc[1],sc[2]};
+    }
+#endif
     if(ex->gate.kind==Q38_WEIGHT_INT2G32||ex->gate.kind==Q38_WEIGHT_LOWBIT16||ex->gate.kind==Q38_WEIGHT_VQ2){
         /* the low-bit forms (VKT_SRC_LB_*): codes, and per matrix its group scales (a byte
          * per 32 inputs, vq2 per 64) then its f32 row scales in one block, the copy freed by
@@ -4029,6 +4077,7 @@ enum { Q38_ROWS_NONE = 0, Q38_ROWS_F32 = 1, Q38_ROWS_X2 = 2, Q38_ROWS_GQ = 3 };
  * at all (GQ_EXACT=1's float path among them) */
 static int q38_rows_kind(const Q38Weight *w) {
     if(!w->data||w->q4||w->q8||w->gpu||w->act2)return Q38_ROWS_NONE;
+    if(w->kind==Q38_WEIGHT_INT4G64&&w->r16)return Q38_ROWS_GQ;   /* xf16 rows take gq_act */
     if(w->kind==Q38_WEIGHT_INT4G64&&w->scales)return Q38_ROWS_F32;
     if((w->kind==Q38_WEIGHT_LOWBIT16||(w->kind==Q38_WEIGHT_VQ2&&w->vqb))&&w->r16)return Q38_ROWS_GQ;   /* xl16 / vq2r16 rows take gq_act */
     if((w->kind==Q38_WEIGHT_INT2G32||w->kind==Q38_WEIGHT_LOWBIT16)&&w->scales&&w->x2q)return Q38_ROWS_X2;
@@ -4041,6 +4090,9 @@ static int q38_rows_kind(const Q38Weight *w) {
  * xq/dx the int8-per-32 ones ([n][I], [n][I/32]), ga the GGUF types' (n rows) */
 static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
                      const float *const *xr,const int8_t *xq,const float *dx,const gq_act *ga,int n) {
+#ifdef XF16_ON
+    if(w->kind==Q38_WEIGHT_INT4G64&&w->r16){q38_xf16_rows(y,ys,w,ga,r0,r1,n);return;}   /* whole groups, as below */
+#endif
 #ifdef XL16_ON
     if(w->kind==Q38_WEIGHT_LOWBIT16&&w->r16){   /* whole groups: the callers' blocks start and end on 16 */
         const size_t gb=xl16_group_bytes(w->lbits,I);

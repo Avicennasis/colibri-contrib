@@ -358,6 +358,202 @@ static inline void xf_dot_i8_rows(float *y, int ystride, const uint8_t *w, const
 #endif
 }
 
+/* ---- rows interleaved by 16 (xf16_*) ------------------------------------------
+ * The row kernels above keep a float lane sum per row, one fma per element (f32) or
+ * one per block (i8), and pay the nibble widening once per activation row: a
+ * prompt's rows cost as many passes as there are rows. Here 16 rows share a
+ * register (lane r = row r). A group of 16 rows holds, per 64 inputs (block b),
+ *   64 bytes   the 16 rows' f32 scales of b
+ *   512 bytes  words W = 0..7 of 64 bytes, row r's four bytes at 4r: bytes 4W..4W+3
+ *              of its planar block (low nibbles elements 4W..4W+3, high 32+4W..)
+ * so quad W of the 16 rows is one mask and quad 8+W a shift and a mask, each one
+ * vpdpbusd against the activation's broadcast quad. The same bytes as the rows
+ * and their scales.
+ * Activations: int8 per 32 with a scale per 32 and the sums per 16 (xf_act32: the
+ * GGUF kernels' gq_quant_act, byte for byte), not the i8 mode's one per row.
+ * Numerics: per 32 inputs the exact integer sum (u - 8) x, p0 and p1 for the two
+ * halves of a block, then y = fma(fma(p1, dx1, p0 * dx0), scale, y) block by
+ * block: xf16_ref, the bits of every SIMD path whatever S. */
+#define XF16_BLOCK_BYTES 576
+static inline size_t xf16_group_bytes(int I) { return (size_t)(I / XF_BLOCK) * XF16_BLOCK_BYTES; }
+/* rows (whole groups) of planar codes w [rows][I/2] and scales sc [rows][I/64] into dst */
+static void xf16_pack(uint8_t *dst, const uint8_t *w, const float *sc, int rows, int I) {
+    const size_t rb = xf_row_bytes(I); const int nb = I / XF_BLOCK;
+    for (int g = 0; g < rows / 16; g++)
+        for (int b = 0; b < nb; b++) {
+            uint8_t *o = dst + ((size_t)g * nb + b) * XF16_BLOCK_BYTES;
+            for (int r = 0; r < 16; r++) {
+                const uint8_t *blk = w + (size_t)(16 * g + r) * rb + (size_t)b * XF_BLOCK_BYTES;
+                memcpy(o + 4 * r, sc + (size_t)(16 * g + r) * nb + b, 4);
+                for (int W = 0; W < 8; W++) memcpy(o + 64 + 64 * W + 4 * r, blk + 4 * W, 4);
+            }
+        }
+}
+/* the inverse: planar codes and scales back from the groups */
+static void xf16_unpack(uint8_t *w, float *sc, const uint8_t *src, int rows, int I) {
+    const size_t rb = xf_row_bytes(I); const int nb = I / XF_BLOCK;
+    for (int g = 0; g < rows / 16; g++)
+        for (int b = 0; b < nb; b++) {
+            const uint8_t *o = src + ((size_t)g * nb + b) * XF16_BLOCK_BYTES;
+            for (int r = 0; r < 16; r++) {
+                uint8_t *blk = w + (size_t)(16 * g + r) * rb + (size_t)b * XF_BLOCK_BYTES;
+                memcpy(sc + (size_t)(16 * g + r) * nb + b, o + 4 * r, 4);
+                for (int W = 0; W < 8; W++) memcpy(blk + 4 * W, o + 64 + 64 * W + 4 * r, 4);
+            }
+        }
+}
+/* x[I] as int8 per 32: scale amax/127 per 32 (dx), the codes rounded as lrintf and
+ * clamped to +-127, the sums of every 16 codes (xs); ggml_quants.h's gq_quant_act */
+static inline void xf_act32_ref(const float *x, int I, int8_t *xq, float *dx, int32_t *xs) {
+    for (int b = 0; b < I / 32; b++) {
+        const float *v = x + b * 32; float amax = 0.f;
+        for (int i = 0; i < 32; i++) { float a = fabsf(v[i]); if (a > amax) amax = a; }
+        const float id = amax > 0.f ? 127.f / amax : 0.f;
+        dx[b] = amax / 127.f;
+        int32_t s0 = 0, s1 = 0;
+        for (int i = 0; i < 32; i++) {
+            int q = (int)lrintf(v[i] * id); if (q > 127) q = 127; if (q < -127) q = -127;
+            xq[b * 32 + i] = (int8_t)q; if (i < 16) s0 += q; else s1 += q;
+        }
+        xs[2 * b] = s0; xs[2 * b + 1] = s1;
+    }
+}
+/* row r of a group (rows at w, scales at sc as xf16_pack takes them) against one row */
+static inline float xf16_ref(const uint8_t *w, const float *sc, const int8_t *xq, const float *dx, int I) {
+    float acc = 0.f;
+    for (int b = 0; b < I / XF_BLOCK; b++) {
+        const uint8_t *blk = w + (size_t)b * XF_BLOCK_BYTES; const int8_t *xb = xq + (size_t)b * XF_BLOCK;
+        int32_t p0 = 0, p1 = 0;
+        for (int k = 0; k < 32; k++) { p0 += ((int)(blk[k] & 15) - 8) * xb[k]; p1 += ((int)(blk[k] >> 4) - 8) * xb[32 + k]; }
+        acc = fmaf(fmaf((float)p1, dx[2 * b + 1], (float)p0 * dx[2 * b]), sc[b], acc);
+    }
+    return acc;
+}
+#if defined(__AVX2__) && defined(__FMA__)
+#define XF16_ON 1   /* the interleaved form has kernels in this build: the engines may make it */
+static inline int32_t xf16_ld32(const int8_t *p) { int32_t v; memcpy(&v, p, 4); return v; }
+/* gq_quant_block_avx2's codes, scale and sums for a block of 32: its bits */
+static inline void xf_act32_block(const float *v, int8_t *q, float *d, int32_t *s16) {
+    const __m256 sign = _mm256_set1_ps(-0.f);
+    const __m256 v0 = _mm256_loadu_ps(v), v1 = _mm256_loadu_ps(v + 8), v2 = _mm256_loadu_ps(v + 16), v3 = _mm256_loadu_ps(v + 24);
+    const __m256 a = _mm256_max_ps(_mm256_max_ps(_mm256_andnot_ps(sign, v0), _mm256_andnot_ps(sign, v1)),
+                                   _mm256_max_ps(_mm256_andnot_ps(sign, v2), _mm256_andnot_ps(sign, v3)));
+    __m128 m = _mm_max_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
+    m = _mm_max_ps(m, _mm_movehl_ps(m, m)); m = _mm_max_ss(m, _mm_movehdup_ps(m));
+    const float amax = _mm_cvtss_f32(m);
+    const float id = amax > 0.f ? 127.f / amax : 0.f;
+    *d = amax / 127.f;
+    const __m256 idv = _mm256_set1_ps(id);
+    const __m256i lo = _mm256_set1_epi32(-127), hi = _mm256_set1_epi32(127);
+    const __m256i q0 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v0, idv)), lo), hi);
+    const __m256i q1 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v1, idv)), lo), hi);
+    const __m256i q2 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v2, idv)), lo), hi);
+    const __m256i q3 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v3, idv)), lo), hi);
+    const __m256i p = _mm256_packs_epi16(_mm256_packs_epi32(q0, q1), _mm256_packs_epi32(q2, q3));
+    _mm256_storeu_si256((__m256i *)q, _mm256_permutevar8x32_epi32(p, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7)));
+    __m256i t0 = _mm256_add_epi32(q0, q1), t1 = _mm256_add_epi32(q2, q3);
+    __m128i u0 = _mm_add_epi32(_mm256_castsi256_si128(t0), _mm256_extracti128_si256(t0, 1));
+    __m128i u1 = _mm_add_epi32(_mm256_castsi256_si128(t1), _mm256_extracti128_si256(t1, 1));
+    u0 = _mm_hadd_epi32(u0, u1); u0 = _mm_hadd_epi32(u0, u0);
+    s16[0] = _mm_cvtsi128_si32(u0); s16[1] = _mm_extract_epi32(u0, 1);
+}
+static inline void xf_act32(const float *x, int I, int8_t *xq, float *dx, int32_t *xs) {
+    for (int b = 0; b < I / 32; b++) xf_act32_block(x + b * 32, xq + b * 32, dx + b, xs + 2 * b);
+}
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+/* the 16 rows of a group against S <= 8 activation rows: y[s][o .. o + 15] */
+static inline __attribute__((always_inline)) void xf16_body512(float *const *y, int o, const uint8_t *grp, const int8_t *const *xq,
+                                                              const float *const *dx, const int32_t *const *xs, int I, const int S) {
+    const __m512i m4 = _mm512_set1_epi8(15);
+    __m512 acc[8];
+    for (int s = 0; s < S; s++) acc[s] = _mm512_setzero_ps();
+    for (int b = 0; b < I / XF_BLOCK; b++) {
+        const uint8_t *g = grp + (size_t)b * XF16_BLOCK_BYTES;
+        const __m512 sv = _mm512_loadu_ps((const float *)g);
+        __m512i lo[8], hi[8];
+        for (int W = 0; W < 8; W++) {
+            const __m512i v = _mm512_loadu_si512(g + 64 + 64 * W);
+            lo[W] = _mm512_and_si512(v, m4); hi[W] = _mm512_and_si512(_mm512_srli_epi16(v, 4), m4);
+        }
+        for (int s = 0; s < S; s++) {
+            const int8_t *xb = xq[s] + (size_t)b * XF_BLOCK;
+            __m512i p0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), lo[0], _mm512_set1_epi32(xf16_ld32(xb)));
+            __m512i p1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), hi[0], _mm512_set1_epi32(xf16_ld32(xb + 32)));
+            for (int W = 1; W < 8; W++) {
+                p0 = _mm512_dpbusd_epi32(p0, lo[W], _mm512_set1_epi32(xf16_ld32(xb + 4 * W)));
+                p1 = _mm512_dpbusd_epi32(p1, hi[W], _mm512_set1_epi32(xf16_ld32(xb + 32 + 4 * W)));
+            }
+            const int32_t *x16 = xs[s] + 4 * (size_t)b; const float *d = dx[s] + 2 * (size_t)b;
+            p0 = _mm512_sub_epi32(p0, _mm512_set1_epi32(8 * (x16[0] + x16[1])));
+            p1 = _mm512_sub_epi32(p1, _mm512_set1_epi32(8 * (x16[2] + x16[3])));
+            const __m512 t = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p1), _mm512_set1_ps(d[1]), _mm512_mul_ps(_mm512_cvtepi32_ps(p0), _mm512_set1_ps(d[0])));
+            acc[s] = _mm512_fmadd_ps(t, sv, acc[s]);
+        }
+    }
+    for (int s = 0; s < S; s++) _mm512_storeu_ps(y[s] + o, acc[s]);
+}
+#define XF16_SMAX 8
+#else
+/* half h (rows 8h .. 8h+7) of a group against S <= 4 activation rows */
+static inline __attribute__((always_inline)) void xf16_body256(float *const *y, int o, const uint8_t *grp, const int8_t *const *xq,
+                                                              const float *const *dx, const int32_t *const *xs, int I, const int S, const int h) {
+    const __m256i m4 = _mm256_set1_epi8(15);
+    __m256 acc[4];
+    for (int s = 0; s < S; s++) acc[s] = _mm256_setzero_ps();
+    for (int b = 0; b < I / XF_BLOCK; b++) {
+        const uint8_t *g = grp + (size_t)b * XF16_BLOCK_BYTES;
+        const __m256 sv = _mm256_loadu_ps((const float *)g + 8 * h);
+        __m256i lo[8], hi[8];
+        for (int W = 0; W < 8; W++) {
+            const __m256i v = _mm256_loadu_si256((const __m256i *)(g + 64 + 64 * W + 32 * h));
+            lo[W] = _mm256_and_si256(v, m4); hi[W] = _mm256_and_si256(_mm256_srli_epi16(v, 4), m4);
+        }
+        for (int s = 0; s < S; s++) {
+            const int8_t *xb = xq[s] + (size_t)b * XF_BLOCK;
+            __m256i p0 = _mm256_setzero_si256(), p1 = _mm256_setzero_si256();
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+            for (int W = 0; W < 8; W++) {
+                p0 = xf_dpbusd(p0, lo[W], _mm256_set1_epi32(xf16_ld32(xb + 4 * W)));
+                p1 = xf_dpbusd(p1, hi[W], _mm256_set1_epi32(xf16_ld32(xb + 32 + 4 * W)));
+            }
+#else   /* codes <= 15: two maddubs add in 16 bits below 2^15 */
+            const __m256i one = _mm256_set1_epi16(1);
+            for (int W = 0; W < 8; W += 2) {
+                p0 = _mm256_add_epi32(p0, _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(lo[W], _mm256_set1_epi32(xf16_ld32(xb + 4 * W))),
+                         _mm256_maddubs_epi16(lo[W + 1], _mm256_set1_epi32(xf16_ld32(xb + 4 * W + 4)))), one));
+                p1 = _mm256_add_epi32(p1, _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(hi[W], _mm256_set1_epi32(xf16_ld32(xb + 32 + 4 * W))),
+                         _mm256_maddubs_epi16(hi[W + 1], _mm256_set1_epi32(xf16_ld32(xb + 36 + 4 * W)))), one));
+            }
+#endif
+            const int32_t *x16 = xs[s] + 4 * (size_t)b; const float *d = dx[s] + 2 * (size_t)b;
+            p0 = _mm256_sub_epi32(p0, _mm256_set1_epi32(8 * (x16[0] + x16[1])));
+            p1 = _mm256_sub_epi32(p1, _mm256_set1_epi32(8 * (x16[2] + x16[3])));
+            const __m256 t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1), _mm256_set1_ps(d[1]), _mm256_mul_ps(_mm256_cvtepi32_ps(p0), _mm256_set1_ps(d[0])));
+            acc[s] = _mm256_fmadd_ps(t, sv, acc[s]);
+        }
+    }
+    for (int s = 0; s < S; s++) _mm256_storeu_ps(y[s] + o + 8 * h, acc[s]);
+}
+#define XF16_SMAX 4
+#endif
+/* the group grp (rows o .. o + 15 of its matrix) against S activation rows: y[s][o ..],
+ * xq[s] / dx[s] / xs[s] each row's codes, scales per 32 and sums per 16 (xf_act32) */
+static void xf16_rows(float *const *y, int o, const uint8_t *grp, const int8_t *const *xq, const float *const *dx,
+                      const int32_t *const *xs, int I, int S) {
+    for (int s0 = 0; s0 < S; s0 += XF16_SMAX) {
+        const int n = S - s0 < XF16_SMAX ? S - s0 : XF16_SMAX;
+#if XF16_SMAX == 8
+#define XF16_CALL(N) xf16_body512(y + s0, o, grp, xq + s0, dx + s0, xs + s0, I, N)
+#else
+#define XF16_CALL(N) do { xf16_body256(y + s0, o, grp, xq + s0, dx + s0, xs + s0, I, N, 0); xf16_body256(y + s0, o, grp, xq + s0, dx + s0, xs + s0, I, N, 1); } while (0)
+#endif
+        switch (n) { case 1: XF16_CALL(1); break; case 2: XF16_CALL(2); break; case 3: XF16_CALL(3); break;
+                     case 4: XF16_CALL(4); break; default: XF16_CALL(n); break; }
+#undef XF16_CALL
+    }
+}
+#endif /* AVX2 */
+
 /* ---- one expert ------------------------------------------------------------- */
 
 typedef struct {
@@ -418,8 +614,112 @@ static inline size_t xf_moe_scratch_bytes(int S, int K, int H, int F) {
          + n * (size_t)F * sizeof(float)                           /* h per (s,k) */
          + n * ((size_t)F + 64) + n * (size_t)(F / XF_BLOCK) * sizeof(float) /* hq, hsum (i8 mode) */
          + (size_t)S * ((size_t)H + 64) + (size_t)S * (size_t)(H / XF_BLOCK) * sizeof(float) /* xq, xsum */
-         + n * sizeof(int) * 4 + 4096;
+         + n * sizeof(int) * 4 + 4096
+         + (n * (size_t)(F / 32 + F / 16) + (size_t)S * (H / 32 + H / 16)) * 4 + n * sizeof(int) * 3 + 1024;   /* XF_MODE_R16 */
 }
+
+/* mode XF_MODE_R16: the experts' matrices in xf16 groups (XfExpert g4/u4/d4 the groups,
+ * the scales inside them), the activations per 32 (xf_act32). Made only where XF16_ON. */
+#define XF_MODE_R16 2
+#ifdef XF16_ON
+/* xf_moe_compute's work in that mode: the same (expert, row chunk) items, rows by 16, each
+ * expert's routed rows handed to the kernel as pointers (no gather) */
+static inline float *xf_moe_compute_r16(float *ctb_out, const float *x, int S, int K, int H, int F,
+                                        const int *idx, const XfExpert *const *experts, void *scratch) {
+    const size_t n = (size_t)S * K;
+    char *p = (char *)scratch;
+#define XF_TAKE(T, count) ((T *)p); p += (((size_t)(count) * sizeof(T)) + 63) & ~(size_t)63
+    float *g     = XF_TAKE(float, n * F);
+    float *u     = XF_TAKE(float, n * F);
+    float *h     = XF_TAKE(float, n * F);
+    float *ctb   = XF_TAKE(float, n * H);
+    int8_t *hq   = XF_TAKE(int8_t, n * F);
+    float *hdx   = XF_TAKE(float, n * (F / 32));
+    int32_t *hxs = XF_TAKE(int32_t, n * (F / 16));
+    int8_t *xq   = XF_TAKE(int8_t, (size_t)S * H);
+    float *xdx   = XF_TAKE(float, (size_t)S * (H / 32));
+    int32_t *xxs = XF_TAKE(int32_t, (size_t)S * (H / 16));
+    int *uniq    = XF_TAKE(int, n);          /* distinct expert ids, in first-seen order */
+    int *head    = XF_TAKE(int, n);
+    int *next    = XF_TAKE(int, n);
+    int *start   = XF_TAKE(int, n + 1);      /* expert j's pairs: ord[start[j] .. start[j+1]) */
+    int *ord     = XF_TAKE(int, n);
+#undef XF_TAKE
+    if (ctb_out) ctb = ctb_out;
+
+    #pragma omp parallel for schedule(static) if (S >= 8)
+    for (int s = 0; s < S; s++) xf_act32(x + (size_t)s * H, H, xq + (size_t)s * H, xdx + (size_t)s * (H / 32), xxs + (size_t)s * (H / 16));
+
+    int nu = 0;
+    for (int s = 0; s < S; s++) for (int k = 0; k < K; k++) {
+        int i = s * K + k; next[i] = -1;
+        if (idx[i] < 0 || !experts[i]) continue;
+        int j = 0; for (; j < nu; j++) if (uniq[j] == idx[i]) break;
+        if (j == nu) { uniq[nu] = idx[i]; head[nu] = i; nu++; }
+        else { int t = head[j]; while (next[t] >= 0) t = next[t]; next[t] = i; }
+    }
+    if (nu == 0) return NULL;
+    start[0] = 0;
+    for (int j = 0; j < nu; j++) { int c = start[j]; for (int i = head[j]; i >= 0; i = next[i]) ord[c++] = i; start[j + 1] = c; }
+
+    int T = 1;
+#ifdef _OPENMP
+    T = omp_get_max_threads();
+#endif
+    /* chunking as xf_moe_compute's, rows in multiples of 16 */
+    int cF = (4 * T + nu - 1) / nu; if (cF < 1) cF = 1; if (cF > F / 16) cF = F / 16 > 0 ? F / 16 : 1;
+    int cH = (4 * T + nu - 1) / nu; if (cH < 1) cH = 1; if (cH > H / 16) cH = H / 16 > 0 ? H / 16 : 1;
+    int rowsF = (F + cF - 1) / cF; rowsF = (rowsF + 15) & ~15; cF = (F + rowsF - 1) / rowsF;
+    int rowsH = (H + cH - 1) / cH; rowsH = (rowsH + 15) & ~15; cH = (H + rowsH - 1) / rowsH;
+    const size_t gbH = xf16_group_bytes(H), gbF = xf16_group_bytes(F);
+#define XF16_PAIRS 64
+    /* phase 1: gate+up for every (expert, chunk), all rows routed to that expert */
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int it = 0; it < nu * cF; it++) {
+        int e = it / cF, c = it % cF;
+        int r0 = c * rowsF, r1 = r0 + rowsF; if (r1 > F) r1 = F;
+        const XfExpert *ex = experts[ord[start[e]]];
+        for (int j0 = start[e]; j0 < start[e + 1]; j0 += XF16_PAIRS) {
+            const int m = start[e + 1] - j0 < XF16_PAIRS ? start[e + 1] - j0 : XF16_PAIRS;
+            float *yg[XF16_PAIRS], *yu[XF16_PAIRS]; const int8_t *xp[XF16_PAIRS]; const float *dp[XF16_PAIRS]; const int32_t *sp[XF16_PAIRS];
+            for (int j = 0; j < m; j++) {
+                const int i = ord[j0 + j], s = i / K;
+                yg[j] = g + (size_t)i * F; yu[j] = u + (size_t)i * F;
+                xp[j] = xq + (size_t)s * H; dp[j] = xdx + (size_t)s * (H / 32); sp[j] = xxs + (size_t)s * (H / 16);
+            }
+            for (int o = r0; o < r1; o += 16) {
+                xf16_rows(yg, o, ex->g4 + (size_t)(o / 16) * gbH, xp, dp, sp, H, m);
+                xf16_rows(yu, o, ex->u4 + (size_t)(o / 16) * gbH, xp, dp, sp, H, m);
+            }
+        }
+    }
+    /* hidden rows, quantized once per pair */
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < (int)n; i++) {
+        if (idx[i] < 0 || !experts[i]) continue;
+        xf_swiglu(h + (size_t)i * F, g + (size_t)i * F, u + (size_t)i * F, F);
+        xf_act32(h + (size_t)i * F, F, hq + (size_t)i * F, hdx + (size_t)i * (F / 32), hxs + (size_t)i * (F / 16));
+    }
+    /* phase 2: down for every (expert, chunk) */
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (int it = 0; it < nu * cH; it++) {
+        int e = it / cH, c = it % cH;
+        int r0 = c * rowsH, r1 = r0 + rowsH; if (r1 > H) r1 = H;
+        const XfExpert *ex = experts[ord[start[e]]];
+        for (int j0 = start[e]; j0 < start[e + 1]; j0 += XF16_PAIRS) {
+            const int m = start[e + 1] - j0 < XF16_PAIRS ? start[e + 1] - j0 : XF16_PAIRS;
+            float *yd[XF16_PAIRS]; const int8_t *xp[XF16_PAIRS]; const float *dp[XF16_PAIRS]; const int32_t *sp[XF16_PAIRS];
+            for (int j = 0; j < m; j++) {
+                const int i = ord[j0 + j];
+                yd[j] = ctb + (size_t)i * H; xp[j] = hq + (size_t)i * F; dp[j] = hdx + (size_t)i * (F / 32); sp[j] = hxs + (size_t)i * (F / 16);
+            }
+            for (int o = r0; o < r1; o += 16) xf16_rows(yd, o, ex->d4 + (size_t)(o / 16) * gbF, xp, dp, sp, F, m);
+        }
+    }
+#undef XF16_PAIRS
+    return ctb;
+}
+#endif
 
 /* The per-(s,k) expert outputs alone: ctb[(s*K+k)*H ..] = expert_k(x[s]) for every
  * pair with an expert, nothing summed. ctb may be the caller's (an engine that adds
@@ -428,6 +728,9 @@ static inline size_t xf_moe_scratch_bytes(int S, int K, int H, int F) {
 static inline float *xf_moe_compute(float *ctb_out, const float *x, int S, int K, int H, int F,
                                     const int *idx, const XfExpert *const *experts,
                                     int mode, void *scratch) {
+#ifdef XF16_ON
+    if (mode == XF_MODE_R16) return xf_moe_compute_r16(ctb_out, x, S, K, H, F, idx, experts, scratch);
+#endif
     const size_t n = (size_t)S * K;
     char *p = (char *)scratch;
 #define XF_TAKE(T, count) ((T *)p); p += (((size_t)(count) * sizeof(T)) + 63) & ~(size_t)63
