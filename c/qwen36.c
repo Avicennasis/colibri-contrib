@@ -933,13 +933,17 @@ typedef struct {
  * g4/u4/d4 are then NULL. */
 typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; uint8_t *pw; float *gs, *us, *ds; uint64_t used;
                  unsigned busy; /* callers computing from this slot (expert_hold): never evicted */
-                 uint8_t *gqe;  /* GGUF mode: the expert as the file stores it, [gate | up | down] rows of their own ggml types (GqExp) */
-                 int8_t *t8; float *t8s; int t8_eid;   /* GGUF mode, the Vulkan tier: gqe as int8 with one scale per 32 weights, for expert t8_eid - 1 (gq_slot_i8) */ } Slot;
+                 uint8_t *gqe;  /* GGUF mode: the expert, [gate | up | down] in their held types (GqExp hg/hu/hd) */
+                 int8_t *t8; float *t8s; int t8_eid;   /* GGUF mode, the Vulkan tier: gqe as int8 with one scale per 32 weights (gq_slot_i8),
+                                                          or as the file's rows when gqe holds them interleaved (vk_slot_src), for expert t8_eid - 1 */ } Slot;
 /* GGUF mode: where layer L's experts live. The three fused tensors hold
  * n_experts contiguous matrices each; expert e of gate is eb_g bytes at
  * e*eb_g. The types can differ per matrix and per layer (a Q4_K_M file keeps
- * down in Q5_K or Q6_K), so each keeps its own. */
+ * down in Q5_K or Q6_K), so each keeps its own. hg/hu/hd and hb_*: the types
+ * and bytes a slot holds them in (q36_gq_held: the file's, or its rows
+ * interleaved by 16 for the CPU). */
 typedef struct { const gguf_tensor *g, *u, *d; int tg, tu, td; int64_t eb_g, eb_u, eb_d;
+                 int hg, hu, hd; int64_t hb_g, hb_u, hb_d;
                  const gguf_tensor *packed; int64_t stride;
                  float *sg, *su, *sd; } GqExp;   /* per-expert ".scale" factors, NULL when the file has none */   /* packed: tools/gguf_import.py --mode copy */
 typedef struct {
@@ -2266,6 +2270,24 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
     return p;
 }
 
+/* The type a GGUF matrix of a ggml block type is held in for the CPU: its rows
+ * interleaved by 16 (gq_r16_*, GQ_*_R16), the same bytes or a few percent more,
+ * on an AVX2 or AVX-512 build, when the type has that form and the matrix whole
+ * groups; else the file's rows. Q36_ILV16=0 keeps the file's rows, as GQ_EXACT=1
+ * does. Only the CPU reads these copies: the Vulkan tier gets the file's rows
+ * back (vk_slot_src, gq_rows_i8), the dense chain and CUDA take no GGUF. */
+static int q36_gq_held(int type, int rows, int cols) {
+#ifdef GQ_R16_ON
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("Q36_ILV16"); on = !(e && !strcmp(e, "0")) && !gq_exact_mode(); }
+    const int r = gq_r16_of(type);
+    if (on && r >= 0 && rows % 16 == 0 && cols % GQ_TYPES[type].blck == 0) return r;
+#else
+    (void)rows; (void)cols;
+#endif
+    return type;
+}
+
 /* Dense matrix load, quantized to int8 (+ int4 planar per `tag`, see
  * dense_int4_wanted) DURING loading rather than in a separate pass over the
  * whole model afterward (see QW, above Layer): reads `name` (I*O elements,
@@ -2294,6 +2316,15 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
         if (g_gguf_dry) { out->gq_type = t->type; return; }
         out->gq = malloc((size_t)t->nbytes); out->gq_type = t->type;
         if (!out->gq || gguf_read(&g_gg, t, out->gq, 0, t->nbytes)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
+        const int ht = q36_gq_held(t->type, O, I);
+        if (ht != t->type) {   /* interleaved by 16 for the CPU's kernels */
+            const int64_t rb = gq_row_bytes(t->type, I), hb = gq_row_bytes(ht, I);
+            uint8_t *h = malloc((size_t)(hb * O));
+            if (!h) { fprintf(stderr, "OOM GGUF %s\n", t->name); exit(1); }
+            #pragma omp parallel for schedule(static)
+            for (int g = 0; g < O / 16; g++) gq_r16_pack(ht, h + (int64_t)g * 16 * hb, out->gq + (int64_t)g * 16 * rb, 16, I);
+            free(out->gq); out->gq = h; out->gq_type = ht;
+        }
         return;
     }
     float *p = load_t_n(m, name, (int64_t)I * O);
@@ -2596,6 +2627,18 @@ static void gguf_expert_scales(Model *m, int L) {
     }
 }
 
+/* Layer x's experts as a slot holds them (q36_gq_held) and the slot size that needs. */
+static void gguf_expert_held(Model *m, GqExp *x) {
+    const int D = m->c.hidden, I = m->c.inter;
+    x->hg = q36_gq_held(x->tg, I, D); x->hu = q36_gq_held(x->tu, I, D); x->hd = q36_gq_held(x->td, D, I);
+    x->hb_g = x->hg == x->tg ? x->eb_g : gq_row_bytes(x->hg, D) * I;
+    x->hb_u = x->hu == x->tu ? x->eb_u : gq_row_bytes(x->hu, D) * I;
+    x->hb_d = x->hd == x->td ? x->eb_d : gq_row_bytes(x->hd, I) * D;
+    const int64_t tot = x->hb_g + x->hb_u + x->hb_d;
+    if (tot > m->gqe_max) m->gqe_max = tot;
+}
+static int gguf_expert_ilv(const GqExp *x) { return x->hg != x->tg || x->hu != x->tu || x->hd != x->td; }
+
 /* GGUF mode: locate every layer's fused expert tensors and size the slot. */
 static void gguf_map_experts(Model *m) {
     Cfg *c = &m->c; char nm[96];
@@ -2623,6 +2666,7 @@ static void gguf_map_experts(Model *m) {
             if (!ok) { fprintf(stderr, "colibri container: layer %d expert tensor disagrees with its declared layout\n", i); exit(1); }
             int64_t tot = x->eb_g + x->eb_u + x->eb_d;
             if (tot > m->gqe_max) m->gqe_max = tot;
+            gguf_expert_held(m, x);
         }
         for (int i = 0; i < c->n_layers; i++) gguf_expert_scales(m, i);
         fprintf(stderr, "[gguf] colibri container: experts packed, one read each (layer 0 gate %s up %s down %s, %.2f MB)\n",
@@ -2650,9 +2694,11 @@ static void gguf_map_experts(Model *m) {
         x->eb_g = x->g->nbytes / c->n_experts; x->eb_u = x->u->nbytes / c->n_experts; x->eb_d = x->d->nbytes / c->n_experts;
         int64_t tot = x->eb_g + x->eb_u + x->eb_d;
         if (tot > m->gqe_max) m->gqe_max = tot;
+        gguf_expert_held(m, x);
     }
-    fprintf(stderr, "[gguf] experts: layer 0 gate %s up %s down %s, %.2f MB per expert at most\n",
-            gq_type_name(m->gqx[0].tg), gq_type_name(m->gqx[0].tu), gq_type_name(m->gqx[0].td), m->gqe_max / 1048576.0);
+    fprintf(stderr, "[gguf] experts: layer 0 gate %s up %s down %s, %.2f MB per expert at most%s\n",
+            gq_type_name(m->gqx[0].tg), gq_type_name(m->gqx[0].tu), gq_type_name(m->gqx[0].td), m->gqe_max / 1048576.0,
+            gguf_expert_ilv(&m->gqx[0]) ? "; held interleaved by 16 for the CPU (Q36_ILV16=0 keeps the rows)" : "");
 }
 
 /* After loading: every tensor of the file the engine did not consume. The
@@ -3045,18 +3091,42 @@ static void unpack_int4_to_int8(int8_t *out, const uint8_t *raw, int64_t n)
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     if (g_gguf) {
         /* three reads, one per fused tensor: expert eid's gate, up, down rows */
-        const GqExp *x = &m->gqx[layer];
+        const GqExp *x = &m->gqx[layer]; const int ilv = gguf_expert_ilv(x);
+        uint8_t *b = s->gqe;
+        if (ilv) {   /* read beside, interleave into the slot (each loader thread its buffer) */
+            static __thread uint8_t *raw; static __thread int64_t cap;
+            const int64_t need = x->eb_g + x->eb_u + x->eb_d;
+            if (cap < need) {
+                free(raw); raw = malloc((size_t)need); cap = raw ? need : 0;
+                if (!raw) { fprintf(stderr, "OOM GGUF expert\n"); exit(1); }
+            }
+            b = raw;
+        }
         if (x->packed) {
-            if (gguf_read(&g_gg, x->packed, s->gqe, (int64_t)eid * x->stride, x->eb_g + x->eb_u + x->eb_d)) {
+            if (gguf_read(&g_gg, x->packed, b, (int64_t)eid * x->stride, x->eb_g + x->eb_u + x->eb_d)) {
                 fprintf(stderr, "GGUF: reading layer %d expert %d failed\n", layer, eid); exit(1);
             }
-            s->is_int4 = 0;
-            return;
-        }
-        if (gguf_read(&g_gg, x->g, s->gqe, (int64_t)eid * x->eb_g, x->eb_g) ||
-            gguf_read(&g_gg, x->u, s->gqe + x->eb_g, (int64_t)eid * x->eb_u, x->eb_u) ||
-            gguf_read(&g_gg, x->d, s->gqe + x->eb_g + x->eb_u, (int64_t)eid * x->eb_d, x->eb_d)) {
+        } else if (gguf_read(&g_gg, x->g, b, (int64_t)eid * x->eb_g, x->eb_g) ||
+                   gguf_read(&g_gg, x->u, b + x->eb_g, (int64_t)eid * x->eb_u, x->eb_u) ||
+                   gguf_read(&g_gg, x->d, b + x->eb_g + x->eb_u, (int64_t)eid * x->eb_d, x->eb_d)) {
             fprintf(stderr, "GGUF: reading layer %d expert %d failed\n", layer, eid); exit(1);
+        }
+        if (ilv) {   /* the three matrices' groups of 16 rows on the threads, unless the caller already runs on them */
+            const int D = m->c.hidden, I = m->c.inter;
+            const int ft[3] = { x->tg, x->tu, x->td }, ht[3] = { x->hg, x->hu, x->hd }, rows[3] = { I, I, D }, cols[3] = { D, D, I };
+            const int64_t fo[3] = { 0, x->eb_g, x->eb_g + x->eb_u }, ho[3] = { 0, x->hb_g, x->hb_g + x->hb_u }, fb[3] = { x->eb_g, x->eb_u, x->eb_d };
+            int ng[3];
+            uint8_t *dst = s->gqe;
+            for (int k = 0; k < 3; k++) {
+                ng[k] = ht[k] != ft[k] ? rows[k] / 16 : 0;
+                if (!ng[k]) memcpy(dst + ho[k], b + fo[k], (size_t)fb[k]);
+            }
+            #pragma omp parallel for schedule(static) if (!omp_in_parallel())
+            for (int j = 0; j < ng[0] + ng[1] + ng[2]; j++) {
+                const int k = j < ng[0] ? 0 : j < ng[0] + ng[1] ? 1 : 2, g = j - (k > 0 ? ng[0] : 0) - (k > 1 ? ng[1] : 0);
+                const int64_t fr = gq_row_bytes(ft[k], cols[k]), hr = gq_row_bytes(ht[k], cols[k]);
+                gq_r16_pack(ht[k], dst + ho[k] + (int64_t)g * 16 * hr, b + fo[k] + (int64_t)g * 16 * fr, 16, cols[k]);
+            }
         }
         s->is_int4 = 0;
         return;
@@ -3760,15 +3830,30 @@ static void gq_slot_i8(Model *m, int layer, Slot *e) {
         e->t8 = malloc((size_t)(3 * n)); e->t8s = malloc((size_t)(3 * (n / 32)) * sizeof(float));
         if (!e->t8 || !e->t8s) { fprintf(stderr, "OOM gq_slot_i8\n"); exit(1); }
     }
-    gq_rows_i8(x->tg, e->gqe, I, D, x->sg ? x->sg[e->eid] : 1.f, e->t8, e->t8s);
-    gq_rows_i8(x->tu, e->gqe + x->eb_g, I, D, x->su ? x->su[e->eid] : 1.f, e->t8 + n, e->t8s + n / 32);
-    gq_rows_i8(x->td, e->gqe + x->eb_g + x->eb_u, D, I, x->sd ? x->sd[e->eid] : 1.f, e->t8 + 2 * n, e->t8s + 2 * (n / 32));
+    gq_rows_i8(x->hg, e->gqe, I, D, x->sg ? x->sg[e->eid] : 1.f, e->t8, e->t8s);
+    gq_rows_i8(x->hu, e->gqe + x->hb_g, I, D, x->su ? x->su[e->eid] : 1.f, e->t8 + n, e->t8s + n / 32);
+    gq_rows_i8(x->hd, e->gqe + x->hb_g + x->hb_u, D, I, x->sd ? x->sd[e->eid] : 1.f, e->t8 + 2 * n, e->t8s + 2 * (n / 32));
     e->t8_eid = e->eid + 1;
 }
 static int g_vk_gguf_raw;   /* the tier holds the GGUF experts' blocks as the file has them (blockdec.glsl) */
 static VktExpertSrc vk_slot_src(Model *m, int layer, Slot *e) {
     if (g_gguf && g_vk_gguf_raw) {
         const GqExp *x = &m->gqx[layer];
+        if (gguf_expert_ilv(x)) {   /* the device reads the file's rows: back from the interleaved slot, once per expert */
+            const int D = m->c.hidden, I = m->c.inter;
+            if (!e->t8 && !(e->t8 = malloc((size_t)(x->eb_g + x->eb_u + x->eb_d)))) { fprintf(stderr, "OOM GGUF expert for the Vulkan tier\n"); exit(1); }
+            uint8_t *b = (uint8_t *)e->t8;
+            if (e->t8_eid != e->eid + 1) {
+                const int ft[3] = { x->tg, x->tu, x->td }, ht[3] = { x->hg, x->hu, x->hd }, rows[3] = { I, I, D }, cols[3] = { D, D, I };
+                const int64_t fo[3] = { 0, x->eb_g, x->eb_g + x->eb_u }, ho[3] = { 0, x->hb_g, x->hb_g + x->hb_u }, fb[3] = { x->eb_g, x->eb_u, x->eb_d };
+                for (int k = 0; k < 3; k++) {
+                    if (ht[k] != ft[k]) gq_r16_unpack(ht[k], b + fo[k], e->gqe + ho[k], rows[k], cols[k]);
+                    else memcpy(b + fo[k], e->gqe + ho[k], (size_t)fb[k]);
+                }
+                e->t8_eid = e->eid + 1;
+            }
+            return (VktExpertSrc){b, b + x->eb_g, b + x->eb_g + x->eb_u, NULL, NULL, NULL};
+        }
         return (VktExpertSrc){e->gqe, e->gqe + x->eb_g, e->gqe + x->eb_g + x->eb_u, NULL, NULL, NULL};
     }
     if (g_gguf) {
@@ -3846,11 +3931,11 @@ static void moe_vk_gq_cpu(Model *m, int layer, const float *x, int S, const int 
         if (idx[i] < 0 || !want[i]) continue;
         const float *xs = x + (int64_t)(i / K) * D; float *y = ctb + (int64_t)i * D;
         Slot *e = expert_hold(m, layer, idx[i]);
-        gq_matmul(G, xs, e->gqe, gx->tg, 1, D, I);
-        gq_matmul(U, xs, e->gqe + gx->eb_g, gx->tu, 1, D, I);
+        gq_matmul(G, xs, e->gqe, gx->hg, 1, D, I);
+        gq_matmul(U, xs, e->gqe + gx->hb_g, gx->hu, 1, D, I);
         float sg = gx->sg ? gx->sg[idx[i]] : 1.f, su = gx->su ? gx->su[idx[i]] : 1.f;
         for (int j = 0; j < I; j++) { float gv = G[j] * sg; G[j] = (gv / (1.f + expf(-gv))) * (U[j] * su); }
-        gq_matmul(y, G, e->gqe + gx->eb_g + gx->eb_u, gx->td, 1, I, D);
+        gq_matmul(y, G, e->gqe + gx->hb_g + gx->hb_u, gx->hd, 1, I, D);
         if (gx->sd) for (int d = 0; d < D; d++) y[d] *= gx->sd[idx[i]];
         if (vkt_wants(layer, idx[i])) { VktExpertSrc vs = vk_slot_src(m, layer, e); vkt_note(layer, idx[i], &vs); }
         slot_release(e);
@@ -3913,10 +3998,22 @@ static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, flo
 /* Decode (one token, cache can hold all K at once): every routed expert's
  * gate and up rows in ONE parallel region, then every down row in another,
  * instead of two regions per expert. Returns 0, or -1 to take the general path. */
+/* u rows of W from its first (a group of 16 when t is a GQ_*_R16 form) against the
+ * one-row activation a */
+static inline void gq_rows_u(float *y, int u, const gq_act *a, const uint8_t *W, int t, int I) {
+#ifdef GQ_R16_ON
+    if (gq_r16_base(t) >= 0) { gq_r16_rows(t, y, 16, W, a, I); return; }
+#endif
+    const int64_t rb = gq_row_bytes(t, I);
+    for (int j = 0; j < u; j++) gq_row_all(y + j, 1, a, W + (int64_t)j * rb, t, I);
+}
 static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const int *idx, const float *val) {
     Cfg *c = &m->c; const int D = c->hidden, K = c->topk, I = c->inter;
     const GqExp *gx = &m->gqx[layer];
-    if (m->cache[layer].cap < K || K > 64 || !gq_int_ok(gx->tg, D) || !gq_int_ok(gx->tu, D) || !gq_int_ok(gx->td, I)) return -1;
+    if (m->cache[layer].cap < K || K > 64 || !gq_int_ok(gx->hg, D) || !gq_int_ok(gx->hu, D) || !gq_int_ok(gx->hd, I)) return -1;
+    /* rows interleaved by 16 (q36_gq_held) go a group at a time, and then every matrix's rows by 16 */
+    const int u = gguf_expert_ilv(gx) ? 16 : 1;
+    if (u == 16 && (I % 16 || D % 16)) return -1;
     Slot *sl[64]; int ids[64]; float w[64]; int n = 0;
     for (int k = 0; k < K; k++) if (idx[k] >= 0) { ids[n] = idx[k]; w[n] = val[k]; n++; }
     for (int k = 0; k < n; k++) expert_get(m, layer, ids[k], &sl[k]);
@@ -3936,13 +4033,14 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     }
     float *GU = GU_s, *H = H_s, *Y = Y_s;
     if (gq_act_set(pax, x, 1, D)) return -1;
-    const int64_t rbg = gq_row_bytes(gx->tg, D), rbu = gq_row_bytes(gx->tu, D), rbd = gq_row_bytes(gx->td, I);
+    const int64_t rbg = gq_row_bytes(gx->hg, D), rbu = gq_row_bytes(gx->hu, D), rbd = gq_row_bytes(gx->hd, I);
+    const int gI = I / u, gD = D / u;
     #pragma omp parallel for schedule(static)
-    for (int r = 0; r < n * 2 * I; r++) {
-        int k = r / (2 * I), rr = r % (2 * I);
+    for (int r = 0; r < n * 2 * gI; r++) {
+        int k = r / (2 * gI), rr = (r % (2 * gI)) * u;
         const uint8_t *base = sl[k]->gqe;
-        if (rr < I) gq_row_all(GU + (int64_t)k * 2 * I + rr, 1, pax, base + (int64_t)rr * rbg, gx->tg, D);
-        else        gq_row_all(GU + (int64_t)k * 2 * I + rr, 1, pax, base + gx->eb_g + (int64_t)(rr - I) * rbu, gx->tu, D);
+        if (rr < I) gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, base + (int64_t)rr * rbg, gx->hg, D);
+        else        gq_rows_u(GU + (int64_t)k * 2 * I + rr, u, pax, base + gx->hb_g + (int64_t)(rr - I) * rbu, gx->hu, D);
     }
     for (int k = 0; k < n; k++) {
         float *g = GU + (int64_t)k * 2 * I, *u = g + I; float *h = H + (int64_t)k * I;
@@ -3952,11 +4050,11 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     }
     if (gq_act_set(pah, H, n, I)) return -1;   /* row k of ah is expert k's hidden */
     #pragma omp parallel for schedule(static)
-    for (int r = 0; r < n * D; r++) {
-        int k = r / D, o = r % D;
+    for (int r = 0; r < n * gD; r++) {
+        int k = r / gD, o = (r % gD) * u;
         gq_act one = *pah; one.S = 1; one.q = pah->q + (int64_t)k * I; one.d = pah->d + (int64_t)k * (I / 32); one.s = pah->s + (int64_t)k * (I / 16);
         one.l4 = pah->l4 ? pah->l4 + (int64_t)k * (I / 4) : NULL;
-        gq_row_all(Y + (int64_t)k * D + o, 1, &one, sl[k]->gqe + gx->eb_g + gx->eb_u + (int64_t)o * rbd, gx->td, I);
+        gq_rows_u(Y + (int64_t)k * D + o, u, &one, sl[k]->gqe + gx->hb_g + gx->hb_u + (int64_t)o * rbd, gx->hd, I);
     }
     /* accumulate in expert-id order, as the general path does: same sums, same bits */
     int ord[64]; for (int k = 0; k < n; k++) ord[k] = k;
@@ -3988,16 +4086,16 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
         const int *tl = tok + cnt[e]; const float *wl = wt + cnt[e];
         Slot *sl; expert_get(m, layer, e, &sl);
         for (int r = 0; r < n; r++) memcpy(X + (int64_t)r * D, x + (int64_t)tl[r] * D, sizeof(float) * (size_t)D);
-        if (gq_int_ok(gx->tg, D) && gq_int_ok(gx->tu, D) && !gq_act_set(&act, X, n, D))
-            gq_matmul2_act(G, sl->gqe, gx->tg, U, sl->gqe + gx->eb_g, gx->tu, &act, I);   /* x quantized once */
+        if (gq_int_ok(gx->hg, D) && gq_int_ok(gx->hu, D) && !gq_act_set(&act, X, n, D))
+            gq_matmul2_act(G, sl->gqe, gx->hg, U, sl->gqe + gx->hb_g, gx->hu, &act, I);   /* x quantized once */
         else {
-            gq_matmul(G, X, sl->gqe, gx->tg, n, D, I);
-            gq_matmul(U, X, sl->gqe + gx->eb_g, gx->tu, n, D, I);
+            gq_matmul(G, X, sl->gqe, gx->hg, n, D, I);
+            gq_matmul(U, X, sl->gqe + gx->hb_g, gx->hu, n, D, I);
         }
         if (gx->sg) for (int64_t q = 0; q < (int64_t)n * I; q++) G[q] *= gx->sg[e];
         if (gx->su) for (int64_t q = 0; q < (int64_t)n * I; q++) U[q] *= gx->su[e];
         for (int64_t q = 0; q < (int64_t)n * I; q++) { float gv = G[q]; G[q] = (gv / (1.f + expf(-gv))) * U[q]; }
-        gq_matmul(Y, G, sl->gqe + gx->eb_g + gx->eb_u, gx->td, n, I, D);
+        gq_matmul(Y, G, sl->gqe + gx->hb_g + gx->hb_u, gx->hd, n, I, D);
         if (gx->sd) for (int64_t q = 0; q < (int64_t)n * D; q++) Y[q] *= gx->sd[e];
         for (int r = 0; r < n; r++) {
             float *os = out + (int64_t)tl[r] * D; const float *ys = Y + (int64_t)r * D; const float w = wl[r];

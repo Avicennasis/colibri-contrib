@@ -535,7 +535,8 @@ static inline gq_blk_fn gq_blk_decoder(int t) {
 /* Decode n elements (a whole number of blocks) of type t into dst.
  * Returns 0, or -1 for an unsupported type or a partial block. */
 static int gq_dequant_row(int t, const uint8_t *src, float *dst, int64_t n);
-/* One matrix of ggml rows as int8 with one f32 scale per 32 weights (the Vulkan tier's
+static int gq_r16_dequant_row(int t, const uint8_t *W, int64_t row, float *out, int I);
+/* One matrix of ggml rows (or of a GQ_*_R16 form) as int8 with one f32 scale per 32 weights (the Vulkan tier's
  * VKT_SRC_I8_GS, fmt 13), times mul (an expert's ".scale" factor, else 1). Measured on
  * Qwen3.6's unsloth levels (IQ1_M to Q8_0): +0.4-0.55% relative error on top of each
  * level's own against Q8_0, and exactly the weights for Q8_0; int4 would add 7-10%. */
@@ -547,7 +548,8 @@ static void gq_rows_i8(int t, const uint8_t *src, int rows, int cols, float mul,
         #pragma omp for schedule(static)
         for (int o = 0; o < rows; o++) {
             if (!row) continue;
-            gq_dequant_row(t, src + (int64_t)o * rb, row, cols);
+            if (gq_r16_base(t) >= 0) gq_r16_dequant_row(t, src, o, row, cols);
+            else gq_dequant_row(t, src + (int64_t)o * rb, row, cols);
             for (int g = 0; g < ng; g++) {
                 const float *v = row + g * 32; float a = 0.f;
                 for (int i = 0; i < 32; i++) { float f = fabsf(v[i]); if (f > a) a = f; }
