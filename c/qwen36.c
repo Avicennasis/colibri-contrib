@@ -2260,7 +2260,7 @@ static float *load_t_affine(Model *m, const char *wname, int64_t want) {
  * while every read afterwards used CONFIG dims, so a short tensor was a plain
  * heap OOB read (embed is indexed as m->embed + ids[s]*D). The expert path
  * already refuses a wrong size; this is the same discipline for the dense set. */
-/* GGUF mode: the llama.cpp name of a converter-named tensor (qwen35moe).
+/* GGUF mode: the llama.cpp name of a converter-named tensor (qwen35moe, qwen35).
  * NULL for a name the arch does not have. */
 static const char *gg_name(const char *hf, char *out, size_t cap) {
     static const struct { const char *hf, *gg; } glob[] = {
@@ -2281,6 +2281,9 @@ static const char *gg_name(const char *hf, char *out, size_t cap) {
         { "mlp.shared_expert.up_proj.weight", "ffn_up_shexp.weight" },
         { "mlp.shared_expert.down_proj.weight", "ffn_down_shexp.weight" },
         { "mlp.shared_expert_gate.weight", "ffn_gate_inp_shexp.weight" },
+        { "mlp.gate_proj.weight", "ffn_gate.weight" },   /* qwen35: a dense model's MLP */
+        { "mlp.up_proj.weight", "ffn_up.weight" },
+        { "mlp.down_proj.weight", "ffn_down.weight" },
         { "self_attn.q_proj.weight", "attn_q.weight" },
         { "self_attn.k_proj.weight", "attn_k.weight" },
         { "self_attn.v_proj.weight", "attn_v.weight" },
@@ -2303,6 +2306,8 @@ static const char *gg_name(const char *hf, char *out, size_t cap) {
 }
 static const gguf_tensor *gg_tensor(const char *hf) {
     char nm[256]; const char *g = gg_name(hf, nm, sizeof nm);
+    /* tied embeddings (the small dense models): no output.weight, the head reads token_embd */
+    if (g && !strcmp(g, "output.weight") && !gguf_find(&g_gg, g)) g = "token_embd.weight";
     return g ? gguf_mark(&g_gg, g) : NULL;
 }
 static int64_t gg_numel(const gguf_tensor *t) { return t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3]; }
@@ -2758,6 +2763,7 @@ static int q36_vision_attach(Model *m, const float *patches, int grid_h, int gri
  * come through this loader. */
 static float *load_norm_n(Model *m, const char *name, int64_t want) {
     float *w = load_t_n(m, name, want);
+    if (!w) return NULL;   /* GGUF_CHECK=1: shapes checked, nothing read */
     if (!m->c.zero_centered_norms)
         for (int64_t i = 0; i < want; i++) w[i] -= 1.0f;
     return w;
@@ -2772,8 +2778,15 @@ static void gguf_load_cfg(Cfg *c) {
     if (!arch && ((gtype && !strcmp(gtype, "imatrix")) || gguf_get(g, "imatrix.datasets") || gguf_get(g, "imatrix.chunk_count"))) {
         fprintf(stderr, "this GGUF is an importance matrix (imatrix): calibration data for quantizing, not a model to run\n"); exit(1);
     }
-    if (!arch || strcmp(arch, "qwen35moe")) { fprintf(stderr, "GGUF architecture '%s' is not qwen35moe (Qwen3.6): this engine cannot run it\n", arch ? arch : "?"); exit(1); }
-    #define GK(k) "qwen35moe." k
+    /* qwen35moe: Qwen3.5 / Qwen3.6 MoE; qwen35: the dense checkpoints of the same family
+     * (Qwen3.5 0.8B to 27B, Qwen3.8 27B), their MLP run as the shared expert, ungated (#1757) */
+    const int dense = arch && !strcmp(arch, "qwen35");
+    if (!arch || (strcmp(arch, "qwen35moe") && !dense)) {
+        fprintf(stderr, "GGUF architecture '%s' is neither qwen35moe (Qwen3.5 / 3.6 MoE) nor qwen35 (their dense models): "
+                        "this engine cannot run it\n", arch ? arch : "?"); exit(1);
+    }
+    char key[128];
+    #define GK(k) (snprintf(key, sizeof key, "%s.%s", arch, k), key)
     memset(c, 0, sizeof *c);
     int n_mtp = (int)gguf_get_int(g, GK("nextn_predict_layers"), 0);
     c->n_layers = (int)gguf_get_int(g, GK("block_count"), 0) - n_mtp;
@@ -2796,6 +2809,11 @@ static void gguf_load_cfg(Cfg *c) {
     c->dn_kdim   = (int)gguf_get_int(g, GK("ssm.state_size"), 0);
     int inner    = (int)gguf_get_int(g, GK("ssm.inner_size"), 0);
     c->dn_convk  = (int)gguf_get_int(g, GK("ssm.conv_kernel"), 0);
+    if (dense) {   /* nothing routed: the MLP is feed_forward_length wide */
+        c->n_experts = 0; c->topk = 0; c->inter = 0;
+        c->shared_inter = (int)gguf_get_int(g, GK("feed_forward_length"), 0);
+        CFG_NEED(c->shared_inter > 0, "GGUF %s.feed_forward_length %d", arch, c->shared_inter);
+    }
     #undef GK
     CFG_NEED(c->n_layers > 0 && c->n_layers <= 512 && c->hidden > 0 && c->q_heads > 0 && c->head_dim > 0 && interval > 0,
              "GGUF metadata: layers %d hidden %d heads %d head_dim %d interval %d", c->n_layers, c->hidden, c->q_heads, c->head_dim, interval);
@@ -2829,8 +2847,12 @@ static void gguf_load_cfg(Cfg *c) {
     c->has_qk_norm = gguf_find(g, nm) != NULL;
     snprintf(nm, sizeof nm, "blk.0.exp_probs_b.bias");
     c->has_bias = gguf_find(g, nm) != NULL;
-    fprintf(stderr, "[gguf] qwen35moe: %d layers (%d attention), hidden %d, %d experts top-%d, inter %d, vocab %d, DeltaNet v/k heads %d/%d\n",
-            c->n_layers, c->n_active, c->hidden, c->n_experts, c->topk, c->inter, c->vocab, c->dn_vheads, c->dn_kheads);
+    if (dense)
+        fprintf(stderr, "[gguf] qwen35 (dense): %d layers (%d attention), hidden %d, MLP %d, vocab %d, DeltaNet v/k heads %d/%d\n",
+                c->n_layers, c->n_active, c->hidden, c->shared_inter, c->vocab, c->dn_vheads, c->dn_kheads);
+    else
+        fprintf(stderr, "[gguf] qwen35moe: %d layers (%d attention), hidden %d, %d experts top-%d, inter %d, vocab %d, DeltaNet v/k heads %d/%d\n",
+                c->n_layers, c->n_active, c->hidden, c->n_experts, c->topk, c->inter, c->vocab, c->dn_vheads, c->dn_kheads);
 }
 
 /* blk.L.ffn_{gate,up,down}_exps.scale: one factor per expert, by name so the
@@ -3122,7 +3144,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         fprintf(stderr, "[dense-i8] %d matrices %s during load, %.1f GB f32 freed\n", qcount,
                 dense_bits() == 16 ? "kept in f16" : "quantized", qfreed/1073741824.0);
     if (g_gguf) {
-        gguf_map_experts(m);
+        if (c->n_experts > 0) gguf_map_experts(m);
         if (load_boundaries && gguf_report_unused(c) && !g_gguf_dry && !getenv("GGUF_IGNORE_UNUSED")) {
             fprintf(stderr, "refusing: running without them would compute a different model (GGUF_IGNORE_UNUSED=1 to run anyway)\n"); exit(1);
         }

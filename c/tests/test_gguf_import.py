@@ -50,13 +50,17 @@ def blocks(name, shape, rng, std=0.02):
     return raw.reshape(*shape[:-1], nb * size)
 
 
-def write_model(path, rng):
-    w = gguf.GGUFWriter(str(path), "qwen35moe")
-    p = "qwen35moe."
+def write_model(path, rng, dense=False):
+    """dense: llama.cpp's qwen35 (a dense model of the family): an MLP per layer instead of the
+    experts, and no output.weight (the head tied to token_embd), as the small checkpoints ship."""
+    arch = "qwen35" if dense else "qwen35moe"
+    w = gguf.GGUFWriter(str(path), arch)
+    p = arch + "."
+    moe = (("feed_forward_length", I),) if dense else \
+        (("expert_count", E), ("expert_used_count", TOPK), ("expert_feed_forward_length", I), ("expert_shared_feed_forward_length", I))
     for k, v in (("block_count", LAYERS), ("embedding_length", H), ("attention.head_count", QH),
                  ("attention.head_count_kv", KVH), ("attention.key_length", HD), ("attention.value_length", HD),
-                 ("expert_count", E), ("expert_used_count", TOPK), ("expert_feed_forward_length", I),
-                 ("expert_shared_feed_forward_length", I), ("full_attention_interval", 4),
+                 *moe, ("full_attention_interval", 4),
                  ("rope.dimension_count", HD // 4), ("ssm.conv_kernel", 4), ("ssm.state_size", KD),
                  ("ssm.group_count", KH), ("ssm.time_step_rank", VH), ("ssm.inner_size", VH * KD),
                  ("context_length", 4096)):
@@ -69,19 +73,25 @@ def write_model(path, rng):
 
     def f32(name, shape): w.add_tensor(name, (rng.standard_normal(shape) * 0.02).astype(np.float32))
     def q(name, shape, t): w.add_tensor(name, blocks(t, shape, rng), raw_dtype=QT[t])
-    q("token_embd.weight", (VOCAB, H), "Q8_0"); q("output.weight", (VOCAB, H), "Q6_K")
+    q("token_embd.weight", (VOCAB, H), "Q8_0")
+    if not dense:
+        q("output.weight", (VOCAB, H), "Q6_K")
     w.add_tensor("output_norm.weight", np.ones(H, np.float32))
     conv = 2 * KH * KD + VH * KD
     for L in range(LAYERS):
         b = f"blk.{L}."
         w.add_tensor(b + "attn_norm.weight", np.ones(H, np.float32))
         w.add_tensor(b + "post_attention_norm.weight", np.ones(H, np.float32))
-        f32(b + "ffn_gate_inp.weight", (E, H)); f32(b + "ffn_gate_inp_shexp.weight", (H,))
-        q(b + "ffn_gate_shexp.weight", (I, H), "Q8_0"); q(b + "ffn_up_shexp.weight", (I, H), "Q8_0")
-        q(b + "ffn_down_shexp.weight", (H, I), "Q8_0")
-        q(b + "ffn_gate_exps.weight", (E, I, H), "IQ2_XXS" if L == 0 else "Q4_K")
-        q(b + "ffn_up_exps.weight", (E, I, H), "Q4_K")
-        q(b + "ffn_down_exps.weight", (E, H, I), "Q6_K" if L % 2 else "Q5_K")
+        if dense:
+            q(b + "ffn_gate.weight", (I, H), "Q4_K"); q(b + "ffn_up.weight", (I, H), "Q4_K")
+            q(b + "ffn_down.weight", (H, I), "Q6_K" if L % 2 else "Q5_K")
+        else:
+            f32(b + "ffn_gate_inp.weight", (E, H)); f32(b + "ffn_gate_inp_shexp.weight", (H,))
+            q(b + "ffn_gate_shexp.weight", (I, H), "Q8_0"); q(b + "ffn_up_shexp.weight", (I, H), "Q8_0")
+            q(b + "ffn_down_shexp.weight", (H, I), "Q8_0")
+            q(b + "ffn_gate_exps.weight", (E, I, H), "IQ2_XXS" if L == 0 else "Q4_K")
+            q(b + "ffn_up_exps.weight", (E, I, H), "Q4_K")
+            q(b + "ffn_down_exps.weight", (E, H, I), "Q6_K" if L % 2 else "Q5_K")
         if (L + 1) % 4 == 0:
             q(b + "attn_q.weight", (QH * HD * 2, H), "Q8_0"); q(b + "attn_k.weight", (KVH * HD, H), "Q8_0")
             q(b + "attn_v.weight", (KVH * HD, H), "Q8_0"); q(b + "attn_output.weight", (H, QH * HD), "Q8_0")
@@ -169,6 +179,41 @@ class GgufImport(unittest.TestCase):
         for k in ("expert_count", "expert_layers", "expert_bytes", "per_cap_bytes", "dense_bytes"):
             self.assertEqual(a[k], b[k], k)
         self.assertEqual(a["expert_count"], LAYERS * E)
+
+
+@unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+@unittest.skipUnless(ENGINE.is_file(), "qwen36 is not built")
+class GgufImportDense(unittest.TestCase):
+    """llama.cpp's qwen35 (the family's dense models): the importer writes a dense config with
+    the head tied to the embedding, and the engine gives the same tokens from the bare file
+    and from the link directory, on the float and on the integer path."""
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(); d = Path(cls.tmp.name)
+        cls.src = d / "tiny-qwen35.gguf"
+        write_model(cls.src, np.random.default_rng(12), dense=True)
+        cls.ref = d / "ref.json"
+        cls.ref.write_text(json.dumps({"prompt_ids": [5, 6, 7, 8], "full_ids": [5, 6, 7, 8] + [0] * 12}))
+        p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(cls.src), str(d / "link"), "--mode", "link"],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert p.returncode == 0, p.stdout.decode()
+        cls.dir = d
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_dense_config(self):
+        cfg = json.loads((self.dir / "link" / "config.json").read_text())
+        self.assertEqual(cfg["model_type"], "qwen3_5_text")
+        self.assertEqual((cfg["num_hidden_layers"], cfg["hidden_size"], cfg["intermediate_size"]), (LAYERS, H, I))
+        self.assertNotIn("num_experts", cfg)
+        self.assertTrue(cfg["tie_word_embeddings"])
+
+    def test_same_tokens_from_file_and_link(self):
+        for env in ({}, {"GQ_EXACT": "1"}):
+            with self.subTest(path="exact" if env else "integer"):
+                self.assertEqual(engine_tokens(self.dir / "link", self.ref, env), engine_tokens(self.src, self.ref, env))
 
 
 class Qwen4ExpLayers(unittest.TestCase):

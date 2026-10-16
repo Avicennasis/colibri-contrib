@@ -17,7 +17,8 @@ Two modes, both lossless (the ggml blocks are used or copied as they are):
 Either way the directory is an ordinary colibri model: `coli chat`, `coli
 serve`, `coli web` and the planner treat it like any other.
 
-Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine),
+Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine), qwen35 (their
+dense models -> qwen36 engine),
 qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine).
 
 Usage:
@@ -156,6 +157,25 @@ def qwen35moe_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
+def qwen35_config(meta, tensors, overrides=None):
+    """A dense model of the Qwen3.5 family (llama.cpp's qwen35: Qwen3.5 0.8B to 27B, Qwen3.8 27B)
+    as the qwen36 engine's config.json: the qwen35moe layout with an MLP instead of experts,
+    and the embedding tied to the head when the file has no output.weight."""
+    p = "qwen35."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    moe_like = {(("qwen35moe." + k[len(p):]) if k.startswith(p) else k): v for k, v in meta.items()}
+    moe_like.setdefault("qwen35moe.expert_count", 1)
+    moe_like.setdefault("qwen35moe.expert_used_count", 1)
+    moe_like.setdefault("qwen35moe.expert_feed_forward_length", int(need("feed_forward_length")))
+    cfg, layers = qwen35moe_config(moe_like, tensors, overrides)
+    for k in ("num_experts", "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size"):
+        cfg.pop(k, None)
+    cfg.update({"model_type": "qwen3_5_text", "architectures": ["Qwen3_5ForCausalLM"],
+                "intermediate_size": int(need("feed_forward_length")),
+                "tie_word_embeddings": "output.weight" not in tensors})
+    return cfg, layers
+
+
 def qwen4exp_config(meta, tensors, overrides=None):
     """Qwen3.8-Flash-Next (llama.cpp's qwen4exp) as the qwen38 engine's config.json. The
     PLE table is one tensor here (per_layer_token_embd), so split_ngram_parts is 1; its
@@ -237,7 +257,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the

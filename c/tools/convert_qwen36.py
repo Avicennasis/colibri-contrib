@@ -463,7 +463,10 @@ def main():
                  f"tensors for layer(s) {missing_layers[:8]}")
     globals_keys = [global_map[kind] for kind in ("embed_tokens.weight", "lm_head.weight",
                                                   "norm.weight") if kind in global_map]
-    if len(globals_keys) != 3:
+    # tied embeddings (the small dense Qwen3.5 checkpoints): no lm_head, the head is embed_tokens
+    tied = bool(cfg_full.get("tie_word_embeddings", mcfg.get("tie_word_embeddings", False))) and \
+        "lm_head.weight" not in global_map
+    if len(globals_keys) != 3 - tied:
         sys.exit(f"ERROR: expected embed_tokens, lm_head and final norm, found {sorted(global_map)}")
     for k in globals_keys:
         shard_layers.setdefault(wm[k], set()).add(-1)
@@ -543,6 +546,8 @@ def main():
             arr = get_tensor(k).half()
             newk = k.replace("model.language_model.", "model.")
             g_out[newk] = arr
+        if tied:   # written out: the engine reads lm_head.weight
+            g_out["lm_head.weight"] = g_out["model.embed_tokens.weight"].clone()
         gpath = out / "model-globals.safetensors"
         save_file(g_out, str(gpath))
         print(f"[globals] {gpath.name} ({len(g_out)} tensors)")
