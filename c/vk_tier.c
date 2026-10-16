@@ -57,9 +57,15 @@ static struct {
     char engine[32];
     /* the forms of the experts, as the engine holds them and on the device: [0] the main
      * layers', [1] the extra layers' (VktConfig.extra_layers, an MTP head's), from
-     * main_layers on */
+     * main_layers on; [2..nform) the main layers' other forms when their formats differ
+     * by layer (VktConfig.layer_gate_up/layer_down), lform[l] naming each layer's. Then
+     * every main tensor takes the room of its role's biggest form (pad_w, pad_s: [0]
+     * gate and up, [1] down), so a freed expert's ranges fit any other expert. */
     int main_layers;
-    struct { VktFmt gu, dn; int gu_fmt, gu_gs, dn_fmt, dn_gs; size_t gu_codes, gu_scales, d_codes, d_scales, stage_bytes; } form[2];
+    struct { VktFmt gu, dn; int gu_fmt, gu_gs, dn_fmt, dn_gs; size_t gu_codes, gu_scales, d_codes, d_scales, stage_bytes; } form[VKT_FORMS];
+    int nform, per_layer;
+    uint8_t lform[VKT_MAX_LAYERS];
+    size_t pad_w[2], pad_s[2];
     /* the extra layers' experts: on the primary device, in a pool of their own (another
      * size than the main ones', so neither leaves holes the other cannot use), at most
      * xmax of x_bytes each in x_budget */
@@ -150,13 +156,18 @@ static const char *human(double b, char *buf, size_t n) {
 }
 static double vkt_now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 static VSlot *slot(int layer, int eid) { return &T.s[(size_t)layer * T.c.experts + eid]; }
-static int kind_of(int layer) { return layer >= T.main_layers; }   /* the form of a layer's experts */
+static int kind_of(int layer) { return layer >= T.main_layers; }   /* main (0) or extra (1): the pool */
+static int form_of(int layer) { return T.per_layer && layer < T.main_layers ? T.lform[layer] : kind_of(layer); }
 
 /* ---- source formats ---------------------------------------------------------- */
 static int src_per_row(VktSrc k) {
     return k == VKT_SRC_I8_ROW || k == VKT_SRC_I8_AS_I4_ROW || k == VKT_SRC_I4S_PAIRS_ROW || k == VKT_SRC_I4U_PAIRS_ROW;
 }
+static int src_lowbit(VktSrc k) { return k == VKT_SRC_LB_I2G32 || k == VKT_SRC_LB_I2G16 || k == VKT_SRC_LB_I3G16 || k == VKT_SRC_LB_VQ2; }
+static size_t src_lb_qbytes(VktSrc k, int I) { return (size_t)I / (k == VKT_SRC_LB_VQ2 ? 64 : 32); }   /* group scales a row */
 static size_t src_row_bytes(VktSrc k, int I) {
+    if (k >= VKT_SRC_GGML) return coli_vk_tensor_row_bytes(100 + (int)(k - VKT_SRC_GGML), I);   /* as the device holds it */
+    if (src_lowbit(k)) return (size_t)I * (k == VKT_SRC_LB_I3G16 ? 3 : 2) / 8;
     switch (k) {
     case VKT_SRC_I8_ROW: case VKT_SRC_I8_GS: case VKT_SRC_I8_AS_I4_ROW: case VKT_SRC_I8_AS_I4_GS:
     case VKT_SRC_FP8_GS: case VKT_SRC_FP8_BLOCK: return (size_t)I;
@@ -167,7 +178,8 @@ static size_t src_row_bytes(VktSrc k, int I) {
     }
 }
 static size_t src_scale_bytes(VktFmt f, int I, int O) {
-    if (f.kind == VKT_SRC_BF16 || f.kind == VKT_SRC_F32) return 0;
+    if (f.kind == VKT_SRC_BF16 || f.kind == VKT_SRC_F32 || f.kind >= VKT_SRC_GGML) return 0;
+    if (src_lowbit(f.kind)) return (size_t)O * (src_lb_qbytes(f.kind, I) + 4);   /* group scales, then f32 row scales */
     if (src_per_row(f.kind)) return (size_t)O * 4;
     if (f.kind == VKT_SRC_I4U_PLANAR64 || f.kind == VKT_SRC_I3_G64) return (size_t)O * (((size_t)I + 63) / 64) * 4;
     size_t ng = ((size_t)I + f.gs - 1) / f.gs;
@@ -178,6 +190,8 @@ static size_t src_scale_bytes(VktFmt f, int I, int O) {
 /* The backend format a source kind lands in; 0 when the combination is not one. */
 static int dev_fmt(VktFmt f, int *fmt, int *gs) {
     int g = f.gs;
+    if (f.kind >= VKT_SRC_GGML) { *fmt = 100 + (int)(f.kind - VKT_SRC_GGML); *gs = 0; return coli_vk_block_elems(*fmt) > 0; }
+    if (src_lowbit(f.kind)) { *fmt = f.kind == VKT_SRC_LB_I2G32 ? 200 : f.kind == VKT_SRC_LB_I2G16 ? 201 : f.kind == VKT_SRC_LB_VQ2 ? 203 : 202; *gs = 0; return 1; }
     switch (f.kind) {
     case VKT_SRC_I8_ROW: *fmt = 1; *gs = 0; return 1;
     case VKT_SRC_I8_GS: *fmt = 13; *gs = g; return g >= 4 && g % 4 == 0;
@@ -207,6 +221,19 @@ static void convert_par(VktFmt f, int I, int O, const uint8_t *codes, const void
                         uint8_t *rows, size_t stride, float *sc, int par) {
     size_t rb = src_row_bytes(f.kind, I);
     par = par && O >= 64;
+    if (src_lowbit(f.kind)) {   /* device row: codes | group scales | f32 row scale (blockdec.glsl) */
+        const uint8_t *q = scales; const size_t qb = src_lb_qbytes(f.kind, I);
+        const uint8_t *d = q + (size_t)O * qb;
+        #pragma omp parallel for schedule(static) if (par)
+        for (int o = 0; o < O; o++) {
+            uint8_t *dst = rows + (size_t)o * stride;
+            memcpy(dst, codes + (size_t)o * rb, rb);
+            memcpy(dst + rb, q + (size_t)o * qb, qb);
+            memcpy(dst + rb + qb, d + (size_t)o * 4, 4);
+        }
+        sc[0] = 1.0f;
+        return;
+    }
     switch (f.kind) {
     case VKT_SRC_I8_AS_I4_ROW: case VKT_SRC_I8_AS_I4_GS:   /* int8 in [-8,7] -> v+8 nibble pairs */
         #pragma omp parallel for schedule(static) if (par)
@@ -249,7 +276,7 @@ static void convert_par(VktFmt f, int I, int O, const uint8_t *codes, const void
         for (int o = 0; o < O; o++) memcpy(rows + (size_t)o * stride, codes + (size_t)o * rb, rb);
         break;
     }
-    if (f.kind == VKT_SRC_BF16 || f.kind == VKT_SRC_F32) { sc[0] = 1.0f; return; }
+    if (f.kind == VKT_SRC_BF16 || f.kind == VKT_SRC_F32 || f.kind >= VKT_SRC_GGML) { sc[0] = 1.0f; return; }
     if (f.kind == VKT_SRC_MXFP4_E8M0) {        /* ue8m0 -> f32 2^(s-127), quant.h's mx4_scale */
         size_t n = (size_t)O * (((size_t)I + f.gs - 1) / f.gs);
         const uint8_t *e = scales;
@@ -268,10 +295,10 @@ static void convert_par(VktFmt f, int I, int O, const uint8_t *codes, const void
 /* Upload one expert from its RAM form to device dev's pool (any thread). 0 when the pool
  * refused, -1 when the copy to the device failed (staged uploads: the room was there,
  * and is given back). */
-static int upload(int dev, int kind, const uint8_t *g, const uint8_t *u, const uint8_t *d,
+static int upload(int dev, int layer, const uint8_t *g, const uint8_t *u, const uint8_t *d,
                   const void *gs, const void *us, const void *ds, ColiVkTensor *t[3]) {
-    const int H = T.c.hidden, F = T.c.inter;
-    const __typeof__(T.form[0]) *fm = &T.form[kind];
+    const int H = T.c.hidden, F = T.c.inter, kind = kind_of(layer);
+    const __typeof__(T.form[0]) *fm = &T.form[form_of(layer)];
     const uint8_t *codes[3] = {g, u, d}; const void *sc[3] = {gs, us, ds};
     t[0] = t[1] = t[2] = NULL;
     for (int k = 0; k < 3; k++) {
@@ -280,7 +307,8 @@ static int upload(int dev, int kind, const uint8_t *g, const uint8_t *u, const u
         int I = k < 2 ? H : F, O = k < 2 ? F : H;
         uint8_t *rows; size_t stride; float *scales;
         if (!(kind ? coli_vk_tier_tensor_extra(&t[k], fmt, I, O, fgs, &rows, &stride, &scales)   /* its own pool */
-                   : coli_vk_tier_tensor_dev(dev, &t[k], fmt, I, O, fgs, &rows, &stride, &scales))) {
+                   : coli_vk_tier_tensor_pad(dev, &t[k], fmt, I, O, fgs, T.pad_w[k == 2], T.pad_s[k == 2],
+                                             &rows, &stride, &scales))) {
             for (int j = 0; j < k; j++) { coli_vk_tensor_free(t[j]); t[j] = NULL; }
             return 0;
         }
@@ -345,8 +373,8 @@ static void *uploader(void *arg) {
         VQ e = T.q[T.qh]; T.qh = (T.qh + 1) % VKT_QCAP; T.qn--; T.busy = 1;
         pthread_mutex_unlock(&T.mx);
         const uint8_t *b = e.buf;
-        const int kd = kind_of(e.layer);
-        const size_t guc = T.form[kd].gu_codes, dc = T.form[kd].d_codes, gus = T.form[kd].gu_scales;
+        const int fi = form_of(e.layer);
+        const size_t guc = T.form[fi].gu_codes, dc = T.form[fi].d_codes, gus = T.form[fi].gu_scales;
         const uint8_t *g = b, *u = g + guc, *d = u + guc;
         const uint8_t *gs = d + dc, *us = gs + gus, *ds = us + gus;
         ColiVkTensor *t[3];
@@ -357,7 +385,7 @@ static void *uploader(void *arg) {
          * and try again; refused again after three frees, or nothing freed for a
          * minute (the engine stopped stepping), the pool is full for real. */
         for (int frees = 0, waited = 0; !ok; ) {
-            r = upload(e.dev, kd, g, u, d, gs, us, ds, t);
+            r = upload(e.dev, e.layer, g, u, d, gs, us, ds, t);
             ok = r > 0;
             /* sync: every free decided so far came first (above), and the engine now waits
              * on us, not we on it: the pool is full for real. A failed copy is no question
@@ -554,7 +582,7 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
      * counted apart, or the model's layers would always have spent the rate first */
     const int kd = kind_of(layer);
     if (T.promos[kd] >= T.promo_cap) { T.rated++; return; }
-    const __typeof__(T.form[0]) *fm = &T.form[kd];
+    const __typeof__(T.form[0]) *fm = &T.form[form_of(layer)];
     if (fm->gu_scales && (!src->gs || !src->us || !src->ds)) return;
     int victim = -1, dev = room_dev(layer);
     if (dev < 0 && (!v->heat || (victim = peek_victim(kd, score(v))) < 0)) return;
@@ -670,7 +698,7 @@ int vkt_put(int layer, int eid, const VktExpertSrc *src) {
     if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return 0;
     ColiVkTensor *t[3] = {NULL, NULL, NULL};
     int dev = slot(layer, eid)->dev;   /* vkt_plan's choice */
-    int r = src && src->g && src->u && src->d ? upload(dev, kind_of(layer), src->g, src->u, src->d, src->gs, src->us, src->ds, t) : 0;
+    int r = src && src->g && src->u && src->d ? upload(dev, layer, src->g, src->u, src->d, src->gs, src->us, src->ds, t) : 0;
     int ok = r > 0;
     push_done(layer, eid, ok, r < 0, t);
     if (ok) __atomic_add_fetch(&T.warm, 1, __ATOMIC_RELAXED);
@@ -773,7 +801,8 @@ static int st_alloc(void) {
         for (int k = 0; k < 3 && ok; k++) {
             int fmt = k < 2 ? T.form[0].gu_fmt : T.form[0].dn_fmt, gs = k < 2 ? T.form[0].gu_gs : T.form[0].dn_gs;
             uint8_t *rows; size_t stride; float *sc;
-            ok = coli_vk_tier_tensor(&v->t[k], fmt, k < 2 ? H : F, k < 2 ? F : H, gs, &rows, &stride, &sc);
+            ok = coli_vk_tier_tensor_pad(0, &v->t[k], fmt, k < 2 ? H : F, k < 2 ? F : H, gs, T.pad_w[k == 2], T.pad_s[k == 2],
+                                         &rows, &stride, &sc);
             if (!ok) v->t[k] = NULL;
         }
         if (ok) v->ex = coli_vk_xb_expert(v->t[0], v->t[1], v->t[2]);
@@ -800,14 +829,19 @@ static int st_alloc(void) {
  * parallel, each expert into its own slot. */
 static int st_put(int layer, int eid, VStage *v, const VktExpertSrc *src, int par) {
     const int H = T.c.hidden, F = T.c.inter;
-    if (!src->g || !src->u || !src->d || (T.form[0].gu_scales && (!src->gs || !src->us || !src->ds))) return 0;
+    /* the slots hold form 0; with forms by layer a slot takes each layer's in turn */
+    const __typeof__(T.form[0]) *fm = &T.form[T.per_layer ? form_of(layer) : 0];
+    if (!src->g || !src->u || !src->d || (fm->gu_scales && (!src->gs || !src->us || !src->ds))) return 0;
     const uint8_t *codes[3] = {src->g, src->u, src->d}; const void *scs[3] = {src->gs, src->us, src->ds};
     for (int k = 0; k < 3; k++) {
         uint8_t *rows; size_t stride; float *sc;
-        if (!coli_vk_tensor_refill(v->t[k], &rows, &stride, &sc)) return 0;
-        convert_par(k < 2 ? T.form[0].gu : T.form[0].dn, k < 2 ? H : F, k < 2 ? F : H, codes[k], scs[k], rows, stride, sc, par);
+        int I = k < 2 ? H : F, O = k < 2 ? F : H;
+        if (!(T.per_layer ? coli_vk_tensor_refill_as(v->t[k], k < 2 ? fm->gu_fmt : fm->dn_fmt, I, O, k < 2 ? fm->gu_gs : fm->dn_gs,
+                                                     &rows, &stride, &sc)
+                          : coli_vk_tensor_refill(v->t[k], &rows, &stride, &sc))) return 0;
+        convert_par(k < 2 ? fm->gu : fm->dn, I, O, codes[k], scs[k], rows, stride, sc, par);
     }
-    (void)layer; (void)eid;
+    (void)eid;
     return 1;
 }
 static void st_fill_group(int layer, const int *eids, const int *slots, int n, uint8_t *ok) {
@@ -1482,6 +1516,9 @@ static int form_init(int k, VktFmt gu, VktFmt dn) {
     __typeof__(T.form[0]) *fm = &T.form[k];
     const int H = T.c.hidden, F = T.c.inter;
     if (!dev_fmt(gu, &fm->gu_fmt, &fm->gu_gs) || !dev_fmt(dn, &fm->dn_fmt, &fm->dn_gs)) return 0;
+    /* a block format reads whole blocks of a row */
+    int bg = coli_vk_block_elems(fm->gu_fmt), bd = coli_vk_block_elems(fm->dn_fmt);
+    if ((bg && H % bg) || (bd && F % bd)) return 0;
     fm->gu = gu; fm->dn = dn;
     fm->gu_codes = src_row_bytes(gu.kind, H) * (size_t)F;
     fm->d_codes = src_row_bytes(dn.kind, F) * (size_t)H;
@@ -1489,6 +1526,50 @@ static int form_init(int k, VktFmt gu, VktFmt dn) {
     fm->d_scales = src_scale_bytes(dn, F, H);
     fm->stage_bytes = 2 * fm->gu_codes + fm->d_codes + 2 * fm->gu_scales + fm->d_scales;
     return 1;
+}
+
+static int fmt_eq(VktFmt a, VktFmt b) { return a.kind == b.kind && a.gs == b.gs; }
+/* VktConfig.layer_gate_up/layer_down: each main layer's form, the ones past form 0 from 2
+ * on, and the room every main tensor takes (the biggest form's of its role). 0 when a
+ * layer's form has no device form, or there are more than VKT_FORMS. */
+static int forms_per_layer(void) {
+    const int H = T.c.hidden, F = T.c.inter;
+    T.nform = 2;
+    if (!T.c.layer_gate_up || !T.c.layer_down) return 1;
+    if (T.main_layers > VKT_MAX_LAYERS) return 0;
+    for (int l = 0; l < T.main_layers; l++) {
+        VktFmt a = T.c.layer_gate_up[l], b = T.c.layer_down[l];
+        int f = fmt_eq(a, T.c.gate_up) && fmt_eq(b, T.c.down) ? 0 : -1;
+        for (int j = 2; f < 0 && j < T.nform; j++) if (fmt_eq(a, T.form[j].gu) && fmt_eq(b, T.form[j].dn)) f = j;
+        if (f < 0) {
+            if (T.nform == VKT_FORMS || !form_init(T.nform, a, b)) return 0;
+            f = T.nform++;
+        }
+        T.lform[l] = (uint8_t)f;
+    }
+    if (T.nform == 2) return 1;   /* every layer has form 0 */
+    T.per_layer = 1;
+    for (int j = 0; j < T.nform; j++) {
+        if (j == 1) continue;
+        size_t sg, sd, wg = coli_vk_tensor_alloc_bytes(T.form[j].gu_fmt, H, F, T.form[j].gu_gs, &sg),
+               wd = coli_vk_tensor_alloc_bytes(T.form[j].dn_fmt, F, H, T.form[j].dn_gs, &sd);
+        if (wg > T.pad_w[0]) T.pad_w[0] = wg;
+        if (sg > T.pad_s[0]) T.pad_s[0] = sg;
+        if (wd > T.pad_w[1]) T.pad_w[1] = wd;
+        if (sd > T.pad_s[1]) T.pad_s[1] = sd;
+    }
+    return 1;
+}
+/* One main expert's bytes on a device whose ranges start at `a`: its form's, or with
+ * forms by layer the padded room of every one. */
+static size_t tier_expert_bytes_at(size_t a) {
+    if (!T.per_layer) return expert_bytes_at(T.c.hidden, T.c.inter, T.c.gate_up, T.c.down, a);
+    size_t b = 0;
+    for (int k = 0; k < 3; k++) {
+        size_t w = T.pad_w[k == 2], sc = T.pad_s[k == 2];
+        b += (w + a - 1) / a * a + (sc + a - 1) / a * a;
+    }
+    return b;
 }
 
 /* COLI_VK_DEV2: the second device's share. Its budget is what it has free less
@@ -1511,7 +1592,7 @@ static void d2_init(long long fit0, long long all, int act) {
     }
     snprintf(T.d2_name, sizeof T.d2_name, "%s", di.name ? di.name : "?");
     const double GiB = 1073741824.0;
-    T.d2_exp_bytes = expert_bytes_at(T.c.hidden, T.c.inter, T.c.gate_up, T.c.down, di.buf_align ? di.buf_align : 256);
+    T.d2_exp_bytes = tier_expert_bytes_at(di.buf_align ? di.buf_align : 256);
     double heap_free = di.has_budget ? (double)di.free_bytes : (double)di.local_bytes * 0.8;
     double room = heap_free - env_gb("COLI_VK_RESERVE2_GB", 0.5) * GiB, want = room;
     if (di.shares_ram) {
@@ -1573,7 +1654,12 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         return 0;
     }
     int H = T.c.hidden, F = T.c.inter;
-    T.exp_bytes = vkt_expert_bytes(H, F, T.c.gate_up, T.c.down);
+    if (!forms_per_layer()) {
+        fprintf(stderr, "[VK] tier %s: the layers' expert formats (more than %d forms, or one with no device form) do not "
+                        "all go to the device, the experts stay on the CPU\n", eng, VKT_FORMS - 1);
+        return 0;
+    }
+    T.exp_bytes = T.per_layer ? tier_expert_bytes_at(coli_vk_buffer_alignment()) : vkt_expert_bytes(H, F, T.c.gate_up, T.c.down);
     /* the extra layers (an MTP head's): on the tier when their form has a device form */
     if (T.c.extra_layers > 0) {
         if (form_init(1, T.c.extra_gate_up, T.c.extra_down) && T.exp_bytes &&
@@ -1735,6 +1821,12 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.form[0].gu_gs) fprintf(stderr, " gs %d", T.form[0].gu_gs);
     fprintf(stderr, ", down fmt %d", T.form[0].dn_fmt);
     if (T.form[0].dn_gs) fprintf(stderr, " gs %d", T.form[0].dn_gs);
+    if (T.per_layer) {
+        int other = 0;
+        for (int l = 0; l < T.main_layers; l++) other += T.lform[l] != 0;
+        fprintf(stderr, "; %d layer%s in %d other form%s, each expert in the room of the biggest",
+                other, other == 1 ? "" : "s", T.nform - 2, T.nform == 3 ? "" : "s");
+    }
     fprintf(stderr, "), %s, %s queue, up to %d promotions per token%s%s",
             T.uma ? (cap && *cap ? "shared RAM (COLI_VK_TIER_GB)" : "shared RAM: a quarter of what the expert cache leaves")
                   : "device memory", coli_vk_xb_queue_shared() ? "shared" : "own", T.rate,

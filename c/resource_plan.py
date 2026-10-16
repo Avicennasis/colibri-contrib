@@ -77,7 +77,7 @@ class _CgroupMount:
 # sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
 # straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
 _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
-_ANALYSIS_CACHE_VERSION = 11
+_ANALYSIS_CACHE_VERSION = 12
 
 
 def _dense_in_ram(descriptor, on_disk_bytes):
@@ -1559,17 +1559,86 @@ def _tensor_sizes(path, with_shape=False):
         yield (*item, meta.get("shape")) if with_shape else item
 
 
+def _gguf_sources(model_dir):
+    """A model directory made by tools/gguf_import.py: (gguf.json, [GGUF parts]) or None."""
+    link = Path(model_dir) / "gguf.json"
+    if not link.is_file():
+        return None
+    meta = json.loads(link.read_text(encoding="utf-8"))
+    target = Path(meta["gguf"])
+    if not target.is_absolute():
+        target = Path(model_dir) / target
+    m = re.match(r"^(.*)-00001-of-(\d{5})\.gguf$", str(target))
+    parts = [Path(f"{m.group(1)}-{i:05d}-of-{m.group(2)}.gguf") for i in range(1, int(m.group(2)) + 1)] if m else [target]
+    missing = [str(p) for p in parts if not p.is_file()]
+    if missing:
+        raise ValueError(f"GGUF named by {link} is missing: {', '.join(missing)}")
+    return link, parts
+
+
+def _gguf_tensor_sizes(parts):
+    """(name, bytes, dtype, shape) for a GGUF model, the shape in safetensors
+    order (rows first; ggml stores the dimensions the other way round), named so the family's expert
+    inventory sees one entry per routed expert (the file stores each layer's
+    experts fused, or packed by tools/gguf_import.py --mode copy)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gguf_reader", Path(__file__).resolve().parent / "tools" / "gguf_reader.py")
+    gr = importlib.util.module_from_spec(spec); spec.loader.exec_module(gr)
+    fused = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
+    packed = re.compile(r"^blk\.(\d+)\.ffn_exps_colibri$")
+    last = None
+    for part in parts:
+        reader = gr.GGUFReader(str(part))
+        try:
+            meta = reader.metadata
+            arch = meta.get("general.architecture", "")
+            # a multi-token-prediction head is stored as extra layers past the
+            # model's own (nextn_predict_layers); the engine does not load it.
+            # Only the first part of a split model carries the metadata.
+            blocks = meta.get(f"{arch}.block_count")
+            if blocks:
+                last = int(blocks) - int(meta.get(f"{arch}.nextn_predict_layers", 0) or 0)
+            stride_bytes = None
+            if meta.get("colibri.layout") == "expert-packed-v1":
+                b = meta.get("colibri.expert_bytes") or []
+                stride_bytes = [sum(b[3 * i:3 * i + 3]) for i in range(len(b) // 3)]
+            for t in reader.tensors:
+                dtype = "GGUF_" + t["type_name"]
+                m = fused.match(t["name"])
+                if m and last is not None and int(m.group(1)) >= last:
+                    continue
+                if m:
+                    n = int(t["dims"][-1])
+                    shape = [int(d) for d in reversed(t["dims"][:-1])]
+                    for e in range(n):
+                        yield (f"model.layers.{m.group(1)}.mlp.experts.{e}.{m.group(2)}_proj.weight",
+                               t["nbytes"] // n, dtype, shape)
+                    continue
+                m = packed.match(t["name"])
+                if m and stride_bytes is not None:
+                    layer, n = int(m.group(1)), int(t["dims"][1])
+                    for e in range(n):
+                        yield (f"model.layers.{layer}.mlp.experts.{e}.gguf", stride_bytes[layer], dtype, None)
+                    continue
+                yield t["name"], t["nbytes"], dtype, [int(d) for d in reversed(t["dims"])]
+        finally:
+            reader.close()
+
+
 def analyze_model(model):
     resolved = resolve_model(model)
     model = Path(resolved.model_dir)
     config = resolved.config
-    shards = sorted(model.glob("*.safetensors"))
+    gguf = _gguf_sources(model)
+    shards = gguf[1] if gguf else sorted(model.glob("*.safetensors"))
     if not shards:
         raise ValueError(f"no safetensors shards: {model}")
 
     # Sidecar cache: return the stored analysis if every shard + config is unchanged.
     # resolve_model() already read config.json, so it exists by this point.
     signature = _analysis_signature(shards, model / "config.json")
+    if gguf:
+        signature += f"|gguf.json:{gguf[0].stat().st_size}:{gguf[0].stat().st_mtime_ns}"
     cache_path = model / _ANALYSIS_CACHE_NAME
     try:
         cached = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -1615,9 +1684,10 @@ def analyze_model(model):
     dense_tensors = []
     expert_groups = {}
     tensor_names = set()
-    for shard in shards:
+    for shard in ([None] if gguf else shards):
         try:
-            sizes = list(_tensor_sizes(shard, with_shape=True))
+            sizes = (list(_gguf_tensor_sizes(shards)) if gguf
+                     else list(_tensor_sizes(shard, with_shape=True)))
         except OSError as error:
             # Name the file. An OSError raised by read() on an already-open
             # stream carries no filename, so `coli doctor` reported bare
@@ -1748,6 +1818,8 @@ def analyze_model(model):
 
 
 QWEN38_INT4_SIDECAR = "experts-int4g64"
+QWEN38_INT2_SIDECAR = "experts-int2g32"
+QWEN38_LOWBIT = ("int2g32", "int2g16", "int3g16", "vq2g32", "vq1g64")   # Q38_EXPERT_LOWBIT: experts-<name>/ (qwen38_core.h)
 
 
 def qwen38_int4_sidecar(info):
@@ -1762,18 +1834,27 @@ def qwen38_int4_sidecar(info):
     sidecar that disagrees with it. Returns the analysis unchanged when the
     sidecar does not apply, otherwise a copy priced with its records and
     marked `qwen38_int4_experts`: no FP8 scale bank is built either.
+    Q38_EXPERT_LOWBIT=<name> (int2g32, int2g16, int3g16, vq2g32, vq1g64; Q38_EXPERT_INT2=1:
+    int2g32) makes the engine load experts-<name>/ instead (1.40 MB a record at 2 bits,
+    2.01 MB at 3, 1.32 MB vq2, 0.82 MB vq1 on the release), priced the same way: by the
+    record its index states, whatever the name, so a format this list does not know yet is
+    never priced with the FP8 bytes (a 188-expert cap where RAM held 512, 2026-10-14).
     """
     resolved = info["resolved_family"]
-    if resolved.descriptor.id != "qwen38" or os.environ.get("Q38_EXPERT_INT4") == "0":
+    lowbit = (os.environ.get("Q38_EXPERT_LOWBIT") or "").strip()
+    if not re.fullmatch(r"[a-z0-9]+", lowbit):   # a sidecar name; its index is checked below
+        lowbit = "int2g32" if os.environ.get("Q38_EXPERT_INT2") == "1" else ""
+    if resolved.descriptor.id != "qwen38" or (os.environ.get("Q38_EXPERT_INT4") == "0" and not lowbit):
         return info
     try:
-        index = json.loads((Path(info["path"]) / QWEN38_INT4_SIDECAR / "index.json")
-                           .read_text(encoding="utf-8"))
+        index = json.loads((Path(info["path"]) / (f"experts-{lowbit}" if lowbit else QWEN38_INT4_SIDECAR) /
+                            "index.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return info
     config = info["config"]
     text = config.get("text_config", config) if isinstance(config, dict) else {}
-    want = {"format": "colibri.qwen38.experts-int4g64", "version": 1, "complete": True,
+    want = {"format": f"colibri.qwen38.experts-{lowbit}" if lowbit else "colibri.qwen38.experts-int4g64",
+            "version": 1, "complete": True,
             "layers": text.get("num_hidden_layers"), "experts": text.get("num_experts"),
             "hidden_size": text.get("hidden_size"),
             "moe_intermediate_size": text.get("moe_intermediate_size")}

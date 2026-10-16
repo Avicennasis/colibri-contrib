@@ -89,6 +89,13 @@ GEOMETRIES = {
     # Qwen/Qwen3.8-2.4T-A95B, config.json: 92 layers / full_attention_interval 4
     # / 512 experts top-10 / 64:4 attention heads / 128:16 DeltaNet heads /
     # mtp_num_hidden_layers 1 / fused experts. Widths shrunk, ratios kept.
+    # GGUF oracle: every matrix row a whole number of 256-weight blocks, so the
+    # K and i-quant types apply to it, and 32 value : 16 key DeltaNet heads as
+    # in the 35B, so llama.cpp's value-head reorder is really exercised.
+    "gguf-256": dict(hidden=256, n_layers=8, q_heads=4, kv_heads=2, head_dim=64,
+                     rope_dim=16, n_experts=8, topk=2, inter=256,
+                     dn_key_heads=16, dn_value_heads=32,
+                     fused_experts=False, mtp=False),
     "qwen38-2p4t": dict(hidden=32, n_layers=92, q_heads=16, kv_heads=1, head_dim=16,
                         rope_dim=8, n_experts=512, topk=10, inter=16,
                         dn_key_heads=2, dn_value_heads=16,

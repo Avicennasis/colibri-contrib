@@ -121,8 +121,9 @@ jobs:
           cd c
           make colibri VK=1
           # The shaders are a separate failure mode from the C: glslc can reject a .comp
-          # while backend_vulkan.c compiles perfectly. Assert all four exist.
-          ls -l shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
+          # while backend_vulkan.c compiles perfectly. Assert they exist, the block formats'
+          # two (qmatmul*_bd, blockdec.glsl) among them.
+          ls -l shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv \
                 shaders/attention_absorb.spv shaders/rmsnorm.spv
           # Nothing links the loader (vk_load.h): a VK=1 binary starts without one, as
           # the release archives' must. The Vulkan build is the string it opens.

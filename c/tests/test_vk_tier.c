@@ -29,6 +29,11 @@
  *            streamed, equals the reference, the sum the all-CPU sum, the cold experts
  *            below the rule's rows stay on the CPU, and the resident set is the warm
  *            start's before and after (streaming promotes nothing);
+ *   layers   formats that change by layer (VktConfig.layer_gate_up/layer_down, a GGUF typed
+ *            by layer): every device row equals the reference with the model resident,
+ *            with a budget of four (experts of one form evicted for the other's, no
+ *            upload refused), and streamed through slots that change format between
+ *            the layers' steps;
  *   timeout  a batch's wait gives up (COLI_VK_WAIT_FAULT): the tier stops and the experts
  *            that batch names keep their device memory until the device is idle.
  *
@@ -40,6 +45,7 @@
 #include <unistd.h>
 #include "../backend_vulkan.h"
 #include "../vk_tier.h"
+#include "../ggml_quants.h"   /* the block formats' CPU decoders, the reference of section blocks */
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -190,12 +196,13 @@ static double step(int layer, int S, const int *idx, const float *w, Books *bk) 
             expert_ref(&ex[layer][idx[i]], x + (size_t)s * H, y);
             for (int d = 0; d < H; d++) ref[(size_t)s * H + d] += w[i] * y[d];
             const float *c = taken[i] && joined ? dev[i] : cpu + (size_t)i * H;
-            if (taken[i] && joined) { double r = rel(c, y, H); if (r > worst) worst = r; }
+            if (taken[i] && joined) { double r = rel(c, y, H); if (!(r <= worst)) worst = r; }   /* a NaN counts as the worst */
             for (int d = 0; d < H; d++) out[(size_t)s * H + d] += w[i] * c[d];
             bk->routed++; bk->dev += taken[i] != 0;
         }
     double r = rel(out, ref, S * H);
-    if (r > worst) worst = r;
+    if (!(r <= worst)) worst = r;
+    if (getenv("VKT_TEST_DUMP") && n) fprintf(stderr, "dump: ref %g %g dev %g %g\n", ref[0], ref[1], out[0], out[1]);
     free(x); free(cpu); free(out); free(ref); free(y); free(taken); free(dev);
     return worst;
 }
@@ -270,6 +277,134 @@ static void formats(void) {
         CHECK(worst < 2e-3, "%s: device rows off the reference (%.3g)", cs[c].name, worst);
         vkt_shutdown(); model_free();
     }
+}
+
+/* ---- block formats (shaders/blockdec.glsl): ggml block types and colibri's low-bit ---- */
+/* a block's scale fields set to sane values over random bytes (the decoders read f16 /
+ * e8m0 / ue4m3 scales at these places) */
+static void block_fix(int t, uint8_t *b) {
+    const uint8_t h0 = 0x00, h1 = 0x24;   /* f16 0x2400 = 2^-6 */
+    #define F16AT(o) do { b[o] = h0; b[(o) + 1] = (uint8_t)(h1 + rnd() % 3); } while (0)
+    switch (t) {
+    case GQ_Q4_1: case GQ_Q5_1: case GQ_Q4_K: case GQ_Q5_K: F16AT(0); F16AT(2); break;
+    case GQ_Q2_K: F16AT(80); F16AT(82); break;
+    case GQ_Q3_K: F16AT(108); break;
+    case GQ_Q6_K: F16AT(208); break;
+    case GQ_TQ1_0: F16AT(52); break;
+    case GQ_TQ2_0: F16AT(64); break;
+    case GQ_MXFP4: b[0] = (uint8_t)(118 + rnd() % 4); break;
+    case GQ_NVFP4: for (int i = 0; i < 4; i++) b[i] = (uint8_t)(0x28 + rnd() % 8); break;
+    case GQ_IQ1_M: {   /* d is the top nibble of the four u16 scale words at 48..54 */
+        uint16_t d = (uint16_t)(0x2400 + rnd() % 0x300);
+        for (int i = 0; i < 4; i++) b[48 + 2 * i + 1] = (uint8_t)((b[48 + 2 * i + 1] & 0x0f) | (((d >> (4 * i)) & 15) << 4));
+        break; }
+    default: F16AT(0); break;
+    }
+    #undef F16AT
+}
+static int lb_bits(VktSrc k) { return k == VKT_SRC_LB_I3G16 ? 3 : 2; }
+/* vq2's codebooks for the test: per coordinate max|a| + max|b| = 127, as the converter scales them */
+static int8_t g_vq_a[256][8], g_vq_b[256][8];
+static void vq_books(void) {
+    for (int j = 0; j < 8; j++) {
+        int ta = 30 + (int)(rnd() % 70), tb = 127 - ta;
+        for (int e = 0; e < 256; e++) {
+            g_vq_a[e][j] = (int8_t)(e < 2 ? (e ? -ta : ta) : (int)(rnd() % (2 * ta + 1)) - ta);
+            g_vq_b[e][j] = (int8_t)(e < 2 ? (e ? -tb : tb) : (int)(rnd() % (2 * tb + 1)) - tb);
+        }
+    }
+}
+static void mat_make_block(Mat *m, VktFmt f, int I, int O) {
+    m->f = f; m->I = I; m->O = O;
+    m->w = malloc((size_t)I * O * sizeof(float));
+    if (f.kind >= VKT_SRC_GGML) {
+        int t = (int)(f.kind - VKT_SRC_GGML); size_t rb = (size_t)gq_row_bytes(t, I);
+        int bl = GQ_TYPES[t].blck, by = GQ_TYPES[t].bytes;
+        m->codes = malloc(rb * O); m->scales = NULL;
+        for (size_t i = 0; i < rb * O; i++) m->codes[i] = (uint8_t)rnd();
+        for (int o = 0; o < O; o++) {
+            uint8_t *row = m->codes + (size_t)o * rb;
+            for (int b = 0; b < I / bl; b++) block_fix(t, row + (size_t)b * by);
+            gq_dequant_row(t, row, m->w + (size_t)o * I, I);
+        }
+        return;
+    }
+    /* colibri low-bit: codes, then as "scales" the group scales (I/32 bytes a row, vq2 I/64)
+     * and the f32 row scales; decoded here from lowbit_g16.h's and vq2_g32.h's descriptions */
+    int bits = lb_bits(f.kind), g32 = f.kind == VKT_SRC_LB_I2G32, vq = f.kind == VKT_SRC_LB_VQ2;
+    size_t rb = (size_t)I * bits / 8, qb = (size_t)I / (vq ? 64 : 32);
+    m->codes = malloc(rb * O);
+    for (size_t i = 0; i < rb * O; i++) m->codes[i] = (uint8_t)rnd();
+    uint8_t *sc = malloc((size_t)O * (qb + 4)); m->scales = sc;
+    for (size_t i = 0; i < (size_t)O * qb; i++) sc[i] = (uint8_t)(g32 ? 1 + rnd() % 255 : rnd());
+    float *d = (float *)(sc + (size_t)O * qb);
+    static const int l2[4] = {-10, -3, 3, 10}, l3[8] = {-26, -16, -9, -3, 3, 9, 16, 26};
+    for (int o = 0; o < O; o++) {
+        d[o] = 0.0005f + (rnd() % 100) / 100000.0f;
+        const uint8_t *row = m->codes + (size_t)o * rb, *q = sc + (size_t)o * qb;
+        for (int i = 0; vq && i < I; i++) {   /* vq2: index bytes a, b per 8, a nibble per 32 */
+            const uint8_t *v = row + (size_t)(i / 8) * 2;
+            int qs = (q[i / 64] >> (4 * ((i / 32) & 1))) & 15;
+            m->w[(size_t)o * I + i] = d[o] * (float)qs * (float)(g_vq_a[v[0]][i % 8] + g_vq_b[v[1]][i % 8]);
+        }
+        for (int i = 0; !vq && i < I; i++) {
+            const uint8_t *blk = row + (size_t)(i / 128) * (bits == 3 ? 48 : 32);
+            int k = i % 128, c = (blk[k % 32] >> (2 * (k / 32))) & 3;
+            if (bits == 3) c |= ((blk[32 + k % 16] >> (k / 16)) & 1) << 2;
+            int qs = g32 ? q[i / 32] : (q[i / 32] >> (4 * ((i / 16) & 1))) & 15;
+            m->w[(size_t)o * I + i] = d[o] * (float)qs * (float)(bits == 3 ? l3[c] : l2[c]);
+        }
+    }
+}
+static void blocks(void) {
+    const int H0 = H, F0 = F;
+    H = 512; F = 256;   /* whole blocks of 256 in both widths, and of 128 for the low-bit forms */
+    struct { int gu, dn; const char *name; } cs[] = {
+        {GQ_Q4_0, GQ_Q4_0, "Q4_0"}, {GQ_Q4_1, GQ_Q4_1, "Q4_1"}, {GQ_Q5_0, GQ_Q5_0, "Q5_0"}, {GQ_Q5_1, GQ_Q5_1, "Q5_1"},
+        {GQ_Q8_0, GQ_Q8_0, "Q8_0"}, {GQ_IQ4_NL, GQ_IQ4_NL, "IQ4_NL"}, {GQ_MXFP4, GQ_MXFP4, "MXFP4 (ggml)"},
+        {GQ_NVFP4, GQ_NVFP4, "NVFP4"}, {GQ_Q1_0, GQ_Q1_0, "Q1_0"}, {GQ_Q2_0, GQ_Q2_0, "Q2_0"},
+        {GQ_Q2_K, GQ_Q2_K, "Q2_K"}, {GQ_Q3_K, GQ_Q3_K, "Q3_K"}, {GQ_Q4_K, GQ_Q6_K, "Q4_K, Q6_K down"},
+        {GQ_Q5_K, GQ_Q5_K, "Q5_K"}, {GQ_IQ2_XXS, GQ_IQ2_XXS, "IQ2_XXS"}, {GQ_IQ2_XS, GQ_IQ2_XS, "IQ2_XS"},
+        {GQ_IQ2_S, GQ_IQ2_S, "IQ2_S"}, {GQ_IQ3_XXS, GQ_IQ3_XXS, "IQ3_XXS"}, {GQ_IQ3_S, GQ_IQ3_S, "IQ3_S"},
+        {GQ_IQ1_S, GQ_IQ1_S, "IQ1_S"}, {GQ_IQ1_M, GQ_IQ1_M, "IQ1_M"}, {GQ_IQ4_XS, GQ_IQ4_XS, "IQ4_XS"},
+        {GQ_TQ1_0, GQ_TQ1_0, "TQ1_0"}, {GQ_TQ2_0, GQ_TQ2_0, "TQ2_0"},
+        {-1, -1, "colibri int2-g32"}, {-2, -2, "colibri int2-g16"}, {-3, -3, "colibri int3-g16"},
+        {-4, -4, "colibri vq2"},
+    };
+    vq_books();   /* before the first block-format tensor builds the device's table */
+    CHECK(!coli_vk_set_vq2_books(&g_vq_a[0][0], &g_vq_b[0][0]), "vq2: the codebooks did not reach the table");
+    for (size_t c = 0; c < sizeof cs / sizeof *cs; c++) {
+        VktFmt gu, dn;
+        if (cs[c].gu >= 0) { gu.kind = (VktSrc)(VKT_SRC_GGML + cs[c].gu); dn.kind = (VktSrc)(VKT_SRC_GGML + cs[c].dn); }
+        else { VktSrc k = cs[c].gu == -1 ? VKT_SRC_LB_I2G32 : cs[c].gu == -2 ? VKT_SRC_LB_I2G16 : cs[c].gu == -3 ? VKT_SRC_LB_I3G16 : VKT_SRC_LB_VQ2; gu.kind = dn.kind = k; }
+        gu.gs = dn.gs = 0;
+        for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) {
+            mat_make_block(&ex[l][e].g, gu, H, F); mat_make_block(&ex[l][e].u, gu, H, F); mat_make_block(&ex[l][e].d, dn, F, H);
+        }
+        g_act = VKT_ACT_SWIGLU; g_limit = 0;
+        set_budget(L * E, gu, dn);
+        setenv("COLI_VK_TIER_RATE", "64", 1);
+        setenv("COLI_VK_TIER_SYNC", "1", 1);
+        VktConfig vc = cfg_of(gu, dn, VKT_ACT_SWIGLU, 0);
+        int on = vkt_init(&vc, NULL);
+        unsetenv("COLI_VK_TIER_SYNC");
+        CHECK(on, "%s: the tier did not start", cs[c].name);
+        if (!on) { model_free(); continue; }
+        Books bk = {0, 0}; double worst = 0;
+        static const int Ss[] = {1, 3, 20, 1, 2, 24};
+        for (int t = 0; t < 6; t++)
+            for (int l = 0; l < L; l++) {
+                int idx[24 * K]; float w[24 * K];
+                route(Ss[t], 0, E, idx, w);
+                double r = step(l, Ss[t], idx, w, &bk);
+                if (r > worst) worst = r;
+            }
+        printf("  %-34s device %3llu of %3llu assignments, worst relative error %.2e\n", cs[c].name, bk.dev, bk.routed, worst);
+        CHECK(bk.dev > 0, "%s: nothing ran on the device", cs[c].name);
+        CHECK(worst < 2e-3, "%s: device rows off the reference (%.3g)", cs[c].name, worst);
+        vkt_shutdown(); model_free();
+    }
+    H = H0; F = F0;
 }
 
 /* a history fills the budget in heat order */
@@ -707,7 +842,8 @@ static double stream_step(int layer, int S, const int *idx, const float *w, int 
             bk->routed++; bk->dev += taken[i] != 0;
         }
     double r = rel(out, ref, S * H);
-    if (r > worst) worst = r;
+    if (!(r <= worst)) worst = r;
+    if (getenv("VKT_TEST_DUMP") && n) fprintf(stderr, "dump: ref %g %g dev %g %g\n", ref[0], ref[1], out[0], out[1]);
     free(x); free(xq); free(cpu); free(out); free(ref); free(y); free(taken); free(dev); free(res);
     return worst;
 }
@@ -772,6 +908,78 @@ static void stream(void) {
         vkt_shutdown(); model_free();
         unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS"); unsetenv("COLI_VK_TIER_FILL");
     }
+}
+
+/* formats by layer: layer 0 Q4_K gate/up and Q5_K down (the main form), layer 1 the
+ * bigger Q5_K and Q6_K, as a published GGUF gives a few layers */
+static void layers(void) {
+    const int H0 = H, F0 = F;
+    H = 512; F = 256;
+    VktFmt lgu[L], ldn[L];
+    lgu[0] = (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}; ldn[0] = (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q5_K), 0};
+    lgu[1] = (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q5_K), 0}; ldn[1] = (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0};
+    for (int mode = 0; mode < 3; mode++) {   /* resident, evicting, streaming */
+        for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) {
+            mat_make_block(&ex[l][e].g, lgu[l], H, F); mat_make_block(&ex[l][e].u, lgu[l], H, F);
+            mat_make_block(&ex[l][e].d, ldn[l], F, H);
+        }
+        g_act = VKT_ACT_SWIGLU; g_limit = 0;
+        set_budget(mode == 0 ? L * E : 4, lgu[1], ldn[1]);   /* counted in the biggest form */
+        setenv("COLI_VK_TIER_RATE", mode == 2 ? "0" : "64", 1);
+        setenv("COLI_VK_TIER_SYNC", "1", 1);
+        if (mode == 2) { setenv("COLI_VK_TIER_STREAM_SLOTS", "4", 1); setenv("COLI_VK_TIER_STREAM_ROWS", "3", 1);
+                         setenv("COLI_VK_TIER_STREAM_HALF", "40", 1); }
+        VktConfig vc = cfg_of(lgu[0], ldn[0], VKT_ACT_SWIGLU, 0);
+        vc.layer_gate_up = lgu; vc.layer_down = ldn;
+        if (mode == 2) { vc.load = load_cb; vc.release = release_cb; }
+        uint32_t hist[L][E], *hr[L];
+        for (int l = 0; l < L; l++) { hr[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = l == 0 && e < 4 ? 100 - e : 0; }
+        int on = vkt_init(&vc, mode == 2 ? hr : NULL);
+        unsetenv("COLI_VK_TIER_SYNC"); unsetenv("COLI_VK_TIER_STREAM_HALF");
+        CHECK(on, "layers: the tier did not start");
+        if (!on) { model_free(); break; }
+        if (mode == 2) {   /* the warm start: layer 0's four, the slots then stream layer 1's experts */
+            int pl[L * E], pe[L * E], np = vkt_plan(pl, pe, L * E);
+            for (int i = 0; i < np; i++) { VktExpertSrc s = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &s); }
+            vkt_put_done();
+        }
+        Books bk = {0, 0}; double worst = 0; unsigned long long streamed = 0, kept = 0;
+        int res1 = 0;
+        static const int Ss[2][6] = {{1, 3, 20, 1, 2, 24}, {48, 33, 1, 64, 2, 40}};
+        if (mode == 1)   /* layer 0's experts settle, then layer 1's take their room (LFRU: a few hundred steps) */
+            for (int t = 0; t < 360; t++) {
+                int lay = t < 60 ? 0 : 1, idx[4 * K]; float w[4 * K];
+                route(4, 0, 5, idx, w);
+                vkt_begin_forward();
+                double r = step(lay, 4, idx, w, &bk);
+                if (!(r <= worst)) worst = r;
+            }
+        else
+            for (int t = 0; t < 6; t++)
+                for (int l = 0; l < L; l++) {
+                    int S = Ss[mode / 2][t], idx[64 * K]; float w[64 * K];
+                    route(S, 0, E, idx, w);
+                    vkt_begin_forward();
+                    double r = mode == 2 ? stream_step(l, S, idx, w, 0, &bk, &streamed, &kept, 0) : step(l, S, idx, w, &bk);
+                    if (!(r <= worst)) worst = r;
+                }
+        for (int e = 0; e < E; e++) res1 += vkt_resident(1, e);
+        static const char *mn[3] = {"resident", "budget of four", "streaming"};
+        printf("  Q4_K/Q5_K and Q5_K/Q6_K layers, %-15s device %3llu of %3llu (%llu streamed), %d of layer 1 resident, worst %.2e\n",
+               mn[mode], bk.dev, bk.routed, streamed, res1, worst);
+        unsigned long long ev, failed;
+        report_counts(&ev, &failed);
+        int counted = failed != ~0ull;   /* the report read back (not where stderr cannot be redirected: mingw) */
+        CHECK(bk.dev > 0, "layers %s: nothing ran on the device", mn[mode]);
+        CHECK(!counted || failed == 0, "layers %s: %llu uploads refused", mn[mode], failed);
+        CHECK(worst < 2e-3, "layers %s: device rows off the reference (%.3g)", mn[mode], worst);
+        if (mode == 1) CHECK(res1 > 0 && (!counted || ev > 0), "layers: no expert of the bigger form took a freed one's room "
+                                                "(%d resident, %llu evictions)", res1, ev);
+        if (mode == 2) CHECK(streamed > 0, "layers: nothing streamed");
+        vkt_shutdown(); model_free();
+        unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
+    }
+    H = H0; F = F0;
 }
 
 /* A large requested step under a deliberately tiny scratch budget: reserve a
@@ -904,7 +1112,7 @@ static double sum_step(int layer, int S, const int *idx, const float *w, Books *
             int i = s * K + k;
             expert_ref(&ex[layer][idx[i]], x + (size_t)s * H, y);
             const float *c = taken[i] && joined ? dev[i] : cpu + (size_t)i * H;
-            if (taken[i] && joined) { double r = rel(c, y, H); if (r > worst) worst = r; }
+            if (taken[i] && joined) { double r = rel(c, y, H); if (!(r <= worst)) worst = r; }   /* a NaN counts as the worst */
             for (int d = 0; d < H; d++) { ref[(size_t)s * H + d] += w[i] * y[d]; loop[(size_t)s * H + d] += w[i] * c[d]; }
             bk->routed++; bk->dev += taken[i] != 0;
         }
@@ -991,6 +1199,7 @@ int main(int argc, char **argv) {
     setenv("COLI_VK_TIER_RESERVE_GB", "0", 1);
     scratch_budget();
     printf("formats:\n"); formats();
+    printf("blocks:\n"); blocks();
     printf("grouped:\n"); grouped();
     printf("warm:\n"); warm();
     printf("adapt:\n"); adapt();
@@ -1000,6 +1209,7 @@ int main(int argc, char **argv) {
     printf("fill:\n"); fill();   /* after extra: its exact pool capacities assume no tier came before with more experts */
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
+    printf("layers:\n"); layers();
     ColiVkPoolStats ps, px; coli_vk_pool_stats(1, &ps); coli_vk_pool_stats(4, &px);
     CHECK(ps.live == 0 && px.live == 0, "%d + %d tier ranges still live after every shutdown", ps.live, px.live);
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */
