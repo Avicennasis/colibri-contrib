@@ -7181,9 +7181,15 @@ class ChatFlavorLogprobsGateTest(unittest.TestCase):
         return engine
 
     def test_no_family_with_the_numeric_channel_is_ever_given_a_chat_flavor(self):
-        # Both sides come from the sources the server reads: the registry's families, the
-        # capability each one's Engine sets, and detect_chat_flavor over a checkpoint that
-        # ships Qwen3.8's template -- the one input that flavors anything today.
+        # The flavor (Qwen3.8's template on a qwen36 checkpoint, or Qwen3-Coder's on the
+        # same engine) is resolved from the checkpoint before the engine is built, and a
+        # flavored engine parses tool calls with another family's parser -- no span maps,
+        # so nothing to align the logprobs against. The guard is therefore per ENGINE and
+        # behavioural: whatever the family declares, a flavored engine exposes no channel,
+        # and an engine under its own rendering exposes exactly what its family declares.
+        # Stated as family-set orthogonality it would forbid qwen36's channel outright --
+        # a Qwen3.6 checkpoint shipping Qwen3.8's template is ordinary, so the family being
+        # flavorable says nothing about the engine serving it.
         families = family_ids()
         self.assertGreater(len(families), 0)
         with tempfile.TemporaryDirectory() as model_dir:
@@ -7192,17 +7198,24 @@ class ChatFlavorLogprobsGateTest(unittest.TestCase):
                 encoding="utf-8")
             flavored = {family_id for family_id in families
                         if detect_chat_flavor(family_id, model_dir) is not None}
-        channel = set()
-        for family_id in families:
-            process = FakeProcess(lambda _process, _frame: None)
-            with patch("openai_server.subprocess.Popen", return_value=process):
-                engine = Engine("engine", "model", cap=1, family=family_by_id(family_id))
-            self.addCleanup(engine.close)
-            if engine.supports_logprobs_echo:
-                channel.add(family_id)
         self.assertIn("qwen36", flavored)
-        self.assertIn("glm", channel)
-        self.assertEqual(flavored & channel, set())
+        declared = {family_id for family_id in families
+                    if family_by_id(family_id).capabilities.logprobs_echo}
+        self.assertIn("glm", declared)
+        for family_id in families:
+            for flavor in (None, "qwen38"):
+                process = FakeProcess(lambda _process, _frame: None)
+                with patch("openai_server.subprocess.Popen", return_value=process), \
+                        patch("openai_server.CHAT_FLAVOR", flavor):
+                    engine = Engine("engine", "model", cap=1,
+                                    family=family_by_id(family_id))
+                self.addCleanup(engine.close)
+                with self.subTest(family=family_id, flavor=flavor):
+                    if flavor is not None and flavor != family_id:
+                        self.assertFalse(engine.supports_logprobs_echo)
+                    else:
+                        self.assertEqual(engine.supports_logprobs_echo,
+                                         family_id in declared)
 
     def test_logprobs_is_refused_on_a_qwen36_engine_with_the_qwen38_template(self):
         engine = self._engine("qwen36", "qwen38")

@@ -5671,7 +5671,7 @@ class Engine:
         # tool-call spans the alignment reads. ChatFlavorLogprobsGateTest keeps the two sets
         # apart for every registry family.
         self.supports_logprobs_echo = (family.capabilities.logprobs_echo
-                                       and chat_flavor() == arch)
+                                       and CHAT_FLAVOR in (None, arch))
         self.supports_tok_ids = (arch == "glm")
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
