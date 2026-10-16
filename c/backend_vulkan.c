@@ -431,6 +431,7 @@ static struct {
     uint32_t memtype_dev;        /* DEVICE_LOCAL, for scratch only the device touches */
     char spv_path[1024];         /* the main shader, its siblings are found beside it */
 } G;
+static int g_vk_software;   /* G's device is a CPU one (llvmpipe): vk_fence_wait_us waits longer */
 
 struct PC { int fmt, S, I, O, rowWords, gs; };
 /* gate_up shader only: the activation (COLI_VK_ACT_*) and its parameters: act 0's
@@ -1024,6 +1025,7 @@ int coli_vk_init(const char *spv_path) {
                    p.deviceType == VK_PHYSICAL_DEVICE_TYPE_OTHER          ? 1 : 0; // CPU last
         if (rank > bestrank) { bestrank = rank; G.phys = devs[i]; }
     }
+    { VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(G.phys, &p); g_vk_software = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU; }
 
     uint32_t nq = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(G.phys, &nq, NULL);
@@ -2127,6 +2129,11 @@ int coli_vk_tensor_import(ColiVkTensor **tensor, const void *weights, size_t all
  * then fall back to the blocking wait. The spinning thread is stalled on the
  * GPU result anyway. COLI_VK_SPIN_US=0 restores the pure blocking wait. */
 static long g_vk_spin_us = -1;
+/* The blocked wait's limit before the device counts as lost: 10 s tells a GPU that
+ * hangs. A software device (llvmpipe) generates a shader's code at its first launch,
+ * inside the wait, and caches it on disk: on a CI runner's empty cache the block-format
+ * GEMVs' first batch (qmatmul*_bd.spv) took longer than that, and the tier was given up
+ * for a compile. There a wait runs up to 5 minutes, as the chain's frames do. */
 static VkResult vk_fence_wait_us(VkDevice dev, VkFence f, long spin_us) {
     if (spin_us > 0) {
         double t0 = vk_now();
@@ -2135,7 +2142,7 @@ static VkResult vk_fence_wait_us(VkDevice dev, VkFence f, long spin_us) {
             if (r != VK_NOT_READY) return r;   /* VK_SUCCESS or a real error */
         } while ((vk_now() - t0) * 1000.0 < (double)spin_us);
     }
-    return vkWaitForFences(dev, 1, &f, VK_TRUE, 10000000000ULL);
+    return vkWaitForFences(dev, 1, &f, VK_TRUE, g_vk_software && dev == G.dev ? 300000000000ULL : 10000000000ULL);
 }
 static long vk_spin_us(void) {
     if (g_vk_spin_us < 0) {
