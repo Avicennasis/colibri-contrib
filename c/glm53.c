@@ -3673,17 +3673,21 @@ static void glm53_state_restore(const GModel *m, const Glm53PinState *st, GSessi
 static int (*g_layer_halt)(void *) = NULL;
 static void *g_layer_halt_arg = NULL;
 static int g_halted_at_layer = -1;
+static int g_halted_on_device = 0;   /* il layer l'ha fermato la catena Vulkan */
 
 static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
                          int n, int start, int begin, int end) {
     const Cfg *c = &m->c;
     const int H = c->hc_mult, D = c->hidden;
+    const int from = begin;   /* g_layer_halt: anche dopo i layer di una catena parziale */
 #ifdef COLI_VULKAN
     /* every layer on the device (glm53_chain.h); 0: the CPU below, its state current
      * first; a partial chain (the first N layers on the device) hands the streams back
-     * after layer N - 1 and the CPU runs the rest from there */
+     * after layer N - 1 and the CPU runs the rest from there; -1: g_layer_halt stopped
+     * it between layers */
     if (g_vk_chain && begin == 0 && end == c->n_layers) {
         const int done = g53c_forward(m, s, streams, n, start);
+        if (done < 0) return NULL;   /* i due banchi restano al chiamante */
         if (done >= c->n_layers) return streams;
         if (!done) g53c_cpu_step(m, s, start);
         begin = done;
@@ -3699,8 +3703,9 @@ static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
     }
 
     for (int i = begin; i < end; i++) {
-        if (g_layer_halt && i > begin && g_layer_halt(g_layer_halt_arg)) {
+        if (g_layer_halt && i > from && g_layer_halt(g_layer_halt_arg)) {
             g_halted_at_layer = i;
+            g_halted_on_device = 0;
             free(comb); free(post); free(branch); free(normed); free(collapsed);
             return NULL;          /* i due banchi restano al chiamante */
         }
@@ -4068,8 +4073,9 @@ static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
         if (!part) {
             glm53_state_restore(m, chunk_start, s);
             if (getenv("GLM53_VERBOSE"))
-                fprintf(stderr, "HALT layer %d of %d, back to %d\n",
-                        g_halted_at_layer, c->n_layers, s->filled);
+                fprintf(stderr, "HALT layer %d of %d%s, back to %d\n",
+                        g_halted_at_layer, c->n_layers,
+                        g_halted_on_device ? " on the device" : "", s->filled);
             free(all);
             free(last);
             return NULL;
