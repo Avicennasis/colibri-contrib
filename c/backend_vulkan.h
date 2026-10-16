@@ -419,6 +419,9 @@ void coli_vk_xb_stats_dev(int dev, ColiVkXbStats *st);
 /* 1 if the selected device is an integrated GPU (shares physical memory with
  * the host), 0 otherwise or when no device is selected. */
 int coli_vk_device_integrated(void);
+/* 1 if the selected device is an integrated GPU with many active compute units
+ * (COLI_VK_IGPU_MANY_CU, vk_igpu_threshold.h), 0 otherwise or when it reports none. */
+int coli_vk_device_igpu_many_cu(void);
 /* 1 for an integrated GPU or a CPU device (Lavapipe): device memory is host RAM. */
 int coli_vk_device_shares_ram(void);
 /* VK_KHR_shader_integer_dot_product on the primary device: 0 none, 1 supported, 2 with
