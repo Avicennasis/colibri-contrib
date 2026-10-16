@@ -9,7 +9,9 @@
 // matrix (more workgroups to fill the device), more for a long one. nr rows of x (up to
 // 4: a speculative verify's) share a workgroup and every weight load; each row keeps
 // its own sums in the same order, so its bits are a decode step's (nr = 1).
-// Host: I % 32 == 0, nr * I <= 16384, rowWords % 4 == 0; fmt 4: gs % 32 == 0.
+// Host: I % 32 == 0, nr * I <= 4 * XS, rowWords % 4 == 0; fmt 4: gs % 32 == 0. XS (vec4s of
+// x staged, constant_id 0) is set from the device's maxComputeSharedMemorySize: 4096 (64
+// KiB) where it allows, 3072 on a 48 KiB GPU (#1998: a fixed 64 KiB lost the device there).
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_clustered : require
@@ -24,7 +26,8 @@ layout(push_constant) uniform P { int fmt, S, I, O, rowWords, gs, rpw, nr; } p;
 #define NRMAX 4
 
 #define RPS 4u
-shared vec4 xsh[4096];
+layout(constant_id = 0) const int XS = 4096;
+shared vec4 xsh[XS];
 
 float i8(uint w, uint k) { return float(int(w << (24u - 8u * k)) >> 24); }
 float d8(uint w, vec4 a) { return a.x * i8(w, 0u) + a.y * i8(w, 1u) + a.z * i8(w, 2u) + a.w * i8(w, 3u); }

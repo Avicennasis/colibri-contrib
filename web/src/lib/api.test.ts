@@ -59,7 +59,7 @@ describe("chat request extensions", () => {
     headers: { "content-type": "text/event-stream" },
   })
 
-  async function requestBody(cacheSlot?: number, compact?: boolean) {
+  async function requestBody(cacheSlot?: number, compact?: boolean, maxTokens: number | null = 8) {
     const fetchMock = vi.fn().mockResolvedValue(completedStream())
     vi.stubGlobal("fetch", fetchMock)
     await streamChat({
@@ -68,7 +68,7 @@ describe("chat request extensions", () => {
       model: "test-model",
       messages: [],
       temperature: 0,
-      maxTokens: 8,
+      maxTokens: maxTokens ?? undefined,
       enableThinking: false,
       cacheSlot,
       compact,
@@ -86,9 +86,50 @@ describe("chat request extensions", () => {
     expect(await requestBody(0)).toMatchObject({ cache_slot: 0 })
   })
 
+  /* #382: no ceiling of the user's own leaves the server's, which on colibrì is the
+     context the engine holds; a fixed 4096 cut a reasoning model's turns short */
+  it("sends max_completion_tokens only when the user set one", async () => {
+    expect(await requestBody(undefined, undefined, 512)).toMatchObject({ max_completion_tokens: 512 })
+    expect(await requestBody(undefined, undefined, null)).not.toHaveProperty("max_completion_tokens")
+  })
+
   it("asks a colibrì server for context compaction, and only a colibrì server", async () => {
     expect(await requestBody(undefined, true)).toMatchObject({ context_compaction: "auto" })
     expect(await requestBody()).not.toHaveProperty("context_compaction")
+  })
+})
+
+describe("reasoning in the history", () => {
+  /* #382: a past turn's reasoning goes back to a colibrì server, so a GLM prompt is what
+     the engine holds (its KV state reused, not prefilled again); never to another server */
+  async function sent(keepReasoning?: boolean) {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("data: [DONE]\n\n", {
+      headers: { "content-type": "text/event-stream" },
+    }))
+    vi.stubGlobal("fetch", fetchMock)
+    await streamChat({
+      baseUrl: "http://localhost:8000/v1", apiKey: "", model: "test-model",
+      messages: [
+        { id: "u1", role: "user", content: "hi" },
+        { id: "a1", role: "assistant", content: "hello", reasoning: "the user greets me" },
+        { id: "a2", role: "assistant", content: "again", reasoning: "  " },
+        { id: "u2", role: "user", content: "and?", reasoning: "not a user field" },
+      ],
+      temperature: 0, maxTokens: 8, enableThinking: true, keepReasoning,
+      signal: new AbortController().signal, onDelta: () => undefined,
+    })
+    return (JSON.parse(fetchMock.mock.calls[0][1].body as string) as { messages: Record<string, unknown>[] }).messages
+  }
+
+  it("sends a past assistant turn's reasoning to a colibrì server", async () => {
+    const messages = await sent(true)
+    expect(messages[1]).toEqual({ role: "assistant", content: "hello", reasoning_content: "the user greets me" })
+    expect(messages[2]).not.toHaveProperty("reasoning_content")   // blank: nothing to keep
+    expect(messages[3]).not.toHaveProperty("reasoning_content")   // a user turn has none
+  })
+
+  it("keeps it from any other server", async () => {
+    for (const message of await sent()) expect(message).not.toHaveProperty("reasoning_content")
   })
 })
 

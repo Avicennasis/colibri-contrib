@@ -1008,13 +1008,21 @@ static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, .
  * matrix is uploaded once the device is open and its host copy is given back, before the
  * expert cache sizes itself from the free memory (expert_cache_init), so that RAM goes to
  * the experts. mv and mm multiply a matrix the device holds alone by that copy (f32 as
- * the backend's fmt 10, as the chain uploads it); anything else that reads it (mv_rows,
- * mm_rows, a parallel region, a lost device) reads it back from the checkpoint first:
+ * bf16 or f16 where that holds it exactly, else fmt 10, as the chain uploads it);
+ * anything else that reads it (mv_rows, mm_rows, a parallel region, a lost device) reads
+ * it back from the checkpoint first:
  * load_mat, or absorb_kvb for kv_b's two halves, with the GLM53_BITS of the load, so the
  * same bytes; the copy stays from there on. */
 static GModel *g_g53_dho_model;
 static pthread_mutex_t g_g53_dho_mx = PTHREAD_MUTEX_INITIALIZER;
-static int g53_vk_fmt(const Mat *w) { return w->fmt == 0 ? 10 : w->fmt; }
+/* y = x W^T for S rows on the device by w's copy, uploaded first if it is not up (f32 as
+ * coli_vk_matmul_f32 holds it: bf16 or f16 where exact); 0 = the CPU computes. */
+static int g53_vk_matmul(const Mat *wc, float *out, const float *x, int S) {
+    Mat *w = (Mat *)wc;
+    if (w->fmt == 0) return coli_vk_matmul_f32((ColiVkTensor **)&w->vk, out, x, w->f, S, w->columns, w->rows);
+    return coli_vk_matmul((ColiVkTensor **)&w->vk, out, x, w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8, w->s,
+                          w->fmt, S, w->columns, w->rows, w->fmt == 4 ? w->gs : 0);
+}
 static size_t g53_host_bytes(const Mat *w) {
     const size_t r = (size_t)w->rows, cl = (size_t)w->columns;
     if (w->fmt == 0) return r * cl * 4;
@@ -1051,8 +1059,7 @@ static int g53_dho_gone(const Mat *w) { return __atomic_load_n(&w->vk_gone, __AT
 /* The device's copy of a matrix it holds alone: 0 = the CPU computes (after a read-back). */
 static int g53_dho_matmul(const Mat *w, float *out, const float *x, int S) {
     if (omp_in_parallel() || !w->vk || coli_vk_tensor_dev((const ColiVkTensor *)w->vk)) return 0;
-    return coli_vk_matmul((ColiVkTensor **)&((Mat *)w)->vk, out, x, NULL, NULL, g53_vk_fmt(w), S, w->columns,
-                          w->rows, w->fmt == 4 ? w->gs : 0);
+    return g53_vk_matmul(w, out, x, S);   /* the host copy is gone: the device's is up */
 }
 #endif
 
@@ -1105,13 +1112,7 @@ static void mv(float *out, const Mat *w, const float *x) {
         g53_dho_reload((Mat *)w);
     }
     if (g_vk_dense && w->resident && (w->fmt == 0 || w->fmt == 1 || w->fmt == 4) && G53_VK_MAY(w)) {
-        Mat *mutable_w = (Mat *)w;
-        if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
-                           w->fmt == 0 ? (const void *)w->f :
-                           w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
-                           w->fmt == 0 ? NULL : w->s, w->fmt == 0 ? 10 : w->fmt,
-                           1, w->columns, w->rows, w->gs))
-            return;
+        if (g53_vk_matmul(w, out, x, 1)) return;
     }
 #endif
     switch (w->fmt) {
@@ -1140,13 +1141,7 @@ static void mm(float *out, const Mat *w, const float *x, int S) {
         return;
     }
     if (S > 1 && g_vk_dense && w->resident && (w->fmt == 0 || w->fmt == 1 || w->fmt == 4) && G53_VK_MAY(w)) {
-        Mat *mutable_w = (Mat *)w;
-        if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
-                           w->fmt == 0 ? (const void *)w->f :
-                           w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
-                           w->fmt == 0 ? NULL : w->s, w->fmt == 0 ? 10 : w->fmt,
-                           S, w->columns, w->rows, w->gs))
-            return;
+        if (g53_vk_matmul(w, out, x, S)) return;
     }
     gpu |= g_vk_dense && w->resident && (w->fmt == 0 || w->fmt == 1 || w->fmt == 4) && G53_VK_MAY(w);
 #endif
@@ -3214,15 +3209,17 @@ static void expert_table_init(GModel *m);
 static void expert_cache_init(GModel *m);
 
 #ifdef COLI_VULKAN
+static size_t glm53_mat_dev_bytes(const Mat *w);
 /* Upload one matrix as glm53_chain.h's g53c_tensor would (the same format and geometry,
  * so the chain and mv/mm find this copy) and give its host copy back. */
 static int g53_dho_drop(Mat *w, int keep, int drop, size_t *bytes) {
     if (keep || !w->resident || !w->vk_name || w->vk_gone || w->rows < 1 || w->columns < 1) return 0;
     const void *p = w->fmt == 0 ? (const void *)w->f : w->fmt == 1 ? (const void *)w->q8 : (const void *)w->q4;
     if (!p || (w->fmt != 0 && w->fmt != 1 && w->fmt != 4) || (w->fmt == 4 && (w->gs < 8 || w->gs % 8))) return 0;
-    if (!drop) { *bytes += g53_host_bytes(w); return 1; }
-    if (!coli_vk_tensor_ensure((ColiVkTensor **)&w->vk, p, w->fmt ? w->s : NULL, g53_vk_fmt(w), w->columns, w->rows,
-                               w->fmt == 4 ? w->gs : 0)) return 0;
+    if (!drop) { *bytes += glm53_mat_dev_bytes(w); return 1; }   /* the decision: what the device will hold */
+    if (!(w->fmt == 0 ? coli_vk_tensor_ensure_f32((ColiVkTensor **)&w->vk, w->f, w->columns, w->rows, 0)
+                      : coli_vk_tensor_ensure((ColiVkTensor **)&w->vk, p, w->s, w->fmt, w->columns, w->rows,
+                                              w->fmt == 4 ? w->gs : 0))) return 0;
     const size_t b = g53_host_bytes(w);
     free((void *)w->f); free((void *)w->q8); free((void *)w->q4); free((void *)w->s);
     w->f = NULL; w->q8 = NULL; w->q4 = NULL; w->s = NULL;
@@ -5151,7 +5148,7 @@ static int glm53_in_ram(void *ctx, int layer, int eid) {
 static size_t glm53_mat_dev_bytes(const Mat *w) {
     if (!w->resident || (w->fmt != 0 && w->fmt != 1 && w->fmt != 4) || w->rows < 1 || w->columns < 1) return 0;
     const size_t r = (size_t)w->rows, cl = (size_t)w->columns;
-    if (w->fmt == 0) return r * cl * sizeof(float);
+    if (w->fmt == 0) return coli_vk_f32_payload(w->f, w->columns, w->rows);   /* bf16 or f16 where exact */
     return w->fmt == 1 ? r * cl + r * 4 : r * ((cl + 1) / 2) + r * ((cl + w->gs - 1) / w->gs) * 4;
 }
 static size_t glm53_dense_dev_bytes(const GModel *m) {
@@ -5211,7 +5208,7 @@ static void glm53_vk_tier_start(GModel *m) {
                 }
                 vkt_put_done();
                 m->hits = hits; m->miss = miss; m->ebytes = eb;
-                fprintf(stderr, "[VK] tier glm53: warm start, %d experts from the history in %.1fs\n", n, now_s() - t0);
+                vkt_warm_report("glm53", n, now_s() - t0);
             }
             free(pl); free(pe);
         }

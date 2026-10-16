@@ -486,12 +486,25 @@ static void k3_vk_aliases(void){
 }
 /* the backend format of a resident W: int8 rows, int4 groups, f32 */
 static int k3_vk_fmt(const W *w){ return w->fmt==1?1 : w->fmt==4?4 : w->fmt==0?10 : -1; }
-static int w_vk_upload(W *w){
-    if(w->vk) return 1;
+/* the format the device holds w in: an f32 W as bf16 or f16 where that holds it exactly */
+static int k3_vk_dev_fmt(const W *w){ return w->fmt==0&&w->f?coli_vk_f32_fmt(w->f,(size_t)w->I*w->O):k3_vk_fmt(w); }
+/* w's device copy into *t on device dev (0 or 1, the second) */
+static int k3_vk_ensure(W *w, ColiVkTensor **t, int dev){
     int fmt=k3_vk_fmt(w);
     if(fmt<0||w->mapped) return 0;
-    const void *src=fmt==1?(const void*)w->q8 : fmt==4?(const void*)w->q4 : (const void*)w->f;
-    return coli_vk_tensor_ensure((ColiVkTensor**)&w->vk,src,fmt==10?NULL:w->s,fmt,w->I,w->O,fmt==4?w->gs:0);
+    if(fmt==10) return coli_vk_tensor_ensure_f32(t,w->f,w->I,w->O,dev);
+    const void *src=fmt==1?(const void*)w->q8:(const void*)w->q4;
+    return dev?coli_vk_tensor_ensure2(t,src,w->s,fmt,w->I,w->O,fmt==4?w->gs:0)
+              :coli_vk_tensor_ensure(t,src,w->s,fmt,w->I,w->O,fmt==4?w->gs:0);
+}
+static int w_vk_upload(W *w){
+    if(w->vk) return 1;
+    return k3_vk_ensure(w,(ColiVkTensor**)&w->vk,0);
+}
+/* y = x W^T on the device by w's copy (up already) */
+static int k3_w_vk_mm(const W *w, float *y, const float *x, int S){
+    if(w->fmt==0) return coli_vk_matmul_f32((ColiVkTensor**)&((W*)w)->vk,y,x,NULL,S,w->I,w->O);
+    return coli_vk_matmul((ColiVkTensor**)&((W*)w)->vk,y,x,NULL,NULL,k3_vk_fmt(w),S,w->I,w->O,w->gs);
 }
 #endif
 /* ---------- Metal tier (K3_METAL, build with `make METAL=1 kimi_k3`) ----------
@@ -535,12 +548,10 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
     }
 #endif
 #ifdef COLI_VULKAN
-    if(g_k3_vk&&S==1&&w->vk&&!g_k3_dho&&
-       coli_vk_matmul((ColiVkTensor**)&((W*)w)->vk,y,x,NULL,NULL,k3_vk_fmt(w),1,w->I,w->O,w->gs))
+    if(g_k3_vk&&S==1&&w->vk&&!g_k3_dho&&k3_w_vk_mm(w,y,x,1))
         return;
     /* device only: every row count, from the main thread (one command buffer) */
-    if(g_k3_dho&&g_k3_vk&&w->vk&&S>=1&&S<=65535&&!k3_in_par()&&
-       coli_vk_matmul((ColiVkTensor**)&((W*)w)->vk,y,x,NULL,NULL,k3_vk_fmt(w),S,w->I,w->O,w->gs))
+    if(g_k3_dho&&g_k3_vk&&w->vk&&S>=1&&S<=65535&&!k3_in_par()&&k3_w_vk_mm(w,y,x,S))
         return;
     if(w->vk_gone) k3_w_reload((W*)w);    /* the CPU needs a matrix the device held alone (a lost device) */
 #endif
@@ -816,7 +827,7 @@ static void k3_f32_need(float **p){
  * may hold none); 0 = the CPU multiplies, reading the matrix back first if it must. */
 static int k3_f32_dev(void *t, float *y, const float *x, int S, int I, int O){
     return g_k3_dho&&g_k3_vk&&t&&S>=1&&S<=65535&&!k3_in_par()&&
-           coli_vk_matmul((ColiVkTensor**)&t,y,x,NULL,NULL,10,S,I,O,0);
+           coli_vk_matmul_f32((ColiVkTensor**)&t,y,x,NULL,S,I,O);
 }
 #define K3_F32_DEV(t,y,x,S,I,O) k3_f32_dev(t,y,x,S,I,O)
 /* Every W of the model, in a fixed order (with a partial chain, its layers' and the head
@@ -832,13 +843,20 @@ static void k3_dho_each(Model *m, void (*f)(W *, size_t *, int *), size_t *b, in
     if(m->has_head&&g_k3_dho_head) f(&m->lm_head,b,n);
 }
 static void k3_dho_count(W *w, size_t *b, int *n){ size_t x=k3_w_host_bytes(w); if(x&&!w->mapped&&k3_vk_fmt(w)>0){ *b+=x; (*n)++; } }
-/* The f32 matrices the chain multiplies on the device: the routers, the KDA decay pair and beta. */
+/* the same matrices at the bytes the device will hold (an f32 one as bf16 or f16 where exact) */
+static void k3_dho_count_dev(W *w, size_t *b, int *n){
+    size_t x=k3_w_host_bytes(w);
+    if(x&&!w->mapped&&k3_vk_fmt(w)>0){ *b+=w->fmt==0?coli_vk_f32_payload(w->f,w->I,w->O):x; (*n)++; }
+}
+/* The f32 matrices the chain multiplies on the device, at the bytes it holds them in (bf16
+ * where exact): the routers, the KDA decay pair and beta. */
 static size_t k3_dho_f32_bytes(const Model *m){
     const Cfg *c=&m->c; size_t b=0;
     for(int i=0;i<c->n_layers&&i<g_k3_dho_layers;i++){
         const Layer *l=&m->L[i];
-        if(l->sparse&&l->moe.router) b+=(size_t)c->n_experts*c->hidden*4;
-        if(l->kda&&l->a.fa) b+=((size_t)c->kda_hd*c->hidden+(size_t)c->kda_proj*c->kda_hd+(size_t)c->kda_heads*c->hidden)*4;
+        if(l->sparse&&l->moe.router) b+=coli_vk_f32_payload(l->moe.router,c->hidden,c->n_experts);
+        if(l->kda&&l->a.fa) b+=coli_vk_f32_payload(l->a.fa,c->hidden,c->kda_hd)+coli_vk_f32_payload(l->a.fb,c->kda_hd,c->kda_proj)+
+                              coli_vk_f32_payload(l->a.bp,c->hidden,c->kda_heads);
     }
     return b;
 }
@@ -855,9 +873,10 @@ static void k3_dho_decide(Model *m, int tier_on, int cuda_on){
         g_k3_dho_layers=g_k3_fit.n; g_k3_dho_head=g_k3_fit.n==m->c.n_layers&&g_k3_fit.tail;
         chain=g_k3_fit.n>0; dense_on=chain||(coli_vk_dense()&&!g_k3_partial);
     }
-    size_t b=0; int n=0;
+    size_t b=0,bd=0; int n=0,nd=0;
     k3_dho_each(m,k3_dho_count,&b,&n);
-    int on=coli_vk_dense_host_decide("kimi_k3",dense_on,b+(chain?k3_dho_f32_bytes(m):0));
+    k3_dho_each(m,k3_dho_count_dev,&bd,&nd);
+    int on=coli_vk_dense_host_decide("kimi_k3",dense_on,bd+(chain?k3_dho_f32_bytes(m):0));
     if(g_k3_fit.L>0) coli_vk_dense_host_layers(g_k3_fit.n,m->c.n_layers);
     if(!on) return;
     g_k3_dho=1; g_k3_dho_model=m; g_k3_dho_bytes=b;
@@ -2136,7 +2155,7 @@ static int  k3_vk_load_batch(void *ctx,int li,const int *e,int n,VktExpertSrc *s
 static void k3_vk_unhold(void *ctx,void *h);
 static size_t k3_w_bytes(const W *w){
     int fmt=k3_vk_fmt(w);
-    if(fmt==10) return (size_t)w->O*w->I*4;
+    if(fmt==10) return coli_vk_f32_payload(w->f,w->I,w->O);   /* bf16 or f16 where exact */
     if(fmt==1)  return (size_t)w->O*w->I+(size_t)w->O*4;
     if(fmt==4)  return (size_t)w->O*((w->I+1)/2)+(size_t)w->O*((w->I+w->gs-1)/w->gs)*4;
     return 0;
@@ -2251,7 +2270,7 @@ static void k3_vk_tier_start(Model *m){
                     free(tmp.base);
                 }
                 vkt_put_done();
-                fprintf(stderr,"[VK] tier kimi_k3: warm start, %d experts from the history in %.1fs\n",n,now_s()-t0);
+                vkt_warm_report("kimi_k3", n, now_s() - t0);
             }
             free(pl); free(pe);
         }

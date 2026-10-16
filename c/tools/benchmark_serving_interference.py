@@ -10,6 +10,11 @@ import sys
 import threading
 import time
 
+try:
+    from tools.benchmark_process import close_engine
+except ModuleNotFoundError:              # direct execution from c/tools
+    from benchmark_process import close_engine
+
 
 def submit(proc, request_id, slot, prompt, max_tokens):
     body = prompt.encode()
@@ -133,9 +138,7 @@ def main():
             elif line.startswith("ERROR "):
                 raise RuntimeError(line)
     finally:
-        if proc.stdin:
-            proc.stdin.close()
-        proc.wait(timeout=30)
+        close_engine(proc)
         thread.join(timeout=1)
 
     control_gaps = gaps(requests[1]["data"])

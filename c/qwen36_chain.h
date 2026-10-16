@@ -74,6 +74,7 @@
  * layers have not run that forward yet, so theirs is already the host's. */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
+#include "vk_dmoe.h"
 
 #define Q36C_HOST 0
 #define Q36C_DEV  1
@@ -100,6 +101,7 @@ typedef struct {
     float *host_routed;
     unsigned long long forwards, frames, host_ms_n;
     double wait_ms, host_ms;
+    VkcDmoe dm;                                /* the routed experts in the frame (vk_dmoe.h) */
 } Q36Chain;
 
 static int g_vk_chain = 0;     /* COLI_VK_CHAIN decided on, and the chain's pipelines are up */
@@ -772,12 +774,61 @@ static int q36c_shared(Q36Chain *ch, Model *m, Layer *l, int i, int n) {
     if (ok && ch->t_sg[i]) ok = vkc_matmul(ch->t_sg[i], ch->h2, 0, ch->sgd, 0, n);
     return ok;
 }
-/* x += routed + gate * shared, as moe() leaves `out` and layers_forward_range adds it */
-static int q36c_combine(Q36Chain *ch, Model *m, int i, int n) {
+/* x += routed + gate * shared, as moe() leaves `out` and layers_forward_range adds it;
+ * routed: the host's sum (ch->routed) or the device's (ch->dm.y) */
+static int q36c_combine(Q36Chain *ch, Model *m, int i, int n, VkcBuf *routed) {
     Cfg *c = &m->c;
     int flags = (c->n_experts > 0 ? 1 : 0) | (c->shared_inter > 0 ? 2 : 0) | (m->L[i].sh_gate && c->shared_inter > 0 ? 4 : 0);
     VkcEw p = {VKC_EW_COMBINE, n * c->hidden, c->hidden, 1, flags, 1, 0, 0, 0, 0, 0, 1.f};
-    return vkc_ew(ch->x, ch->x, ch->routed, ch->ds, ch->sgd, &p);
+    return vkc_ew(ch->x, ch->x, routed, ch->ds, ch->sgd, &p);
+}
+/* Layer i's new K/V rows (an attention layer's) into the host's cache once their frame is done. */
+static void q36c_kv_down(Q36Chain *ch, Model *m, int i, int n, int pb) {
+    Cfg *c = &m->c; int kvo = c->kv_heads * c->k_head_dim;
+    if (!c->is_attn[i]) return;
+    const float *kv = (const float *)vkc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
+    for (int s = 0; s < n; s++) for (int h = 0; h < c->kv_heads; h++) {
+        size_t dst = ((size_t)h * m->max_t + pb + s) * c->k_head_dim, src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
+        memcpy(m->K[i] + dst, kv + src, c->k_head_dim * sizeof(float));
+        memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
+    }
+}
+
+/* ---- the routed experts in the frame (vk_dmoe.h) ---------------------------------------
+ * A decode-sized step (or a verify's rows) runs a layer's shared expert, routing and
+ * routed experts in the frame when the tier holds all of that layer's experts here:
+ * moe_ex's softmax, group-limited top-k (n_group <= E), renormalization when the sum is
+ * above 0 (unconditional, as HF), SwiGLU experts and rank-order sum, then the next
+ * layer's combine reads the device's sum. Each row is computed alone (a verify's rows have
+ * a decode step's bits). The books follow at the frame's end from the ids: the resident
+ * collection, the hot-pin frequencies, the history (rt_count) and HITS, the tier's heat.
+ * Off with cache routing or the agreement meter (their state crosses tokens on the host),
+ * a gate bias, a qpack container or the CUDA tier (the experts are not the Vulkan tier's),
+ * more groups than the shader keeps, and on the second device. */
+static int q36c_dmoe(Q36Chain *ch, Model *m, int rows) {
+    Cfg *c = &m->c; int E = c->n_experts;
+    int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1;
+    if (ch->d || E <= 0 || g_cache_route || g_route_agree || c->has_bias || qq_active() || qt_ready() ||
+        (ng > 1 && (ng > 64 || E % ng || c->topk_group < 1 || c->topk_group > ng))) return 0;
+    return vkc_dmoe_prepare(&ch->dm, ch->lo, ch->n, E, c->topk, c->hidden, c->inter, rows);
+}
+/* After the frame that ran layers [from, to) for n rows from pb: the K/V rows and the
+ * books of those that ran their experts in it. */
+static void q36c_dmoe_done(Q36Chain *ch, Model *m, int from, int to, int n, int pb) {
+    Cfg *c = &m->c; int K = c->topk, E = c->n_experts;
+    for (int i = from; i < to; i++) {
+        if (!vkc_dmoe_on(&ch->dm, i)) continue;
+        q36c_kv_down(ch, m, i, n, pb);
+        const int *ids = vkc_dmoe_ids(&ch->dm, i);
+        for (int s = 0; s < n; s++) {
+            const int *idx = ids + s * K;
+            if (m->resident_collecting) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) m->seen[(int64_t)i * E + idx[kk]] = 1;
+            if (!m->hot_pinned && m->freq) for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) m->freq[(int64_t)i * E + idx[kk]]++;
+            if (m->vk_hist) rt_count(i, idx, K);
+        }
+        for (int j = 0; j < n * K; j++) if (ids[j] >= 0) ehit_mark(m, i, ids[j]);
+        vkt_dev_count(i, n, K, ids);
+    }
 }
 
 /* Every layer for S rows from host rows xh, the last row's logits into `logit`; xh gets
@@ -798,7 +849,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
     int mirror_ok = q36c_mirror(ch, m);
     int CH = mirror_ok ? q36c_chunk_rows(ch, m) : 1, rows = S < CH ? S : CH;
     if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;   /* a step's rows fit the split's window */
-    int kvo = c->kv_heads * c->k_head_dim, half = c->rotary_dim / 2;
+    int half = c->rotary_dim / 2;
     if (m->snap_rows > 0 && !q36c_spec_slots(ch, m, m->snap_rows)) {
         fprintf(stderr, "[VK] qwen36 chain: device memory for a verify's %d copies refused; this verify on the CPU\n",
                 m->snap_rows);
@@ -813,7 +864,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
         return 0;
     }
     vkc_gemm_rows(g_q36_rowwise ? 0 : -1);   /* a verify's rows get a decode step's bits */
-    int snapped = 0;
+    int snapped = 0, dmoe = q36c_dmoe(ch, m, rows);
     for (int c0 = 0; c0 < S; c0 += rows) {
         int n = S - c0 < rows ? S - c0 : rows, pb = pos_base + c0;
         int ns = m->snap_rows - c0 < n ? m->snap_rows - c0 : n;   /* the rows of this chunk a verify copies */
@@ -821,6 +872,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
         if (ns) snapped = c0 + ns;
         if (!vkc_begin() || !vkc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
             !q36c_push_state(ch, m, pb, n)) goto lost;
+        if (dmoe && !vkc_dmoe_upload(&ch->dm)) goto lost;   /* the tier's residents changed: the table again */
         if (half) {   /* the CPU's own angles, cosines and sines (rope_head_partial / _mrope) */
             float *cs = (float *)vkc_ptr(ch->cs);
             for (int s = 0; s < n; s++) {
@@ -834,11 +886,11 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
                 }
             }
         }
-        int ok = 1, pending = 0;
+        int ok = 1, pending = 0, prev_dev = 0, from = lo;   /* prev_dev: the layer before summed its experts here */
         for (int i = lo; i < hi && ok; i++) {
             Layer *l = &m->L[i];
             if (pending) {
-                ok = q36c_combine(ch, m, i - 1, n);
+                ok = q36c_combine(ch, m, i - 1, n, prev_dev ? ch->dm.y : ch->routed);
                 if (ok && lf) ok = vkc_copy(ch->lfd, ((size_t)(i - 1 - lo) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
             }
             ok = ok && q36c_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps);
@@ -848,6 +900,15 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
             ok = ok && vkc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
             if (ok && lf) ok = vkc_copy(ch->lfd, ((size_t)(i - lo) * 3 + 1) * D, ch->x, (size_t)(n - 1) * D, D);
             ok = ok && q36c_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps);
+            if (ok && E > 0 && dmoe && vkc_dmoe_on(&ch->dm, i)) {   /* everything here, and on to the next layer */
+                int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1;
+                VkcRoute rp = {.kind = 0, .n_group = ng, .topk_group = ng > 1 ? c->topk_group : 1, .norm = 1, .temp = 1.f, .scale = 1.f};
+                VkcMoe mp = {.D = D, .I = c->inter, .act = 0};
+                ok = vkc_matmul(vk_qw_tensor(&l->gate), ch->h2, 0, ch->lg, 0, n) && q36c_shared(ch, m, l, i, n) &&
+                     vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->h2, &rp, &mp);
+                prev_dev = 1; pending = 1;
+                continue;
+            }
             if (ok && E > 0) {
                 ok = vkc_matmul(vk_qw_tensor(&l->gate), ch->h2, 0, ch->lg, 0, n) &&
                      vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
@@ -859,14 +920,9 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
                 ok = ok && vkc_finish();
                 ch->frames++; ch->wait_ms += tm_now() - t0;
                 if (!ok) break;
-                if (c->is_attn[i]) {                           /* the rows into the host's cache */
-                    const float *kv = (const float *)vkc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
-                    for (int s = 0; s < n; s++) for (int h = 0; h < c->kv_heads; h++) {
-                        size_t dst = ((size_t)h * m->max_t + pb + s) * c->k_head_dim, src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
-                        memcpy(m->K[i] + dst, kv + src, c->k_head_dim * sizeof(float));
-                        memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
-                    }
-                }
+                if (dmoe) q36c_dmoe_done(ch, m, from, i, n, pb);   /* the layers before it in this frame */
+                from = i + 1; prev_dev = 0;
+                q36c_kv_down(ch, m, i, n, pb);                   /* the rows into the host's cache */
                 /* A2: the shared expert, while the host computes the routed experts */
                 ok = vkc_begin() && q36c_shared(ch, m, l, i, n) && vkc_submit(0);
                 ch->frames++;
@@ -876,6 +932,8 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
                 double t2 = tm_now();
                 tm_add(n, 2, t2 - t1); ch->host_ms += t2 - t1;
                 ok = ok && vkc_begin();
+                /* the host's step ran the tier: the table again before a layer reads it */
+                if (ok && dmoe) ok = vkc_dmoe_upload(&ch->dm);
             } else if (ok) {
                 ok = q36c_shared(ch, m, l, i, n);
                 /* A dense backbone has no expert readback to end the frame.
@@ -886,7 +944,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
             }
             pending = 1;
         }
-        if (ok) ok = q36c_combine(ch, m, hi - 1, n);
+        if (ok) ok = q36c_combine(ch, m, hi - 1, n, prev_dev ? ch->dm.y : ch->routed);
         if (ok && lf) ok = vkc_copy(ch->lfd, ((size_t)(L - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
         if (ok && want_x) ok = vkc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
         int last = c0 + n == S;
@@ -901,15 +959,8 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
         ok = ok && vkc_submit(1);
         ch->frames++; ch->wait_ms += tm_now() - t0;
         if (!ok) goto lost;
-        if (E == 0) for (int i = lo; i < hi; i++) {           /* a dense model reads its K/V rows back here */
-            if (!c->is_attn[i]) continue;
-            const float *kv = (const float *)vkc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
-            for (int s = 0; s < n; s++) for (int h = 0; h < c->kv_heads; h++) {
-                size_t dst = ((size_t)h * m->max_t + pb + s) * c->k_head_dim, src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
-                memcpy(m->K[i] + dst, kv + src, c->k_head_dim * sizeof(float));
-                memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
-            }
-        }
+        if (E == 0) for (int i = lo; i < hi; i++) q36c_kv_down(ch, m, i, n, pb);   /* a dense model reads its K/V rows back here */
+        if (dmoe) q36c_dmoe_done(ch, m, from, hi, n, pb);
         if (want_x) memcpy(xh + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
         for (int i = lo; i < hi; i++) if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
         ch->dn_where = Q36C_DEV; ch->host_zero = 0;
@@ -970,9 +1021,10 @@ static void q36c_report(Model *m) {
         int was = vkc_device(d);
         VkcStats st; vkc_stats(&st);
         fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
-                        "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %.1f MiB on the device\n",
+                        "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %llu layer steps with "
+                        "the routed experts in the frame, %.1f MiB on the device\n",
                 q36c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
-                st.dev_bytes / 1048576.0);
+                ch->dm.steps, st.dev_bytes / 1048576.0);
         vkc_kv_report(&ch->ks);
         vkc_prof_print();
         vkc_device(was);

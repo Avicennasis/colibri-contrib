@@ -224,8 +224,8 @@ static int inkc_place_layer(Model *m, InkChain *ch, int i, const char **what) {
         if (!(ch->t_dg[i] = inkc_tensor(d, l->dg, D, c->dense_inter)) || !(ch->t_du[i] = inkc_tensor(d, l->du, D, c->dense_inter)) ||
             !(ch->t_dd[i] = inkc_tensor(d, l->dd, c->dense_inter, D))) *what = "a dense MLP matrix";
     } else {
-        if (!(d ? coli_vk_tensor_ensure2(&ch->t_router[i], l->router, NULL, 10, D, E + ns, 0)
-                : coli_vk_tensor_ensure(&ch->t_router[i], l->router, NULL, 10, D, E + ns, 0))) *what = "the router";
+        /* the router's f32: bf16 or f16 where exact */
+        if (!coli_vk_tensor_ensure_f32(&ch->t_router[i], l->router, D, E + ns, d)) *what = "the router";
         for (int j = 0; j < ns && !*what; j++)
             if (!(ch->t_sg[(size_t)i * nsl + j] = inkc_tensor(d, wt_off_i(l->sh_g, (int64_t)j * I * D, D), D, I)) ||
                 !(ch->t_su[(size_t)i * nsl + j] = inkc_tensor(d, wt_off_i(l->sh_u, (int64_t)j * I * D, D), D, I)) ||
@@ -304,7 +304,8 @@ static void inkc_fit_start(Model *m) {
         INKC_FITW(&l->r, D, H * dr); INKC_FITW(&l->o, H * hd, D);
         if (!c->sparse[i]) { INKC_FITW(&l->dg, D, c->dense_inter); INKC_FITW(&l->du, D, c->dense_inter); INKC_FITW(&l->dd, c->dense_inter, D); }
         else {
-            per[i] += vkc_fit_tensor(10, D, E + ns, 0); mat[i] += coli_vk_tensor_payload(10, D, E + ns, 0);
+            int rf = l->router ? coli_vk_f32_fmt(l->router, (size_t)D * (E + ns)) : 10;
+            per[i] += vkc_fit_tensor(rf, D, E + ns, 0); mat[i] += coli_vk_tensor_payload(rf, D, E + ns, 0);
             for (int j = 0; j < ns; j++) { INKC_FITW(&l->sh_g, D, I); INKC_FITW(&l->sh_u, D, I); INKC_FITW(&l->sh_d, I, D); }
         }
         per[i] += ((size_t)2 * D + 2 * (size_t)hd + (size_t)dr * L_EXT(c, i) + (size_t)2 * kvo * CK + (size_t)2 * D * CK) * sizeof(float);
@@ -364,7 +365,8 @@ static size_t inkc_fit_later(const Model *m) {
         INKC_LW(&l->r, D, H * c->d_rel); INKC_LW(&l->o, H * hd, D);
         if (!c->sparse[i]) { INKC_LW(&l->dg, D, c->dense_inter); INKC_LW(&l->du, D, c->dense_inter); INKC_LW(&l->dd, c->dense_inter, D); }
         else {
-            w += vkc_fit_tensor(10, D, c->n_experts + c->n_shared, 0);
+            w += vkc_fit_tensor(l->router ? coli_vk_f32_fmt(l->router, (size_t)D * (c->n_experts + c->n_shared)) : 10,
+                                D, c->n_experts + c->n_shared, 0);
             for (int j = 0; j < c->n_shared; j++) { INKC_LW(&l->sh_g, D, I); INKC_LW(&l->sh_u, D, I); INKC_LW(&l->sh_d, I, D); }
         }
 #undef INKC_LW

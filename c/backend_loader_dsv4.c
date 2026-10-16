@@ -348,14 +348,19 @@ static struct {
  * engine's OWN directory by absolute path — never a bare name — so the
  * dependency search anchors to the trusted install directory and an attacker
  * cannot plant a same-named DLL in the CWD (classic DLL hijacking). */
-static HMODULE dsv4_load_one(const char *name){
+/* *present: whether the file is in the engine's folder at all, so a failure can
+ * say "not in this folder" apart from "a DLL it needs is missing" -- Windows
+ * reports both as error 126 (#2047). */
+static HMODULE dsv4_load_one(const char *name, int *present){
     char dllpath[MAX_PATH];
     HMODULE dll = NULL;
+    *present = 0;
     DWORD mn = GetModuleFileNameA(NULL, dllpath, (DWORD)sizeof(dllpath));
     if(mn > 0 && mn < sizeof(dllpath)){
         char *slash = strrchr(dllpath, '\\');
         if(slash && (size_t)(slash + 1 - dllpath) + strlen(name) + 1 <= sizeof(dllpath)){
             strcpy(slash + 1, name);
+            *present = GetFileAttributesA(dllpath) != INVALID_FILE_ATTRIBUTES;
             dll = LoadLibraryExA(dllpath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
         }
     }
@@ -379,11 +384,13 @@ static int dsv4_cuda_load(void){
     /* why each candidate was passed over, for the closing line (#1906: it named no cause) */
     char why[512]; size_t wn = 0; why[0] = 0;
     for(int i = 0; i < n; i++){
-        g_dsv4.dll = dsv4_load_one(candidates[i]);
+        int present = 0;
+        g_dsv4.dll = dsv4_load_one(candidates[i], &present);
         if(!g_dsv4.dll){
             DWORD err = GetLastError();
             int w = snprintf(why + wn, sizeof(why) - wn, "%s%s: %s (Windows error %lu)", wn ? "; " : "", candidates[i],
-                             err == ERROR_MOD_NOT_FOUND ? "not next to the engine, or a DLL it needs (the CUDA runtime) is missing"
+                             !present ? "not in the engine's folder (the Windows CUDA package carries it)"
+                             : err == ERROR_MOD_NOT_FOUND ? "present, but a DLL it needs is missing (cudart64_12.dll beside it, or the NVIDIA driver's nvcuda.dll)"
                              : err == ERROR_BAD_EXE_FORMAT ? "not a 64-bit DLL" : "not loadable", (unsigned long)err);
             if(w > 0 && (size_t)w < sizeof(why) - wn) wn += (size_t)w;
             continue;

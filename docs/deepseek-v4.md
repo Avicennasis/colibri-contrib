@@ -126,6 +126,15 @@ picks at start-up by GPU:
 | `coli_cuda_dsv4_dg.dll` | `make cuda-dsv4-dg-dll` (from a vcvars64 shell; fetches the pinned DeepGEMM headers on first use) | DeepGEMM tensor-core prefill paths + generic kernels | compute capability 12.x (RTX 50-series) |
 | `coli_cuda_dsv4.dll` | `make cuda-dsv4-dll CUDA_ARCH=portable` | generic CUDA kernels only (fp32 compute from fp8/fp4 decode) | any sm_80+ (RTX 30/40/50, A/H series) |
 
+The release's Windows CUDA package (`colibri-<tag>-windows-x86_64-cuda.zip`)
+carries both, built with `DSV4_TC=0`: that leaves out the opt-in cuBLASLt
+MXFP8 path (`DSV4_CUDA_TC=1`), so the DLLs need only the `cudart64_12.dll`
+shipped beside them and the NVIDIA driver, not cuBLASLt's hundreds of MB.
+Unpacked next to the main archive's `deepseek_v4.exe`, the tier is on by
+default (`DSV4_CUDA=0` turns it off). A DLL that is not in the engine's folder
+and one whose own dependency is missing are told apart at start-up; Windows
+reports both as error 126.
+
 The DeepGEMM sm120 headers the DLL needs are not in the repository:
 `c/tools/fetch_deepgemm.sh` checks out the community sm120 port of DeepGEMM
 (MIT; upstream DeepGEMM has no sm120 kernels) plus its CUTLASS/CuTe submodule
@@ -234,6 +243,11 @@ numbers, still far ahead of CPU.
 **Give it RAM.** 43 × 256 routed experts are ~137 GiB on disk and a token
 touches 301 of them, so the expert cache hit rate is what sets tok/s: `--ram`
 is the single most valuable knob, and it changes speed only, never output.
+
+A serve reads the cache full before it says ready: with RAM for every expert the
+first request runs at the warm speed instead of climbing as the cache fills one
+miss at a time (#2109), and the start takes as long as the disk needs to read
+the cache. `COLI_V4_PREWARM=0` starts with it empty.
 
 Two opt-in GPU levers are looking for community numbers, both default off and
 byte-identical when unset: `DSV4_HYBRID=1` splits VRAM-tier misses between the
@@ -425,7 +439,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_LOADER_LANES` (9, max 16) | persistent expert-loader threads for decode. The default suits the CPU path (1.41× decode, #1097); **with the GPU tier set `3`**: mirrors/RAM absorb most decode misses (9 lanes ≈ +4 % decode) while the extra readers contend with the MoE bank refill for the NVMe queues (~10 % slower prefill; measured on the reference box, v1.7.0) |
 | `V4_EXPERT_UNION` (1) | per-chunk expert union batching on the CPU path |
 | `COLI_V4_DIRECT` (1) | O_DIRECT streaming reads |
-| `COLI_V4_AUTOPIN`, `COLI_V4_PREWARM`, `COLI_V4_SAVE_USAGE` | hot-expert pinning from `.coli_usage` history |
+| `COLI_V4_AUTOPIN`, `COLI_V4_SAVE_USAGE` | hot-expert pinning from `.coli_usage` history |
+| `COLI_V4_PREWARM` (unset) | the expert cache filled before the first request: unset, a serve (chat, web) reads every expert its RAM plan holds, or with a smaller cache each layer's most used ones in `.coli_usage`, before it says ready, in parallel with a progress line, and stops short of the RAM the plan keeps for the system; a one-shot run fills it as experts are used. `0` skips it, `1` fills it in every run (#2109) |
 
 **Speculative decoding** (off by default): `V4_DRAFT`, `V4_MTP`, `V4_MTP_GB`,
 `V4_MTP_MIN`, `V4_MTP_DRAFT`, `V4_MTP_PARTIAL_KEEP`, `V4_NGRAM` (1),

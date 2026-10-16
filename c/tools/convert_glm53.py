@@ -392,6 +392,9 @@ def main():
                     help="non cancella lo shard sorgente dopo la conversione")
     a = ap.parse_args()
 
+    if a.indir and os.path.realpath(a.indir) == os.path.realpath(a.outdir):
+        ap.error("--indir and --outdir must differ (in-place conversion would overwrite the source checkpoint)")
+
     os.makedirs(a.outdir, exist_ok=True)
     done_path = os.path.join(a.outdir, ".converted.json")
     done = set(json.load(open(done_path))) if os.path.exists(done_path) else set()

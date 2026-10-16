@@ -53,15 +53,15 @@ static const char *const pipe_file[P_NPIPE] = {
 /* COLI_VK_CHAIN_PROF=1: device time per kind of op (timestamps after every op; ops
  * that run side by side between two barriers share the time unevenly) */
 enum { PK_GEMV8, PK_GEMV, PK_GEMM, PK_NORM, PK_ROPE, PK_ATTN, PK_DNCONV, PK_DNREC, PK_EW, PK_QSA, PK_PLE, PK_COPY,
-       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_N };
+       PK_MLA, PK_MLAW, PK_DSA, PK_KDA, PK_MHC, PK_ARES, PK_ROUTE, PK_MOE, PK_N };
 static const char *const pk_name[PK_N] = {"GEMV int8", "GEMV other", "tiled GEMM", "norm", "rope", "attention",
                                           "dn conv", "dn recurrence", "element-wise", "qsa", "ple", "copy",
-                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres"};
+                                          "mla", "mla weights", "dsa", "kda", "mhc", "attnres", "route", "experts"};
 /* the MLA, KDA, mHC and AttnRes pipelines: optional (an engine without such layers
  * needs none of them, and a missing one turns off only its own ops) */
-enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_ARES, PM_N };
+enum { PM_MLA, PM_HGEMV, PM_DSA, PM_KDA, PM_MHC, PM_ARES, PM_ROUTE, PM_N };
 static const char *const mla_file[PM_N] = {"chain_mla.spv", "chain_hgemv.spv", "chain_dsa.spv", "chain_kda.spv",
-                                           "chain_mhc.spv", "chain_ares.spv"};
+                                           "chain_mhc.spv", "chain_ares.spv", "chain_route.spv"};
 #define VKC_KDA_MAX 8
 
 /* ---- memory: blocks per kind, buffers bound at offsets inside them -------------- */
@@ -95,10 +95,13 @@ typedef struct {
     ColiVkCore core;
     VkDevice dev;
     VkQueue queue;
+    uint64_t fence_ns;                /* a frame's wait before the device counts as lost (vkc_init) */
     VkDescriptorSetLayout dsl;
     VkPipelineLayout pl;
     VkShaderModule mod[P_NPIPE], mod_gemm, mod_dnrec;
-    VkShaderModule mod_gv2; VkPipeline gv2;   /* chain_gemv2.comp: int8 decode GEMVs (COLI_VK_CHAIN_GEMV2) */
+    VkShaderModule mod_gv2; VkPipeline gv2; int gv2_floats;   /* chain_gemv2.comp: int8 decode GEMVs (COLI_VK_CHAIN_GEMV2), x staged up to gv2_floats */
+    VkShaderModule mod_moe; VkPipeline moe;                   /* chain_moe.comp: the routed experts, by address (bufferDeviceAddress) */
+    int moe_xs, moe_tried;                                    /* its staging floats (0: the device cannot); built once asked for */
     VkPipeline pipe[P_NPIPE];
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
@@ -337,10 +340,28 @@ static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
 static void dsv4_init(void);       /* chain_dsv4.comp (DeepSeek V4.1 / V4), below */
 static void dsv4_shutdown(void);
 static void kvs_shutdown(void);    /* chain_kvs.comp (the split KV cache), below */
+/* The compute shared memory a workgroup may declare: the device's
+ * maxComputeSharedMemorySize, or COLI_VK_SHARED_LIMIT (tests: Lavapipe reports 32 KiB of
+ * what is host memory, and the op tests run the 38 KiB full attention there). */
+static uint32_t kc_shared_limit(void) {
+    const char *e = getenv("COLI_VK_SHARED_LIMIT");
+    if (e && *e) return (uint32_t)strtoul(e, NULL, 10);
+    VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+    return pp.limits.maxComputeSharedMemorySize;
+}
+
 int vkc_init(void) {
     if (KC.ready) return !KC.lost;
     if (!coli_vk_core_dev(g_kd, &KC.core)) return 0;
     KC.dev = (VkDevice)KC.core.device; KC.queue = (VkQueue)KC.core.queue;
+    /* 20 s tells a GPU that hangs. A software device (llvmpipe) generates a shader's code
+     * at its first launch, inside the frame's wait, and caches it on disk: on a CI runner's
+     * empty cache chain_moe's first frame took more than 20 s (4 s on a laptop), and the
+     * device was given up for a compile. There a frame waits up to 5 minutes. */
+    {
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+        KC.fence_ns = pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? 300000000000ULL : 20000000000ULL;
+    }
     KC.align = KC.core.ssbo_align > 16 ? KC.core.ssbo_align : 16;
     VkDescriptorSetLayoutBinding b[VKC_BIND];
     for (int i = 0; i < VKC_BIND; i++) b[i] = (VkDescriptorSetLayoutBinding){.binding = (uint32_t)i,
@@ -376,15 +397,43 @@ int vkc_init(void) {
         }
     }
     /* the int8/int4 decode GEMV with lanes per row and rows per workgroup chosen per
-     * matrix (chain_gemv2.comp): needs clustered subgroup operations */
+     * matrix (chain_gemv2.comp): needs clustered subgroup operations. Its x staging is
+     * sized from the device's shared memory as chain_gemv's is: a fixed 64 KiB lost the
+     * device on a 48 KiB GPU (#1998, a Quadro P2000), where it now stages 48 KiB and a
+     * matrix whose rows of x do not fit takes chain_gemv. */
     {
         const char *e = getenv("COLI_VK_CHAIN_GEMV2");
         VkPhysicalDeviceSubgroupProperties sgp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
         VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sgp};
         vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &p2);
+        int xs = (int)(kc_shared_limit() / 16);   /* vec4s */
+        if (xs > 4096) xs = 4096;
         int ok = (sgp.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) && (sgp.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
-                 sgp.subgroupSize >= 16 && !(e && *e == '0');
-        if (ok && (KC.mod_gv2 = load_module(KC.core.spv_path, "chain_gemv2.spv"))) KC.gv2 = make_pipe(KC.mod_gv2, NULL);
+                 sgp.subgroupSize >= 16 && xs >= 256 && !(e && *e == '0');
+        if (ok && (KC.mod_gv2 = load_module(KC.core.spv_path, "chain_gemv2.spv"))) {
+            int32_t v = xs;
+            VkSpecializationMapEntry me = {0, 0, 4};
+            VkSpecializationInfo si = {1, &me, 4, &v};
+            if ((KC.gv2 = make_pipe(KC.mod_gv2, &si))) {
+                KC.gv2_floats = 4 * xs;
+                if (xs < 4096)
+                    fprintf(stderr, "[VK] chain: chain_gemv2 stages x in %d KiB of shared memory, the device's limit\n", xs / 64);
+            }
+        }
+    }
+    /* the routed experts by address (chain_moe.comp): a device with bufferDeviceAddress
+     * and clustered subgroup adds; the input rows staged in what shared memory allows */
+    VkPhysicalDeviceSubgroupProperties msg = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    VkPhysicalDeviceProperties2 mp2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &msg};
+    vkGetPhysicalDeviceProperties2((VkPhysicalDevice)KC.core.phys, &mp2);
+    /* built at the first vkc_moe_ready (moe_build): only an engine that runs its experts
+     * in the frame pays for it. Built here for every engine, it cost a software device an
+     * LLVM compile whose memory the process kept: GLM's resident set at exit, +100 MiB on
+     * Lavapipe, no longer fell by what its dense weights gave back */
+    if (KC.core.bda && (msg.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) &&
+        (msg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
+        int32_t xs = (int32_t)(kc_shared_limit() / 4) & ~3;
+        KC.moe_xs = xs > 8192 ? 8192 : xs >= 1024 ? xs : 0;
     }
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
     for (int i = 0; i < PM_N; i++) {
@@ -494,7 +543,7 @@ static int frame_wait(VkcFrame *f) {
     VkResult r = VK_NOT_READY;
     for (long spin = chain_spin_us(); spin > 0 && r == VK_NOT_READY && (vkc_now_ms() - t0) * 1000.0 < spin; )
         r = vkGetFenceStatus(KC.dev, f->fence);
-    if (r == VK_NOT_READY) r = vkWaitForFences(KC.dev, 1, &f->fence, VK_TRUE, 20000000000ULL);
+    if (r == VK_NOT_READY) r = vkWaitForFences(KC.dev, 1, &f->fence, VK_TRUE, KC.fence_ns);
     KC.st.wait_ms += vkc_now_ms() - t0; KC.st.waits++;
     f->inflight = 0;
     if (r != VK_SUCCESS) { lose("fence wait", r); return 0; }
@@ -796,12 +845,12 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
              (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) && (ti->rowWords / 4) * per / 4 <= KC.gemv4_xs;
     KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
     int g2 = path < 0 && KC.gv2 && S <= 4 && ti->fmt == 1 &&   /* int4 measured slower than chain_gemv here */
-             ti->I % 32 == 0 && ti->I <= 16384 && ti->rowWords % 4 == 0;
+             ti->I % 32 == 0 && ti->I <= KC.gv2_floats && ti->rowWords % 4 == 0;
     if (g2) {
         /* rows a workgroup: short matrices in small blocks, so they still fill the device */
         int rpw = ti->O <= 1024 ? 16 : ti->O <= 4096 ? 32 : 64;
         /* a speculative verify's rows (S <= 4) share each weight load */
-        int nr = S <= 4 && S * ti->I <= 16384 ? S : 1;
+        int nr = S <= 4 && S * ti->I <= KC.gv2_floats ? S : 1;
         struct { int fmt, S, I, O, rowWords, gs, rpw, nr; } pc8 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, rpw, nr};
         ok = record(KC.gv2, bd, 4, &pc8, sizeof pc8, (uint32_t)((ti->O + rpw - 1) / rpw), (uint32_t)((S + nr - 1) / nr), 1);
     }
@@ -1231,6 +1280,61 @@ int vkc_mhc(int mode, VkcBuf *x, VkcBuf *m, VkcBuf *hp, VkcBuf *prm, VkcBuf *y, 
 }
 
 /* ---- attention residuals and SiTU-GLU (chain_ares.comp) ---------------------------- */
+/* the router's pick (chain_route.comp): one workgroup per row */
+int vkc_route_ready(void) { return vkc_ready() && KC.mpipe[PM_ROUTE]; }
+int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRoute *p) {
+    KC.kind = PK_ROUTE;
+    if (!KC.mpipe[PM_ROUTE] || p->S < 1 || p->E < 1 || p->E > VKC_ROUTE_EMAX || p->K < 1 || p->K > VKC_ROUTE_KMAX ||
+        p->K > p->E || p->kind < 0 || p->kind > 2 || p->has_bias < 0 || p->has_bias > 2 || (p->has_bias && !bias) || !(p->temp > 0.0f) ||
+        (p->n_group > 1 && (p->n_group > 64 || p->E % p->n_group || p->topk_group < 1 || p->topk_group > p->n_group)))
+        return 0;
+    /* without a bias the logits stand in for it, at their own offset: a device that reads
+     * both sides of the shader's choice stays in bounds (the 256-byte dummy would not) */
+    VkcRoute q = *p;
+    if (!q.has_bias) q.b_off = q.l_off;
+    VkcBind bd[4] = {B(logits, 0), B(q.has_bias ? bias : logits, 0), B(ids, 1), B(w, 1)};
+    uint32_t gx, gy; grid((uint64_t)q.S, &gx, &gy);
+    return record(KC.mpipe[PM_ROUTE], bd, 4, &q, sizeof q, gx, gy, 1);
+}
+/* the routed experts (chain_moe.comp): gate and up of every (row, slot), then down and
+ * the weighted sum of each row's slots */
+static int moe_build(void) {
+    if (KC.moe || KC.moe_tried || !KC.moe_xs) return KC.moe != VK_NULL_HANDLE;
+    KC.moe_tried = 1;
+    if (!(KC.mod_moe = load_module(KC.core.spv_path, "chain_moe.spv"))) return 0;
+    int32_t xs = KC.moe_xs;
+    VkSpecializationMapEntry me = {0, 0, 4};
+    VkSpecializationInfo si = {1, &me, 4, &xs};
+    double t0 = vkc_now_ms();
+    KC.moe = make_pipe(KC.mod_moe, &si);
+    double dt = vkc_now_ms() - t0;
+    if (dt > 5000.0) fprintf(stderr, "[VK] chain: chain_moe.spv took %.1f s to build\n", dt / 1e3);
+    return KC.moe != VK_NULL_HANDLE;
+}
+int vkc_moe_ready(void) { return vkc_ready() && moe_build(); }
+int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p) {
+    KC.kind = PK_MOE;
+    if (!moe_build() || p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || p->D < 1 || p->I < 1 || p->act < 0 || p->act > 1 ||
+        (p->act == 1 && !(p->a > 0.0f && p->b > 0.0f)) || p->t_off < 0 || !x || !ids || !w || !table || !hid || !y ||
+        hid == x || hid == y || y == x) return 0;
+    if ((size_t)p->S * p->K * ((size_t)p->I + p->D) * sizeof(float) > hid->bytes) return 0;
+    struct { int mode, S, K, D, I, act; float limit, a, b;
+             int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row, rpw; } pc =
+        {0, p->S, p->K, p->D, p->I, p->act, p->limit, p->a, p->b,
+         p->t_off, p->x_off, p->x_row, p->i_off, p->i_row, p->w_off, p->w_row, p->y_off, p->y_row, 64};
+    /* gate and up, then down, each (pair, 64 outputs) a workgroup; then the rank-order sum */
+    VkcBind bd[6] = {B(x, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 1), B(NULL, 0)};
+    uint32_t gx, gy;
+    grid((uint64_t)p->S * p->K * ((p->I + 63) / 64), &gx, &gy);
+    if (!record(KC.moe, bd, 6, &pc, sizeof pc, gx, gy, 1)) return 0;
+    pc.mode = 1;
+    grid((uint64_t)p->S * p->K * ((p->D + 63) / 64), &gx, &gy);
+    if (!record(KC.moe, bd, 6, &pc, sizeof pc, gx, gy, 1)) return 0;
+    pc.mode = 2;
+    VkcBind bd2[6] = {B(NULL, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 0), B(y, 1)};
+    grid((uint64_t)p->S * ((p->D + 255) / 256), &gx, &gy);
+    return record(KC.moe, bd2, 6, &pc, sizeof pc, gx, gy, 1);
+}
 int vkc_ares_ready(void) { return vkc_ready() && KC.mpipe[PM_ARES]; }
 int vkc_ares_mix(VkcBuf *x, VkcBuf *blk, VkcBuf *prm, VkcBuf *y, const VkcAres *p) {
     KC.kind = PK_ARES;
@@ -1423,12 +1527,23 @@ static void kf_shutdown(void) {
     if (KF.cmod) vkDestroyShaderModule(KC.dev, KF.cmod, NULL);
     memset(&KF, 0, sizeof KF);
 }
+/* chain_attn_full.comp's shared arrays have a fixed size: a device with less shared
+ * memory declines the op (the CPU runs it) instead of getting an invalid pipeline, as
+ * chain_gemv2 did on a 48 KiB GPU (#1998). tests/test_vk_shared_memory.py holds this
+ * number to the compiled shader's. */
+#define ATTN_FULL_SHARED 38912u
+static void kf_load(void) {
+    if (KF.mod || KF.tried) return;
+    KF.tried = 1;
+    if (kc_shared_limit() < ATTN_FULL_SHARED) return;
+    KF.mod = load_module(KC.core.spv_path, "chain_attn_full.spv");
+}
 int vkc_attn_full(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p) {
     if (!vkc_ready() || p->S < 1 || p->T < 1 || p->H < 1 || (p->hd != 32 && p->hd != 64 && p->hd != 128) ||
         (int64_t)p->S > 65535LL * 64 || p->H > 65535) return 0;
     int k = p->hd == 32 ? 0 : p->hd == 64 ? 1 : 2;
     if (!KF.pipe[k]) {
-        if (!KF.mod && !KF.tried) { KF.tried = 1; KF.mod = load_module(KC.core.spv_path, "chain_attn_full.spv"); }
+        kf_load();
         if (!KF.mod) return 0;
         int hd = p->hd;
         VkSpecializationMapEntry me = {0, 0, sizeof(int)};
@@ -1476,7 +1591,7 @@ int vkc_attn_full_coop(VkcBuf *qkv, VkcBuf *o, const VkcAttnFull *p) {
 int vkc_attn_full_coop_ready(int hd) { return vkc_ready() && kf_coop_pipe(hd) != VK_NULL_HANDLE; }
 int vkc_attn_full_ready(void) {
     if (!vkc_ready()) return 0;
-    if (!KF.mod && !KF.tried) { KF.tried = 1; KF.mod = load_module(KC.core.spv_path, "chain_attn_full.spv"); }
+    kf_load();
     return KF.mod != VK_NULL_HANDLE;
 }
 
@@ -1817,6 +1932,8 @@ void vkc_shutdown(void) {
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);
     if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
     if (KC.mod_gv2) vkDestroyShaderModule(KC.dev, KC.mod_gv2, NULL);
+    if (KC.moe) vkDestroyPipeline(KC.dev, KC.moe, NULL);
+    if (KC.mod_moe) vkDestroyShaderModule(KC.dev, KC.mod_moe, NULL);
     if (KC.mod_gemm) vkDestroyShaderModule(KC.dev, KC.mod_gemm, NULL);
     if (KC.mod_dnrec) vkDestroyShaderModule(KC.dev, KC.mod_dnrec, NULL);
     for (int i = 0; i < KC.nfa; i++) vkDestroyPipeline(KC.dev, KC.fa[i], NULL);

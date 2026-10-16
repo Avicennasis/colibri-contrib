@@ -149,8 +149,8 @@ ms in the last windows, peak RSS 29 -> 17 GB. Of the 20 ms, 11 are the kernel
 97.6% hit rate, fetched one at a time; that fetch is the next thing to
 overlap, not this kernel. `tests/test_expert_ffn` holds the numerics.
 `QWEN_EXPERT_KERNEL=0` restores the int8 path for A/Bs. The CUDA expert tier
-keeps its own path: it uploads the pair-layout int4 and computes misses from
-the int8 copy.
+uses this kernel too for the experts it leaves to the CPU, and converts the
+planar bytes to its own pair layout when it uploads one (#2090).
 
 ## The dense trunk: integer dot products
 
@@ -164,7 +164,7 @@ on the 35B, three times what the routed experts read.
 
 Since 1.12.1 the activation is quantized to int8 once per call (one scale,
 amax/127, the same contract the expert integer kernels use) and the products
-are integer: 32 weights per instruction on AVX2, 64 on AVX-512 VNNI, exact
+are integer: 16 weights per instruction on SSSE3 (maddubs + madd pairs), 32 on AVX2, 64 on AVX-512 VNNI, exact
 int32 sums scaled once per output. The routed experts take the same path for
 their activations. Measured on Qwen3.6-35B-A3B, 8 threads, 300 decoded
 tokens, every expert resident, perplexity on 4 x 512 tokens of English text:
@@ -197,6 +197,47 @@ A least-squares refinement of the block scale was tried and changes nothing
 (15.16 against 15.17): the loss is the matrices' sensitivity, not the
 quantizer. If you take one, take `lmhead`: 254 MB less per token for the
 smallest cost.
+
+## `canonical.qc`: the dense trunk converted once
+
+At every start the engine reads the dense matrices (16-bit floats in the
+container) and quantizes them to int8 (`qw_quantize`): 1.9 GB of int8 on the
+35B, made from 3.9 GB of f16 through f32 copies. `qwen36-canonical` does that
+conversion once and writes the result beside the model (1.94 GB of disk for the
+35B). The tool is not in the release archives; build it from the source:
+
+```sh
+make -C c qwen36-canonical
+./c/qwen36-canonical /path/to/model        # writes /path/to/model/canonical.qc
+```
+
+When `canonical.qc` is there (or `QWEN_DENSE_CACHE` names it), the engine reads
+the matrices from it instead of converting them: the same bytes, so the same
+logits, without the conversion and its f32 copies at start. They are copied into
+ordinary memory, as after a conversion, and the file is closed once they are: the
+CPU reads every dense matrix at every token. On an 8 GB M1 the 35B model is then
+ready in 3.6 s instead of 4.4, with a peak memory footprint of 3.5 GB instead of
+4.7 and the same speed ([experiment manifest](experiments/qwen36-canonical-dense-2026-10-07/manifest.json)).
+
+The file is checked against the model before it is used: the list of matrices
+and their shapes, the quantizer (`QDF_QUANTIZER`), and the first and last 128
+bytes of every source matrix. So a file made from other weights (a full fine-tune
+of the same shape too) or for another quantizer is not used. The check samples
+the source and is not a checksum: an edit confined to the middle of a matrix is
+not seen, and the int8 rows of the file are not verified. A file beside the
+model that does not match (other weights, a converter that changed with an
+engine update, a damaged file) is set aside with the reason, and the matrices
+are converted at start as without it; run `qwen36-canonical` again then. A file
+named by `QWEN_DENSE_CACHE` that does not match stops the start with the reason.
+
+It is used only where every dense matrix is the int8 copy the engine would make:
+the whole model, `COLI_DENSE_BITS=8` (the default), no `COLI_KEEP_F32`, and a run
+on the CPU, not with `COLI_CUDA=1` or `COLI_VULKAN=1`, and not in the Segment and
+Edge adapters. A `VK=1` build that runs on the CPU, as the Linux and Windows
+release binaries do without `COLI_VULKAN=1`, uses it. The tool converts BF16, F16
+and F32 dense matrices, with or without the `language_model.` prefix (the
+containers of `convert_qwen36.py`); it does not convert a qpack container's
+affine matrices. Delete the file to go back to the conversion at start.
 
 ## Cache-aware routing (`CACHE_ROUTE`, off by default)
 
@@ -239,8 +280,9 @@ the rest sits in gate/up, and at equal bits Q4_K_M's asymmetric quantizer is
 ahead. Keep it as a measurement tool and a middle step for boxes with RAM to
 spare; it is not the answer to the gap. The engine tells the layout apart by
 size and reads each matrix in its own format on the CPU path; the CUDA VRAM
-tier takes one format per expert and refuses a mixed container with a line
-(`COLI_CUDA=1 ignored`), so such a container runs CPU-only for now.
+tier takes one format per expert, so the routed experts of a mixed container
+stay on the CPU, said with a line under `COLI_CUDA=1`; the dense trunk still
+goes to the card (#2090).
 
 ## Which checkpoints, and what the banner calls them
 
