@@ -2512,6 +2512,28 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
     return "".join(parts)
 
 
+def resends_reasoning(messages):
+    """Whether the client sent a past turn's reasoning back (`reasoning_content` on an
+    assistant message), as colibri's web does for a colibri server.
+
+    The engine's state holds that reasoning where the turn generated it. A history that
+    keeps it is that state token for token, so the next turn reuses it and reads only the
+    new text; a history that strips it diverges at the first past answer, and an engine
+    whose reuse is all or nothing (a recurrent or windowed state) reads the whole
+    conversation again, every turn. The renderers whose template drops past reasoning
+    by default keep it when this is true, in the form their template gives a kept turn."""
+    return isinstance(messages, list) and any(
+        isinstance(m, dict) and m.get("role") == "assistant"
+        and isinstance(m.get("reasoning_content"), str) and m["reasoning_content"].strip()
+        for m in messages)
+
+
+def preserve_thinking_default(messages, enable_thinking):
+    """Qwen3.6's preserve_thinking when the request does not set it: on with thinking off,
+    and on when the client sends the reasoning back (see the request handler)."""
+    return not enable_thinking or resends_reasoning(messages)
+
+
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                         tool_choice=None, audio_out=None, add_generation_prompt=True):
     """Text-only subset of Inkling's chat_template.jinja: role tokens with
@@ -2574,6 +2596,16 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
                                   + "<|audio|>" * val + "<|audio_end|><|end_message|>")
         else:
             text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+            reasoning = message.get("reasoning_content") if role == "assistant" else None
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            # chat_template.jinja: a model turn's reasoning is a message of its own,
+            # <|message_model|><|content_thinking|>...<|end_message|>, before its text. That
+            # is also how the turn was generated, so a history that keeps it is the
+            # engine's state and the next turn reuses it (resends_reasoning).
+            if reasoning:
+                prompt.append(f"<|message_model|><|content_thinking|>{reasoning}<|end_message|>")
             # A continued turn is the last model message rendered open: no <|end_message|>.
             terminator = "" if open_turn else "<|end_message|>"
             prompt.append(f"{rtok}<|content_text|>{text}{terminator}")
@@ -3330,8 +3362,11 @@ def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, to
         if turn["role"] == "user" or (turn["role"] == "system" and index > 0):
             last_user = index
     # With tools on the table the reference keeps every turn's reasoning; without them it
-    # drops the reasoning of everything before the last user message.
-    drop_thinking = not tools
+    # drops the reasoning of everything before the last user message. A client that sends
+    # the reasoning back gets the kept form too: the engine holds those turns as they were
+    # generated, and with them stripped the next turn reads the whole conversation again
+    # (resends_reasoning).
+    drop_thinking = not tools and not resends_reasoning(messages)
     prompt = [DSV41_BOS]
     for index, turn in enumerate(turns):
         role = turn["role"]
@@ -8096,12 +8131,15 @@ class APIHandler(BaseHTTPRequestHandler):
             # true end-to-end instead of trusting every path to opt out.
             enable_thinking = False
         # Qwen3.6's preserve_thinking (#1759), under the name Qwen's own API gives it. Off
-        # by default with thinking on: a standard client does not send the reasoning back,
-        # and the block would come back empty where the model did think. On by default with
-        # thinking off: there the block the history gets is the empty one the turn was
-        # actually generated after, so the resent history is the engine's state byte for
-        # byte and prefix reuse can engage. Only the qwen36 renderer reads it.
-        preserve_thinking = body.get("preserve_thinking", not enable_thinking)
+        # by default with thinking on when the client sends no reasoning back: the block
+        # would come back empty where the model did think. On by default with thinking off:
+        # there the block the history gets is the empty one the turn was actually generated
+        # after. On, too, when the client sends the reasoning back (resends_reasoning): the
+        # block then carries what the model wrote. Either way the resent history is the
+        # engine's state byte for byte and prefix reuse can engage. Only the qwen36
+        # renderer reads it.
+        preserve_thinking = body.get("preserve_thinking",
+                                     preserve_thinking_default(body.get("messages"), enable_thinking))
         if not isinstance(preserve_thinking, bool):
             raise APIError(400, "`preserve_thinking` must be a boolean.", "preserve_thinking")
         # The request's shape is checked before the image expanders and the renderer read it.
