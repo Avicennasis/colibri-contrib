@@ -141,6 +141,7 @@ static void q36_wfree(void *p){
 static gguf_ctx g_gg;
 static int   g_gguf = 0;
 static int   g_gguf_dry = 0;       /* GGUF_CHECK=1: validate every tensor the loader wants, read none */
+static int   g_gguf_plain = 0;     /* qwen3moe: llama.cpp's names for a Qwen3 MoE layer (ffn_norm after attention) */
 static int   g_ssm_a_direct = 0, g_dn_tiled = 0;
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
@@ -2300,6 +2301,7 @@ static const char *gg_name(const char *hf, char *out, size_t cap) {
     };
     int L = -1, off = 0;
     if (sscanf(hf, "model.layers.%d.%n", &L, &off) != 1 || L < 0 || !off) return NULL;
+    if (g_gguf_plain && !strcmp(hf + off, "post_attention_layernorm.weight")) { snprintf(out, cap, "blk.%d.ffn_norm.weight", L); return out; }
     for (size_t i = 0; i < sizeof lay / sizeof *lay; i++)
         if (!strcmp(hf + off, lay[i].hf)) { snprintf(out, cap, "blk.%d.%s", L, lay[i].gg); return out; }
     return NULL;
@@ -2779,12 +2781,16 @@ static void gguf_load_cfg(Cfg *c) {
         fprintf(stderr, "this GGUF is an importance matrix (imatrix): calibration data for quantizing, not a model to run\n"); exit(1);
     }
     /* qwen35moe: Qwen3.5 / Qwen3.6 MoE; qwen35: the dense checkpoints of the same family
-     * (Qwen3.5 0.8B to 27B, Qwen3.8 27B), their MLP run as the shared expert, ungated (#1757) */
+     * (Qwen3.5 0.8B to 27B, Qwen3.8 27B), their MLP run as the shared expert, ungated (#1757);
+     * qwen3moe: Qwen3 MoE (Qwen3-30B-A3B, Qwen3-Coder), every layer attention, no output
+     * gate, no shared expert, full rotary, plain RMSNorm (stored as is, so the 1 still comes off) */
     const int dense = arch && !strcmp(arch, "qwen35");
-    if (!arch || (strcmp(arch, "qwen35moe") && !dense)) {
-        fprintf(stderr, "GGUF architecture '%s' is neither qwen35moe (Qwen3.5 / 3.6 MoE) nor qwen35 (their dense models): "
-                        "this engine cannot run it\n", arch ? arch : "?"); exit(1);
+    const int plain = arch && !strcmp(arch, "qwen3moe");
+    if (!arch || (strcmp(arch, "qwen35moe") && !dense && !plain)) {
+        fprintf(stderr, "GGUF architecture '%s' is not one of qwen35moe (Qwen3.5 / 3.6 MoE), qwen35 (their dense models) "
+                        "or qwen3moe (Qwen3 MoE): this engine cannot run it\n", arch ? arch : "?"); exit(1);
     }
+    g_gguf_plain = plain;
     char key[128];
     #define GK(k) (snprintf(key, sizeof key, "%s.%s", arch, k), key)
     memset(c, 0, sizeof *c);
@@ -2803,6 +2809,7 @@ static void gguf_load_cfg(Cfg *c) {
     c->theta = (float)gguf_get_float(g, GK("rope.freq_base"), 10000.0);
     c->eps   = (float)gguf_get_float(g, GK("attention.layer_norm_rms_epsilon"), 1e-6);
     int rope_n = (int)gguf_get_int(g, GK("rope.dimension_count"), c->head_dim / 4);
+    const int rope_given = gguf_get(g, GK("rope.dimension_count")) != NULL;
     int interval = (int)gguf_get_int(g, GK("full_attention_interval"), 4);
     c->dn_kheads = (int)gguf_get_int(g, GK("ssm.group_count"), 0);
     c->dn_vheads = (int)gguf_get_int(g, GK("ssm.time_step_rank"), 0);
@@ -2817,14 +2824,19 @@ static void gguf_load_cfg(Cfg *c) {
     #undef GK
     CFG_NEED(c->n_layers > 0 && c->n_layers <= 512 && c->hidden > 0 && c->q_heads > 0 && c->head_dim > 0 && interval > 0,
              "GGUF metadata: layers %d hidden %d heads %d head_dim %d interval %d", c->n_layers, c->hidden, c->q_heads, c->head_dim, interval);
-    CFG_NEED(c->dn_vheads > 0 && inner % c->dn_vheads == 0, "GGUF ssm.inner_size %d / time_step_rank %d", inner, c->dn_vheads);
-    c->dn_vdim = inner / c->dn_vheads;
-    c->dn_conv_dim = 2 * c->dn_kheads * c->dn_kdim + c->dn_vheads * c->dn_vdim;
-    c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->attn_output_gate = 1;
+    if (plain) {   /* no DeltaNet: every layer attends; the rotary spans the head */
+        if (!rope_given) rope_n = c->head_dim;
+        interval = 1;
+    } else {
+        CFG_NEED(c->dn_vheads > 0 && inner % c->dn_vheads == 0, "GGUF ssm.inner_size %d / time_step_rank %d", inner, c->dn_vheads);
+        c->dn_vdim = inner / c->dn_vheads;
+        c->dn_conv_dim = 2 * c->dn_kheads * c->dn_kdim + c->dn_vheads * c->dn_vdim;
+    }
+    c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->attn_output_gate = !plain;
     c->partial_rotary_factor = (float)rope_n / (float)c->head_dim;
     c->rotary_dim = rope_n; c->rope_dim = rope_n;
     c->o_in = c->q_heads * c->head_dim;
-    c->q_head_dim = c->head_dim * 2;
+    c->q_head_dim = plain ? c->head_dim : c->head_dim * 2;
     c->expert_gs = 0;
     const gguf_tensor *emb = gguf_find(g, "token_embd.weight");
     CFG_NEED(emb && emb->ne[0] == c->hidden, "GGUF token_embd.weight missing or not [hidden x vocab]");
@@ -2839,7 +2851,7 @@ static void gguf_load_cfg(Cfg *c) {
         CFG_NEED(c->is_attn[i] == ((i + 1) % interval == 0), "GGUF layer %d: attention tensors disagree with full_attention_interval %d", i, interval);
         if (q) {
             c->n_active++;
-            /* q_proj carries the output gate: 2 x head_dim per head */
+            /* q_proj carries the output gate (qwen35moe, qwen35): 2 x head_dim per head */
             CFG_NEED(q->ne[0] == c->hidden && q->ne[1] == (int64_t)c->q_heads * c->q_head_dim, "GGUF %s: [%lld x %lld]", nm, (long long)q->ne[0], (long long)q->ne[1]);
         }
     }
@@ -2847,7 +2859,10 @@ static void gguf_load_cfg(Cfg *c) {
     c->has_qk_norm = gguf_find(g, nm) != NULL;
     snprintf(nm, sizeof nm, "blk.0.exp_probs_b.bias");
     c->has_bias = gguf_find(g, nm) != NULL;
-    if (dense)
+    if (plain)
+        fprintf(stderr, "[gguf] qwen3moe: %d layers (all attention), hidden %d, %d experts top-%d, inter %d, vocab %d\n",
+                c->n_layers, c->hidden, c->n_experts, c->topk, c->inter, c->vocab);
+    else if (dense)
         fprintf(stderr, "[gguf] qwen35 (dense): %d layers (%d attention), hidden %d, MLP %d, vocab %d, DeltaNet v/k heads %d/%d\n",
                 c->n_layers, c->n_active, c->hidden, c->shared_inter, c->vocab, c->dn_vheads, c->dn_kheads);
     else

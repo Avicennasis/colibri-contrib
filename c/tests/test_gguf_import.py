@@ -216,6 +216,30 @@ class GgufImportDense(unittest.TestCase):
                 self.assertEqual(engine_tokens(self.dir / "link", self.ref, env), engine_tokens(self.src, self.ref, env))
 
 
+class Qwen3MoeConfig(unittest.TestCase):
+    """llama.cpp's qwen3moe (Qwen3-30B-A3B, Qwen3-Coder) as the qwen36 engine's config, from the
+    metadata of unsloth's Qwen3-Coder-30B-A3B-Instruct GGUF: every layer attention, no shared
+    expert, the head untied when the file has output.weight."""
+    def test_coder_metadata(self):
+        import tools.gguf_import as gi
+        p = "qwen3moe."
+        meta = {p + k: v for k, v in {
+            "block_count": 48, "context_length": 262144, "embedding_length": 2048, "feed_forward_length": 5472,
+            "attention.head_count": 32, "attention.head_count_kv": 4, "rope.freq_base": 10000000.0,
+            "attention.layer_norm_rms_epsilon": 1e-6, "expert_used_count": 8, "attention.key_length": 128,
+            "attention.value_length": 128, "expert_count": 128, "expert_feed_forward_length": 768,
+            "expert_shared_feed_forward_length": 0}.items()}
+        tensors = {"token_embd.weight": {"dims": [2048, 151936]}, "output.weight": {"dims": [2048, 151936]}}
+        cfg, layers = gi.qwen3moe_config(meta, tensors)
+        self.assertEqual(layers, 48)
+        self.assertEqual(cfg["model_type"], "qwen3_moe")
+        self.assertEqual((cfg["num_experts"], cfg["num_experts_per_tok"], cfg["moe_intermediate_size"]), (128, 8, 768))
+        self.assertEqual((cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"]), (32, 4, 128))
+        self.assertEqual(cfg["layer_types"], ["full_attention"] * 48)
+        self.assertFalse(cfg["tie_word_embeddings"])
+        self.assertEqual(cfg["vocab_size"], 151936)
+
+
 class Qwen4ExpLayers(unittest.TestCase):
     """Which layers attend, from either way a qwen4exp GGUF says it: unsloth's Qwen3.8-Flash-Next
     files give full_attention_interval (no attention.recurrent_layers), newer llama.cpp

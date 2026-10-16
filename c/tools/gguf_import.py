@@ -18,7 +18,7 @@ Either way the directory is an ordinary colibri model: `coli chat`, `coli
 serve`, `coli web` and the planner treat it like any other.
 
 Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine), qwen35 (their
-dense models -> qwen36 engine),
+dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engine),
 qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine).
 
 Usage:
@@ -176,6 +176,38 @@ def qwen35_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
+def qwen3moe_config(meta, tensors, overrides=None):
+    """Qwen3 MoE (llama.cpp's qwen3moe: Qwen3-30B-A3B, Qwen3-Coder) as the qwen36 engine's
+    config.json: every layer attention, no shared expert, no output gate, full rotary."""
+    p = "qwen3moe."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    head_dim = int(need("attention.key_length"))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    cfg = {
+        "model_type": "qwen3_moe",
+        "architectures": ["Qwen3MoeForCausalLM"],
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "num_attention_heads": int(need("attention.head_count")),
+        "num_key_value_heads": int(need("attention.head_count_kv")),
+        "head_dim": head_dim,
+        "num_experts": int(need("expert_count")),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "intermediate_size": int(meta.get(p + "feed_forward_length", need("expert_feed_forward_length"))),
+        "norm_topk_prob": True,
+        "vocab_size": int(emb["dims"][1]),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-6)),
+        "max_position_embeddings": int(meta.get(p + "context_length", 262144)),
+        "rope_theta": float(meta.get(p + "rope.freq_base", 1000000.0)),
+        "layer_types": ["full_attention"] * layers,
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "hidden_act": "silu",
+    }
+    return cfg, layers
+
+
 def qwen4exp_config(meta, tensors, overrides=None):
     """Qwen3.8-Flash-Next (llama.cpp's qwen4exp) as the qwen38 engine's config.json. The
     PLE table is one tensor here (per_layer_token_embd), so split_ngram_parts is 1; its
@@ -257,7 +289,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the
