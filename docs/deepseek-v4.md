@@ -244,6 +244,11 @@ numbers, still far ahead of CPU.
 touches 301 of them, so the expert cache hit rate is what sets tok/s: `--ram`
 is the single most valuable knob, and it changes speed only, never output.
 
+A serve reads the cache full before it says ready: with RAM for every expert the
+first request runs at the warm speed instead of climbing as the cache fills one
+miss at a time (#2109), and the start takes as long as the disk needs to read
+the cache. `COLI_V4_PREWARM=0` starts with it empty.
+
 Two opt-in GPU levers are looking for community numbers, both default off and
 byte-identical when unset: `DSV4_HYBRID=1` splits VRAM-tier misses between the
 GPU fill branch and the CPU branch using bandwidths measured at runtime, and
@@ -434,7 +439,8 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `V4_LOADER_LANES` (9, max 16) | persistent expert-loader threads for decode. The default suits the CPU path (1.41× decode, #1097); **with the GPU tier set `3`**: mirrors/RAM absorb most decode misses (9 lanes ≈ +4 % decode) while the extra readers contend with the MoE bank refill for the NVMe queues (~10 % slower prefill; measured on the reference box, v1.7.0) |
 | `V4_EXPERT_UNION` (1) | per-chunk expert union batching on the CPU path |
 | `COLI_V4_DIRECT` (1) | O_DIRECT streaming reads |
-| `COLI_V4_AUTOPIN`, `COLI_V4_PREWARM`, `COLI_V4_SAVE_USAGE` | hot-expert pinning from `.coli_usage` history |
+| `COLI_V4_AUTOPIN`, `COLI_V4_SAVE_USAGE` | hot-expert pinning from `.coli_usage` history |
+| `COLI_V4_PREWARM` (unset) | the expert cache filled before the first request: unset, a serve (chat, web) reads every expert its RAM plan holds, or with a smaller cache each layer's most used ones in `.coli_usage`, before it says ready, in parallel with a progress line, and stops short of the RAM the plan keeps for the system; a one-shot run fills it as experts are used. `0` skips it, `1` fills it in every run (#2109) |
 
 **Speculative decoding** (off by default): `V4_DRAFT`, `V4_MTP`, `V4_MTP_GB`,
 `V4_MTP_MIN`, `V4_MTP_DRAFT`, `V4_MTP_PARTIAL_KEEP`, `V4_NGRAM` (1),

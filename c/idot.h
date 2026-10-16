@@ -2,7 +2,7 @@
  *
  * The activation is quantized to int8 once (one scale per row, amax/127,
  * qrow_i8) and the weights, int8 rows or int4 planar blocks with per-row or
- * per-group scales, are multiplied with integer instructions: maddubs on
+ * per-group scales, are multiplied with integer instructions: maddubs on SSSE3 and
  * AVX2, vpdpbusd on AVX-VNNI and AVX-512 VNNI, sdot/smmla on NEON, and the
  * AMX tile kernel where the CPU has it. Exact int32 sums, scaled once per
  * output, so every ISA path is bit-identical to the scalar reference.
@@ -33,7 +33,10 @@ static inline int hsum256_i32(__m256i v){
     return _mm_cvtsi128_si32(lo);
 }
 #endif
-#if defined(__AVXVNNI__) && defined(__AVX2__)
+#ifdef __SSSE3__
+#include <tmmintrin.h>
+#endif
+#if defined(__AVXVNNI__) || defined(__SSSE3__)
 static inline int hsum128_i32(__m128i v){
     v=_mm_hadd_epi32(v,v); v=_mm_hadd_epi32(v,v); return _mm_cvtsi128_si32(v);
 }
@@ -56,6 +59,8 @@ static inline int hsum128_i32(__m128i v){
 #define IDOT_KERNEL "avx-vnni"
 #elif defined(__AVX2__)
 #define IDOT_KERNEL "avx2"
+#elif defined(__SSSE3__)
+#define IDOT_KERNEL "ssse3"
 #elif defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
 #define IDOT_KERNEL "neon-i8mm"
 #elif defined(__ARM_NEON)
@@ -82,7 +87,7 @@ static inline float qrow_i8(const float *x, int8_t *q, int I){
 static float dense_act_i8(const float *x, int I, int8_t *xq, int32_t *xsg){
     float amax = 0.f;
     int i = 0;
-#ifdef __AVX2__
+#if defined(__AVX2__)
     {
         __m256 am = _mm256_setzero_ps();
         const __m256 sign = _mm256_set1_ps(-0.0f);
@@ -90,12 +95,20 @@ static float dense_act_i8(const float *x, int I, int8_t *xq, int32_t *xsg){
         float tmp[8]; _mm256_storeu_ps(tmp, am);
         for (int k = 0; k < 8; k++) if (tmp[k] > amax) amax = tmp[k];
     }
+#elif defined(__SSSE3__)
+    {
+        __m128 am = _mm_setzero_ps();
+        const __m128 sign = _mm_set1_ps(-0.0f);
+        for (; i + 4 <= I; i += 4) am = _mm_max_ps(am, _mm_andnot_ps(sign, _mm_loadu_ps(x + i)));
+        float tmp[4]; _mm_storeu_ps(tmp, am);
+        for (int k = 0; k < 4; k++) if (tmp[k] > amax) amax = tmp[k];
+    }
 #endif
     for (; i < I; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
     float s = amax / 127.f; if (s < 1e-12f) s = 1e-12f;
     float inv = 1.f / s;
     i = 0;
-#ifdef __AVX2__
+#if defined(__AVX2__)
     {
         const __m256 vinv = _mm256_set1_ps(inv);
         for (; i + 32 <= I; i += 32) {
@@ -108,6 +121,18 @@ static float dense_act_i8(const float *x, int I, int8_t *xq, int32_t *xsg){
             __m256i abcd = _mm256_packs_epi16(ab, cd);
             abcd = _mm256_permutevar8x32_epi32(abcd, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
             _mm256_storeu_si256((__m256i *)(xq + i), abcd);
+        }
+    }
+#elif defined(__SSSE3__)
+    {
+        const __m128 vinv = _mm_set1_ps(inv);
+        for (; i + 16 <= I; i += 16) {
+            __m128i a = _mm_cvtps_epi32(_mm_mul_ps(_mm_loadu_ps(x + i),      vinv));
+            __m128i b = _mm_cvtps_epi32(_mm_mul_ps(_mm_loadu_ps(x + i + 4),  vinv));
+            __m128i c = _mm_cvtps_epi32(_mm_mul_ps(_mm_loadu_ps(x + i + 8),  vinv));
+            __m128i d = _mm_cvtps_epi32(_mm_mul_ps(_mm_loadu_ps(x + i + 12), vinv));
+            __m128i abcd = _mm_packs_epi16(_mm_packs_epi32(a, b), _mm_packs_epi32(c, d));
+            _mm_storeu_si128((__m128i *)(xq + i), abcd);
         }
     }
 #endif
@@ -169,6 +194,15 @@ static inline int32_t dot_i8i8(const int8_t *w, const int8_t *x, int I){
         acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
     }
     sum=hsum256_i32(acc);
+#elif defined(__SSSE3__)
+    __m128i acc=_mm_setzero_si128(); const __m128i ones=_mm_set1_epi16(1);
+    for(;i+16<=I;i+=16){
+        __m128i wv=_mm_loadu_si128((const __m128i*)(w+i));
+        __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i p=_mm_maddubs_epi16(_mm_sign_epi8(wv,wv),_mm_sign_epi8(xv,wv));
+        acc=_mm_add_epi32(acc,_mm_madd_epi16(p,ones));
+    }
+    sum=hsum128_i32(acc);
 #elif defined(__ARM_NEON)
 #if defined(__ARM_FEATURE_DOTPROD)
     int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
@@ -274,6 +308,19 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
         acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p,ones));
     }
     sum=hsum256_i32(acc);
+#elif defined(__SSSE3__)
+    const __m128i m4=_mm_set1_epi8(0x0F); const __m128i b8=_mm_set1_epi8(8);
+    const __m128i ones=_mm_set1_epi16(1);
+    __m128i acc=_mm_setzero_si128();
+    for(;i+16<=I;i+=16){
+        __m128i by=_mm_loadl_epi64((const __m128i*)(w4+(i>>1)));
+        __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+        __m128i wv=_mm_sub_epi8(_mm_unpacklo_epi8(lo,hi),b8);
+        __m128i xv=_mm_loadu_si128((const __m128i*)(x+i));
+        __m128i p=_mm_maddubs_epi16(_mm_sign_epi8(wv,wv),_mm_sign_epi8(xv,wv));
+        acc=_mm_add_epi32(acc,_mm_madd_epi16(p,ones));
+    }
+    sum=hsum128_i32(acc);
 #elif defined(__ARM_NEON)
     const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -573,6 +620,29 @@ static inline int32_t dot_i4p_u(const uint8_t *w4, const int8_t *x, int I){
         acc=_mm256_add_epi32(acc,_mm256_madd_epi16(p1,ones));
     }
     sum=hsum256_i32(acc);
+#elif defined(__SSSE3__)
+    const __m128i m4=_mm_set1_epi8(0x0F);
+    const __m128i ones=_mm_set1_epi16(1);
+    __m128i acc=_mm_setzero_si128();
+    for(;i+64<=I;i+=64){
+        const __m128i *blk=(const __m128i*)(w4+(i>>1));
+        __m128i b0=_mm_loadu_si128(blk);
+        __m128i b1=_mm_loadu_si128(blk+1);
+        /* maddubs(u8,s8): u<=15, |x|<=127 -> pair <= 3810, int16-safe */
+        __m128i p0=_mm_maddubs_epi16(_mm_and_si128(b0,m4),
+                                     _mm_loadu_si128((const __m128i*)(x+i)));
+        __m128i p1=_mm_maddubs_epi16(_mm_and_si128(b1,m4),
+                                     _mm_loadu_si128((const __m128i*)(x+i+16)));
+        __m128i p2=_mm_maddubs_epi16(_mm_and_si128(_mm_srli_epi16(b0,4),m4),
+                                     _mm_loadu_si128((const __m128i*)(x+i+32)));
+        __m128i p3=_mm_maddubs_epi16(_mm_and_si128(_mm_srli_epi16(b1,4),m4),
+                                     _mm_loadu_si128((const __m128i*)(x+i+48)));
+        acc=_mm_add_epi32(acc,_mm_madd_epi16(p0,ones));
+        acc=_mm_add_epi32(acc,_mm_madd_epi16(p1,ones));
+        acc=_mm_add_epi32(acc,_mm_madd_epi16(p2,ones));
+        acc=_mm_add_epi32(acc,_mm_madd_epi16(p3,ones));
+    }
+    sum=hsum128_i32(acc);
 #elif defined(__ARM_NEON)
     int32x4_t acc=vdupq_n_s32(0);
     for(;i+64<=I;i+=64){
@@ -643,6 +713,19 @@ static inline void i4p_blk256(const uint8_t *blk, __m256i *lo, __m256i *hi){
     __m256i b=_mm256_loadu_si256((const __m256i*)blk);
     *lo=_mm256_and_si256(b,m4);
     *hi=_mm256_and_si256(_mm256_srli_epi16(b,4),m4);
+}
+#endif
+#if defined(__SSSE3__) && !defined(__AVX2__) && !defined(coli_dpbusd256)
+/* 128-bit unpack of a planar 64-element block: lo0=elems 0..15, lo1=16..31,
+ * hi0=32..47, hi1=48..63 — the SSSE3 K1b tier (AVX2/VNNI use i4p_blk256). */
+static inline void i4p_blk128(const uint8_t *blk, __m128i *lo0, __m128i *lo1, __m128i *hi0, __m128i *hi1){
+    const __m128i m4=_mm_set1_epi8(0x0F);
+    __m128i b0=_mm_loadu_si128((const __m128i*)blk);
+    __m128i b1=_mm_loadu_si128((const __m128i*)(blk+16));
+    *lo0=_mm_and_si128(b0,m4);
+    *lo1=_mm_and_si128(b1,m4);
+    *hi0=_mm_and_si128(_mm_srli_epi16(b0,4),m4);
+    *hi1=_mm_and_si128(_mm_srli_epi16(b1,4),m4);
 }
 #endif
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
@@ -851,6 +934,32 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                 }
                 d0=hsum256_i32(A0); d1=hsum256_i32(A1);
                 d2=hsum256_i32(A2); d3=hsum256_i32(A3);
+#elif defined(__SSSE3__)
+                const __m128i ones=_mm_set1_epi16(1);
+                __m128i A0=_mm_setzero_si128(),A1=_mm_setzero_si128();
+                __m128i A2=_mm_setzero_si128(),A3=_mm_setzero_si128();
+                for(int b=0;b<bpg;b++){
+                    int base=g*gs+b*64;
+                    __m128i lo0,lo1,hi0,hi1; i4p_blk128(w+(base>>1),&lo0,&lo1,&hi0,&hi1);
+                    A0=_mm_add_epi32(A0,_mm_madd_epi16(_mm_maddubs_epi16(lo0,_mm_loadu_si128((const __m128i*)(x0+base))),ones));
+                    A0=_mm_add_epi32(A0,_mm_madd_epi16(_mm_maddubs_epi16(lo1,_mm_loadu_si128((const __m128i*)(x0+base+16))),ones));
+                    A0=_mm_add_epi32(A0,_mm_madd_epi16(_mm_maddubs_epi16(hi0,_mm_loadu_si128((const __m128i*)(x0+base+32))),ones));
+                    A0=_mm_add_epi32(A0,_mm_madd_epi16(_mm_maddubs_epi16(hi1,_mm_loadu_si128((const __m128i*)(x0+base+48))),ones));
+                    A1=_mm_add_epi32(A1,_mm_madd_epi16(_mm_maddubs_epi16(lo0,_mm_loadu_si128((const __m128i*)(x1+base))),ones));
+                    A1=_mm_add_epi32(A1,_mm_madd_epi16(_mm_maddubs_epi16(lo1,_mm_loadu_si128((const __m128i*)(x1+base+16))),ones));
+                    A1=_mm_add_epi32(A1,_mm_madd_epi16(_mm_maddubs_epi16(hi0,_mm_loadu_si128((const __m128i*)(x1+base+32))),ones));
+                    A1=_mm_add_epi32(A1,_mm_madd_epi16(_mm_maddubs_epi16(hi1,_mm_loadu_si128((const __m128i*)(x1+base+48))),ones));
+                    A2=_mm_add_epi32(A2,_mm_madd_epi16(_mm_maddubs_epi16(lo0,_mm_loadu_si128((const __m128i*)(x2+base))),ones));
+                    A2=_mm_add_epi32(A2,_mm_madd_epi16(_mm_maddubs_epi16(lo1,_mm_loadu_si128((const __m128i*)(x2+base+16))),ones));
+                    A2=_mm_add_epi32(A2,_mm_madd_epi16(_mm_maddubs_epi16(hi0,_mm_loadu_si128((const __m128i*)(x2+base+32))),ones));
+                    A2=_mm_add_epi32(A2,_mm_madd_epi16(_mm_maddubs_epi16(hi1,_mm_loadu_si128((const __m128i*)(x2+base+48))),ones));
+                    A3=_mm_add_epi32(A3,_mm_madd_epi16(_mm_maddubs_epi16(lo0,_mm_loadu_si128((const __m128i*)(x3+base))),ones));
+                    A3=_mm_add_epi32(A3,_mm_madd_epi16(_mm_maddubs_epi16(lo1,_mm_loadu_si128((const __m128i*)(x3+base+16))),ones));
+                    A3=_mm_add_epi32(A3,_mm_madd_epi16(_mm_maddubs_epi16(hi0,_mm_loadu_si128((const __m128i*)(x3+base+32))),ones));
+                    A3=_mm_add_epi32(A3,_mm_madd_epi16(_mm_maddubs_epi16(hi1,_mm_loadu_si128((const __m128i*)(x3+base+48))),ones));
+                }
+                d0=hsum128_i32(A0); d1=hsum128_i32(A1);
+                d2=hsum128_i32(A2); d3=hsum128_i32(A3);
 #else
                 d0=d1=d2=d3=0;
                 for(int b=0;b<bpg;b++){
@@ -923,6 +1032,15 @@ static void i4p_gidot_rows(float *y, const int8_t *xq, const float *sx,
                     __m256i acc=_mm256_add_epi32(_mm256_madd_epi16(p0,ones),
                                                  _mm256_madd_epi16(p1,ones));
                     d+=hsum256_i32(acc);
+#elif defined(__SSSE3__)
+                    __m128i lo0,lo1,hi0,hi1; i4p_blk128(blk,&lo0,&lo1,&hi0,&hi1);
+                    const __m128i ones=_mm_set1_epi16(1);
+                    __m128i acc=_mm_setzero_si128();
+                    acc=_mm_add_epi32(acc,_mm_madd_epi16(_mm_maddubs_epi16(lo0,_mm_loadu_si128((const __m128i*)xb)),ones));
+                    acc=_mm_add_epi32(acc,_mm_madd_epi16(_mm_maddubs_epi16(lo1,_mm_loadu_si128((const __m128i*)(xb+16))),ones));
+                    acc=_mm_add_epi32(acc,_mm_madd_epi16(_mm_maddubs_epi16(hi0,_mm_loadu_si128((const __m128i*)(xb+32))),ones));
+                    acc=_mm_add_epi32(acc,_mm_madd_epi16(_mm_maddubs_epi16(hi1,_mm_loadu_si128((const __m128i*)(xb+48))),ones));
+                    d+=hsum128_i32(acc);
 #else
                     for(int k=0;k<32;k++){
                         d+=(int32_t)(blk[k]&0xF)*xb[k];

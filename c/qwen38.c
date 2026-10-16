@@ -1463,6 +1463,9 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
 #ifdef COLI_VULKAN
     if (to_state) q38c_sync_host(m);   /* the dense chain keeps the newest state on the device */
 #endif
+#ifdef COLI_CUDA
+    if (to_state) q38cc_sync_host(m);
+#endif
     if (!q38_prefix_geometry(m, &rec, &conv, &ple)) return 0;
     Q38PinState *st = *slot;
     if (st && st->n_layers != c->layers){ q38_pin_state_free(st); st = NULL; }
@@ -1515,6 +1518,9 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
     if (!to_state) q38_dn_gpu_invalidate(m);   /* restored on the host: the card's copy is from another prompt */
 #ifdef COLI_VULKAN
     if (!to_state) q38c_host_wrote(m, 0);   /* up to the device before the next chain step */
+#endif
+#ifdef COLI_CUDA
+    if (!to_state) q38cc_host_wrote(m, 0);
 #endif
     return 1;
 }
@@ -1619,6 +1625,10 @@ static void q38_prefix_copy_state(Model *m,int to_cache){
 #ifdef COLI_VULKAN
     if(to_cache)q38c_sync_host(m);
     else q38c_host_wrote(m,0);
+#endif
+#ifdef COLI_CUDA
+    if(to_cache)q38cc_sync_host(m);
+    else q38cc_host_wrote(m,0);
 #endif
     for(int i=0;i<m->c.layers;i++)if(!m->c.is_attn[i]){
         float *rec=to_cache?g_q38_prefix.dn_rec[i]:m->DN_rec[i];
@@ -1814,7 +1824,26 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     if(m->vis_map && m->vis_rows_n>0){
         kv_prefix_taint(&m->kvp);q38_prefix_cache_invalidate();
     }
-    {
+    /* The live state first. After a turn it holds the prompt AND the answer this
+     * engine wrote, recorded where they were fed (q38_spec_end undoes the drafts
+     * nobody consumed), and a chat's next request begins with both: only its new
+     * text is read. The snapshot below stops at the previous prompt's end, so
+     * with it every turn re-read the whole answer before (15.8-24.5 s for a
+     * 1,712-token second turn on a CPU box). An echo request (logprobs) still
+     * goes through a snapshot: its first fresh token's predictor is the logits
+     * saved with one. */
+    /* COLI_KV_PREFIX=0 reads every prompt from the start (the B arm of the A/B
+     * that shows reuse changes nothing but the time); a pin the client asked
+     * for still counts. */
+    const char *kv_prefix_env=getenv("COLI_KV_PREFIX");
+    int prefix_off=kv_prefix_env&&*kv_prefix_env=='0';
+    const char *reused_from="the live state";
+    if(!q->logprobs&&!prefix_off){
+        int live=kv_prefix_reuse(&m->kvp,ids,np);
+        if(live>0&&m->kv_len==live)reuse=live;
+    }
+    if(!reuse)reused_from="a pin";
+    if(!reuse){
         int ps=coli_pin_best(&g_q38_pins,ids,np);
         while(ps>=0){
             ColiPin *k=&g_q38_pins.slot[ps];
@@ -1831,7 +1860,16 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
             ps=coli_pin_best(&g_q38_pins,ids,np);
         }
     }
-    if(!reuse) reuse=q38_prefix_restore(m,ids,np);
+    if(!reuse&&!prefix_off){ reuse=q38_prefix_restore(m,ids,np); reused_from="the prompt-end snapshot"; }
+    if(getenv("COLI_PREFIX_LOG")){
+        if(reuse)
+            fprintf(stderr,"[PREFIX] reusing %d of %d prompt tokens (%.0f%%) from %s\n",
+                    reuse,np,100.0*reuse/np,reused_from);
+        else
+            fprintf(stderr,"[PREFIX] no reuse: held=%d prompt=%d%s%s\n",m->kvp.len,np,
+                    m->kvp.tainted?" tainted":"",prefix_off?" (COLI_KV_PREFIX=0)":"");
+        fflush(stderr);
+    }
     /* L'eco vale per il prefill, e il predittore del primo token fresco sono i
      * logit salvati con lo stato che si e appena rimesso. reuse==np e il caso
      * "prompt identico": li non c'e nessun token fresco da leggere. */
@@ -1931,9 +1969,9 @@ static int serve_one(Model *m, ServeReq *q){
         }
         if(cancelled||stopped){limited=0;break;}
         /* The next logits are not needed after the final requested token.
-         * The published prompt snapshot, rather than the live decode state,
-         * is restored on the next request, so stepping here would only run a
-         * full discarded decode pass. */
+         * A next request that continues this conversation reads the token in
+         * its own prompt, after the live state's last one, so stepping here
+         * would only run a decode pass that prefill repeats. */
         if(s == q->max_tok - 1) break;
         lo = q38_spec_step(m, &spec, tk, np+s, q->max_tok-1-s);
     }
@@ -2199,6 +2237,9 @@ static void serve_loop(Model *m){
         if(r<0){q38_prefix_cache_release(m);return;}
         if(r==2){
             int status=serve_one(m,&q);free(q.payload);
+#ifdef COLI_CUDA
+            q38cc_report(m);
+#endif
 #ifdef COLI_VULKAN
             q38_vk_report();   /* stderr: the wire protocol on stdout is untouched */
             q38c_report(m);
@@ -2375,6 +2416,12 @@ int main(int argc, char **argv) {
                 g_q38_mux_slots);
     }
     q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */
+#ifdef COLI_CUDA
+    /* COLI_CUDA_CHAIN=1: every layer on the device as one chain (qwen38_cuda_chain.h), set up
+     * now that the tier placed the trunk and the CPU holds its int8 rows (the chain's own
+     * copies of the rest come from the same bytes) */
+    if (q38cc_env_on() && q38cc_setup(&m, g_q38_mux_slots)) { g_cuda_chain=1; atexit(cc_shutdown); }
+#endif
     q38_expert_report(&m, cap);         /* expert format, bytes per expert, what the cache costs */
 #ifdef COLI_VULKAN
     /* After the trunk is int8: those rows upload at their first matmul. No
@@ -2435,6 +2482,9 @@ int main(int argc, char **argv) {
         printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
+#ifdef COLI_CUDA
+        q38cc_report(&m);
+#endif
 #ifdef COLI_VULKAN
         q38_vk_report();
         q38c_report(&m);
@@ -2519,6 +2569,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
+#ifdef COLI_CUDA
+    q38cc_report(&m);
+#endif
 #ifdef COLI_VULKAN
     q38_vk_report();
     q38c_report(&m);
