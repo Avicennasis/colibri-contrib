@@ -141,7 +141,7 @@ static void q36_wfree(void *p){
 static gguf_ctx g_gg;
 static int   g_gguf = 0;
 static int   g_gguf_dry = 0;       /* GGUF_CHECK=1: validate every tensor the loader wants, read none */
-static int   g_gguf_plain = 0;     /* qwen3moe: llama.cpp's names for a Qwen3 MoE layer (ffn_norm after attention) */
+static int   g_gguf_plain = 0;     /* qwen3moe, qwen3: llama.cpp's names for a Qwen3 layer (ffn_norm after attention) */
 static int   g_ssm_a_direct = 0, g_dn_tiled = 0;
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
@@ -2783,12 +2783,13 @@ static void gguf_load_cfg(Cfg *c) {
     /* qwen35moe: Qwen3.5 / Qwen3.6 MoE; qwen35: the dense checkpoints of the same family
      * (Qwen3.5 0.8B to 27B, Qwen3.8 27B), their MLP run as the shared expert, ungated (#1757);
      * qwen3moe: Qwen3 MoE (Qwen3-30B-A3B, Qwen3-Coder), every layer attention, no output
-     * gate, no shared expert, full rotary, plain RMSNorm (stored as is, so the 1 still comes off) */
-    const int dense = arch && !strcmp(arch, "qwen35");
-    const int plain = arch && !strcmp(arch, "qwen3moe");
+     * gate, no shared expert, full rotary, plain RMSNorm (stored as is, so the 1 still comes off);
+     * qwen3: the dense Qwen3 (0.6B to 32B), qwen3moe's layers with qwen35's dense MLP */
+    const int dense = arch && (!strcmp(arch, "qwen35") || !strcmp(arch, "qwen3"));
+    const int plain = arch && (!strcmp(arch, "qwen3moe") || !strcmp(arch, "qwen3"));
     if (!arch || (strcmp(arch, "qwen35moe") && !dense && !plain)) {
-        fprintf(stderr, "GGUF architecture '%s' is not one of qwen35moe (Qwen3.5 / 3.6 MoE), qwen35 (their dense models) "
-                        "or qwen3moe (Qwen3 MoE): this engine cannot run it\n", arch ? arch : "?"); exit(1);
+        fprintf(stderr, "GGUF architecture '%s' is not one of qwen35moe (Qwen3.5 / 3.6 MoE), qwen35 (their dense models), "
+                        "qwen3moe (Qwen3 MoE) or qwen3 (dense Qwen3): this engine cannot run it\n", arch ? arch : "?"); exit(1);
     }
     g_gguf_plain = plain;
     char key[128];
@@ -2799,7 +2800,7 @@ static void gguf_load_cfg(Cfg *c) {
     c->hidden   = (int)gguf_get_int(g, GK("embedding_length"), 0);
     c->q_heads  = (int)gguf_get_int(g, GK("attention.head_count"), 0);
     c->kv_heads = (int)gguf_get_int(g, GK("attention.head_count_kv"), 0);
-    c->head_dim = (int)gguf_get_int(g, GK("attention.key_length"), 0);
+    c->head_dim = (int)gguf_get_int(g, GK("attention.key_length"), c->q_heads > 0 ? c->hidden / c->q_heads : 0);
     c->k_head_dim = c->head_dim;
     c->v_head_dim = (int)gguf_get_int(g, GK("attention.value_length"), c->head_dim);
     c->n_experts = (int)gguf_get_int(g, GK("expert_count"), 0);
@@ -2859,7 +2860,10 @@ static void gguf_load_cfg(Cfg *c) {
     c->has_qk_norm = gguf_find(g, nm) != NULL;
     snprintf(nm, sizeof nm, "blk.0.exp_probs_b.bias");
     c->has_bias = gguf_find(g, nm) != NULL;
-    if (plain)
+    if (plain && dense)
+        fprintf(stderr, "[gguf] qwen3 (dense): %d layers (all attention), hidden %d, MLP %d, vocab %d\n",
+                c->n_layers, c->hidden, c->shared_inter, c->vocab);
+    else if (plain)
         fprintf(stderr, "[gguf] qwen3moe: %d layers (all attention), hidden %d, %d experts top-%d, inter %d, vocab %d\n",
                 c->n_layers, c->hidden, c->n_experts, c->topk, c->inter, c->vocab);
     else if (dense)

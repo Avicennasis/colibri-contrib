@@ -18,8 +18,8 @@ Either way the directory is an ordinary colibri model: `coli chat`, `coli
 serve`, `coli web` and the planner treat it like any other.
 
 Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine), qwen35 (their
-dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engine),
-qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine).
+dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engine), qwen3 (the dense
+Qwen3 -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine).
 
 Usage:
   python3 tools/gguf_import.py MODEL.gguf OUT_DIR [--mode link|copy]
@@ -182,7 +182,8 @@ def qwen3moe_config(meta, tensors, overrides=None):
     p = "qwen3moe."
     need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
     layers = int(need("block_count"))
-    head_dim = int(need("attention.key_length"))
+    # written when the config names head_dim; else the width split over the heads
+    head_dim = int(meta.get(p + "attention.key_length", int(need("embedding_length")) // int(need("attention.head_count"))))
     emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
     cfg = {
         "model_type": "qwen3_moe",
@@ -205,6 +206,23 @@ def qwen3moe_config(meta, tensors, overrides=None):
         "tie_word_embeddings": "output.weight" not in tensors,
         "hidden_act": "silu",
     }
+    return cfg, layers
+
+
+def qwen3_config(meta, tensors, overrides=None):
+    """The dense Qwen3 (llama.cpp's qwen3: Qwen3 0.6B to 32B) as the qwen36 engine's config.json:
+    qwen3moe's layers with one MLP of feed_forward_length each."""
+    p = "qwen3."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    moe_like = {(("qwen3moe." + k[len(p):]) if k.startswith(p) else k): v for k, v in meta.items()}
+    moe_like.setdefault("qwen3moe.expert_count", 1)
+    moe_like.setdefault("qwen3moe.expert_used_count", 1)
+    moe_like.setdefault("qwen3moe.expert_feed_forward_length", int(need("feed_forward_length")))
+    cfg, layers = qwen3moe_config(moe_like, tensors, overrides)
+    for k in ("num_experts", "num_experts_per_tok", "moe_intermediate_size", "norm_topk_prob"):
+        cfg.pop(k, None)
+    cfg.update({"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"],
+                "intermediate_size": int(need("feed_forward_length"))})
     return cfg, layers
 
 
@@ -289,7 +307,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the
@@ -464,6 +482,21 @@ def write_packed(parts, readers, meta, tensors, layers, out_path):
     return data0 + total
 
 
+def model_name(meta):
+    """What the file calls the model, {"name": "Qwen3-0.6B", "size": "0.6B"} from general.name
+    (else basename and size label), {} without either: the banner and the API id of a model
+    no colibri variant names (family_registry.display_for, default_model_id)."""
+    name = meta.get("general.name")
+    if not isinstance(name, str) or not name.strip():
+        name = "-".join(str(meta[k]) for k in ("general.basename", "general.size_label") if meta.get(k))
+    if not name.strip():
+        return {}
+    out = {"name": name.strip()}
+    if isinstance(meta.get("general.size_label"), str):
+        out["size"] = meta["general.size_label"]
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("gguf", type=Path)
@@ -501,7 +534,7 @@ def main():
             cfg["mtp_use_dedicated_embeddings"] = False
     tok, tcfg, gen = tokenizer_files(meta)
     args.out.mkdir(parents=True, exist_ok=True)
-    cfg["colibri_gguf"] = {"arch": arch, "mode": args.mode, "source": str(src)}
+    cfg["colibri_gguf"] = {"arch": arch, "mode": args.mode, "source": str(src), **model_name(meta)}
     for name, obj in (("config.json", cfg), ("tokenizer.json", tok), ("tokenizer_config.json", tcfg),
                       ("generation_config.json", gen)):
         (args.out / name).write_text(json.dumps(obj, ensure_ascii=False, indent=1 if name != "tokenizer.json" else None))

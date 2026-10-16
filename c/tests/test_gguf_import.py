@@ -240,6 +240,62 @@ class Qwen3MoeConfig(unittest.TestCase):
         self.assertEqual(cfg["vocab_size"], 151936)
 
 
+class Qwen3DenseConfig(unittest.TestCase):
+    """llama.cpp's qwen3 (the dense Qwen3) as the qwen36 engine's config: Qwen3-0.6B's numbers,
+    whose head (128) is not the width over the heads (64), and whose embedding is tied."""
+    def test_small_tied(self):
+        import tools.gguf_import as gi
+        p = "qwen3."
+        meta = {p + k: v for k, v in {
+            "block_count": 28, "context_length": 40960, "embedding_length": 1024, "feed_forward_length": 3072,
+            "attention.head_count": 16, "attention.head_count_kv": 8, "rope.freq_base": 1000000.0,
+            "attention.layer_norm_rms_epsilon": 1e-6, "attention.key_length": 128,
+            "attention.value_length": 128}.items()}
+        tensors = {"token_embd.weight": {"dims": [1024, 151936]}}
+        cfg, layers = gi.qwen3_config(meta, tensors)
+        self.assertEqual(layers, 28)
+        self.assertEqual((cfg["model_type"], cfg["architectures"]), ("qwen3", ["Qwen3ForCausalLM"]))
+        self.assertEqual((cfg["intermediate_size"], cfg["head_dim"]), (3072, 128))
+        for k in ("num_experts", "num_experts_per_tok", "moe_intermediate_size"):
+            self.assertNotIn(k, cfg)
+        self.assertEqual(cfg["layer_types"], ["full_attention"] * 28)
+        self.assertTrue(cfg["tie_word_embeddings"])
+        # the family registry plans it as a dense qwen36 model: KV on every layer, no experts
+        from family_registry import family_by_id
+        fam = family_by_id("qwen36")
+        self.assertIn("qwen3", fam.model_types)
+
+    def test_named_by_the_file(self):
+        """A GGUF no variant of the family names keeps its own name (general.name) in the
+        banner and the API id, not the family's (it was served as qwen3.6-colibri)."""
+        import tools.gguf_import as gi
+        from family_registry import resolve_model, display_for, default_model_id
+        meta = {"general.name": "Qwen3-0.6B", "general.basename": "Qwen3", "general.size_label": "0.6B"}
+        self.assertEqual(gi.model_name(meta), {"name": "Qwen3-0.6B", "size": "0.6B"})
+        self.assertEqual(gi.model_name({"general.basename": "Qwen3", "general.size_label": "8B"}), {"name": "Qwen3-8B", "size": "8B"})
+        self.assertEqual(gi.model_name({}), {})
+        cfg, _ = gi.qwen3_config({"qwen3." + k: v for k, v in {
+            "block_count": 28, "embedding_length": 1024, "feed_forward_length": 3072,
+            "attention.head_count": 16, "attention.head_count_kv": 8, "attention.key_length": 128}.items()},
+            {"token_embd.weight": {"dims": [1024, 151936]}})
+        with tempfile.TemporaryDirectory() as d:
+            named = dict(cfg, colibri_gguf={"arch": "qwen3", "mode": "link", "source": "x.gguf", **gi.model_name(meta)})
+            (Path(d) / "config.json").write_text(json.dumps(named))
+            r = resolve_model(d)
+            self.assertEqual(display_for(r), ("Qwen3-0.6B", "0.6B"))
+            self.assertEqual(default_model_id(r), "qwen3-0.6b-colibri")
+            # a GGUF of a model colibri names keeps that name and id (Qwen3-Coder-30B-A3B)
+            coder, _ = gi.qwen3moe_config({"qwen3moe." + k: v for k, v in {
+                "block_count": 48, "embedding_length": 2048, "attention.head_count": 32, "attention.head_count_kv": 4,
+                "attention.key_length": 128, "expert_count": 128, "expert_used_count": 8,
+                "expert_feed_forward_length": 768}.items()}, {"token_embd.weight": {"dims": [2048, 151936]}})
+            coder["colibri_gguf"] = {"arch": "qwen3moe", "name": "Qwen3-Coder-30B-A3B-Instruct"}
+            (Path(d) / "config.json").write_text(json.dumps(coder))
+            r = resolve_model(d)
+            self.assertEqual(display_for(r), ("Qwen3-Coder-30B-A3B", "30B"))
+            self.assertEqual(default_model_id(r), "qwen3-coder-30b-a3b-colibri")
+
+
 class Qwen4ExpLayers(unittest.TestCase):
     """Which layers attend, from either way a qwen4exp GGUF says it: unsloth's Qwen3.8-Flash-Next
     files give full_attention_interval (no attention.recurrent_layers), newer llama.cpp
