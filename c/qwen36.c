@@ -3955,6 +3955,7 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
     for (int r = 0; r < n * D; r++) {
         int k = r / D, o = r % D;
         gq_act one = *pah; one.S = 1; one.q = pah->q + (int64_t)k * I; one.d = pah->d + (int64_t)k * (I / 32); one.s = pah->s + (int64_t)k * (I / 16);
+        one.l4 = pah->l4 ? pah->l4 + (int64_t)k * (I / 4) : NULL;
         gq_row_all(Y + (int64_t)k * D + o, 1, &one, sl[k]->gqe + gx->eb_g + gx->eb_u + (int64_t)o * rbd, gx->td, I);
     }
     /* accumulate in expert-id order, as the general path does: same sums, same bits */

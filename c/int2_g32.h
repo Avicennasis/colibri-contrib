@@ -135,7 +135,7 @@ static inline void x2_dot(float *y, int ystride, const uint8_t *codes, const uin
 
 /* The activation contract: int8 per 32 elements, one f32 scale (amax/127) each,
  * rounded to nearest; the arithmetic of ggml_quants.h's gq_quant_act. */
-static inline void x2_quant_act(const float *x, int I, int8_t *xq, float *dx) {
+static inline void x2_quant_act_ref(const float *x, int I, int8_t *xq, float *dx) {
     for (int b = 0; b < I / X2_GROUP; b++) {
         const float *v = x + (size_t)b * X2_GROUP; float amax = 0.f;
         for (int i = 0; i < X2_GROUP; i++) { float a = fabsf(v[i]); if (a > amax) amax = a; }
@@ -146,6 +146,33 @@ static inline void x2_quant_act(const float *x, int I, int8_t *xq, float *dx) {
             xq[(size_t)b * X2_GROUP + i] = (int8_t)t;
         }
     }
+}
+/* x2_quant_act_ref eight lanes at a time, byte for byte (see gq_quant_block_avx2) */
+static inline void x2_quant_act(const float *x, int I, int8_t *xq, float *dx) {
+#if defined(__AVX2__)
+    const __m256 sign = _mm256_set1_ps(-0.f);
+    const __m256i lo = _mm256_set1_epi32(-127), hi = _mm256_set1_epi32(127);
+    for (int b = 0; b < I / X2_GROUP; b++) {
+        const float *v = x + (size_t)b * X2_GROUP;
+        const __m256 v0 = _mm256_loadu_ps(v), v1 = _mm256_loadu_ps(v + 8), v2 = _mm256_loadu_ps(v + 16), v3 = _mm256_loadu_ps(v + 24);
+        const __m256 a = _mm256_max_ps(_mm256_max_ps(_mm256_andnot_ps(sign, v0), _mm256_andnot_ps(sign, v1)),
+                                       _mm256_max_ps(_mm256_andnot_ps(sign, v2), _mm256_andnot_ps(sign, v3)));
+        __m128 m = _mm_max_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
+        m = _mm_max_ps(m, _mm_movehl_ps(m, m)); m = _mm_max_ss(m, _mm_movehdup_ps(m));
+        const float amax = _mm_cvtss_f32(m);
+        const float id = amax > 0.f ? 127.f / amax : 0.f;
+        dx[b] = amax / 127.f;
+        const __m256 idv = _mm256_set1_ps(id);
+        const __m256i q0 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v0, idv)), lo), hi);
+        const __m256i q1 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v1, idv)), lo), hi);
+        const __m256i q2 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v2, idv)), lo), hi);
+        const __m256i q3 = _mm256_min_epi32(_mm256_max_epi32(_mm256_cvtps_epi32(_mm256_mul_ps(v3, idv)), lo), hi);
+        const __m256i p = _mm256_packs_epi16(_mm256_packs_epi32(q0, q1), _mm256_packs_epi32(q2, q3));
+        _mm256_storeu_si256((__m256i *)(xq + (size_t)b * X2_GROUP), _mm256_permutevar8x32_epi32(p, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7)));
+    }
+#else
+    x2_quant_act_ref(x, I, xq, dx);
+#endif
 }
 
 /* y[s*O + o] = W[o,:] . x[s,:] for an int2-g32 matrix: codes [O][I/4], q [O][I/32],

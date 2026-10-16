@@ -438,16 +438,49 @@ static uint64_t q38_weight_bytes(const Q38Weight *weight) {
 /* Native BF16 storage with FP32 activations and accumulation.  This deliberately
  * does not round activations to BF16 or use BF16 dot-product instructions: it is
  * the storage-equivalent form of the existing st_read_f32 reference. */
+/* BF16 rows (the small trunk matrices kept in BF16: DeltaNet's gates, the PLE
+ * projections, the MTP head's): eight lanes a row, lane l summing elements l, l+8, ...
+ * with fma in order, then the lanes added as xf_hsum8; a row's weights widened to f32
+ * once for up to four activation rows. Each row's result is the same whatever S is.
+ * The scalar loop this replaces summed one element at a time on one lane. */
+#if defined(__AVX2__)&&defined(__FMA__)
+static inline __attribute__((always_inline)) void q38_bf16_rows(float *y,int ys,const uint16_t *w,const float *x,int I,const int S) {
+    __m256 acc[4];
+    for(int s=0;s<S;s++)acc[s]=_mm256_setzero_ps();
+    int i=0;
+    for(;i+8<=I;i+=8){
+        const __m256 wf=_mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(w+i))),16));
+        for(int s=0;s<S;s++)acc[s]=_mm256_fmadd_ps(wf,_mm256_loadu_ps(x+(int64_t)s*I+i),acc[s]);
+    }
+    for(int s=0;s<S;s++){
+        float a=xf_hsum8(acc[s]);
+        for(int k=i;k<I;k++)a=fmaf(x[(int64_t)s*I+k],bf16_to_f32(w[k]),a);
+        y[(int64_t)s*ys]=a;
+    }
+}
+#endif
 static void q38_matmul_bf16(float *y,const float *x,const uint16_t *W,
                             int S,int I,int O) {
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
         const uint16_t *w=W+(int64_t)o*I;
+#if defined(__AVX2__)&&defined(__FMA__)
+        for(int s0=0;s0<S;s0+=4){
+            const int n=S-s0<4?S-s0:4;float *yo=y+(int64_t)s0*O+o;const float *xs=x+(int64_t)s0*I;
+            switch(n){
+            case 1:q38_bf16_rows(yo,O,w,xs,I,1);break;
+            case 2:q38_bf16_rows(yo,O,w,xs,I,2);break;
+            case 3:q38_bf16_rows(yo,O,w,xs,I,3);break;
+            default:q38_bf16_rows(yo,O,w,xs,I,4);break;
+            }
+        }
+#else
         for(int s=0;s<S;s++){
             const float *xs=x+(int64_t)s*I;float a=0.f;
             for(int i=0;i<I;i++)a+=xs[i]*bf16_to_f32(w[i]);
             y[(int64_t)s*O+o]=a;
         }
+#endif
     }
 }
 
@@ -531,22 +564,25 @@ static void q38_matmul_int4g64(float *y,const float *x,const uint8_t *codes,
                                const float *scales,int S,int I,int O) {
     int64_t row_bytes=q38_int4_row_bytes(I),groups=q38_int4_groups(I);
     int body=I/XF_BLOCK*XF_BLOCK;
+    const float **xs_rows=(const float**)malloc((size_t)(S>0?S:1)*sizeof(float*));
+    if(!xs_rows){fprintf(stderr,"OOM int4 rows\n");exit(1);}
+    for(int s=0;s<S;s++)xs_rows[s]=x+(int64_t)s*I;
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
         const uint8_t *w=codes+(int64_t)o*row_bytes;
         const float *sc=scales+(int64_t)o*groups;
-        for(int s=0;s<S;s++){
-            const float *xs=x+(int64_t)s*I;
-            float a=body?xf_dot_f32(w,sc,xs,body):0.f;
-            if(body<I){
-                float tail=0.f;
-                for(int i=body;i<I;i++)
-                    tail+=(float)((int)((w[i>>1]>>((i&1)*4))&15)-8)*xs[i];
-                a=fmaf(tail,sc[groups-1],a);
-            }
-            y[(int64_t)s*O+o]=a;
+        /* every row at once: the nibbles widened once, each row's bits xf_dot_f32's */
+        if(body)xf_dot_f32_rows(y+o,O,w,sc,xs_rows,body,S);
+        else for(int s=0;s<S;s++)y[(int64_t)s*O+o]=0.f;
+        if(body<I)for(int s=0;s<S;s++){
+            const float *xs=xs_rows[s];
+            float tail=0.f;
+            for(int i=body;i<I;i++)
+                tail+=(float)((int)((w[i>>1]>>((i&1)*4))&15)-8)*xs[i];
+            y[(int64_t)s*O+o]=fmaf(tail,sc[groups-1],y[(int64_t)s*O+o]);
         }
     }
+    free(xs_rows);
 }
 
 #ifdef COLI_VULKAN
@@ -2822,6 +2858,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
     float *aa=falloc((int64_t)rows_capacity*VH);
     float *norm=falloc((int64_t)rows_capacity*V);
     float *conv=falloc(CD);
+    float *convs=falloc((int64_t)rows_capacity*CD);   /* each row's conv output */
     float *q=falloc((int64_t)VH*KD),*k=falloc((int64_t)VH*KD);
     float *core=falloc(V);
     /* a multiplexed step parks every conversation: each row's state below */
@@ -2843,7 +2880,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
         q38_dn_gpu_push(m,layer);
         if(m->dn_dev_fresh[layer]&&qt_dn_gpu_step(layer,x,out,egh,beta)){
             m->dn_host_stale[layer]=1;
-            free(qkv);free(z);free(bb);free(aa);free(norm);free(conv);free(q);free(k);free(core);
+            free(qkv);free(z);free(bb);free(aa);free(norm);free(conv);free(convs);free(q);free(k);free(core);
             q38_tm_add(m,Q38_TM_DELTANET,phase_started);
             return;
         }
@@ -2859,39 +2896,44 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
         q38_dense_matmul(m,aa,chunk,&l->dn_a,rows,H,VH);
 
         double recur_started=now_s(),snap_s=0.0;
-        for(int s=0;s<rows;s++) {
-            if(m->mux_rows){rec=m->mux_rows[base+s].seq->DN_rec[layer];ring=m->mux_rows[base+s].seq->DN_conv[layer];}
-            float *qkv_row=qkv+(int64_t)s*CD;
-            float *z_row=z+(int64_t)s*V;
-            float *b_row=bb+(int64_t)s*VH;
-            float *a_row=aa+(int64_t)s*VH;
-            /* One parallel region per row: the causal conv by channel, then each value
-             * head on its own (its q/k normalized, the recurrence, the rollback copy,
-             * the gated norm). Each value comes from the code and in the order the
-             * serial loops had, so the bits are theirs; the serial conv and norms (an
-             * expf per channel, 10240 a row) were most of dn-recur. */
-            const float *qi=conv,*ki=conv+K,*vi=conv+2*K;
-            float *norm_row=norm+(int64_t)s*V;
-            /* a verify: the state this row leaves, for the rollback of a draft rejected
-             * after it (q38_spec_rollback), each head copied by its thread right after
-             * its update, while it is in that core's cache */
-            float *snap_rec=base+s<m->snap_rows?m->snap_rec[base+s][layer]:NULL;
-            #pragma omp parallel
-            {
-            #pragma omp for schedule(static)
-            for(int d=0;d<CD;d++) {
+        /* One parallel region for all the rows. The causal conv by channel, each
+         * channel's rows in order (its ring advances row by row, and a verify keeps the
+         * ring each row leaves); then each value head with every row in turn, while
+         * its state is in that core's cache (q/k normalized, the recurrence, the
+         * rollback copy, the gated norm). A (row, head) is computed from the same
+         * values in the same order as one region per row did, so the bits are those;
+         * the state is crossed once instead of once a row. */
+        #pragma omp parallel
+        {
+        #pragma omp for schedule(static)
+        for(int d=0;d<CD;d++) {
+            for(int s=0;s<rows;s++){
+                float *ring_s=m->mux_rows?m->mux_rows[base+s].seq->DN_conv[layer]:ring;
+                const float *qkv_row=qkv+(int64_t)s*CD;
                 float value=l->dn_conv[(int64_t)d*CK+CK-1]*qkv_row[d];
-                float *history=ring+(int64_t)d*(CK-1);
+                float *history=ring_s+(int64_t)d*(CK-1);
                 for(int tap=0;tap<CK-1;tap++)
                     value+=l->dn_conv[(int64_t)d*CK+tap]*history[tap];
-                conv[d]=q38_silu(value);
+                convs[(int64_t)s*CD+d]=q38_silu(value);
                 for(int tap=0;tap<CK-2;tap++)history[tap]=history[tap+1];
                 history[CK-2]=qkv_row[d];
+                /* a verify: the ring this row leaves, for the rollback (q38_spec_rollback) */
+                if(base+s<m->snap_rows)
+                    memcpy(m->snap_conv[base+s][layer]+(int64_t)d*(CK-1),history,(size_t)(CK-1)*sizeof(float));
             }
-            #pragma omp for schedule(static)
-            for(int h=0;h<VH;h++) {
-                float *qh=q+(int64_t)h*KD,*kh=k+(int64_t)h*KD;
-                int kh_of=g_q38_dn_tiled?h%KH:h/rep;   /* GGUF: value heads tiled over the key heads */
+        }
+        #pragma omp for schedule(static)
+        for(int h=0;h<VH;h++) {
+            float *qh=q+(int64_t)h*KD,*kh=k+(int64_t)h*KD;
+            int kh_of=g_q38_dn_tiled?h%KH:h/rep;   /* GGUF: value heads tiled over the key heads */
+            for(int s=0;s<rows;s++){
+                float *rec_s=m->mux_rows?m->mux_rows[base+s].seq->DN_rec[layer]:rec;
+                const float *qi=convs+(int64_t)s*CD,*ki=qi+K,*vi=qi+2*K;
+                const float *z_row=z+(int64_t)s*V,*b_row=bb+(int64_t)s*VH,*a_row=aa+(int64_t)s*VH;
+                float *norm_row=norm+(int64_t)s*V;
+                /* a verify: the state this row leaves, for the rollback of a draft rejected
+                 * after it (q38_spec_rollback), copied while it is in this core's cache */
+                float *snap_rec=base+s<m->snap_rows?m->snap_rec[base+s][layer]:NULL;
                 memcpy(qh,qi+(int64_t)kh_of*KD,(size_t)KD*sizeof(float));
                 memcpy(kh,ki+(int64_t)kh_of*KD,(size_t)KD*sizeof(float));
                 double qsum=1e-6,ksum=1e-6;
@@ -2902,7 +2944,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                 float qscale=1.f/sqrtf((float)qsum)/sqrtf((float)KD);
                 float kscale=1.f/sqrtf((float)ksum);
                 for(int d=0;d<KD;d++){qh[d]*=qscale;kh[d]*=kscale;}
-                float *state=rec+(int64_t)h*KD*VD;
+                float *state=rec_s+(int64_t)h*KD*VD;
                 const float *vh=vi+(int64_t)h*VD;
                 float alpha=expf((g_q38_a_direct?l->dn_alog[h]:-expf(l->dn_alog[h]))*
                                  q38_softplus(a_row[h]+l->dn_dtbias[h]));
@@ -2929,13 +2971,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
                 if(snap_rec)memcpy(snap_rec+(int64_t)h*KD*VD,state,(size_t)KD*VD*sizeof(float));
                 q38_rmsg(norm_row+(int64_t)h*VD,current,z_row+(int64_t)h*VD,l->dn_norm,VD,c->eps,1);
             }
-            }
-            /* and the conv ring this row leaves (the state went with the heads above) */
-            if(base+s<m->snap_rows){
-                double snap_started=now_s();
-                memcpy(m->snap_conv[base+s][layer],ring,(size_t)CD*(CK-1)*sizeof(float));
-                snap_s+=now_s()-snap_started;
-            }
+        }
         }
         m->timers.seconds[Q38_TM_DN_RECUR]+=now_s()-recur_started-snap_s;
         m->timers.seconds[Q38_TM_DN_SNAP]+=snap_s;
@@ -2944,7 +2980,7 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
         base+=rows;
     }
     if(m->dn_dev_fresh)m->dn_dev_fresh[layer]=0;   /* the host advanced: the card's copy is old */
-    free(qkv);free(z);free(bb);free(aa);free(norm);free(conv);
+    free(qkv);free(z);free(bb);free(aa);free(norm);free(conv);free(convs);
     free(q);free(k);free(core);
     q38_tm_add(m,Q38_TM_DELTANET,phase_started);
 }
@@ -3815,15 +3851,14 @@ static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
         const int64_t rb=q38_int4_row_bytes(I),groups=q38_int4_groups(I);const int body=I/XF_BLOCK*XF_BLOCK;
         for(int o=r0;o<r1;o++){
             const uint8_t *wr=(const uint8_t*)w->data+(int64_t)o*rb;const float *sc=w->scales+(int64_t)o*groups;
-            for(int a=0;a<n;a++){
+            /* the body for every row at once (the nibbles widened once, each row's bits xf_dot_f32's) */
+            if(body)xf_dot_f32_rows(y+o,ys,wr,sc,xr,body,n);
+            else for(int a=0;a<n;a++)y[(int64_t)a*ys+o]=0.f;
+            if(body<I)for(int a=0;a<n;a++){
                 const float *xs=xr[a];
-                float v=body?xf_dot_f32(wr,sc,xs,body):0.f;
-                if(body<I){
-                    float tail=0.f;
-                    for(int i=body;i<I;i++)tail+=(float)((int)((wr[i>>1]>>((i&1)*4))&15)-8)*xs[i];
-                    v=fmaf(tail,sc[groups-1],v);
-                }
-                y[(int64_t)a*ys+o]=v;
+                float tail=0.f;
+                for(int i=body;i<I;i++)tail+=(float)((int)((wr[i>>1]>>((i&1)*4))&15)-8)*xs[i];
+                y[(int64_t)a*ys+o]=fmaf(tail,sc[groups-1],y[(int64_t)a*ys+o]);
             }
         }
         return;
@@ -3881,9 +3916,10 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     int *idx=(int*)malloc((size_t)np*sizeof(int)),*pos=(int*)malloc((size_t)np*sizeof(int));
     int *uniq=(int*)malloc((size_t)np*sizeof(int)),*cnt=(int*)calloc((size_t)np,sizeof(int)),*start=(int*)malloc((size_t)np*sizeof(int));
     int *who=(int*)malloc((size_t)np*sizeof(int));   /* grouped position -> assignment s*K+z */
+    int *pos_row=(int*)malloc((size_t)np*sizeof(int));   /* grouped position -> its activation row */
     const float **xr=(const float**)malloc((size_t)np*sizeof(float*)),**hr=(const float**)malloc((size_t)np*sizeof(float*));
     Slot **slot=(Slot**)malloc((size_t)np*sizeof(Slot*));
-    if(!xqt||!xg||!ehq||!idx||!pos||!uniq||!cnt||!start||!who||!xr||!hr||!slot){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
+    if(!xqt||!xg||!ehq||!idx||!pos||!uniq||!cnt||!start||!who||!pos_row||!xr||!hr||!slot){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
     /* route every row, in the decode loop's order and with its side effects */
     if(logits_in)memcpy(logits,logits_in,(size_t)S*E*sizeof(float));
     else q38_dense_matmul(m,logits,x,&l->router,S,H,E);
@@ -3947,15 +3983,16 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     } else {
         /* the inputs: f32 row pointers, or int8 per 32 once per row, gathered per assignment */
         for(int p=0;p<np;p++){xr[p]=x+(int64_t)(who[p]/K)*H;hr[p]=ehf+(int64_t)p*I;}
-        if(kin==Q38_ROWS_GQ){   /* a row's quantization is gq_matmul's, once per assignment */
-            float *xgf=falloc((int64_t)np*H);
-            for(int p=0;p<np;p++)memcpy(xgf+(int64_t)p*H,xr[p],(size_t)H*sizeof(float));
-            if(gq_act_set(&gin,xgf,np,H)){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
-            free(xgf);
+        if(kin==Q38_ROWS_GQ){   /* gq_matmul's quantization, once per row, then each assignment its row's copy */
+            gq_act gx;memset(&gx,0,sizeof gx);
+            for(int p=0;p<np;p++)pos_row[p]=who[p]/K;
+            if(gq_act_set(&gx,x,S,H)||gq_act_gather(&gin,&gx,pos_row,np)){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
+            gq_act_free(&gx);
         }
         if(kdn==Q38_ROWS_GQ){
             gh.q=(int8_t*)malloc((size_t)np*I);gh.d=falloc((int64_t)np*(I/32));gh.s=(int32_t*)malloc((size_t)np*(I/16)*sizeof(int32_t));
-            if(!gh.q||!gh.d||!gh.s){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
+            gh.l4=(int32_t*)malloc((size_t)np*(I/4)*sizeof(int32_t));
+            if(!gh.q||!gh.d||!gh.s||!gh.l4){fprintf(stderr,"OOM grouped MoE\n");exit(1);}
             gh.S=np;gh.I=I;gh.cap=np*I;
         }
         if(kin==Q38_ROWS_X2){
@@ -3980,7 +4017,8 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
             #pragma omp for schedule(dynamic,1)
             for(int it=0;it<nu*cF;it++){
                 const int j=it/cF,r0=(it%cF)*rF,r1=r0+rF<I?r0+rF:I,p0=start[j],n=cnt[j];
-                const gq_act ga={gin.q+(int64_t)p0*H,gin.d+(int64_t)p0*(H/32),gin.s+(int64_t)p0*(H/16),n,H,0};
+                const gq_act ga={gin.q+(int64_t)p0*H,gin.d+(int64_t)p0*(H/32),gin.s+(int64_t)p0*(H/16),n,H,0,
+                                 gin.l4?gin.l4+(int64_t)p0*(H/4):NULL};
                 q38_rows(eg+(int64_t)p0*I,I,&slot[j]->gate,H,r0,r1,xr+p0,xg+(int64_t)p0*H,dxg+(int64_t)p0*(H/32),&ga,n);
                 q38_rows(eu+(int64_t)p0*I,I,&slot[j]->up,H,r0,r1,xr+p0,xg+(int64_t)p0*H,dxg+(int64_t)p0*(H/32),&ga,n);
             }
@@ -3989,12 +4027,16 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
                 const float *g=eg+(int64_t)p*I,*u=eu+(int64_t)p*I;float *h=ehf+(int64_t)p*I;
                 for(int j=0;j<I;j++)h[j]=q38_silu(g[j])*u[j];
                 if(kdn==Q38_ROWS_X2)x2_quant_act(h,I,ehq+(int64_t)p*I,ehdx+(int64_t)p*(I/32));
-                if(kdn==Q38_ROWS_GQ)gq_quant_act(h,I,gh.q+(int64_t)p*I,gh.d+(int64_t)p*(I/32),gh.s+(int64_t)p*(I/16));
+                if(kdn==Q38_ROWS_GQ){
+                    gq_quant_act(h,I,gh.q+(int64_t)p*I,gh.d+(int64_t)p*(I/32),gh.s+(int64_t)p*(I/16));
+                    gq_lane_sums(gh.q+(int64_t)p*I,I,gh.l4+(int64_t)p*(I/4));
+                }
             }
             #pragma omp for schedule(dynamic,1)
             for(int it=0;it<nu*cH;it++){
                 const int j=it/cH,r0=(it%cH)*rH,r1=r0+rH<H?r0+rH:H,p0=start[j],n=cnt[j];
-                const gq_act ga={gh.q+(int64_t)p0*I,gh.d+(int64_t)p0*(I/32),gh.s+(int64_t)p0*(I/16),n,I,0};
+                const gq_act ga={gh.q+(int64_t)p0*I,gh.d+(int64_t)p0*(I/32),gh.s+(int64_t)p0*(I/16),n,I,0,
+                                 gh.l4?gh.l4+(int64_t)p0*(I/4):NULL};
                 q38_rows(eo+(int64_t)p0*H,H,&slot[j]->down,I,r0,r1,hr+p0,ehq+(int64_t)p0*I,ehdx+(int64_t)p0*(I/32),&ga,n);
             }
         }
@@ -4018,7 +4060,7 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
     rt_trace_end();
     free(logits);free(gates);free(sg);free(su);free(sh);free(shared);free(sgate);
     free(eg);free(eu);free(ehf);free(eo);free(dxt);free(dxg);free(ehdx);free(xqt);free(xg);free(ehq);
-    free(idx);free(pos);free(uniq);free(cnt);free(start);free(who);free(xr);free(hr);free(slot);
+    free(idx);free(pos);free(uniq);free(cnt);free(start);free(who);free(pos_row);free(xr);free(hr);free(slot);
     gq_act_free(&gin);gq_act_free(&gh);
     return 1;
 }

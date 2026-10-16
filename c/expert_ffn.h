@@ -258,6 +258,52 @@ static inline float xf_dot_f32(const uint8_t *w, const float *sc, const float *x
     return xf_dot_f32_ref(w, sc, x, I);
 #endif
 }
+/* xf_dot_f32 for up to XF_F32_ROWS activation rows of one weight row (x[s] each): a
+ * block's nibbles widened to floats once, then every row's fmas in xf_dot_f32_avx2's
+ * order, so each row's bits are xf_dot_f32's whatever S. With an MTP verify's rows the
+ * widening (16 conversions a block) is paid once instead of once a row. */
+#define XF_F32_ROWS 4
+#ifdef XF_HAVE_AVX2
+static inline __attribute__((always_inline)) void xf_dot_f32_rows_body(float *y, int ystride, const uint8_t *w, const float *sc,
+                                                                      const float *const *x, int I, const int S) {
+    __m256 acc[XF_F32_ROWS];
+    for (int s = 0; s < S; s++) acc[s] = _mm256_setzero_ps();
+    for (int g = 0; g < I / XF_BLOCK; g++) {
+        __m256i bb = _mm256_loadu_si256((const __m256i *)(w + (size_t)g * XF_BLOCK_BYTES));
+        __m256i lo, hi; xf_nib_s8(bb, &lo, &hi);
+        __m128i lo0 = _mm256_castsi256_si128(lo), lo1 = _mm256_extracti128_si256(lo, 1);
+        __m128i hi0 = _mm256_castsi256_si128(hi), hi1 = _mm256_extracti128_si256(hi, 1);
+        const __m256 wf[8] = {
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo0)), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo0, 8))),
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo1)), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo1, 8))),
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi0)), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi0, 8))),
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi1)), _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi1, 8))) };
+        const __m256 scv = _mm256_set1_ps(sc[g]);
+        for (int s = 0; s < S; s++) {
+            const float *xb = x[s] + g * XF_BLOCK;
+            __m256 lane = _mm256_setzero_ps();
+            for (int k = 0; k < 8; k++) lane = _mm256_fmadd_ps(wf[k], _mm256_loadu_ps(xb + 8 * k), lane);
+            acc[s] = _mm256_fmadd_ps(lane, scv, acc[s]);
+        }
+    }
+    for (int s = 0; s < S; s++) y[(size_t)s * ystride] = xf_hsum8(acc[s]);
+}
+#endif
+static inline void xf_dot_f32_rows(float *y, int ystride, const uint8_t *w, const float *sc, const float *const *x, int I, int S) {
+    for (int s0 = 0; s0 < S; s0 += XF_F32_ROWS) {
+        const int n = S - s0 < XF_F32_ROWS ? S - s0 : XF_F32_ROWS;
+#ifdef XF_HAVE_AVX2
+        switch (n) {
+        case 1: xf_dot_f32_rows_body(y + (size_t)s0 * ystride, ystride, w, sc, x + s0, I, 1); break;
+        case 2: xf_dot_f32_rows_body(y + (size_t)s0 * ystride, ystride, w, sc, x + s0, I, 2); break;
+        case 3: xf_dot_f32_rows_body(y + (size_t)s0 * ystride, ystride, w, sc, x + s0, I, 3); break;
+        default: xf_dot_f32_rows_body(y + (size_t)s0 * ystride, ystride, w, sc, x + s0, I, 4); break;
+        }
+#else
+        for (int s = 0; s < n; s++) y[(size_t)(s0 + s) * ystride] = xf_dot_f32_ref(w, sc, x[s0 + s], I);
+#endif
+    }
+}
 static inline float xf_dot_i8(const uint8_t *w, const float *sc, const int8_t *xq, const float *xsum, float sx, int I) {
 #ifdef XF_HAVE_AVX2
     return xf_dot_i8_avx2(w, sc, xq, xsum, sx, I);
