@@ -57,6 +57,72 @@ class Fmt4ResumeTests(unittest.TestCase):
         for name in expected:
             np.testing.assert_array_equal(actual[name], expected[name])
 
+    def test_unchanged_resume_does_not_hash_shard_payloads(self):
+        self.run_converter()
+        actual_hash = converter._sha256
+        def forbid_payload_reads(path):
+            self.assertFalse(str(path).endswith(".safetensors"), str(path))
+            return actual_hash(path)
+        with mock.patch.object(converter, "_sha256", side_effect=forbid_payload_reads):
+            self.run_converter()
+        self.assert_current_output()
+
+    def test_changed_metadata_rehashes_without_reconverting_identical_bytes(self):
+        self.run_converter()
+        output = self.output / self.shard.name
+        for path in (self.shard, output):
+            info = path.stat()
+            os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1000000000))
+        actual_hash = converter._sha256
+        with mock.patch.object(converter, "_sha256", wraps=actual_hash) as hashed, \
+                mock.patch.object(converter, "convert_shard", wraps=converter.convert_shard) as converted:
+            self.run_converter()
+        payload_reads = [Path(call.args[0]) for call in hashed.call_args_list
+                         if str(call.args[0]).endswith(".safetensors")]
+        self.assertCountEqual(payload_reads, [self.shard, output])
+        self.assertEqual(converted.call_count, 0)
+        with mock.patch.object(converter, "_sha256", side_effect=lambda path: (
+                self.fail("unchanged shard rehashed") if str(path).endswith(".safetensors")
+                else actual_hash(path))):
+            self.run_converter()
+
+    def test_rewritten_source_with_restored_mtime_is_reconverted(self):
+        self.run_converter()
+        previous = self.shard.stat()
+        self.write_source(0x99)
+        os.utime(self.shard, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        self.run_converter()
+        self.assert_current_output()
+
+    def test_source_change_during_hash_does_not_cache_digest(self):
+        actual_hash = converter._sha256
+        def edit_after_hash(path):
+            digest = actual_hash(path)
+            if Path(path) == self.shard:
+                self.write_source(0x99)
+            return digest
+        with mock.patch.object(converter, "_sha256", side_effect=edit_after_hash):
+            with self.assertRaisesRegex(SystemExit, "changed while hashing"):
+                self.run_converter()
+        self.assertFalse((self.output / self.shard.name).exists())
+
+    def test_publication_metadata_change_is_cached_for_next_resume(self):
+        actual_replace = converter.os.replace
+        def rename_with_new_timestamp(src, dst):
+            actual_replace(src, dst)
+            if str(dst).endswith(".safetensors"):
+                info = os.stat(dst)
+                os.utime(dst, ns=(info.st_atime_ns, info.st_mtime_ns + 1000000000))
+        with mock.patch.object(converter.os, "replace", side_effect=rename_with_new_timestamp):
+            self.run_converter()
+        actual_hash = converter._sha256
+        def forbid_payload_reads(path):
+            self.assertFalse(str(path).endswith(".safetensors"), str(path))
+            return actual_hash(path)
+        with mock.patch.object(converter, "_sha256", side_effect=forbid_payload_reads):
+            self.run_converter()
+        self.assert_current_output()
+
     def test_changed_source_same_size_is_reconverted(self):
         self.run_converter()
         original_bytes = self.shard.stat().st_size

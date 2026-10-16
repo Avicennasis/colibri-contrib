@@ -34,7 +34,9 @@ USO:
 
 Resume: a re-run skips output shards only when an atomic sidecar binds the current input,
 configuration, converter math and output bytes. Legacy outputs without a matching receipt are
-converted again. Verification reads shard bytes but never loads a whole shard into memory. Inputs must remain
+converted again. Verified digests are reused while size, nanosecond mtime/ctime and file
+identity match; changed metadata triggers a streamed rehash. This is a local resume cache,
+not protection against forged receipts or filesystems that hide file changes. Inputs must remain
 stable during conversion; concurrent writers to the same output directory are unsupported.
 The before/after checks detect changes at those boundaries, not every possible filesystem race.
 Writes go through a .tmp file + os.replace, so an interrupted run never leaves a half shard.
@@ -256,8 +258,36 @@ def _sha256(path):
     return h.hexdigest()
 
 
+def _file_stamp(path):
+    info = os.stat(path)
+    return [info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_dev, info.st_ino]
+
+
+def _cached_sha256(path, cache):
+    name = os.path.basename(path)
+    before = _file_stamp(path)
+    entry = cache.get(name)
+    if isinstance(entry, dict) and entry.get("stamp") == before:
+        digest = entry.get("sha256")
+        if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+            return digest
+    digest = _sha256(path)
+    if _file_stamp(path) != before:
+        die(f"{name} changed while hashing; rerun from stable files")
+    cache[name] = {"stamp": before, "sha256": digest}
+    return digest
+
+
+def _write_manifest(manifest, path):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, sort_keys=True)
+        stream.write("\n")
+    os.replace(tmp, path)
+
+
 def _resume_manifest(path, config_sha256):
-    context = {"schema": "colibri.fmt4-to-fmt2-resume/v1",
+    context = {"schema": "colibri.fmt4-to-fmt2-resume/v2",
                "numpy_version": np.__version__,
                "config_sha256": config_sha256,
                "converter_sha256": _sha256(__file__),
@@ -266,11 +296,12 @@ def _resume_manifest(path, config_sha256):
         with open(path, encoding="utf-8") as stream:
             previous = json.load(stream)
         if (isinstance(previous, dict) and previous.get("context") == context
-                and isinstance(previous.get("shards"), dict)):
+                and all(isinstance(previous.get(key), dict)
+                        for key in ("shards", "sources", "outputs"))):
             return previous
     except (OSError, ValueError):
         pass
-    return {"context": context, "shards": {}}
+    return {"context": context, "shards": {}, "sources": {}, "outputs": {}}
 
 
 def _verified_shard(dst, expected_bytes, source_sha256, manifest):
@@ -278,24 +309,25 @@ def _verified_shard(dst, expected_bytes, source_sha256, manifest):
     if not (isinstance(entry, dict) and entry.get("source_sha256") == source_sha256
             and _shard_done(dst, expected_bytes)):
         return False
-    return entry.get("output_sha256") == _sha256(dst)
+    return entry.get("output_sha256") == _cached_sha256(dst, manifest["outputs"])
 
 
 def _publish_shard(src, tmp, dst, source_sha256, manifest, manifest_path):
     # Recheck after conversion/copy: a source edited during the run must not
     # acquire a receipt for a mixed or obsolete output.
-    if _sha256(src) != source_sha256:
+    if _cached_sha256(src, manifest["sources"]) != source_sha256:
         os.remove(tmp)
         die(f"{os.path.basename(src)} changed during conversion; rerun from a stable source")
+    output_stamp = _file_stamp(tmp)
     output_sha256 = _sha256(tmp)
+    if _file_stamp(tmp) != output_stamp:
+        die(f"{os.path.basename(tmp)} changed while hashing; rerun from stable files")
     os.replace(tmp, dst)
+    manifest["outputs"][os.path.basename(dst)] = {
+        "stamp": output_stamp, "sha256": output_sha256}
     manifest["shards"][os.path.basename(dst)] = {
         "source_sha256": source_sha256, "output_sha256": output_sha256}
-    manifest_tmp = manifest_path + ".tmp"
-    with open(manifest_tmp, "w", encoding="utf-8") as stream:
-        json.dump(manifest, stream, sort_keys=True)
-        stream.write("\n")
-    os.replace(manifest_tmp, manifest_path)
+    _write_manifest(manifest, manifest_path)
 
 
 def _replaceable_bytes(path):
@@ -456,7 +488,8 @@ def main():
         die(f"output has shards absent from this source: {', '.join(unexpected)}; use a fresh --outdir")
     manifest_path = os.path.join(a.outdir, ".fmt4-to-fmt2-resume.json")
     manifest = _resume_manifest(manifest_path, config_sha256)
-    source_hashes = {os.path.basename(sp): _sha256(sp) for sp in shards}
+    source_hashes = {os.path.basename(sp): _cached_sha256(sp, manifest["sources"])
+                     for sp in shards}
     completed = {bn for bn, pl in plans.items()
                  if _verified_shard(os.path.join(a.outdir, bn), pl["out_bytes"],
                                     source_hashes[bn], manifest)}
@@ -540,13 +573,14 @@ def main():
         die("output shard membership changed during conversion; use a fresh --outdir")
     for sp in shards:
         bn = os.path.basename(sp)
-        if _sha256(sp) != source_hashes[bn]:
+        if _cached_sha256(sp, manifest["sources"]) != source_hashes[bn]:
             die(f"{bn} changed during conversion; rerun from a stable source")
         if not _verified_shard(os.path.join(a.outdir, bn), plans[bn]["out_bytes"],
                                source_hashes[bn], manifest):
             die(f"{bn} output changed during conversion; rerun from a stable output directory")
     if _sha256(cfg_path) != config_sha256:
         die("config.json changed during conversion; rerun from a stable source")
+    _write_manifest(manifest, manifest_path)
     config_dst = os.path.join(a.outdir, "config.json")
     config_tmp = config_dst + ".tmp"
     with open(config_tmp, "wb") as stream:
