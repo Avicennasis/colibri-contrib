@@ -1814,7 +1814,26 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
     if(m->vis_map && m->vis_rows_n>0){
         kv_prefix_taint(&m->kvp);q38_prefix_cache_invalidate();
     }
-    {
+    /* The live state first. After a turn it holds the prompt AND the answer this
+     * engine wrote, recorded where they were fed (q38_spec_end undoes the drafts
+     * nobody consumed), and a chat's next request begins with both: only its new
+     * text is read. The snapshot below stops at the previous prompt's end, so
+     * with it every turn re-read the whole answer before (15.8-24.5 s for a
+     * 1,712-token second turn on a CPU box). An echo request (logprobs) still
+     * goes through a snapshot: its first fresh token's predictor is the logits
+     * saved with one. */
+    /* COLI_KV_PREFIX=0 reads every prompt from the start (the B arm of the A/B
+     * that shows reuse changes nothing but the time); a pin the client asked
+     * for still counts. */
+    const char *kv_prefix_env=getenv("COLI_KV_PREFIX");
+    int prefix_off=kv_prefix_env&&*kv_prefix_env=='0';
+    const char *reused_from="the live state";
+    if(!q->logprobs&&!prefix_off){
+        int live=kv_prefix_reuse(&m->kvp,ids,np);
+        if(live>0&&m->kv_len==live)reuse=live;
+    }
+    if(!reuse)reused_from="a pin";
+    if(!reuse){
         int ps=coli_pin_best(&g_q38_pins,ids,np);
         while(ps>=0){
             ColiPin *k=&g_q38_pins.slot[ps];
@@ -1831,7 +1850,16 @@ static int q38_serve_start(Model *m, ServeReq *q, int **ids_out, int *np_out, fl
             ps=coli_pin_best(&g_q38_pins,ids,np);
         }
     }
-    if(!reuse) reuse=q38_prefix_restore(m,ids,np);
+    if(!reuse&&!prefix_off){ reuse=q38_prefix_restore(m,ids,np); reused_from="the prompt-end snapshot"; }
+    if(getenv("COLI_PREFIX_LOG")){
+        if(reuse)
+            fprintf(stderr,"[PREFIX] reusing %d of %d prompt tokens (%.0f%%) from %s\n",
+                    reuse,np,100.0*reuse/np,reused_from);
+        else
+            fprintf(stderr,"[PREFIX] no reuse: held=%d prompt=%d%s%s\n",m->kvp.len,np,
+                    m->kvp.tainted?" tainted":"",prefix_off?" (COLI_KV_PREFIX=0)":"");
+        fflush(stderr);
+    }
     /* L'eco vale per il prefill, e il predittore del primo token fresco sono i
      * logit salvati con lo stato che si e appena rimesso. reuse==np e il caso
      * "prompt identico": li non c'e nessun token fresco da leggere. */
@@ -1931,9 +1959,9 @@ static int serve_one(Model *m, ServeReq *q){
         }
         if(cancelled||stopped){limited=0;break;}
         /* The next logits are not needed after the final requested token.
-         * The published prompt snapshot, rather than the live decode state,
-         * is restored on the next request, so stepping here would only run a
-         * full discarded decode pass. */
+         * A next request that continues this conversation reads the token in
+         * its own prompt, after the live state's last one, so stepping here
+         * would only run a decode pass that prefill repeats. */
         if(s == q->max_tok - 1) break;
         lo = q38_spec_step(m, &spec, tk, np+s, q->max_tok-1-s);
     }
