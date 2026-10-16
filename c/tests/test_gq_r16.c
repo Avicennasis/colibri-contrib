@@ -104,6 +104,8 @@ int main(int argc, char **argv) {
         const int t = gq_r16_base(t16); const int64_t rb = gq_row_bytes(t, D), hb = gq_row_bytes(t16, D);
         uint8_t **w = malloc(M * sizeof *w), **h = malloc(M * sizeof *h);
         for (int i = 0; i < M; i++) { w[i] = malloc((size_t)rb * D); h[i] = malloc((size_t)hb * D); fill(t, w[i], D, D); gq_r16_pack(t16, h[i], w[i], D, D); }
+        double pk = 1e9;   /* packing (single thread, as a loader thread does it per expert) */
+        for (int r = 0; r < 3; r++) { double t0 = now(); gq_r16_pack(t16, h[r % M], w[r % M], D, D); double dt = now() - t0; if (dt < pk) pk = dt; }
         double best[2] = {1e9, 1e9};
         for (int r = 0; r <= reps; r++)
             for (int k = 0; k < 2; k++) {
@@ -111,8 +113,8 @@ int main(int argc, char **argv) {
                 for (int i = 0; i < M; i++) gq_matmul_act(y, &a, k ? h[i] : w[i], k ? t16 : t, D);
                 double dt = (now() - t0) / M; if (r && dt < best[k]) best[k] = dt;
             }
-        printf("%-7s S=%-3d rows %.3f ms (%.1f GB/s)   interleaved %.3f ms (%.1f GB/s)   %.2fx\n", GQ_TYPES[t].name, S,
-               best[0] * 1e3, rb * D / best[0] / 1e9, best[1] * 1e3, hb * D / best[1] / 1e9, best[0] / best[1]);
+        printf("%-7s S=%-3d rows %.3f ms (%.1f GB/s)   interleaved %.3f ms (%.1f GB/s)   %.2fx   packing %.2f GB/s\n", GQ_TYPES[t].name, S,
+               best[0] * 1e3, rb * D / best[0] / 1e9, best[1] * 1e3, hb * D / best[1] / 1e9, best[0] / best[1], rb * D / pk / 1e9);
         for (int i = 0; i < M; i++) { free(w[i]); free(h[i]); }
         free(w); free(h);
     }

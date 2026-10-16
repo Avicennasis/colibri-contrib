@@ -1856,6 +1856,13 @@ static inline void gq_row_all(float *y, int ystride, const gq_act *a, const uint
  * scales encode back to the same bytes): unpack gives the device tiers and the row
  * readers the file's rows. */
 static inline int32_t gq_ld32(const void *p) { int32_t v; memcpy(&v, p, 4); return v; }
+/* the 4 x 4 transpose of 2-bit codes Q2_0's form keeps: byte k of out, bits 2i = byte i of in,
+ * bits 2k (its own inverse) */
+static inline void gq_r16_t2(uint8_t *out, const uint8_t *in) {
+    uint32_t v = 0;
+    for (int i = 0; i < 4; i++) { const uint32_t b = in[i]; v |= ((b | b << 6 | b << 12 | b << 18) & 0x03030303u) << (2 * i); }
+    memcpy(out, &v, 4);
+}
 /* one group block from the 16 rows' blocks b[r] */
 static void gq_r16_pack_blk(int t, uint8_t *o, const uint8_t *const *b) {
     for (int r = 0; r < 16; r++) {
@@ -1863,11 +1870,7 @@ static void gq_r16_pack_blk(int t, uint8_t *o, const uint8_t *const *b) {
         switch (t) {
         case GQ_Q2_0_R16:   /* byte k of row r's word G: bits 2i = element 16G + 4i + k */
             memcpy(o + 2 * r, s, 2);
-            for (int G = 0; G < 4; G++) for (int k = 0; k < 4; k++) {
-                int v = 0;
-                for (int i = 0; i < 4; i++) v |= ((s[2 + 4 * G + i] >> (2 * k)) & 3) << (2 * i);
-                o[32 + 64 * G + 4 * r + k] = (uint8_t)v;
-            }
+            for (int G = 0; G < 4; G++) gq_r16_t2(o + 32 + 64 * G + 4 * r, s + 2 + 4 * G);
             break;
         case GQ_Q4_K_R16: case GQ_Q5_K_R16: {
             const int five = t == GQ_Q5_K_R16, qo = five ? 832 : 320;
@@ -1918,11 +1921,7 @@ static void gq_r16_unpack_blk(int t, const uint8_t *o, int r, uint8_t *s) {
     switch (t) {
     case GQ_Q2_0_R16:
         memcpy(s, o + 2 * r, 2);
-        for (int G = 0; G < 4; G++) for (int i = 0; i < 4; i++) {
-            int v = 0;
-            for (int k = 0; k < 4; k++) v |= ((o[32 + 64 * G + 4 * r + k] >> (2 * i)) & 3) << (2 * k);
-            s[2 + 4 * G + i] = (uint8_t)v;
-        }
+        for (int G = 0; G < 4; G++) gq_r16_t2(s + 2 + 4 * G, o + 32 + 64 * G + 4 * r);
         break;
     case GQ_Q4_K_R16: case GQ_Q5_K_R16: {
         const int five = t == GQ_Q5_K_R16, qo = five ? 832 : 320;
@@ -1979,6 +1978,17 @@ static void gq_r16_pack(int t, uint8_t *dst, const uint8_t *src, int rows, int I
     if (gq_r16_base(t) < 0) return;
     const int base = gq_r16_base(t), bb = GQ_TYPES[base].bytes, nb = I / GQ_TYPES[base].blck, gb = gq_r16_group_bytes(t);
     const int64_t rb = (int64_t)nb * bb;
+    if (t == GQ_Q2_0_R16) {   /* the experts' form, packed at every read: row by row, no dispatch */
+        for (int g = 0; g < rows / 16; g++)
+            for (int r = 0; r < 16; r++) {
+                const uint8_t *row = src + (int64_t)(16 * g + r) * rb; uint8_t *o = dst + (int64_t)g * nb * gb + 4 * r;
+                for (int b = 0; b < nb; b++, row += 18, o += 288) {
+                    memcpy(o - 2 * r, row, 2);
+                    for (int G = 0; G < 4; G++) gq_r16_t2(o + 32 + 64 * G, row + 2 + 4 * G);
+                }
+            }
+        return;
+    }
     for (int g = 0; g < rows / 16; g++)
         for (int b = 0; b < nb; b++) {
             const uint8_t *rp[16];
