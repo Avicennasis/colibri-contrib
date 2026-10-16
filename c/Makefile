@@ -543,7 +543,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu \
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract \
-	test_ggml_quants test_gguf_c test_gq_dot
+	test_ggml_quants test_gguf_c test_gq_dot test_gq_r16
 TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
@@ -2032,6 +2032,10 @@ tests/test_ggml_quants$(EXE): tests/test_ggml_quants.c ggml_quants.h ggml_grids.
 tests/test_gguf_c$(EXE): tests/test_gguf_c.c gguf.h ggml_quants.h ggml_grids.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_gq_dot$(EXE): tests/test_gq_dot.c ggml_quants.h ggml_grids.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# The row-interleaved forms (GQ_*_R16) against their scalar reference, every type; a
+# no-op on a build without AVX-512 VNNI/VBMI. `tests/test_gq_r16 bench S` times them.
+tests/test_gq_r16$(EXE): tests/test_gq_r16.c ggml_quants.h ggml_grids.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c $(VK_OBJ)

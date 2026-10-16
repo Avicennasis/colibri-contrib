@@ -1,12 +1,14 @@
-/* bench_r16: the row-interleaved forms (GQ_*_R16, ggml_quants.h) of every block type that has one.
+/* test_gq_r16: the row-interleaved forms (GQ_*_R16, ggml_quants.h) of every block type that has one.
  *
- *   bench_r16 check        for each type: pack then unpack gives the file's rows back; the kernel
- *                          against a scalar reference of its numerics (gq_ublk's integers and
- *                          scales: per 32 elements, or 16 where the type's scale is per 16, the
- *                          exact integer dot and one fma), to the bit; the gap to the row kernels
- *                          (same integers, other roundings) relative to the outputs' rms
- *   bench_r16 [S] [reps]   ms per 2560 x 2560 matrix (48 of them, past the caches), interleaved
- *                          against the row kernels, S activation rows */
+ *   test_gq_r16              for each type: pack then unpack gives the file's rows back, and so
+ *                            does the row reader; the kernel against a scalar reference of its
+ *                            numerics (gq_ublk's integers and scales: per 32 elements, or 16 where
+ *                            the type's scale is per 16, the exact integer dot and one fma), to
+ *                            the bit; the gap to the row kernels (the same integers, other
+ *                            roundings) below 1e-4 of the outputs' rms. Exit 0 on a build
+ *                            without AVX-512 VNNI/VBMI, where the forms are never made.
+ *   test_gq_r16 bench [S] [reps]   ms per 2560 x 2560 matrix (48 of them, past the caches),
+ *                            interleaved against the row kernels, S activation rows */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,7 +18,7 @@
 #include "../ggml_quants.h"
 
 #ifndef GQ_VNNI512
-int main(void) { puts("bench_r16: needs AVX-512 VNNI/VBMI (GQ_VNNI512)"); return 0; }
+int main(void) { puts("test_gq_r16: no AVX-512 VNNI/VBMI in this build, nothing to check (the forms are made only there)"); return 0; }
 #else
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static uint64_t rng = 88172645463325252ULL;
@@ -63,7 +65,7 @@ static void ref(int t, float *y, int ys, const uint8_t *w, const gq_act *a, int 
     }
 }
 int main(int argc, char **argv) {
-    if (argc > 1 && !strcmp(argv[1], "check")) {
+    if (argc < 2 || strcmp(argv[1], "bench")) {
         int fails = 0;
         for (int t16 = GQ_Q2_0_R16; t16 < GQ_R16_END; t16++) {
             const int t = gq_r16_base(t16), bl = GQ_TYPES[t].blck; int bad = 0, n = 0, trip = 0; double worst = 0;
@@ -91,9 +93,10 @@ int main(int argc, char **argv) {
                    gq_type_name(t16), bad, n, trip ? "BROKEN" : "exact", worst);
             fails += bad + trip + (worst > 1e-4);
         }
+        printf("test_gq_r16: %s\n", fails ? "FAILED" : "ok");
         return fails != 0;
     }
-    const int S = argc > 1 ? atoi(argv[1]) : 1, reps = argc > 2 ? atoi(argv[2]) : 5, M = 48, D = 2560;
+    const int S = argc > 2 ? atoi(argv[2]) : 1, reps = argc > 3 ? atoi(argv[3]) : 5, M = 48, D = 2560;
     float *x = malloc((size_t)S * D * 4), *y = malloc((size_t)S * D * 4);
     for (int i = 0; i < S * D; i++) x[i] = sinf(i * 0.37f);
     gq_act a; memset(&a, 0, sizeof a); gq_act_set(&a, x, S, D);
