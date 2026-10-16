@@ -2484,6 +2484,13 @@ int main(int argc, char **argv) {
     if(g_vk_ready&&!vkt_ready()&&!g_vk_dense)g_vk_dense=coli_vk_dense_decide("qwen38",0,1);   /* no tier after all */
     if(g_vk_chain)atexit(vkc_shutdown_all);   /* registered after the tier's: runs before the device goes */
 #endif
+    {   /* the trunk's int8 rows interleaved for the CPU, when no device reads them as rows */
+        int dev=qt_ready();
+#ifdef COLI_VULKAN
+        dev=dev||g_vk_ready;
+#endif
+        if(!dev)q38_trunk_q8_interleave(&m);
+    }
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 
     /* coli serve mode: speak the gateway wire protocol instead of argv

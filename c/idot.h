@@ -1078,4 +1078,141 @@ static void matmul_i4p_idot(float *y, const int8_t *xq, const float *sx, const i
     }
 }
 
+
+/* ---- int8 rows interleaved by 16 (the dense trunk on the CPU) -------------------
+ * matmul_q_idot's rows, 16 to a group: for every four consecutive inputs (a quad) the
+ * 16 rows' four bytes as 64 bytes, lane r = row r, stored as w + 128 (unsigned). One
+ * vpdpbusd against an activation row's broadcast quad advances all 16 rows, with no
+ * horizontal sum per row: the row kernel's abs/sign per weight load and its reduction
+ * per (row, activation row) are gone. The sum is the same integer (128 * the
+ * activation row's sum comes off), and it is scaled as matmul_q_idot scales it,
+ * (float)d * scale[o] * sx[s]: the same bits. The same bytes as the rows; a matrix of
+ * whole groups (O % 16 == 0), I % 4 == 0. Without VNNI the products take the signed
+ * bytes with the sign trick (|w| <= 127, the trunk's rows are clamped there). */
+#if defined(__AVX2__)
+#define IDOT_R16 1
+static inline void i8r16_pack(int8_t *dst, const int8_t *src, int O, int I){
+    for(int g=0;g<O/16;g++)
+        for(int r=0;r<16;r++){
+            const int8_t *row=src+(size_t)(16*g+r)*I; int8_t *o=dst+(size_t)g*16*I+4*r;
+            for(int j=0;j<I/4;j++)
+                for(int e=0;e<4;e++) o[64*(size_t)j+e]=(int8_t)((uint8_t)row[4*j+e]^0x80);
+        }
+}
+static inline void i8r16_unpack(int8_t *dst, const int8_t *src, int O, int I){
+    for(int g=0;g<O/16;g++)
+        for(int r=0;r<16;r++){
+            int8_t *row=dst+(size_t)(16*g+r)*I; const int8_t *o=src+(size_t)g*16*I+4*r;
+            for(int j=0;j<I/4;j++)
+                for(int e=0;e<4;e++) row[4*j+e]=(int8_t)((uint8_t)o[64*(size_t)j+e]^0x80);
+        }
+}
+static inline int32_t i8r16_ld32(const int8_t *p){ int32_t v; memcpy(&v,p,4); return v; }
+/* group grp (16 rows, scale sc[0..15]) against n activation rows: y[s*O + r] */
+static inline __attribute__((always_inline)) void i8r16_group(float *y, int O, const int8_t *grp, const float *sc,
+                                                             const int8_t *xq, const float *sx, const int32_t *xsum,
+                                                             int I, const int n){
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    __m512i p[8];
+    for(int s=0;s<n;s++) p[s]=_mm512_setzero_si512();
+    for(int j=0;j<I/4;j++){
+        const __m512i c=_mm512_loadu_si512((const void*)(grp+64*(size_t)j));
+        for(int s=0;s<n;s++) p[s]=_mm512_dpbusd_epi32(p[s],c,_mm512_set1_epi32(i8r16_ld32(xq+(size_t)s*I+4*j)));
+    }
+    const __m512 scv=_mm512_loadu_ps(sc);
+    for(int s=0;s<n;s++){
+        const __m512i d=_mm512_sub_epi32(p[s],_mm512_set1_epi32(128*xsum[s]));
+        _mm512_storeu_ps(y+(size_t)s*O,_mm512_mul_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(d),scv),_mm512_set1_ps(sx[s])));
+    }
+#else
+    for(int h=0;h<2;h++){
+        __m256i p[8];
+        for(int s=0;s<n;s++) p[s]=_mm256_setzero_si256();
+        for(int j=0;j<I/4;j++){
+            const __m256i c=_mm256_loadu_si256((const __m256i*)(grp+64*(size_t)j+32*h));
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+            for(int s=0;s<n;s++){
+                const __m256i x=_mm256_set1_epi32(i8r16_ld32(xq+(size_t)s*I+4*j));
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                p[s]=_mm256_dpbusd_epi32(p[s],c,x);
+#else
+                p[s]=_mm256_dpbusd_avx_epi32(p[s],c,x);
+#endif
+            }
+#else
+            const __m256i w=_mm256_xor_si256(c,_mm256_set1_epi8((char)0x80)), aw=_mm256_sign_epi8(w,w);
+            for(int s=0;s<n;s++)
+                p[s]=_mm256_add_epi32(p[s],_mm256_madd_epi16(_mm256_maddubs_epi16(aw,
+                         _mm256_sign_epi8(_mm256_set1_epi32(i8r16_ld32(xq+(size_t)s*I+4*j)),w)),_mm256_set1_epi16(1)));
+#endif
+        }
+        const __m256 scv=_mm256_loadu_ps(sc+8*h);
+        for(int s=0;s<n;s++){
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+            const __m256i d=_mm256_sub_epi32(p[s],_mm256_set1_epi32(128*xsum[s]));
+#else
+            const __m256i d=p[s];   /* the signed bytes: no bias */
+#endif
+            _mm256_storeu_ps(y+(size_t)s*O+8*h,_mm256_mul_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(d),scv),_mm256_set1_ps(sx[s])));
+        }
+    }
+#endif
+}
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+/* two groups (32 rows) at once: each broadcast quad feeds two vpdpbusd */
+static inline __attribute__((always_inline)) void i8r16_group2(float *y, int O, const int8_t *grp, const float *sc,
+                                                              const int8_t *xq, const float *sx, const int32_t *xsum,
+                                                              int I, const int n){
+    __m512i p[8], q[8]; const int8_t *grp2=grp+(size_t)16*I;
+    for(int s=0;s<n;s++){ p[s]=_mm512_setzero_si512(); q[s]=_mm512_setzero_si512(); }
+    for(int j=0;j<I/4;j++){
+        const __m512i c=_mm512_loadu_si512((const void*)(grp+64*(size_t)j)), c2=_mm512_loadu_si512((const void*)(grp2+64*(size_t)j));
+        for(int s=0;s<n;s++){
+            const __m512i x=_mm512_set1_epi32(i8r16_ld32(xq+(size_t)s*I+4*j));
+            p[s]=_mm512_dpbusd_epi32(p[s],c,x); q[s]=_mm512_dpbusd_epi32(q[s],c2,x);
+        }
+    }
+    const __m512 scv=_mm512_loadu_ps(sc), scv2=_mm512_loadu_ps(sc+16);
+    for(int s=0;s<n;s++){
+        const __m512i b=_mm512_set1_epi32(128*xsum[s]); const __m512 sxv=_mm512_set1_ps(sx[s]);
+        _mm512_storeu_ps(y+(size_t)s*O,_mm512_mul_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(p[s],b)),scv),sxv));
+        _mm512_storeu_ps(y+(size_t)s*O+16,_mm512_mul_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_sub_epi32(q[s],b)),scv2),sxv));
+    }
+}
+#endif
+/* matmul_q_idot on rows packed by i8r16_pack; xsum[s] = the sum of activation row s's bytes */
+static void matmul_q_idot_r16(float *y, const int8_t *xq, const float *sx, const int32_t *xsum,
+                              const int8_t *q, const float *scale, int S, int I, int O){
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    if(S>=4&&(O/16)%2==0){   /* a prompt's rows: two groups a task */
+        #pragma omp parallel for schedule(static)
+        for(int g=0;g<O/16;g+=2){
+            const int8_t *grp=q+(size_t)g*16*I; const float *sc=scale+16*g;
+            for(int s0=0;s0<S;s0+=8){
+                const int n=S-s0<8?S-s0:8; float *ys=y+(size_t)s0*O+16*g;
+                const int8_t *xs=xq+(size_t)s0*I; const float *sxs=sx+s0; const int32_t *xss=xsum+s0;
+                if(n==8) i8r16_group2(ys,O,grp,sc,xs,sxs,xss,I,8); else i8r16_group2(ys,O,grp,sc,xs,sxs,xss,I,n);
+            }
+        }
+        return;
+    }
+#endif
+    #pragma omp parallel for schedule(static)
+    for(int g=0;g<O/16;g++){
+        const int8_t *grp=q+(size_t)g*16*I; const float *sc=scale+16*g;
+        for(int s0=0;s0<S;s0+=8){
+            const int n=S-s0<8?S-s0:8; float *ys=y+(size_t)s0*O+16*g;
+            const int8_t *xs=xq+(size_t)s0*I; const float *sxs=sx+s0; const int32_t *xss=xsum+s0;
+            switch(n){
+            case 1: i8r16_group(ys,O,grp,sc,xs,sxs,xss,I,1); break;
+            case 2: i8r16_group(ys,O,grp,sc,xs,sxs,xss,I,2); break;
+            case 3: i8r16_group(ys,O,grp,sc,xs,sxs,xss,I,3); break;
+            case 4: i8r16_group(ys,O,grp,sc,xs,sxs,xss,I,4); break;
+            default: i8r16_group(ys,O,grp,sc,xs,sxs,xss,I,n); break;
+            }
+        }
+    }
+}
+#endif
+
 #endif /* COLIBRI_IDOT_H */

@@ -113,6 +113,7 @@ typedef struct {
     uint8_t *q4; float *q4sc;      /* Q38_TRUNK_CPU_INT4: the trunk's rows as planar int4-g64 (expert_ffn.h), one scale per 64 */
     double *act2; int64_t act_n;   /* Q38_TRUNK_STATS: sum of x^2 per input column over the rows this matrix met */
     int8_t *q8; float *q8sc;       /* the trunk's int8 rows on the CPU (default; Q38_TRUNK_CPU_INT8=0 keeps BF16): the same rows the GPU holds, met by an int8 activation in idot.h */
+    int q8r16;                     /* q8 interleaved by 16 (idot.h i8r16_pack, q38_trunk_q8_interleave): CPU only, the same bits */
     void *vk; int vk_off;          /* COLI_VULKAN=1: device copy of q8, or of the BF16/F32 rows (uploaded at the first matmul), vk_off = upload failed, stays on the CPU */
     int vk_res;                    /* COLI_VULKAN=1: a resident matrix (q38_load_weight), never an expert slot that is refilled in place */
     char *vk_name;                 /* COLI_VULKAN=1: its tensor's name, to read it back from disk (q38_dho_reload) */
@@ -714,6 +715,17 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
         int8_t *xq=(int8_t*)malloc((size_t)S*I); float *sx=(float*)malloc((size_t)S*sizeof(float));
         if(!xq||!sx){fprintf(stderr,"OOM activation quantization\n");exit(1);}
         for(int s=0;s<S;s++)sx[s]=dense_act_i8(x+(int64_t)s*I,I,xq+(int64_t)s*I,NULL);
+#ifdef IDOT_R16
+        if(weight->q8r16){   /* interleaved rows: 128 * each activation row's sum comes off */
+            int32_t xsum[64],*xs=S<=64?xsum:(int32_t*)malloc((size_t)S*sizeof(int32_t));
+            if(!xs){fprintf(stderr,"OOM activation quantization\n");exit(1);}
+            for(int s=0;s<S;s++){int32_t t=0;const int8_t *r=xq+(int64_t)s*I;for(int i=0;i<I;i++)t+=r[i];xs[s]=t;}
+            matmul_q_idot_r16(y,xq,sx,xs,weight->q8,weight->q8sc,S,I,O);
+            if(xs!=xsum)free(xs);
+            free(xq);free(sx);
+            return;
+        }
+#endif
         matmul_q_idot(y,xq,sx,weight->q8,weight->q8sc,S,I,O);
         free(xq);free(sx);
         return;
@@ -3427,6 +3439,37 @@ static void q38_trunk_cpu_int8(Model *m) {
             n,bytes/1073741824.0,released/1073741824.0,now_s()-t0);
 }
 
+/* The trunk's int8 rows interleaved by 16 for the CPU's kernel (idot.h matmul_q_idot_r16):
+ * the same bytes and the same bits, a prompt's rows about twice as fast. In place, a group
+ * of 16 rows at a time (a group's rows and its interleaved form are the same byte range).
+ * After the draft head has read the rows, and only when no device reads them: the caller
+ * skips it under a GPU tier or the Vulkan dense path. Q38_ILV16=0 keeps the rows. */
+static void q38_trunk_q8_interleave(Model *m) {
+    (void)m;
+#ifdef IDOT_R16
+    const char *e=getenv("Q38_ILV16"); if(e&&!strcmp(e,"0"))return;
+    if(!m->trunk_table_built)return;
+    int n=0; double t0=now_s();
+    for(int i=0;i<g_trunk_n;i++){
+        Q38Weight *w=g_trunk[i].w;
+        if(!w->q8||w->q8r16||w->rows%16||w->cols%4)continue;
+        const int I=w->cols;
+        #pragma omp parallel
+        {
+            int8_t *t=(int8_t*)malloc((size_t)16*I);
+            if(!t){fprintf(stderr,"OOM trunk interleave\n");exit(1);}
+            #pragma omp for schedule(static)
+            for(int g=0;g<w->rows/16;g++){
+                int8_t *grp=w->q8+(size_t)g*16*I;
+                i8r16_pack(t,grp,16,I); memcpy(grp,t,(size_t)16*I);
+            }
+            free(t);
+        }
+        w->q8r16=1; n++;
+    }
+    if(n)fprintf(stderr,"[qwen38] trunk: %d int8 matrices interleaved by 16 for the CPU in %.2fs (Q38_ILV16=0 keeps the rows)\n",n,now_s()-t0);
+#endif
+}
 /* Q38_DRAFT_HEAD=int4: the MTP drafts' lm_head as planar int4-g64 (expert_ffn.h's
  * layout, absmax/7 per 64), built once from the rows the model keeps (int8 or BF16).
  * A draft only needs the most likely token and the verify recomputes every row with
