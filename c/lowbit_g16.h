@@ -174,6 +174,34 @@ static void xl16_pack(uint8_t *dst, const uint8_t *codes, const uint8_t *q, cons
         memcpy(grp, d + 16 * g, 64);
         for (int r = 0; r < 16; r++) {
             const uint8_t *row = codes + (size_t)(16 * g + r) * cb, *qr = q + (size_t)(16 * g + r) * qb;
+#if defined(__AVX2__)
+            /* the same transposes on vectors: a block's 32 low bytes as eight words (W = 0: words
+             * 0-3, W = 1: words 4-7), word i shifted by 2i and the four of a half or-ed together;
+             * the 16 high bytes as four words, word m shifted by m (bit 2h) and by m + 4 (2h + 1) */
+            const __m256i m03 = _mm256_set1_epi32(0x03030303), sl2 = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+            const __m128i m01 = _mm_set1_epi32(0x01010101), slo = _mm_setr_epi32(0, 1, 2, 3), shi = _mm_setr_epi32(4, 5, 6, 7);
+            for (int b = 0; b < I / 128; b++) {
+                const uint8_t *blk = row + (size_t)b * bb;
+                const __m256i v = _mm256_loadu_si256((const __m256i *)blk);
+                const __m128i hp = bits == 3 ? _mm_loadu_si128((const __m128i *)(blk + 32)) : _mm_setzero_si128();
+                for (int h = 0; h < 4; h++) {
+                    const int gi = 4 * b + h; uint8_t *o = grp + 64 + (size_t)gi * gbk;
+                    o[r] = qr[gi];
+                    __m256i c = _mm256_sllv_epi32(_mm256_and_si256(_mm256_srli_epi32(v, 2 * h), m03), sl2);
+                    c = _mm256_or_si256(c, _mm256_shuffle_epi32(c, 0x4E)); c = _mm256_or_si256(c, _mm256_shuffle_epi32(c, 0xB1));
+                    const uint32_t t0 = (uint32_t)_mm256_cvtsi256_si32(c), t1 = (uint32_t)_mm256_extract_epi32(c, 4);
+                    memcpy(o + 16 + 4 * r, &t0, 4); memcpy(o + 80 + 4 * r, &t1, 4);
+                    if (bits == 3) {
+                        __m128i t = _mm_or_si128(_mm_sllv_epi32(_mm_and_si128(_mm_srli_epi32(hp, 2 * h), m01), slo),
+                                                 _mm_sllv_epi32(_mm_and_si128(_mm_srli_epi32(hp, 2 * h + 1), m01), shi));
+                        t = _mm_or_si128(t, _mm_shuffle_epi32(t, 0x4E)); t = _mm_or_si128(t, _mm_shuffle_epi32(t, 0xB1));
+                        const uint32_t th = (uint32_t)_mm_cvtsi128_si32(t);
+                        memcpy(o + 144 + 4 * r, &th, 4);
+                    }
+                }
+            }
+            continue;
+#endif
             for (int gi = 0; gi < I / 32; gi++) {
                 uint8_t *o = grp + 64 + (size_t)gi * gbk;
                 const uint8_t *blk = row + (size_t)(gi / 4) * bb; const int h = gi % 4;
