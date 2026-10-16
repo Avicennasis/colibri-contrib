@@ -773,7 +773,11 @@ static void q38_weight_row(const Q38Weight *weight,int row,float *out) {
         for(int i=0;i<weight->cols;i++)out[i]=bf16_to_f32(src[i]);
     } else if(weight->kind==Q38_WEIGHT_GGML){
         int64_t rb=gq_row_bytes(weight->gq_type,weight->cols);
-        if(rb<0||gq_dequant_row(weight->gq_type,(const uint8_t*)weight->data+(int64_t)row*rb,out,weight->cols)){
+        if(gq_r16_base(weight->gq_type)>=0){
+            if(gq_r16_dequant_row(weight->gq_type,(const uint8_t*)weight->data,row,out,weight->cols)){
+                fprintf(stderr,"qwen38: GGUF row of type %s is not supported\n",gq_type_name(weight->gq_type));exit(1);
+            }
+        } else if(rb<0||gq_dequant_row(weight->gq_type,(const uint8_t*)weight->data+(int64_t)row*rb,out,weight->cols)){
             fprintf(stderr,"qwen38: GGUF row of type %s is not supported\n",gq_type_name(weight->gq_type));exit(1);
         }
     } else {fprintf(stderr,"weight kind %d has no dense row view\n",(int)weight->kind);exit(1);}
@@ -1191,10 +1195,25 @@ static void q38_gg_read(const gguf_tensor *t,void *dst,int64_t off,int64_t n) {
 static void q38_gg_read_f32(const gguf_tensor *t,float *dst) {
     if(gguf_read_f32(q38_gg_ctx_of(t),t,dst)){fprintf(stderr,"GGUF %s: read failed (type %s)\n",t->name,gq_type_name(t->type));exit(1);}
 }
+/* The type a matrix of a GGUF block type is held in for the CPU: its rows interleaved by 16
+ * (gq_r16_*, GQ_*_R16), the same bytes or a few percent more, on an AVX-512 VNNI build, when
+ * the type has that form and the matrix whole groups; else the file's rows. Q38_ILV16=0
+ * keeps the file's rows, as GQ_EXACT=1 does. */
+static int q38_gg_held_type(int type,int rows,int cols) {
+#ifdef GQ_VNNI512
+    static int on=-1;
+    if(on<0){const char *e=getenv("Q38_ILV16");on=!(e&&!strcmp(e,"0"))&&!gq_exact_mode();}
+    const int r=gq_r16_of(type);
+    if(on&&r>=0&&rows%16==0&&cols%GQ_TYPES[type].blck==0)return r;
+#else
+    (void)rows;(void)cols;
+#endif
+    return type;
+}
 /* A matrix [rows][cols] from the GGUF: f32/f16 as f32, bf16 as bf16, any other ggml
- * type as its blocks (Q38_WEIGHT_GGML). `parts` tensors of the same type are stacked
- * by rows (the indexer's q and k projections). */
-static Q38Weight q38_gg_weight_parts(Model *m,const gguf_tensor *const *parts,int n,int rows,int cols) {
+ * type as its blocks (Q38_WEIGHT_GGML; with `held`, in q38_gg_held_type's form). `parts`
+ * tensors of the same type are stacked by rows (the indexer's q and k projections). */
+static Q38Weight q38_gg_weight_parts(Model *m,const gguf_tensor *const *parts,int n,int rows,int cols,int held) {
     Q38Weight w={0}; int64_t have=0; int type=parts[0]->type;
     for(int i=0;i<n;i++){
         const gguf_tensor *t=parts[i];
@@ -1221,6 +1240,14 @@ static Q38Weight q38_gg_weight_parts(Model *m,const gguf_tensor *const *parts,in
         w.data=malloc((size_t)(rb*rows)); if(!w.data){fprintf(stderr,"OOM GGUF weight\n");exit(1);}
         uint8_t *p=(uint8_t*)w.data;
         for(int i=0;i<n;i++){q38_gg_read(parts[i],p,0,parts[i]->nbytes);p+=parts[i]->nbytes;}
+        const int ht=held?q38_gg_held_type(type,rows,cols):type;
+        if(ht!=type){   /* interleaved by 16 for the CPU's kernels */
+            const int64_t hb=gq_row_bytes(ht,cols); uint8_t *h=(uint8_t*)malloc((size_t)(hb*rows));
+            if(!h){fprintf(stderr,"OOM GGUF weight\n");exit(1);}
+            #pragma omp parallel for schedule(static)
+            for(int g=0;g<rows/16;g++)gq_r16_pack(ht,h+(int64_t)g*16*hb,(const uint8_t*)w.data+(int64_t)g*16*rb,16,cols);
+            free(w.data);w.data=h;type=ht;
+        }
         w.kind=Q38_WEIGHT_GGML;w.gq_type=type;w.rows=rows;w.cols=cols;w.elements=(int64_t)rows*cols;w.owns_data=1;
     } else {fprintf(stderr,"GGUF %s: type %s is not supported\n",parts[0]->name,gq_type_name(type));exit(1);}
     m->resident_weight_bytes+=q38_weight_bytes(&w);
@@ -1269,7 +1296,8 @@ static Q38Weight q38_gg_weight(Model *m,const char *name,int rows,int cols) {
         parts[0]=q38_gg(name,NULL);
         if(!parts[0]){fprintf(stderr,"GGUF: no tensor for %s\n",name);exit(1);}
     }
-    return q38_gg_weight_parts(m,parts,n,rows,cols);
+    /* the embedding is read a row at a time: its file rows */
+    return q38_gg_weight_parts(m,parts,n,rows,cols,!strstr(name,"embed_tokens"));
 }
 
 static float *q38_load_tensor(Model *m,const char *name,int64_t want) {
@@ -2340,11 +2368,18 @@ static void q38_gg_read_expert(Model *m,const gguf_tensor *const t[3],int eid,Sl
     Q38Weight *dst[3]={&s->gate,&s->up,&s->down}; const int os[3]={I,I,H},is[3]={H,H,I};
     for(int k=0;k<3;k++){
         int64_t rb=gq_row_bytes(t[k]->type,is[k]),eb=rb*os[k];
-        Q38Weight *w=dst[k];
-        if(w->kind!=Q38_WEIGHT_GGML||w->gq_type!=t[k]->type||w->rows!=os[k]||w->cols!=is[k]||!w->owns_data){
+        Q38Weight *w=dst[k]; const int st=q38_gg_held_type(t[k]->type,os[k],is[k]);
+        if(w->kind!=Q38_WEIGHT_GGML||w->gq_type!=st||w->rows!=os[k]||w->cols!=is[k]||!w->owns_data){
             q38_weight_free(w);
-            w->data=malloc((size_t)eb); if(!w->data){fprintf(stderr,"OOM GGUF expert\n");exit(1);}
-            w->kind=Q38_WEIGHT_GGML;w->gq_type=t[k]->type;w->rows=os[k];w->cols=is[k];w->elements=(int64_t)os[k]*is[k];w->owns_data=1;
+            w->data=malloc((size_t)(gq_row_bytes(st,is[k])*os[k])); if(!w->data){fprintf(stderr,"OOM GGUF expert\n");exit(1);}
+            w->kind=Q38_WEIGHT_GGML;w->gq_type=st;w->rows=os[k];w->cols=is[k];w->elements=(int64_t)os[k]*is[k];w->owns_data=1;
+        }
+        if(st!=t[k]->type){   /* read beside, interleave into the slot (each loader thread its buffer) */
+            static __thread uint8_t *raw; static __thread int64_t cap;
+            if(cap<eb){free(raw);raw=(uint8_t*)malloc((size_t)eb);cap=raw?eb:0;if(!raw){fprintf(stderr,"OOM GGUF expert\n");exit(1);}}
+            q38_gg_read(t[k],raw,(int64_t)eid*eb,eb);
+            gq_r16_pack(st,(uint8_t*)w->data,raw,os[k],is[k]);
+            continue;
         }
         q38_gg_read(t[k],w->data,(int64_t)eid*eb,eb);
     }
@@ -3606,8 +3641,24 @@ static void q38_tier_start(Model *m,int cap) {
  * back once it has copied it (q38_vk_src_done): no second copy stays in RAM. */
 static int g_q38_vk_raw;   /* the tier holds the GGUF experts' blocks as the file has them (blockdec.glsl) */
 static VktExpertSrc q38_vk_src(Slot *ex) {
-    if(g_q38_gguf&&ex->gate.kind==Q38_WEIGHT_GGML&&g_q38_vk_raw)
+    if(g_q38_gguf&&ex->gate.kind==Q38_WEIGHT_GGML&&g_q38_vk_raw){
+        if(gq_r16_base(ex->gate.gq_type)>=0||gq_r16_base(ex->up.gq_type)>=0||gq_r16_base(ex->down.gq_type)>=0){
+            /* the file's rows back from the interleaved slot, in one copy q38_vk_src_done frees */
+            const Q38Weight *w[3]={&ex->gate,&ex->up,&ex->down}; int64_t off[4]={0};
+            for(int k=0;k<3;k++){
+                const int ft=gq_r16_base(w[k]->gq_type)>=0?gq_r16_base(w[k]->gq_type):w[k]->gq_type;
+                off[k+1]=off[k]+(int64_t)w[k]->rows*gq_row_bytes(ft,w[k]->cols);
+            }
+            if(!ex->t8&&!(ex->t8=(int8_t*)malloc((size_t)off[3]))){fprintf(stderr,"OOM GGUF expert for the Vulkan tier\n");exit(1);}
+            uint8_t *b=(uint8_t*)ex->t8;
+            for(int k=0;k<3;k++){
+                if(gq_r16_base(w[k]->gq_type)>=0)gq_r16_unpack(w[k]->gq_type,b+off[k],(const uint8_t*)w[k]->data,w[k]->rows,w[k]->cols);
+                else memcpy(b+off[k],w[k]->data,(size_t)(off[k+1]-off[k]));
+            }
+            return (VktExpertSrc){b,b+off[1],b+off[2],NULL,NULL,NULL};
+        }
         return (VktExpertSrc){ex->gate.data,ex->up.data,ex->down.data,NULL,NULL,NULL};
+    }
     if(ex->gate.kind==Q38_WEIGHT_INT2G32||ex->gate.kind==Q38_WEIGHT_LOWBIT16||ex->gate.kind==Q38_WEIGHT_VQ2){
         /* the low-bit forms (VKT_SRC_LB_*): codes, and per matrix its group scales (a byte
          * per 32 inputs, vq2 per 64) then its f32 row scales in one block, the copy freed by
@@ -3630,7 +3681,17 @@ static VktExpertSrc q38_vk_src(Slot *ex) {
             ex->t8=(int8_t*)malloc((size_t)(3*n)); ex->t8s=(float*)malloc((size_t)(3*(n/32))*sizeof(float));
             if(!ex->t8||!ex->t8s){fprintf(stderr,"OOM GGUF expert for the Vulkan tier\n");exit(1);}
         }
-        for(int k=0;k<3;k++)gq_rows_i8(w[k]->gq_type,(const uint8_t*)w[k]->data,w[k]->rows,w[k]->cols,1.f,ex->t8+k*n,ex->t8s+k*(n/32));
+        for(int k=0;k<3;k++){
+            int t=w[k]->gq_type; const uint8_t *rows=(const uint8_t*)w[k]->data; uint8_t *plain=NULL;
+            if(gq_r16_base(t)>=0){   /* the device reads the file's rows */
+                const int ft=gq_r16_base(t);
+                plain=(uint8_t*)malloc((size_t)(w[k]->rows*gq_row_bytes(ft,w[k]->cols)));
+                if(!plain){fprintf(stderr,"OOM GGUF expert for the Vulkan tier\n");exit(1);}
+                gq_r16_unpack(t,plain,rows,w[k]->rows,w[k]->cols); rows=plain; t=ft;
+            }
+            gq_rows_i8(t,rows,w[k]->rows,w[k]->cols,1.f,ex->t8+k*n,ex->t8s+k*(n/32));
+            free(plain);
+        }
         return (VktExpertSrc){ex->t8,ex->t8+n,ex->t8+2*n,ex->t8s,ex->t8s+n/32,ex->t8s+2*(n/32)};
     }
     VktExpertSrc s={ex->gate.data,ex->up.data,ex->down.data,ex->gate.scales,ex->up.scales,ex->down.scales};
@@ -3825,7 +3886,11 @@ static void q38_expert_row(Model *m,int layer,int eid,const float *xs,float *eg,
  * the decode loop adds it, so the output is the decode loop's to the bit.
  * Q38_MOE_GROUPED=0 keeps the decode loop. */
 enum { Q38_ROWS_NONE = 0, Q38_ROWS_F32 = 1, Q38_ROWS_X2 = 2, Q38_ROWS_GQ = 3 };
-#define Q38_GROUPED_ROWS 16   /* decode rows and MTP verifies (a prompt's chunks keep the prefill MoE) */
+/* decode rows, MTP verifies and a prompt's chunks up to this many rows. The per-expert
+ * paths (q38_moe_decode_ex, q38_moe_prefill) open three parallel regions per distinct
+ * expert, a few rows each: a 32-row chunk of ISTA's Qwen3.8 spent a third of its threads'
+ * time waiting at their barriers. Here a layer is two regions for all its experts. */
+#define Q38_GROUPED_ROWS 256
 /* how a routed expert's matrix takes its input here: f32 (int4-g64), int8 per 32
  * (int2-g32, int2-g16, int3-g16), a GGUF block type's integer form (gq_act), or not
  * at all (GQ_EXACT=1's float path among them) */
@@ -3844,6 +3909,12 @@ static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
                      const float *const *xr,const int8_t *xq,const float *dx,const gq_act *ga,int n) {
     if(w->kind==Q38_WEIGHT_GGML){   /* gq_matmul_act's rows */
         const int64_t rb=gq_row_bytes(w->gq_type,I);
+#ifdef GQ_VNNI512
+        if(gq_r16_base(w->gq_type)>=0){   /* whole groups: the callers' blocks start and end on 16 */
+            for(int o=r0;o<r1;o+=16)gq_r16_rows(w->gq_type,y+o,ys,(const uint8_t*)w->data+(int64_t)o*rb,ga,I);
+            return;
+        }
+#endif
         for(int o=r0;o<r1;o++)gq_row_all(y+o,ys,ga,(const uint8_t*)w->data+(int64_t)o*rb,w->gq_type,I);
         return;
     }
@@ -3895,13 +3966,13 @@ static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
         }
 }
 static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int S,float *out,
-                                  const float *logits_in,int routed_only) {
+                                  const float *logits_in,int routed_only,int row0) {
     static int on=-1;
     if(on<0){const char *e=getenv("Q38_MOE_GROUPED");on=!(e&&e[0]=='0');}
     Cfg *c=&m->c;const int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
     if(!on||S<1||S>Q38_GROUPED_ROWS||!(q38_layer_int4(m,layer)||g_q38_gguf)||H%32||I%32)return 0;
     /* every distinct expert of the rows in the cache at once, or the per-expert paths */
-    if(S*K>m->cache[layer].cap)return 0;
+    if((S*K<E?S*K:E)>m->cache[layer].cap)return 0;   /* at most E distinct, however many rows */
     /* the device tiers take experts per row; the statistics hooks keep the loop's order */
     if((vkt_ready()&&layer<vkt_layers())||(qt_ready()&&layer<c->layers))return 0;
     if(g_q38_act||g_q38_dump||g_q38_cov)return 0;
@@ -3931,7 +4002,7 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
         for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=0;for(int j=0;j<z;j++)if(ix[j]==e)used=1;if(!used&&lg[e]>bv){bv=lg[e];best=e;}}ix[z]=rt_router_pick(best,z,E,layer);val[z]=lg[ix[z]];}
         double top=0;for(int z=0;z<K;z++)top+=val[z];double den=c->norm_topk?top:all;
         for(int z=0;z<K;z++)gates[s*K+z]=(float)(val[z]/den);
-        rt_route(layer,s,ix,gates+(int64_t)s*K,K);
+        rt_route(layer,row0+s,ix,gates+(int64_t)s*K,K);
     }
     /* the distinct experts in first-seen order and each one's assignments, grouped */
     int nu=0;
@@ -4010,7 +4081,9 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
         /* (expert, row block) items: enough for every thread, blocks of 8 rows or more */
         int cF=(4*T+nu-1)/nu;if(cF>I/8)cF=I/8;if(cF<1)cF=1;
         int cH=(4*T+nu-1)/nu;if(cH>H/8)cH=H/8;if(cH<1)cH=1;
-        const int rF=(I+cF-1)/cF,rH=(H+cH-1)/cH;
+        int rF=(I+cF-1)/cF,rH=(H+cH-1)/cH;
+        if(I%16==0&&rF%16)rF+=16-rF%16;   /* whole groups of 16 rows (GQ_*_R16) */
+        if(H%16==0&&rH%16)rH+=16-rH%16;
         cF=(I+rF-1)/rF;cH=(H+rH-1)/rH;
         #pragma omp parallel
         {
@@ -4071,7 +4144,7 @@ static int q38_moe_decode_grouped(Model *m,Layer *l,int layer,const float *x,int
  * expert on the device and adds them there). q38_moe passes NULL, 0: unchanged. */
 static void q38_moe_decode_ex(Model *m,Layer *l,int layer,const float *x,int S,float *out,
                               const float *logits_in,int routed_only) {
-    if(q38_moe_decode_grouped(m,l,layer,x,S,out,logits_in,routed_only))return;
+    if(q38_moe_decode_grouped(m,l,layer,x,S,out,logits_in,routed_only,0))return;
     Cfg *c=&m->c;int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
     float *logits=falloc(E),*sg=falloc(SI),*su=falloc(SI),*sh=falloc(SI),*shared=falloc(H);
     float *eg=falloc(I),*eu=falloc(I),*eh=falloc(I),*eo=falloc(H);
@@ -4453,9 +4526,31 @@ static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
 
 static void q38_moe_ex(Model *m,Layer *l,int layer,const float *x,int S,float *out,
                        const float *logits_in,int routed_only) {
-    /* A few rows (decode, an MTP verify) grouped by expert in one parallel region
-     * when it applies; it gives the bits the paths below give. */
-    if(S>1&&q38_moe_decode_grouped(m,l,layer,x,S,out,logits_in,routed_only))return;
+    /* Up to Q38_GROUPED_ROWS rows (decode, an MTP verify, a prompt chunk) grouped by
+     * expert, two parallel regions a layer, when it applies; it gives the bits the
+     * paths below give. */
+    if(S>=1){
+        /* rows in groups: each its own grouped call (every row computed as alone, so
+         * the split changes no bits), as many rows as the grouped path takes at once
+         * (their assignments all in the expert cache); the first group decides whether
+         * it applies at all, and a later refusal leaves the rest to the paths below */
+        const int H=m->c.hidden,E=m->c.experts,K=m->c.topk;
+        int group=m->cache[layer].cap>=E?Q38_GROUPED_ROWS:m->cache[layer].cap/(K>0?K:1);
+        if(group>Q38_GROUPED_ROWS)group=Q38_GROUPED_ROWS;
+        if(group<1)group=1;
+        int n0=S<group?S:group,base=0;
+        if(q38_moe_decode_grouped(m,l,layer,x,n0,out,logits_in,routed_only,0)){
+            for(base=n0;base<S;base+=group){
+                int n=S-base<group?S-base:group;
+                if(!q38_moe_decode_grouped(m,l,layer,x+(int64_t)base*H,n,out+(int64_t)base*H,
+                                           logits_in?logits_in+(int64_t)base*E:NULL,routed_only,base))break;
+            }
+            if(base>=S)return;
+            x+=(int64_t)base*H;out+=(int64_t)base*H;
+            if(logits_in)logits_in+=(int64_t)base*E;
+            S-=base;
+        }
+    }
     /* An MTP verify on the CUDA tier routes row by row as decode does, so
      * the tier's resident experts serve it (the batched path is CPU only). */
     if(S<=1||!m->prefill_batch||(g_q38_rowwise&&qt_ready()&&layer<m->c.layers))
