@@ -142,4 +142,216 @@ static inline int xl_matmul(float *y, const float *x, const uint8_t *codes, cons
     return 0;
 }
 
+
+/* ---- rows interleaved by 16 (xl16_*) ---------------------------------------------
+ * The row kernel above keeps eight lane sums per row with an fma each, the per-row float
+ * work that held a prompt's chunk back. Here 16 rows share a register (lane r = row r):
+ * a group of 16 rows holds their 16 f32 row scales, then per 32 inputs (g) a block of
+ *   16 bytes   row r's scale byte of g (the two 4-bit scales)
+ *   128 bytes  the low two bits: words W = 0, 1 of 64 bytes, row r's four bytes at 4r, byte k
+ *              holding in bits 2i the code of element 16W + 4i + k
+ *   64 bytes   (3 bits) the high bits: row r's four bytes at 4r, byte k bit i = element 4i + k
+ * so quad i (elements 4i .. 4i+3) of the 16 rows is a shift and a mask (two for the high
+ * bit), one pshufb to the level + bias, one vpdpbusd against the broadcast quad. The same
+ * bytes as the rows (13/32 a weight at 3 bits, 9/32 at 2, and 4 a row).
+ * Numerics: per 32 inputs the exact integer sum_16 level * x times each half's scale (an
+ * integer below 2^24: exact as a float), then one fma with d * dx: one rounding per 32
+ * where xl_dot_ref rounds eight lane sums, so not its bits. xl16_ref is the reference; the
+ * input is the activation contract (x2_quant_act's bytes and scales) plus the sums per 16
+ * of the bytes (gq_quant_act's xs). */
+static inline size_t xl16_gblock(int bits) { return bits == 3 ? 208 : 144; }
+static inline size_t xl16_group_bytes(int bits, int I) { return 64 + (size_t)(I / 32) * xl16_gblock(bits); }
+/* rows (whole groups) of codes [rows][xl_code_bytes], q [rows][I/32], d [rows] into dst */
+static void xl16_pack(uint8_t *dst, const uint8_t *codes, const uint8_t *q, const float *d, int rows, int bits, int I) {
+    const size_t cb = xl_code_bytes(bits, I), qb = xl_scale_bytes(I), gbk = xl16_gblock(bits), gb = xl16_group_bytes(bits, I);
+    for (int g = 0; g < rows / 16; g++) {
+        uint8_t *grp = dst + (size_t)g * gb;
+        memcpy(grp, d + 16 * g, 64);
+        for (int r = 0; r < 16; r++) {
+            const uint8_t *row = codes + (size_t)(16 * g + r) * cb, *qr = q + (size_t)(16 * g + r) * qb;
+            for (int gi = 0; gi < I / 32; gi++) {
+                uint8_t *o = grp + 64 + (size_t)gi * gbk;
+                o[r] = qr[gi];
+                for (int W = 0; W < 2; W++) for (int k = 0; k < 4; k++) {
+                    int v = 0;
+                    for (int i = 0; i < 4; i++) v |= (xl_code(row, bits, 32 * gi + 16 * W + 4 * i + k) & 3) << (2 * i);
+                    o[16 + 64 * W + 4 * r + k] = (uint8_t)v;
+                }
+                if (bits == 3) for (int k = 0; k < 4; k++) {
+                    int v = 0;
+                    for (int i = 0; i < 8; i++) v |= (xl_code(row, bits, 32 * gi + 4 * i + k) >> 2) << i;
+                    o[144 + 4 * r + k] = (uint8_t)v;
+                }
+            }
+        }
+    }
+}
+/* the inverse: the rows' codes, scale bytes and row scales back */
+static void xl16_unpack(uint8_t *codes, uint8_t *q, float *d, const uint8_t *src, int rows, int bits, int I) {
+    const size_t cb = xl_code_bytes(bits, I), qb = xl_scale_bytes(I), gbk = xl16_gblock(bits), gb = xl16_group_bytes(bits, I);
+    memset(codes, 0, cb * (size_t)rows);
+    for (int g = 0; g < rows / 16; g++) {
+        const uint8_t *grp = src + (size_t)g * gb;
+        memcpy(d + 16 * g, grp, 64);
+        for (int r = 0; r < 16; r++) {
+            uint8_t *row = codes + (size_t)(16 * g + r) * cb, *qr = q + (size_t)(16 * g + r) * qb;
+            for (int gi = 0; gi < I / 32; gi++) {
+                const uint8_t *o = grp + 64 + (size_t)gi * gbk;
+                qr[gi] = o[r];
+                for (int e = 0; e < 32; e++) {
+                    const int W = e / 16, i = (e % 16) / 4, k = e % 4;
+                    int c = (o[16 + 64 * W + 4 * r + k] >> (2 * i)) & 3;
+                    if (bits == 3) c |= ((o[144 + 4 * r + k] >> (e / 4)) & 1) << 2;
+                    const int el = 32 * gi + e, kk = el % 128;
+                    uint8_t *blk = row + (size_t)(el / 128) * xl_block_bytes(bits);
+                    blk[kk % 32] |= (uint8_t)((c & 3) << (2 * (kk / 32)));
+                    if (bits == 3) blk[32 + kk % 16] |= (uint8_t)(((c >> 2) & 1) << (kk / 16));
+                }
+            }
+        }
+    }
+}
+/* the numerics in plain C: row r of a group against one activation row */
+static inline float xl16_ref(const uint8_t *codes, const uint8_t *q, float d, int bits,
+                             const int8_t *xq, const float *dx, int I) {
+    float acc = 0.f;
+    for (int g = 0; g < I / 32; g++) {
+        int32_t p[2] = { 0, 0 };
+        for (int j = 0; j < 32; j++) p[j / 16] += xl_level(bits, xl_code(codes, bits, g * 32 + j)) * xq[(size_t)g * 32 + j];
+        acc = fmaf((float)(p[0] * xl_scale(q, 2 * g) + p[1] * xl_scale(q, 2 * g + 1)), d * dx[g], acc);
+    }
+    return acc;
+}
+#if defined(__AVX2__) && defined(__FMA__)
+#define XL16_ON 1
+static inline int32_t xl16_ld32(const int8_t *p) { int32_t v; memcpy(&v, p, 4); return v; }
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+/* 16 rows (one group) against S <= 8 activation rows: y[s * ystride + r] */
+static inline __attribute__((always_inline)) void xl16_body512(float *y, int ystride, const uint8_t *grp, const int8_t *xq,
+                                                              const float *dx, const int32_t *xs, int I, const int S, const int bits) {
+    const int B = bits == 3 ? 26 : 10;   /* levels + B are the unsigned codes */
+    const __m512i lut = _mm512_broadcast_i32x4(bits == 3 ? _mm_setr_epi8(0, 10, 17, 23, 29, 35, 42, 52, 0, 0, 0, 0, 0, 0, 0, 0)
+                                                         : _mm_setr_epi8(0, 7, 13, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    const __m512i m3 = _mm512_set1_epi8(3), m4 = _mm512_set1_epi8(4), m15 = _mm512_set1_epi32(15);
+    const __m512 dv = _mm512_loadu_ps((const float *)grp);
+    const size_t gbk = xl16_gblock(bits);
+    __m512 acc[8];
+    for (int s = 0; s < S; s++) acc[s] = _mm512_setzero_ps();
+    for (int g = 0; g < I / 32; g++) {
+        const uint8_t *o = grp + 64 + (size_t)g * gbk;
+        const __m512i qb = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)o));
+        const __m512 sa = _mm512_cvtepi32_ps(_mm512_and_si512(qb, m15)), sb = _mm512_cvtepi32_ps(_mm512_srli_epi32(qb, 4));
+        __m512i c[8];
+        for (int W = 0; W < 2; W++) {
+            const __m512i v = _mm512_loadu_si512(o + 16 + 64 * W);
+            for (int i = 0; i < 4; i++) c[4 * W + i] = _mm512_and_si512(i ? _mm512_srli_epi16(v, 2 * i) : v, m3);
+        }
+        if (bits == 3) {
+            const __m512i h = _mm512_loadu_si512(o + 144);
+            for (int i = 0; i < 8; i++) {
+                const __m512i hb = i < 2 ? _mm512_slli_epi16(h, 2 - i) : i == 2 ? h : _mm512_srli_epi16(h, i - 2);
+                c[i] = _mm512_or_si512(c[i], _mm512_and_si512(hb, m4));
+            }
+        }
+        for (int i = 0; i < 8; i++) c[i] = _mm512_shuffle_epi8(lut, c[i]);
+        for (int s = 0; s < S; s++) {
+            const int8_t *xb = xq + (size_t)s * I + 32 * (size_t)g;
+            __m512i p0 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), c[0], _mm512_set1_epi32(xl16_ld32(xb)));
+            __m512i p1 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), c[4], _mm512_set1_epi32(xl16_ld32(xb + 16)));
+            for (int i = 1; i < 4; i++) {
+                p0 = _mm512_dpbusd_epi32(p0, c[i], _mm512_set1_epi32(xl16_ld32(xb + 4 * i)));
+                p1 = _mm512_dpbusd_epi32(p1, c[4 + i], _mm512_set1_epi32(xl16_ld32(xb + 16 + 4 * i)));
+            }
+            const int32_t *x16 = xs + (size_t)s * (I / 16) + 2 * (size_t)g;
+            p0 = _mm512_sub_epi32(p0, _mm512_set1_epi32(B * x16[0])); p1 = _mm512_sub_epi32(p1, _mm512_set1_epi32(B * x16[1]));
+            const __m512 t = _mm512_fmadd_ps(_mm512_cvtepi32_ps(p1), sb, _mm512_mul_ps(_mm512_cvtepi32_ps(p0), sa));   /* exact */
+            acc[s] = _mm512_fmadd_ps(t, _mm512_mul_ps(dv, _mm512_set1_ps(dx[(size_t)s * (I / 32) + g])), acc[s]);
+        }
+    }
+    for (int s = 0; s < S; s++) _mm512_storeu_ps(y + (size_t)s * ystride, acc[s]);
+}
+#define XL16_SMAX 8
+#else
+/* half h (rows 8h .. 8h+7) of a group against S <= 4 activation rows */
+static inline __attribute__((always_inline)) void xl16_body256(float *y, int ystride, const uint8_t *grp, const int8_t *xq,
+                                                              const float *dx, const int32_t *xs, int I, const int S, const int bits, const int h) {
+    const int B = bits == 3 ? 26 : 10;
+    const __m256i lut = _mm256_broadcastsi128_si256(bits == 3 ? _mm_setr_epi8(0, 10, 17, 23, 29, 35, 42, 52, 0, 0, 0, 0, 0, 0, 0, 0)
+                                                              : _mm_setr_epi8(0, 7, 13, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+    const __m256i m3 = _mm256_set1_epi8(3), m4 = _mm256_set1_epi8(4), m15 = _mm256_set1_epi32(15);
+    const __m256 dv = _mm256_loadu_ps((const float *)grp + 8 * h);
+    const size_t gbk = xl16_gblock(bits);
+    __m256 acc[4];
+    for (int s = 0; s < S; s++) acc[s] = _mm256_setzero_ps();
+    for (int g = 0; g < I / 32; g++) {
+        const uint8_t *o = grp + 64 + (size_t)g * gbk;
+        const __m256i qb = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(o + 8 * h)));
+        const __m256 sa = _mm256_cvtepi32_ps(_mm256_and_si256(qb, m15)), sb = _mm256_cvtepi32_ps(_mm256_srli_epi32(qb, 4));
+        __m256i c[8];
+        for (int W = 0; W < 2; W++) {
+            const __m256i v = _mm256_loadu_si256((const __m256i *)(o + 16 + 64 * W + 32 * h));
+            for (int i = 0; i < 4; i++) c[4 * W + i] = _mm256_and_si256(i ? _mm256_srli_epi16(v, 2 * i) : v, m3);
+        }
+        if (bits == 3) {
+            const __m256i hh = _mm256_loadu_si256((const __m256i *)(o + 144 + 32 * h));
+            for (int i = 0; i < 8; i++) {
+                const __m256i hb = i < 2 ? _mm256_slli_epi16(hh, 2 - i) : i == 2 ? hh : _mm256_srli_epi16(hh, i - 2);
+                c[i] = _mm256_or_si256(c[i], _mm256_and_si256(hb, m4));
+            }
+        }
+        for (int i = 0; i < 8; i++) c[i] = _mm256_shuffle_epi8(lut, c[i]);
+        for (int s = 0; s < S; s++) {
+            const int8_t *xb = xq + (size_t)s * I + 32 * (size_t)g;
+            __m256i p0 = _mm256_setzero_si256(), p1 = _mm256_setzero_si256();
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+            for (int i = 0; i < 4; i++) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                p0 = _mm256_dpbusd_epi32(p0, c[i], _mm256_set1_epi32(xl16_ld32(xb + 4 * i)));
+                p1 = _mm256_dpbusd_epi32(p1, c[4 + i], _mm256_set1_epi32(xl16_ld32(xb + 16 + 4 * i)));
+#else
+                p0 = _mm256_dpbusd_avx_epi32(p0, c[i], _mm256_set1_epi32(xl16_ld32(xb + 4 * i)));
+                p1 = _mm256_dpbusd_avx_epi32(p1, c[4 + i], _mm256_set1_epi32(xl16_ld32(xb + 16 + 4 * i)));
+#endif
+            }
+#else   /* codes <= 52: two maddubs add in 16 bits below 2^15 */
+            const __m256i one = _mm256_set1_epi16(1);
+            for (int i = 0; i < 4; i += 2) {
+                p0 = _mm256_add_epi32(p0, _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(c[i], _mm256_set1_epi32(xl16_ld32(xb + 4 * i))),
+                         _mm256_maddubs_epi16(c[i + 1], _mm256_set1_epi32(xl16_ld32(xb + 4 * i + 4)))), one));
+                p1 = _mm256_add_epi32(p1, _mm256_madd_epi16(_mm256_add_epi16(_mm256_maddubs_epi16(c[4 + i], _mm256_set1_epi32(xl16_ld32(xb + 16 + 4 * i))),
+                         _mm256_maddubs_epi16(c[5 + i], _mm256_set1_epi32(xl16_ld32(xb + 20 + 4 * i)))), one));
+            }
+#endif
+            const int32_t *x16 = xs + (size_t)s * (I / 16) + 2 * (size_t)g;
+            p0 = _mm256_sub_epi32(p0, _mm256_set1_epi32(B * x16[0])); p1 = _mm256_sub_epi32(p1, _mm256_set1_epi32(B * x16[1]));
+            const __m256 t = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p1), sb, _mm256_mul_ps(_mm256_cvtepi32_ps(p0), sa));
+            acc[s] = _mm256_fmadd_ps(t, _mm256_mul_ps(dv, _mm256_set1_ps(dx[(size_t)s * (I / 32) + g])), acc[s]);
+        }
+    }
+    for (int s = 0; s < S; s++) _mm256_storeu_ps(y + (size_t)s * ystride + 8 * h, acc[s]);
+}
+#define XL16_SMAX 4
+#endif
+/* group grp's 16 rows (outputs y .. y + 15) against S activation rows: xq/dx/xs the
+ * activation contract plus the sums per 16 (gq_act's q, d, s) */
+static void xl16_rows(float *y, int ystride, const uint8_t *grp, const int8_t *xq, const float *dx, const int32_t *xs,
+                      int I, int S, int bits) {
+    for (int s0 = 0; s0 < S; s0 += XL16_SMAX) {
+        const int n = S - s0 < XL16_SMAX ? S - s0 : XL16_SMAX;
+        float *ys = y + (size_t)s0 * ystride; const int8_t *xb = xq + (size_t)s0 * I;
+        const float *db = dx + (size_t)s0 * (I / 32); const int32_t *sb = xs + (size_t)s0 * (I / 16);
+#if XL16_SMAX == 8
+#define XL16_CALL(N, BITS) xl16_body512(ys, ystride, grp, xb, db, sb, I, N, BITS)
+#else
+#define XL16_CALL(N, BITS) do { xl16_body256(ys, ystride, grp, xb, db, sb, I, N, BITS, 0); xl16_body256(ys, ystride, grp, xb, db, sb, I, N, BITS, 1); } while (0)
+#endif
+        if (bits == 3) switch (n) { case 1: XL16_CALL(1, 3); break; case 2: XL16_CALL(2, 3); break; case 3: XL16_CALL(3, 3); break;
+                                    case 4: XL16_CALL(4, 3); break; default: XL16_CALL(n, 3); break; }
+        else switch (n) { case 1: XL16_CALL(1, 2); break; case 2: XL16_CALL(2, 2); break; case 3: XL16_CALL(3, 2); break;
+                          case 4: XL16_CALL(4, 2); break; default: XL16_CALL(n, 2); break; }
+#undef XL16_CALL
+    }
+}
+#endif
+
 #endif /* COLI_LOWBIT_G16_H */

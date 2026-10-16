@@ -121,6 +121,7 @@ typedef struct {
     int gq_type;                   /* Q38_WEIGHT_GGML: the ggml type of the rows */
     const uint8_t *x2q;            /* Q38_WEIGHT_INT2G32: u8 scale per row and 32 inputs; LOWBIT16: two 4-bit ones per byte (borrowed, like data) */
     int lbits;                     /* Q38_WEIGHT_LOWBIT16: 2 or 3 */
+    int r16;                       /* Q38_WEIGHT_LOWBIT16: data holds the rows interleaved by 16 (lowbit_g16.h xl16_*), codes, scales and row scales together; x2q/scales unset */
     const Vq2Books *vqb;           /* Q38_WEIGHT_VQ2: the sidecar's codebooks (borrowed) */
     const Vq1Books *vq1b;          /* Q38_WEIGHT_VQ1: the sidecar's codebooks (borrowed) */
 } Q38Weight;
@@ -750,6 +751,16 @@ static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
             fprintf(stderr,"OOM int2-g32 activation\n");exit(1);
         }
     }
+#ifdef XL16_ON
+    else if(weight->kind==Q38_WEIGHT_LOWBIT16&&weight->r16){   /* gq_act: the same bytes and scales as x2_quant_act, plus the sums per 16 */
+        gq_act a; memset(&a,0,sizeof a);
+        if(gq_act_set(&a,x,S,I)){fprintf(stderr,"OOM low-bit activation\n");exit(1);}
+        const size_t gb=xl16_group_bytes(weight->lbits,I);
+        #pragma omp parallel for schedule(static)
+        for(int g=0;g<O/16;g++)xl16_rows(y+16*g,O,(const uint8_t*)weight->data+(size_t)g*gb,a.q,a.d,a.s,I,S,weight->lbits);
+        gq_act_free(&a);
+    }
+#endif
     else if(weight->kind==Q38_WEIGHT_LOWBIT16&&weight->scales&&weight->x2q){
         if(xl_matmul(y,x,(const uint8_t*)weight->data,weight->x2q,weight->scales,weight->lbits,S,I,O)){
             fprintf(stderr,"OOM low-bit activation\n");exit(1);
@@ -2336,6 +2347,17 @@ static void q38_bind_int4_record(Model *m,Slot *slot,uint8_t *record) {
     }
 }
 
+#ifdef XL16_ON
+/* int2/int3-g16 experts held interleaved by 16 for the CPU (lowbit_g16.h xl16_*): a
+ * read slot, not a mapped one, and every matrix whole groups (the experts' shapes
+ * are). Q38_ILV16=0 keeps the rows. */
+static int q38_xl16_on(const Model *m) {
+    static int on=-1;
+    if(on<0){const char *e=getenv("Q38_ILV16");on=!(e&&!strcmp(e,"0"));}
+    const Q38Int4Experts *x=m->x4;
+    return on&&x&&x->lb&&!x->lb->vq&&x->lb->gs==16&&m->c.inter%16==0&&m->c.hidden%16==0&&m->c.hidden%128==0&&m->c.inter%128==0;
+}
+#endif
 /* One read per miss, into the slot's own slab; with COLI_MAP_EXPERTS=1 the
  * slot points into the mapped file instead, as the FP8 path does. Safe from
  * the parallel batch loader: every job owns a distinct slot. */
@@ -2353,6 +2375,23 @@ static void q38_load_int4_record(Model *m,int layer,int expert,Slot *slot) {
         if(!replacement){fprintf(stderr,"OOM int4 expert record\n");exit(1);}
         slot->int4_slab=replacement;slot->int4_slab_bytes=x->record_bytes;
     }
+#ifdef XL16_ON
+    if(q38_xl16_on(m)){   /* int2/int3-g16: read beside, interleave into the slot (each loader thread its buffer) */
+        static __thread uint8_t *raw; static __thread int64_t cap;
+        if(cap<x->record_bytes){free(raw);raw=(uint8_t*)malloc((size_t)x->record_bytes);cap=raw?x->record_bytes:0;
+                                if(!raw){fprintf(stderr,"OOM int4 expert record\n");exit(1);}}
+        st_read_range_raw_cap(&x->S,fd,off,x->record_bytes,raw,x->record_bytes,1,"pread Qwen3.8 int4 expert");
+        q38_bind_int4_record(m,slot,raw);   /* the three matrices' fields, then their interleaved form */
+        Q38Weight *dst[3]={&slot->gate,&slot->up,&slot->down}; uint8_t *o=(uint8_t*)slot->int4_slab;
+        for(int k=0;k<3;k++){
+            Q38Weight *w=dst[k];
+            xl16_pack(o,(const uint8_t*)w->data,w->x2q,w->scales,w->rows,w->lbits,w->cols);
+            w->data=o;w->x2q=NULL;w->scales=NULL;w->r16=1;
+            o+=(size_t)(w->rows/16)*xl16_group_bytes(w->lbits,w->cols);
+        }
+        return;
+    }
+#endif
     q38_bind_int4_record(m,slot,(uint8_t*)slot->int4_slab);
     st_read_range_raw_cap(&x->S,fd,off,x->record_bytes,slot->int4_slab,
                           slot->int4_slab_bytes,1,"pread Qwen3.8 int4 expert");
@@ -3702,6 +3741,22 @@ static VktExpertSrc q38_vk_src(Slot *ex) {
         }
         return (VktExpertSrc){ex->gate.data,ex->up.data,ex->down.data,NULL,NULL,NULL};
     }
+#ifdef XL16_ON
+    if(ex->gate.kind==Q38_WEIGHT_LOWBIT16&&ex->gate.r16){
+        /* the interleaved slot back to the rows the tier reads: per matrix its codes, then
+         * its scale bytes and f32 row scales, in one copy q38_vk_src_done frees */
+        const Q38Weight *w[3]={&ex->gate,&ex->up,&ex->down};size_t tot=0;
+        for(int k=0;k<3;k++)tot+=(size_t)w[k]->rows*(xl_code_bytes(w[k]->lbits,w[k]->cols)+xl_scale_bytes(w[k]->cols)+sizeof(float));
+        if(!ex->t8&&!(ex->t8=(int8_t*)malloc(tot))){fprintf(stderr,"OOM low-bit expert for the Vulkan tier\n");exit(1);}
+        uint8_t *b=(uint8_t*)ex->t8;const void *cd[3],*bl[3];
+        for(int k=0;k<3;k++){
+            const size_t cbk=(size_t)w[k]->rows*xl_code_bytes(w[k]->lbits,w[k]->cols),qr=(size_t)w[k]->rows*xl_scale_bytes(w[k]->cols);
+            xl16_unpack(b,b+cbk,(float*)(b+cbk+qr),(const uint8_t*)w[k]->data,w[k]->rows,w[k]->lbits,w[k]->cols);
+            cd[k]=b;bl[k]=b+cbk;b+=cbk+qr+(size_t)w[k]->rows*sizeof(float);
+        }
+        return (VktExpertSrc){cd[0],cd[1],cd[2],bl[0],bl[1],bl[2]};
+    }
+#endif
     if(ex->gate.kind==Q38_WEIGHT_INT2G32||ex->gate.kind==Q38_WEIGHT_LOWBIT16||ex->gate.kind==Q38_WEIGHT_VQ2){
         /* the low-bit forms (VKT_SRC_LB_*): codes, and per matrix its group scales (a byte
          * per 32 inputs, vq2 per 64) then its f32 row scales in one block, the copy freed by
@@ -3940,6 +3995,9 @@ enum { Q38_ROWS_NONE = 0, Q38_ROWS_F32 = 1, Q38_ROWS_X2 = 2, Q38_ROWS_GQ = 3 };
 static int q38_rows_kind(const Q38Weight *w) {
     if(!w->data||w->q4||w->q8||w->gpu||w->act2)return Q38_ROWS_NONE;
     if(w->kind==Q38_WEIGHT_INT4G64&&w->scales)return Q38_ROWS_F32;
+#ifdef XL16_ON
+    if(w->kind==Q38_WEIGHT_LOWBIT16&&w->r16)return Q38_ROWS_GQ;   /* xl16 rows take gq_act */
+#endif
     if((w->kind==Q38_WEIGHT_INT2G32||w->kind==Q38_WEIGHT_LOWBIT16)&&w->scales&&w->x2q)return Q38_ROWS_X2;
     if(w->kind==Q38_WEIGHT_VQ2&&w->scales&&w->x2q&&w->vqb)return Q38_ROWS_X2;
     if(w->kind==Q38_WEIGHT_VQ1&&w->scales&&w->x2q&&w->vq1b)return Q38_ROWS_X2;
@@ -3950,6 +4008,13 @@ static int q38_rows_kind(const Q38Weight *w) {
  * xq/dx the int8-per-32 ones ([n][I], [n][I/32]), ga the GGUF types' (n rows) */
 static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
                      const float *const *xr,const int8_t *xq,const float *dx,const gq_act *ga,int n) {
+#ifdef XL16_ON
+    if(w->kind==Q38_WEIGHT_LOWBIT16&&w->r16){   /* whole groups: the callers' blocks start and end on 16 */
+        const size_t gb=xl16_group_bytes(w->lbits,I);
+        for(int o=r0;o<r1;o+=16)xl16_rows(y+o,ys,(const uint8_t*)w->data+(size_t)(o/16)*gb,ga->q,ga->d,ga->s,I,n,w->lbits);
+        return;
+    }
+#endif
     if(w->kind==Q38_WEIGHT_GGML){   /* gq_matmul_act's rows */
         const int64_t rb=gq_row_bytes(w->gq_type,I);
 #ifdef GQ_R16_ON
