@@ -222,6 +222,8 @@ int    coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
 int    coli_vk_tensor_commit(ColiVkTensor *const *t, int n);
 int    coli_vk_staged(void);   /* 1 = resident data goes to the device through staged uploads */
 size_t coli_vk_tensor_row_bytes(int fmt, int I);
+int coli_vk_block_elems(int fmt);   /* block formats (100 + ggml type, 200-203): elements per block; else 0 */
+int coli_vk_set_vq2_books(const int8_t *a, const int8_t *b);   /* fmt 203's codebooks (256 x 8 int8 each) */
 /* What coli_vk_tensor_ensure(fmt, I, O, gs) adds to coli_vk_mem_info's bytes: the rows
  * at their padded stride and the scales (0 for a grouped format without a group size). */
 size_t coli_vk_tensor_payload(int fmt, int I, int O, int gs);
@@ -329,6 +331,16 @@ int  coli_vk_xb_sub_busy(int h);
  * coli_vk_tier_tensor hands them out, then coli_vk_tensor_commit. 0 = no memory. Not
  * while a batch that reads it is in flight. */
 int  coli_vk_tensor_refill(ColiVkTensor *t, uint8_t **rows, size_t *stride, float **scales);
+/* coli_vk_tensor_refill in another format, when the tensor's ranges hold it (one made by
+ * coli_vk_tier_tensor_pad with room for it). 0 = no room or no memory. */
+int  coli_vk_tensor_refill_as(ColiVkTensor *t, int fmt, int I, int O, int gs,
+                              uint8_t **rows, size_t *stride, float **scales);
+/* coli_vk_tier_tensor_dev whose rows' range is at least pad_w bytes and the scales' at
+ * least pad_s: a tier whose layers mix formats sizes every tensor of a role alike. */
+int  coli_vk_tier_tensor_pad(int dev, ColiVkTensor **t, int fmt, int I, int O, int gs, size_t pad_w, size_t pad_s,
+                             uint8_t **rows, size_t *stride, float **scales);
+/* The bytes a tensor's rows take on the device, and (scale_bytes) its scales'. */
+size_t coli_vk_tensor_alloc_bytes(int fmt, int I, int O, int gs, size_t *scale_bytes);
 
 /* ---- the batch on the second device (COLI_VK_DEV2) --------------------------------
  * The routed-expert tier can hold experts on a second device too (vk_tier.c). dev 0

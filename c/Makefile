@@ -542,7 +542,8 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_xdna_execution test_xdna_failure \
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu test_qwen38_cuda_chain \
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
-	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3
+	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 \
+	test_ggml_quants test_gguf_c test_gq_dot
 TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
@@ -720,7 +721,7 @@ endif
 # vk_tier.o: the routed-expert tier the MoE engines share (vk_tier.h); an engine
 # that does not call it links nothing from it.
 VK_OBJ    = backend_vulkan.o vk_tier.o
-VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
+VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv shaders/attention_absorb.spv shaders/rmsnorm.spv \
             shaders/qmatmul_gemm.spv shaders/qmatmul_coop.spv shaders/expert_act.spv \
             shaders/expert_act_v4.spv shaders/qmatmul_grp.spv shaders/qmatmul_grp_gate_up.spv shaders/expert_sum.spv shaders/qmatmul_grp_gemv.spv shaders/qmatmul_grp_gemv_gate_up.spv
 # vk_chain.o: a layer's dense chain recorded into one submission (vk_chain.h), and
@@ -915,6 +916,8 @@ shaders/qmatmul_grp_gemv_gate_up.spv: shaders/qmatmul_grp_gemv.comp
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 vk_chain.o: vk_chain.c .build-config
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@
+# the block formats' decoders (fmt >= 100), included by the two GEMV shaders
+shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv: shaders/blockdec.glsl shaders/blockdec_table.h
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
@@ -2066,6 +2069,24 @@ tests/test_grammar_cache$(EXE): tests/test_grammar_cache.c colibri.c $(VK_OBJ)
 # agreement check against the plain logprob_target the sampling path uses
 # on rows a float subtraction cannot mis-round, and a double-precision
 # check against a second double computation on rows that do.
+# GGUF read natively (ggml_quants.h decoders, gguf.h reader). Both are driven
+# by their Python tests (stdin/argv), not run standalone: test_ggml_quants.py
+# checks every ggml type bit for bit against gguf-py, test_gguf_c.py the reader
+# against gguf-py's and against malformed files.
+tests/test_ggml_quants$(EXE): tests/test_ggml_quants.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_gguf_c$(EXE): tests/test_gguf_c.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_gq_dot$(EXE): tests/test_gq_dot.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# The row-interleaved forms (GQ_*_R16) against their scalar reference, every type; a
+# no-op on a build without AVX2. `tests/test_gq_r16 bench S` times them.
+tests/test_gq_r16$(EXE): tests/test_gq_r16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# The trunk's int8 rows interleaved by 16 (idot.h) against matmul_q_idot, to the bit.
+tests/test_idot_r16$(EXE): tests/test_idot_r16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_logprob_status$(EXE): tests/test_logprob_status.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
@@ -2255,6 +2276,23 @@ tests/test_sparse_attn$(EXE): tests/test_sparse_attn.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_expert_ffn$(EXE): tests/test_expert_ffn.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# int4-g64 rows interleaved by 16 (expert_ffn.h xf16_*) against their reference.
+tests/test_xf16$(EXE): tests/test_xf16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_int2_g32$(EXE): tests/test_int2_g32.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_lowbit_g16$(EXE): tests/test_lowbit_g16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# int2/int3-g16 rows interleaved by 16 (lowbit_g16.h xl16_*) against their reference.
+tests/test_xl16$(EXE): tests/test_xl16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_vq2_g32$(EXE): tests/test_vq2_g32.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# vq2 rows interleaved by 16 (vq2_g32.h vq2r16_*) against their reference.
+tests/test_vq2r16$(EXE): tests/test_vq2r16.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_vq1_g64$(EXE): tests/test_vq1_g64.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 # The Vulkan weight pool's offset allocator (vk_alloc.h): bookkeeping only, no
@@ -2981,7 +3019,7 @@ test-c: $(TEST_BINS)
 # itself (the test ALSO skips loudly if the library is somehow still absent,
 # e.g. when invoked via unittest directly — but a green `make test` must mean
 # the pin was actually checked).
-test-python: $(RANSLIB)
+test-python: $(RANSLIB) tests/test_ggml_quants$(EXE) tests/test_gguf_c$(EXE) tests/test_gq_dot$(EXE)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
 test: test-c test-python

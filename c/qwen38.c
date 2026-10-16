@@ -1325,25 +1325,46 @@ static void serve_data_lp(const char *id, const char *p, int n, const char *tail
     fputc('\n',stdout); fflush(stdout);
 }
 
-/* temperature + top-p sampler (ported from kimi_k3.c; vocab ~250k -> qsort O(V log V) per token) */
+/* temperature + top-p sampler. The nucleus is the head of the probabilities in
+ * descending order (ties by id), and the tokens at or above a threshold are such a
+ * head: when their mass covers top_p only they are sorted, else the threshold goes
+ * down. A full qsort of the ~250k vocabulary per token took ~22 ms on one thread, 2-3
+ * tokens a forward with MTP: most of a chat's time beyond the forward at temperature
+ * > 0. The same probabilities, the same head in the same order, the same draw. With
+ * top_p >= 1 there is no nucleus: the draw walks the vocabulary in id order (the same
+ * distribution, without the sort). */
 typedef struct { float p; int id; } SampleProb;
 static int sample_prob_desc(const void *a, const void *b){
-    float pa=((const SampleProb*)a)->p, pb=((const SampleProb*)b)->p;
-    return (pb>pa)-(pa>pb);
+    const SampleProb *x=(const SampleProb*)a,*y=(const SampleProb*)b;
+    if(x->p!=y->p) return x->p>y->p?-1:1;
+    return (x->id>y->id)-(x->id<y->id);
 }
 static int serve_sample(const float *lo, int V, float temp, float top_p){
     if(temp<=0.f){ int b=0; for(int i=1;i<V;i++) if(lo[i]>lo[b]) b=i; return b; }
-    SampleProb *rank=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
-    if(!rank){ fprintf(stderr,"OOM sampling\n"); exit(1); }
+    float *p=malloc((size_t)V*sizeof(float)); SampleProb *head=malloc((size_t)V*sizeof(SampleProb)); float mx=lo[0];
+    if(!p||!head){ fprintf(stderr,"OOM sampling\n"); exit(1); }
     for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
     double sum=0;
-    for(int i=0;i<V;i++){ float p=expf((lo[i]-mx)/temp); sum+=p; rank[i]=(SampleProb){p,i}; }
-    qsort(rank,(size_t)V,sizeof(SampleProb),sample_prob_desc);
-    double cut=(top_p>0.f&&top_p<1.f)?top_p*sum:sum, kept=0; int n=0;
-    while(n<V&&kept<cut) kept+=rank[n++].p;
-    double r=((double)rand()/RAND_MAX)*kept, acc=0; int pick=rank[0].id;
-    for(int i=0;i<n;i++){ acc+=rank[i].p; if(acc>=r){ pick=rank[i].id; break; } }
-    free(rank); return pick;
+    for(int i=0;i<V;i++){ p[i]=expf((lo[i]-mx)/temp); sum+=p[i]; }
+    int pick=0;
+    if(!(top_p>0.f&&top_p<1.f)){
+        double r=((double)rand()/RAND_MAX)*sum, acc=0; pick=V-1;
+        for(int i=0;i<V;i++){ acc+=p[i]; if(acc>=r){ pick=i; break; } }
+    } else {
+        const double cut=top_p*sum; const float ths[3]={1e-4f,1e-9f,0.f};
+        double kept=0; int n=0;
+        for(int a=0;a<3;a++){
+            int m=0;
+            for(int i=0;i<V;i++) if(p[i]>=ths[a]) head[m++]=(SampleProb){p[i],i};
+            qsort(head,(size_t)m,sizeof(SampleProb),sample_prob_desc);
+            kept=0; n=0;
+            while(n<m&&kept<cut) kept+=head[n++].p;
+            if(kept>=cut||m==V) break;           /* else the nucleus reaches below the threshold */
+        }
+        double r=((double)rand()/RAND_MAX)*kept, acc=0; pick=head[0].id;
+        for(int i=0;i<n;i++){ acc+=head[i].p; if(acc>=r){ pick=head[i].id; break; } }
+    }
+    free(p); free(head); return pick;
 }
 
 /* Chat turns end on <|im_end|>, base completions on <|endoftext|>. Resolve
@@ -2291,6 +2312,38 @@ int main(int argc, char **argv) {
     coli_omp_tune_threads("qwen38");
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
+    {   /* a model directory made by tools/gguf_import.py: gguf.json names llama.cpp's
+         * qwen4exp GGUF, read in place (qwen38_core.h, "GGUF mode") */
+        char gj[4096]; snprintf(gj, sizeof gj, "%s/gguf.json", snap);
+        FILE *f = fopen(gj, "rb");
+        if (f) {
+            char buf[8192], gp[4096]; size_t n = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[n] = 0;
+            char *arena = NULL; jval *r = json_parse(buf, &arena);
+            const char *g = r ? jstr(r, "gguf") : NULL;
+            if (!g || !*g) { fprintf(stderr, "%s: no \"gguf\" path\n", gj); return 1; }
+            if (g[0] == '/') snprintf(gp, sizeof gp, "%s", g); else snprintf(gp, sizeof gp, "%s/%s", snap, g);
+            const char *mt = jstr(r, "mtp");   /* the MTP head's own GGUF (unsloth's mtp-*.gguf), optional */
+            char mp[4096] = "";
+            if (mt && *mt) { if (mt[0] == '/') snprintf(mp, sizeof mp, "%s", mt); else snprintf(mp, sizeof mp, "%s/%s", snap, mt); }
+            free(arena);
+            if (gguf_open(&g_q38gg, gp)) { fprintf(stderr, "GGUF: %s\n", g_q38gg.err); return 1; }
+            if (mp[0]) {
+                if (gguf_open(&g_q38gg_mtp, mp)) { fprintf(stderr, "GGUF (MTP head): %s\n", g_q38gg_mtp.err); return 1; }
+                const char *ma = gguf_get_str(&g_q38gg_mtp, "general.architecture");
+                const gguf_kv *nx = gguf_get(&g_q38gg_mtp, "qwen4exp.nextn_predict_layers");
+                if (!ma || strcmp(ma, "qwen4exp") || !nx) {
+                    fprintf(stderr, "GGUF %s: not a qwen4exp MTP head (architecture %s, nextn_predict_layers %s)\n",
+                            mp, ma ? ma : "(none)", nx ? "present" : "missing"); return 1;
+                }
+                fprintf(stderr, "[gguf] MTP head %s: %d tensors\n", mp, g_q38gg_mtp.n_tensors);
+            }
+            const char *arch = gguf_get_str(&g_q38gg, "general.architecture");
+            if (!arch || strcmp(arch, "qwen4exp")) { fprintf(stderr, "GGUF %s: architecture %s, not qwen4exp\n", gp, arch ? arch : "(none)"); return 1; }
+            g_q38_gguf = 1; g_q38_a_direct = 1; g_q38_dn_tiled = 1;
+            fprintf(stderr, "[gguf] %s: %d file(s), %d tensors, read in place (native ggml types, no conversion)\n",
+                    gp, g_q38gg.n_files, g_q38gg.n_tensors);
+        }
+    }
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
     const char *mv = getenv("MODEL");
     if (mv && *mv) snprintf(g_model, sizeof g_model, "%s", mv);
@@ -2409,6 +2462,23 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[qwen38] KV_SLOTS=%d: the MTP head stays unloaded and nothing drafts "
                         "(speculation follows one conversation)\n", g_q38_mux_slots);
     else q38_mtp_attach(&m, cap);       /* Q38_MTP=1: the checkpoint's MTP head drafts (qwen38_core.h) */
+    q38_act_init(&m);                   /* Q38_ACT_STATS: the experts' input statistics, for a calibrated quantizer */
+    q38_cov_init(&m);                   /* Q38_ACT_COV: their input second moments, for the error-compensating one */
+    q38_dump_init(&m);                  /* Q38_ACT_DUMP: their inputs and routes, row by row */
+    if (g_q38_gguf) {   /* a tensor the files have and nothing loaded: a weight the engine would ignore */
+        int unused = 0, head = 0; char hp[32]; snprintf(hp, sizeof hp, "blk.%d.", m.c.layers);
+        const gguf_ctx *files[2] = { &g_q38gg, &g_q38gg_mtp };
+        for (int f = 0; f < 2; f++)
+            for (int i = 0; i < files[f]->n_tensors; i++) {
+                const gguf_tensor *t = &files[f]->t[i];
+                if (t->used || strstr(t->name, "_exps.weight")) continue;   /* the experts load on demand */
+                if (f == 1 && (!strcmp(t->name, "token_embd.weight") || !strcmp(t->name, "output.weight"))) continue;   /* the model's own are used */
+                if (g_q38_gg_mtp_layer < 0 && !strncmp(t->name, hp, strlen(hp))) { head++; continue; }   /* the head, not attached */
+                fprintf(stderr, "[gguf] not used by the engine: %s\n", t->name); unused++;
+            }
+        if (head) fprintf(stderr, "[gguf] the MTP head's %d tensors (%s*) stay unread: it is not attached\n", head, hp);
+        if (unused && getenv("GGUF_STRICT") && getenv("GGUF_STRICT")[0] == '1') return 3;
+    }
     q38_tier_start(&m, cap);   /* COLI_CUDA=1: hot experts stream to VRAM (qwen36_tier.c) */
     if (g_q38_mux_slots>1 && m.dn_dev) {
         m.dn_dev=0;
@@ -2416,6 +2486,7 @@ int main(int argc, char **argv) {
                 g_q38_mux_slots);
     }
     q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */
+    q38_draft_head_build(&m);  /* Q38_DRAFT_HEAD=int4: the MTP drafts' lm_head in int4 */
 #ifdef COLI_CUDA
     /* COLI_CUDA_CHAIN=1: every layer on the device as one chain (qwen38_cuda_chain.h), set up
      * now that the tier placed the trunk and the CPU holds its int8 rows (the chain's own
@@ -2434,6 +2505,10 @@ int main(int argc, char **argv) {
      * on an integrated GPU (docs/vulkan.md, "The dense chain") */
     if(g_vk_ready&&!qt_ready())
         g_vk_chain=coli_vk_chain_decide("qwen38",vkt_wanted()&&m.c.experts>0,COLI_VK_CHAIN_OFF);
+    if(g_vk_chain&&g_q38_gguf){   /* the chain uploads the dense matrices in its own formats; a GGUF's are ggml blocks */
+        g_vk_chain=0;
+        fprintf(stderr,"[VK] qwen38: the dense chain is off for a GGUF (its dense matrices are ggml blocks, kept on the CPU); the expert tier runs\n");
+    }
     if(g_vk_chain&&g_q38_mux_slots>1){
         g_vk_chain=0;
         fprintf(stderr,"[VK] qwen38: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
@@ -2456,6 +2531,13 @@ int main(int argc, char **argv) {
     if(g_vk_ready&&!vkt_ready()&&!g_vk_dense)g_vk_dense=coli_vk_dense_decide("qwen38",0,1);   /* no tier after all */
     if(g_vk_chain)atexit(vkc_shutdown_all);   /* registered after the tier's: runs before the device goes */
 #endif
+    {   /* the trunk's int8 rows interleaved for the CPU, when no device reads them as rows */
+        int dev=qt_ready();
+#ifdef COLI_VULKAN
+        dev=dev||g_vk_ready;
+#endif
+        if(!dev)q38_trunk_q8_interleave(&m);
+    }
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
 
     /* coli serve mode: speak the gateway wire protocol instead of argv
@@ -2762,6 +2844,19 @@ static int q38_segment_expert_layout(Model *m,uint32_t begin,uint32_t end,
 static void q38_expert_report(Model *m, int cap) {
     Cfg *c = &m->c;
     int layers = m->range_end - m->range_begin;
+    if (g_q38_gguf) {
+        char nm[3][64]; const char *kn[3] = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"};
+        uint64_t bytes = 0; const gguf_tensor *t[3];
+        for (int k = 0; k < 3; k++) {
+            snprintf(nm[k], sizeof nm[k], "blk.%d.%s.weight", m->range_begin, kn[k]);
+            t[k] = gguf_find(&g_q38gg, nm[k]);
+            if (t[k]) bytes += (uint64_t)(t[k]->nbytes / c->experts);
+        }
+        fprintf(stderr, "[qwen38] routed experts: GGUF %s/%s/%s (layer %d), %.2f MiB per expert; cache %d/layer\n",
+                t[0] ? gq_type_name(t[0]->type) : "?", t[1] ? gq_type_name(t[1]->type) : "?",
+                t[2] ? gq_type_name(t[2]->type) : "?", m->range_begin, bytes / 1048576.0, cap);
+        return;
+    }
     uint64_t per_capacity = 0, fixed = 0, snapshot_expert = 0;
     unsigned kinds = 0;
     if (layers < 1) return;
@@ -2778,7 +2873,7 @@ static void q38_expert_report(Model *m, int cap) {
         per_expert = (uint64_t)m->x4->record_bytes;
         snprintf(extra, sizeof extra, " (the snapshot's %s: %llu bytes)", what,
                  (unsigned long long)snapshot_expert);
-        what = "int4-g64 from " Q38_INT4_DIR "/";   /* and no FP8 scale bank is built */
+        what = m->x4->lb ? m->x4->lb->dir : "int4-g64 from " Q38_INT4_DIR "/";   /* and no FP8 scale bank is built */
     } else if (fixed) {
         snprintf(extra, sizeof extra, " + %.1f MiB resident scale bank", fixed / 1048576.0);
     }
@@ -2875,13 +2970,47 @@ static int q38_vk_load(void *ctx,int layer,int e,VktExpertSrc *src,void **h){
     if(!s)return 0;
     *src=q38_vk_src(s);*h=s;return 1;
 }
-static void q38_vk_release(void *ctx,void *h){(void)ctx;(void)h;}
+static void q38_vk_release(void *ctx,void *h){(void)ctx;q38_vk_src_done((Slot*)h);}   /* GGUF: the int8-g32 copy the tier read */
 static int q38_vk_load_batch(void *ctx,int layer,const int *e,int n,VktExpertSrc *srcs,void **h){
     Model *m=(Model*)ctx;Slot *sl[64];
     if(n>m->cache[layer].cap)n=m->cache[layer].cap;
     if(n<2||n>64||!q38_expert_get_batch(m,layer,e,n,sl))return 0;
     for(int i=0;i<n;i++){srcs[i]=q38_vk_src(sl[i]);h[i]=sl[i];}
     return n;
+}
+/* The GGUF experts of layers [begin,end) as the device takes them: their ggml blocks, gate
+ * and up of one type in a layer, whole blocks in both widths. The types may change from
+ * layer to layer (published files give a few layers bigger ones): *gu, *dn the commonest
+ * layer's, lgu/ldn [end-begin] every layer's, *mixed whether they differ (lgu NULL: they
+ * may not). *ram_expert: the biggest expert's bytes in RAM. 0 when they do not go raw. */
+static int q38_vk_gguf_fmts(Model *m,int begin,int end,VktFmt *gu,VktFmt *dn,size_t *ram_expert,
+                            VktFmt *lgu,VktFmt *ldn,int *mixed){
+    Cfg *c=&m->c;int n=end-begin,mx=0,best=0,bestn=0;
+    const char *e=getenv("COLI_VK_GGUF_RAW");
+    if(e&&e[0]=='0')return 0;
+    if(begin>=c->layers&&g_q38_gg_mtp_layer<0)return 0;
+    int *ty=(int*)malloc((size_t)n*2*sizeof(int));
+    if(!ty)return 0;
+    *ram_expert=0;
+    for(int l=begin;l<end;l++){
+        const gguf_tensor *t[3];q38_gg_expert_tensors(m,l,t);
+        int bg=coli_vk_block_elems(100+t[0]->type),bd=coli_vk_block_elems(100+t[2]->type);
+        if(t[0]->type!=t[1]->type||!bg||!bd||c->hidden%bg||c->inter%bd){free(ty);return 0;}
+        size_t b=0;for(int k=0;k<3;k++)b+=(size_t)(t[k]->nbytes/c->experts);
+        if(b>*ram_expert)*ram_expert=b;
+        ty[2*(l-begin)]=t[0]->type;ty[2*(l-begin)+1]=t[2]->type;
+        if(ty[2*(l-begin)]!=ty[0]||ty[2*(l-begin)+1]!=ty[1])mx=1;
+    }
+    if(mx&&!lgu){free(ty);return 0;}
+    for(int a=0;a<n;a++){
+        int k=0;for(int b=0;b<n;b++)k+=ty[2*b]==ty[2*a]&&ty[2*b+1]==ty[2*a+1];
+        if(k>bestn){bestn=k;best=a;}
+        if(lgu){lgu[a]=(VktFmt){(VktSrc)(VKT_SRC_GGML+ty[2*a]),0};ldn[a]=(VktFmt){(VktSrc)(VKT_SRC_GGML+ty[2*a+1]),0};}
+    }
+    gu->kind=(VktSrc)(VKT_SRC_GGML+ty[2*best]);gu->gs=0;dn->kind=(VktSrc)(VKT_SRC_GGML+ty[2*best+1]);dn->gs=0;
+    if(mixed)*mixed=mx;
+    free(ty);
+    return 1;
 }
 /* The tier's source form of layers [begin,end)'s routed experts as the snapshot
  * keeps them (not the int4 sidecar's), and one expert's bytes in RAM; VKT_SRC_NONE
@@ -2890,6 +3019,12 @@ static VktFmt q38_vk_native_fmt(Model *m,int begin,int end,size_t *ram_expert){
     Cfg *c=&m->c;int H=c->hidden,F=c->inter;
     uint64_t per_capacity=0,fixed=0;unsigned kinds=0;
     VktFmt f={VKT_SRC_NONE,0};
+    if(g_q38_gguf){   /* the ggml blocks go to the device as int8 per 32 (q38_vk_src); in RAM, what the file holds */
+        if(begin>=c->layers&&g_q38_gg_mtp_layer<0)return f;
+        const gguf_tensor *t[3]; q38_gg_expert_tensors(m,begin,t);
+        *ram_expert=0; for(int k=0;k<3;k++)*ram_expert+=(size_t)(t[k]->nbytes/c->experts);
+        f.kind=VKT_SRC_I8_GS; f.gs=32; (void)H; (void)F; return f;
+    }
     if(q38_segment_expert_layout(m,(uint32_t)begin,(uint32_t)end,&per_capacity,&fixed,&kinds))return f;
     if(kinds==Q38_EXPERT_FP8_BLOCK&&m->native_fp8){
         for(int l=begin;l<end;l++)
@@ -2907,12 +3042,41 @@ static void q38_vk_tier_start(Model *m,int cap){
             fprintf(stderr,"[VK] tier qwen38: the CUDA expert tier is on and wins; the Vulkan tier stays off\n");
         return;
     }
-    Cfg *c=&m->c;int H=c->hidden,F=c->inter;
-    VktFmt f={VKT_SRC_NONE,0};size_t ram_expert=0;
-    if(m->x4){ f.kind=VKT_SRC_I4U_PLANAR64; f.gs=64; ram_expert=(size_t)m->x4->record_bytes; }
+    Cfg *c=&m->c;int H=c->hidden,F=c->inter,mixed=0;
+    VktFmt f={VKT_SRC_NONE,0},fd;size_t ram_expert=0;
+    /* a GGUF's types by layer, for the tier when they differ */
+    VktFmt *lgu=g_q38_gguf?(VktFmt*)malloc((size_t)c->layers*sizeof(VktFmt)):NULL,
+           *ldn=g_q38_gguf?(VktFmt*)malloc((size_t)c->layers*sizeof(VktFmt)):NULL;
+    if(m->x4&&m->x4->lb&&m->x4->lb->vq==2){
+        fprintf(stderr,"[VK] tier qwen38: the vq1 experts have no device form yet; they stay on the CPU\n");
+        free(lgu);free(ldn);return;
+    }
+    if(m->x4&&m->x4->lb&&m->x4->lb->vq&&coli_vk_set_vq2_books(&m->x4->vqb->a[0][0],&m->x4->vqb->b[0][0])){
+        fprintf(stderr,"[VK] tier qwen38: the device's block table already holds other vq2 codebooks; the experts stay on the CPU\n");
+        free(lgu);free(ldn);return;
+    }
+    if(m->x4&&m->x4->lb){
+        /* colibri's low-bit experts: the same codes and scales on the device (blockdec.glsl;
+         * vq2's codebooks in its table buffer, set above) */
+        f.kind=m->x4->lb->vq?VKT_SRC_LB_VQ2:!strcmp(m->x4->lb->name,"int2g32")?VKT_SRC_LB_I2G32:
+               !strcmp(m->x4->lb->name,"int2g16")?VKT_SRC_LB_I2G16:VKT_SRC_LB_I3G16;
+        f.gs=0;ram_expert=(size_t)m->x4->record_bytes;
+    }
+    else if(m->x4){ f.kind=VKT_SRC_I4U_PLANAR64; f.gs=64; ram_expert=(size_t)m->x4->record_bytes; }
+    else if(g_q38_gguf&&lgu&&ldn&&q38_vk_gguf_fmts(m,0,c->layers,&f,&fd,&ram_expert,lgu,ldn,&mixed)){
+        g_q38_vk_raw=1;
+        int same=0;for(int l=0;l<c->layers;l++)same+=lgu[l].kind==f.kind&&ldn[l].kind==fd.kind;
+        fprintf(stderr,"[VK] tier qwen38: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down",
+                gq_type_name((int)(f.kind-VKT_SRC_GGML)),gq_type_name((int)(fd.kind-VKT_SRC_GGML)));
+        if(mixed)fprintf(stderr," on %d of %d layers, the others their own types",same,c->layers);
+        fprintf(stderr,"; COLI_VK_GGUF_RAW=0: int8 per 32)\n");
+    }
     else f=q38_vk_native_fmt(m,0,c->layers,&ram_expert);
+    if(!g_q38_vk_raw)fd=f;
+    if(!mixed){free(lgu);free(ldn);lgu=ldn=NULL;}
     if(f.kind==VKT_SRC_NONE){
         fprintf(stderr,"[VK] tier qwen38: the routed experts mix formats; they stay on the CPU\n");
+        free(lgu);free(ldn);
         return;
     }
     /* the MTP head's layer (index c->layers): by default on a discrete GPU only. On a
@@ -2921,22 +3085,27 @@ static void q38_vk_tier_start(Model *m,int cap){
     VktFmt fm={VKT_SRC_NONE,0};size_t ram_mtp=0;
     const char *tm=getenv("COLI_VK_TIER_MTP");
     int want_mtp=tm&&*tm?*tm!='0':!coli_vk_device_shares_ram();
+    VktFmt fmd={VKT_SRC_NONE,0};
     if(m->mtp&&want_mtp){
-        fm=q38_vk_native_fmt(m,c->layers,c->layers+1,&ram_mtp);
+        if(g_q38_vk_raw){ if(!q38_vk_gguf_fmts(m,c->layers,c->layers+1,&fm,&fmd,&ram_mtp,NULL,NULL,NULL))fm.kind=VKT_SRC_NONE; }
+        else { fm=q38_vk_native_fmt(m,c->layers,c->layers+1,&ram_mtp); fmd=fm; }
         if(fm.kind==VKT_SRC_NONE)fprintf(stderr,"[VK] tier qwen38: the MTP head's experts mix formats; they stay on the CPU\n");
     }
     VktConfig vc={.engine="qwen38",.layers=c->layers,.experts=c->experts,.hidden=H,.inter=F,.topk=c->topk,
-                  .gate_up=f,.down=f,.act=VKT_ACT_SWIGLU,
-                  .extra_layers=fm.kind!=VKT_SRC_NONE,.extra_gate_up=fm,.extra_down=fm,
+                  .gate_up=f,.down=fd,.act=VKT_ACT_SWIGLU,
+                  .extra_layers=fm.kind!=VKT_SRC_NONE,.extra_gate_up=fm,.extra_down=fmd,
                   .max_rows=q38_moe_prefill_rows(c,q38_prefill_batch_rows())*c->topk,
                   .ram_reserve=ram_expert*(size_t)cap*(size_t)c->layers,
                   .dense_bytes=q38_vk_dense_bytes(m),
                   .in_ram=q38_vk_in_ram,.ram_ctx=m,
-                  .load=q38_vk_load,.release=q38_vk_release,.load_ctx=m,.load_batch=q38_vk_load_batch};
+                  .load=q38_vk_load,.release=q38_vk_release,.load_ctx=m,.load_batch=q38_vk_load_batch,
+                  .layer_gate_up=lgu,.layer_down=ldn};
     if(vc.max_rows<64)vc.max_rows=64;
     uint32_t **heat=rt_counts_all();
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
-    if(!vkt_init(&vc,heat))return;
+    int tier_on=vkt_init(&vc,heat);
+    free(lgu);free(ldn);   /* read during vkt_init only */
+    if(!tier_on)return;
     atexit(vkt_shutdown);
     /* the warm start: the history's hottest experts, read in parallel */
     int all=c->layers*c->experts,*pl=(int*)malloc((size_t)all*sizeof(int)),*pe=(int*)malloc((size_t)all*sizeof(int));
@@ -2946,7 +3115,7 @@ static void q38_vk_tier_start(Model *m,int cap){
     if(n>0){
         double t0=now_s();
         int64_t bufb=m->x4?m->x4->record_bytes:(int64_t)3*H*F;
-        int direct=m->x4||f.kind==VKT_SRC_FP8_BLOCK;
+        int direct=(m->x4&&!m->x4->lb)||f.kind==VKT_SRC_FP8_BLOCK;   /* the int4 record or FP8 ranges read straight */
         if(direct){
             #pragma omp parallel
             {
@@ -2964,7 +3133,7 @@ static void q38_vk_tier_start(Model *m,int cap){
             for(int i=0;i<n;i++){
                 Slot tmp; memset(&tmp,0,sizeof tmp);
                 q38_load_expert(m,pl[i],pe[i],&tmp);
-                VktExpertSrc src=q38_vk_src(&tmp); vkt_put(pl[i],pe[i],&src);
+                VktExpertSrc src=q38_vk_src(&tmp); vkt_put(pl[i],pe[i],&src); q38_vk_src_done(&tmp);
                 q38_weight_free(&tmp.gate);q38_weight_free(&tmp.up);q38_weight_free(&tmp.down);
                 free(tmp.fp8_slab);free(tmp.int4_slab);
             }
