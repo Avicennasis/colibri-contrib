@@ -6386,6 +6386,26 @@ class LogprobsHTTPTest(unittest.TestCase):
         self.assertNotIn(openai_server.ARCH, error["message"])
         self.assertNotIn("glm", error["message"])
 
+    def test_the_seventh_numeric_field_goes_only_to_the_families_that_read_it(self):
+        # The extension keys must land where the engine's own SUBMIT parser expects them:
+        # coli_submit_parse reads seven numeric fields, while a sibling engine's parser
+        # reads six and takes its keys straight after top_p. Sending the field to that one
+        # puts a bare `0` where its parser wants `key=value`, and the engine answers
+        # "bad submit extension" before it ever sees the prompt.
+        original = openai_server.ARCH
+        try:
+            openai_server.ARCH = "glm"
+            self.assertIs(openai_server._engine_extension_args(5)["gbytes_before_ext"], True)
+            openai_server.ARCH = "mimo"
+            self.assertIs(openai_server._engine_extension_args(5)["gbytes_before_ext"], True)
+            openai_server.ARCH = "qwen36"
+            self.assertEqual(openai_server._engine_extension_args(5), {"logprobs": 5})
+            # Nothing requested is nothing sent, whatever the family: a request without the
+            # channel keeps the header it had before the field existed.
+            self.assertEqual(openai_server._engine_extension_args(0), {})
+        finally:
+            openai_server.ARCH = original
+
     def test_break_it_logprobs_rejected_for_non_glm_engine(self):
         # A named 400, never a silent no-op, on an engine these endpoints do not request
         # the channel from.
