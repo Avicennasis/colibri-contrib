@@ -543,7 +543,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu \
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract \
-	test_ggml_quants test_gguf_c test_gq_dot test_gq_r16 test_idot_r16 test_xl16
+	test_ggml_quants test_gguf_c test_gq_dot test_gq_r16 test_idot_r16 test_xl16 test_vq2r16
 TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
@@ -2209,6 +2209,9 @@ tests/test_lowbit_g16$(EXE): tests/test_lowbit_g16.c lowbit_g16.h int2_g32.h
 tests/test_xl16$(EXE): tests/test_xl16.c lowbit_g16.h int2_g32.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_vq2_g32$(EXE): tests/test_vq2_g32.c vq2_g32.h int2_g32.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# vq2 rows interleaved by 16 (vq2_g32.h vq2r16_*) against their reference.
+tests/test_vq2r16$(EXE): tests/test_vq2r16.c vq2_g32.h int2_g32.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_vq1_g64$(EXE): tests/test_vq1_g64.c vq1_g64.h int2_g32.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

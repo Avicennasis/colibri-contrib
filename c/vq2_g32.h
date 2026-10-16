@@ -123,4 +123,231 @@ static inline int vq2_matmul(float *y, const float *x, const Vq2Books *bk, const
     return 0;
 }
 
+
+/* ---- rows interleaved by 16 (vq2r16_*) -------------------------------------------
+ * As lowbit_g16.h's xl16: 16 rows share a register (lane r = row r), so the float work is
+ * one fma per 32 inputs for all of them and nothing is summed across lanes. A group of 16
+ * rows holds their 16 f32 row scales, then per 32 inputs (g) a block of
+ *   8 bytes    the 16 rows' 4-bit scales of g (row r: byte r / 2, nibble r % 2)
+ *   128 bytes  the four vectors' codes, vector v: the 16 rows' (a, b) byte pairs (32 bytes)
+ * the same bytes as the rows (2.125 bits a weight and 4 a row). The vectors are still looked
+ * up in the codebooks, 16 rows at a time; A[a] + B[b] is an int8 (|.| <= 127), taken as
+ * value + 128 by vpdpbusd (signed with the sign trick where there is no VNNI).
+ * Numerics: per 32 inputs the exact integer sum value * x times the scale (below 2^24:
+ * exact as a float), then one fma with d * dx: vq2r16_ref, not vq2_dot's eight lane sums. */
+static inline size_t vq2r16_gblock(void) { return 136; }
+static inline size_t vq2r16_group_bytes(int I) { return 64 + (size_t)(I / 32) * vq2r16_gblock(); }
+static inline int vq2r16_layout_ok(int rows, int I) { return rows % 16 == 0 && I % 64 == 0; }
+static void vq2r16_pack(uint8_t *dst, const uint8_t *codes, const uint8_t *q, const float *d, int rows, int I) {
+    const size_t cb = vq2_code_bytes(I), qb = vq2_scale_bytes(I), gb = vq2r16_group_bytes(I);
+    for (int g = 0; g < rows / 16; g++) {
+        uint8_t *grp = dst + (size_t)g * gb;
+        memcpy(grp, d + 16 * g, 64);
+        for (int gi = 0; gi < I / 32; gi++) {
+            uint8_t *o = grp + 64 + (size_t)gi * vq2r16_gblock();
+            memset(o, 0, 8);
+            for (int r = 0; r < 16; r++) {
+                const uint8_t *row = codes + (size_t)(16 * g + r) * cb;
+                o[r / 2] |= (uint8_t)(vq2_scale(q + (size_t)(16 * g + r) * qb, gi) << (4 * (r % 2)));
+                for (int v = 0; v < 4; v++) memcpy(o + 8 + 32 * v + 2 * r, row + (size_t)gi * 8 + 2 * v, 2);
+            }
+        }
+    }
+}
+static void vq2r16_unpack(uint8_t *codes, uint8_t *q, float *d, const uint8_t *src, int rows, int I) {
+    const size_t cb = vq2_code_bytes(I), qb = vq2_scale_bytes(I), gb = vq2r16_group_bytes(I);
+    memset(q, 0, qb * (size_t)rows);
+    for (int g = 0; g < rows / 16; g++) {
+        const uint8_t *grp = src + (size_t)g * gb;
+        memcpy(d + 16 * g, grp, 64);
+        for (int gi = 0; gi < I / 32; gi++) {
+            const uint8_t *o = grp + 64 + (size_t)gi * vq2r16_gblock();
+            for (int r = 0; r < 16; r++) {
+                uint8_t *row = codes + (size_t)(16 * g + r) * cb, *qr = q + (size_t)(16 * g + r) * qb;
+                qr[gi / 2] |= (uint8_t)(((o[r / 2] >> (4 * (r % 2))) & 15) << (4 * (gi % 2)));
+                for (int v = 0; v < 4; v++) memcpy(row + (size_t)gi * 8 + 2 * v, o + 8 + 32 * v + 2 * r, 2);
+            }
+        }
+    }
+}
+static inline float vq2r16_ref(const Vq2Books *bk, const uint8_t *codes, const uint8_t *q, float d,
+                               const int8_t *xq, const float *dx, int I) {
+    float acc = 0.f;
+    for (int g = 0; g < I / 32; g++) {
+        int32_t p = 0;
+        for (int j = 0; j < 32; j++) p += vq2_value(bk, codes, g * 32 + j) * xq[(size_t)g * 32 + j];
+        acc = fmaf((float)(p * vq2_scale(q, g)), d * dx[g], acc);
+    }
+    return acc;
+}
+#if defined(__AVX2__) && defined(__FMA__)
+#define VQ2R16_ON 1
+static inline int32_t vq2r16_ld32(const int8_t *p) { int32_t v; memcpy(&v, p, 4); return v; }
+static inline int64_t vq2r16_row(const int8_t (*t)[8], int i) { int64_t v; memcpy(&v, t[i], 8); return v; }
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+/* the eight sums A[a] + B[b] of rows r0 .. r0+7 of vector v (pairs at c) */
+static inline __m512i vq2r16_vec8(const Vq2Books *bk, const uint8_t *c) {
+    const __m512i a = _mm512_set_epi64(vq2r16_row(bk->a, c[14]), vq2r16_row(bk->a, c[12]), vq2r16_row(bk->a, c[10]), vq2r16_row(bk->a, c[8]),
+                                       vq2r16_row(bk->a, c[6]), vq2r16_row(bk->a, c[4]), vq2r16_row(bk->a, c[2]), vq2r16_row(bk->a, c[0]));
+    const __m512i b = _mm512_set_epi64(vq2r16_row(bk->b, c[15]), vq2r16_row(bk->b, c[13]), vq2r16_row(bk->b, c[11]), vq2r16_row(bk->b, c[9]),
+                                       vq2r16_row(bk->b, c[7]), vq2r16_row(bk->b, c[5]), vq2r16_row(bk->b, c[3]), vq2r16_row(bk->b, c[1]));
+    return _mm512_add_epi8(a, b);
+}
+/* the 16 rows' codes of every g as value + 128, eight registers a g (for many activation rows) */
+static inline void vq2r16_expand512(const Vq2Books *bk, const uint8_t *grp, int I, __m512i *buf) {
+    const __m512i ev = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30), od = _mm512_add_epi32(ev, _mm512_set1_epi32(1));
+    const __m512i flip = _mm512_set1_epi8((char)0x80);
+    for (int g = 0; g < I / 32; g++) {
+        const uint8_t *o = grp + 64 + (size_t)g * vq2r16_gblock();
+        for (int v = 0; v < 4; v++) {
+            const __m512i lo = vq2r16_vec8(bk, o + 8 + 32 * v), hi = vq2r16_vec8(bk, o + 8 + 32 * v + 16);
+            _mm512_storeu_si512(buf + 8 * g + 2 * v, _mm512_xor_si512(_mm512_permutex2var_epi32(lo, ev, hi), flip));
+            _mm512_storeu_si512(buf + 8 * g + 2 * v + 1, _mm512_xor_si512(_mm512_permutex2var_epi32(lo, od, hi), flip));
+        }
+    }
+}
+static inline __attribute__((always_inline)) void vq2r16_body512(float *y, int ystride, const Vq2Books *bk, const uint8_t *grp,
+                                                                const int8_t *xq, const float *dx, const int32_t *xs, int I, const int S,
+                                                                const __m512i *buf) {
+    const __m512i ev = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30), od = _mm512_add_epi32(ev, _mm512_set1_epi32(1));
+    const __m512i flip = _mm512_set1_epi8((char)0x80);
+    const __m512 dv = _mm512_loadu_ps((const float *)grp);
+    __m512 acc[8];
+    for (int s = 0; s < S; s++) acc[s] = _mm512_setzero_ps();
+    for (int g = 0; g < I / 32; g++) {
+        const uint8_t *o = grp + 64 + (size_t)g * vq2r16_gblock();
+        const __m128i qb = _mm_loadl_epi64((const __m128i *)o);
+        const __m128i qn = _mm_unpacklo_epi8(_mm_and_si128(qb, _mm_set1_epi8(15)), _mm_and_si128(_mm_srli_epi16(qb, 4), _mm_set1_epi8(15)));
+        const __m512 sq = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(qn));
+        __m512i c[8];
+        if (buf) for (int j = 0; j < 8; j++) c[j] = _mm512_loadu_si512(buf + 8 * g + j);
+        else for (int v = 0; v < 4; v++) {
+            const __m512i lo = vq2r16_vec8(bk, o + 8 + 32 * v), hi = vq2r16_vec8(bk, o + 8 + 32 * v + 16);
+            c[2 * v] = _mm512_xor_si512(_mm512_permutex2var_epi32(lo, ev, hi), flip);
+            c[2 * v + 1] = _mm512_xor_si512(_mm512_permutex2var_epi32(lo, od, hi), flip);
+        }
+        for (int s = 0; s < S; s++) {
+            const int8_t *xb = xq + (size_t)s * I + 32 * (size_t)g;
+            __m512i p = _mm512_dpbusd_epi32(_mm512_setzero_si512(), c[0], _mm512_set1_epi32(vq2r16_ld32(xb)));
+            for (int j = 1; j < 8; j++) p = _mm512_dpbusd_epi32(p, c[j], _mm512_set1_epi32(vq2r16_ld32(xb + 4 * j)));
+            const int32_t *x16 = xs + (size_t)s * (I / 16) + 2 * (size_t)g;
+            p = _mm512_sub_epi32(p, _mm512_set1_epi32(128 * (x16[0] + x16[1])));
+            acc[s] = _mm512_fmadd_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(p), sq), _mm512_mul_ps(dv, _mm512_set1_ps(dx[(size_t)s * (I / 32) + g])), acc[s]);
+        }
+    }
+    for (int s = 0; s < S; s++) _mm512_storeu_ps(y + (size_t)s * ystride, acc[s]);
+}
+#define VQ2R16_SMAX 8
+#else
+/* rows 8h .. 8h+7 of vector v: two registers of quads (elements 0-3, 4-7) */
+static inline void vq2r16_vec_h(const Vq2Books *bk, const uint8_t *c, __m256i *q0, __m256i *q1) {
+    const __m256i s0 = _mm256_add_epi8(_mm256_set_epi64x(vq2r16_row(bk->a, c[6]), vq2r16_row(bk->a, c[4]), vq2r16_row(bk->a, c[2]), vq2r16_row(bk->a, c[0])),
+                                       _mm256_set_epi64x(vq2r16_row(bk->b, c[7]), vq2r16_row(bk->b, c[5]), vq2r16_row(bk->b, c[3]), vq2r16_row(bk->b, c[1])));
+    const __m256i s1 = _mm256_add_epi8(_mm256_set_epi64x(vq2r16_row(bk->a, c[14]), vq2r16_row(bk->a, c[12]), vq2r16_row(bk->a, c[10]), vq2r16_row(bk->a, c[8])),
+                                       _mm256_set_epi64x(vq2r16_row(bk->b, c[15]), vq2r16_row(bk->b, c[13]), vq2r16_row(bk->b, c[11]), vq2r16_row(bk->b, c[9])));
+    const __m256i sel = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+    const __m256i p0 = _mm256_permutevar8x32_epi32(s0, sel), p1 = _mm256_permutevar8x32_epi32(s1, sel);
+    *q0 = _mm256_permute2x128_si256(p0, p1, 0x20); *q1 = _mm256_permute2x128_si256(p0, p1, 0x31);
+}
+/* half h's codes of every g as the products take them (value + 128 with VNNI, signed without) */
+static inline void vq2r16_expand256(const Vq2Books *bk, const uint8_t *grp, int I, int h, __m256i *buf) {
+    for (int g = 0; g < I / 32; g++) {
+        const uint8_t *o = grp + 64 + (size_t)g * vq2r16_gblock();
+        for (int v = 0; v < 4; v++) vq2r16_vec_h(bk, o + 8 + 32 * v + 16 * h, &buf[8 * g + 2 * v], &buf[8 * g + 2 * v + 1]);
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+        for (int j = 0; j < 8; j++) buf[8 * g + j] = _mm256_xor_si256(buf[8 * g + j], _mm256_set1_epi8((char)0x80));
+#endif
+    }
+}
+static inline __attribute__((always_inline)) void vq2r16_body256(float *y, int ystride, const Vq2Books *bk, const uint8_t *grp,
+                                                                const int8_t *xq, const float *dx, const int32_t *xs, int I, const int S, const int h,
+                                                                const __m256i *buf) {
+    const __m256 dv = _mm256_loadu_ps((const float *)grp + 8 * h);
+    __m256 acc[4];
+    for (int s = 0; s < S; s++) acc[s] = _mm256_setzero_ps();
+    for (int g = 0; g < I / 32; g++) {
+        const uint8_t *o = grp + 64 + (size_t)g * vq2r16_gblock();
+        const __m128i qb = _mm_cvtsi32_si128(vq2r16_ld32((const int8_t *)o + 4 * h));
+        const __m128i qn = _mm_unpacklo_epi8(_mm_and_si128(qb, _mm_set1_epi8(15)), _mm_and_si128(_mm_srli_epi16(qb, 4), _mm_set1_epi8(15)));
+        const __m256 sq = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(qn));
+        __m256i c[8];
+        if (buf) for (int j = 0; j < 8; j++) c[j] = buf[8 * g + j];
+        else {
+            for (int v = 0; v < 4; v++) vq2r16_vec_h(bk, o + 8 + 32 * v + 16 * h, &c[2 * v], &c[2 * v + 1]);
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+            for (int j = 0; j < 8; j++) c[j] = _mm256_xor_si256(c[j], _mm256_set1_epi8((char)0x80));
+#endif
+        }
+        for (int s = 0; s < S; s++) {
+            const int8_t *xb = xq + (size_t)s * I + 32 * (size_t)g;
+            __m256i p = _mm256_setzero_si256();
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+            for (int j = 0; j < 8; j++)
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                p = _mm256_dpbusd_epi32(p, c[j], _mm256_set1_epi32(vq2r16_ld32(xb + 4 * j)));
+#else
+                p = _mm256_dpbusd_avx_epi32(p, c[j], _mm256_set1_epi32(vq2r16_ld32(xb + 4 * j)));
+#endif
+            const int32_t *x16 = xs + (size_t)s * (I / 16) + 2 * (size_t)g;
+            p = _mm256_sub_epi32(p, _mm256_set1_epi32(128 * (x16[0] + x16[1])));
+#else   /* the signed values, |w| <= 127: a maddubs pair stays below 2^15 */
+            for (int j = 0; j < 8; j++)
+                p = _mm256_add_epi32(p, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(c[j], c[j]),
+                        _mm256_sign_epi8(_mm256_set1_epi32(vq2r16_ld32(xb + 4 * j)), c[j])), _mm256_set1_epi16(1)));
+#endif
+            acc[s] = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(p), sq), _mm256_mul_ps(dv, _mm256_set1_ps(dx[(size_t)s * (I / 32) + g])), acc[s]);
+        }
+    }
+    for (int s = 0; s < S; s++) _mm256_storeu_ps(y + (size_t)s * ystride + 8 * h, acc[s]);
+}
+#define VQ2R16_SMAX 4
+#endif
+/* group grp's 16 rows (outputs y .. y + 15) against S activation rows (the activation
+ * contract plus the sums per 16 of its bytes, gq_act's q, d, s). Past one pass of rows the
+ * codes are looked up once into a per-thread buffer (16 x I bytes) and read from there. */
+static void vq2r16_rows(float *y, int ystride, const Vq2Books *bk, const uint8_t *grp, const int8_t *xq, const float *dx,
+                        const int32_t *xs, int I, int S) {
+#if VQ2R16_SMAX == 8
+    typedef __m512i vq2r16_v;
+#else
+    typedef __m256i vq2r16_v;
+#endif
+    static __thread vq2r16_v *buf; static __thread int cap;
+    const int many = S > VQ2R16_SMAX, need = I / 32 * 8;
+    if (many && cap < need) {
+        free(buf); buf = (vq2r16_v *)aligned_alloc(64, (size_t)need * sizeof(vq2r16_v)); cap = buf ? need : 0;
+        if (!buf) { fprintf(stderr, "OOM vq2 rows\n"); exit(1); }
+    }
+#if VQ2R16_SMAX == 8
+    if (many) vq2r16_expand512(bk, grp, I, buf);
+    for (int s0 = 0; s0 < S; s0 += 8) {
+        const int n = S - s0 < 8 ? S - s0 : 8;
+        float *ys = y + (size_t)s0 * ystride; const int8_t *xb = xq + (size_t)s0 * I;
+        const float *db = dx + (size_t)s0 * (I / 32); const int32_t *sb = xs + (size_t)s0 * (I / 16);
+        const vq2r16_v *bf = many ? buf : NULL;
+        switch (n) { case 1: vq2r16_body512(ys, ystride, bk, grp, xb, db, sb, I, 1, bf); break;
+                     case 2: vq2r16_body512(ys, ystride, bk, grp, xb, db, sb, I, 2, bf); break;
+                     case 3: vq2r16_body512(ys, ystride, bk, grp, xb, db, sb, I, 3, bf); break;
+                     case 4: vq2r16_body512(ys, ystride, bk, grp, xb, db, sb, I, 4, bf); break;
+                     case 8: vq2r16_body512(ys, ystride, bk, grp, xb, db, sb, I, 8, bf); break;
+                     default: vq2r16_body512(ys, ystride, bk, grp, xb, db, sb, I, n, bf); break; }
+    }
+#else
+    for (int h = 0; h < 2; h++) {
+        if (many) vq2r16_expand256(bk, grp, I, h, buf);
+        for (int s0 = 0; s0 < S; s0 += 4) {
+            const int n = S - s0 < 4 ? S - s0 : 4;
+            float *ys = y + (size_t)s0 * ystride; const int8_t *xb = xq + (size_t)s0 * I;
+            const float *db = dx + (size_t)s0 * (I / 32); const int32_t *sb = xs + (size_t)s0 * (I / 16);
+            const vq2r16_v *bf = many ? buf : NULL;
+            switch (n) { case 1: vq2r16_body256(ys, ystride, bk, grp, xb, db, sb, I, 1, h, bf); break;
+                         case 2: vq2r16_body256(ys, ystride, bk, grp, xb, db, sb, I, 2, h, bf); break;
+                         case 3: vq2r16_body256(ys, ystride, bk, grp, xb, db, sb, I, 3, h, bf); break;
+                         default: vq2r16_body256(ys, ystride, bk, grp, xb, db, sb, I, 4, h, bf); break; }
+        }
+    }
+#endif
+}
+#endif
+
 #endif /* COLI_VQ2_G32_H */
