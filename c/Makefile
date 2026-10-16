@@ -2034,7 +2034,7 @@ tests/test_gguf_c$(EXE): tests/test_gguf_c.c gguf.h ggml_quants.h ggml_grids.h
 tests/test_gq_dot$(EXE): tests/test_gq_dot.c ggml_quants.h ggml_grids.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 # The row-interleaved forms (GQ_*_R16) against their scalar reference, every type; a
-# no-op on a build without AVX-512 VNNI/VBMI. `tests/test_gq_r16 bench S` times them.
+# no-op on a build without AVX2. `tests/test_gq_r16 bench S` times them.
 tests/test_gq_r16$(EXE): tests/test_gq_r16.c ggml_quants.h ggml_grids.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 

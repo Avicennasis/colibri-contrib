@@ -6,7 +6,7 @@
  *                            the type's scale is per 16, the exact integer dot and one fma), to
  *                            the bit; the gap to the row kernels (the same integers, other
  *                            roundings) below 1e-4 of the outputs' rms. Exit 0 on a build
- *                            without AVX-512 VNNI/VBMI, where the forms are never made.
+ *                            without AVX2, where the forms are never made.
  *   test_gq_r16 bench [S] [reps]   ms per 2560 x 2560 matrix (48 of them, past the caches),
  *                            interleaved against the row kernels, S activation rows */
 #include <stdio.h>
@@ -17,8 +17,8 @@
 #include <omp.h>
 #include "../ggml_quants.h"
 
-#ifndef GQ_VNNI512
-int main(void) { puts("test_gq_r16: no AVX-512 VNNI/VBMI in this build, nothing to check (the forms are made only there)"); return 0; }
+#ifndef GQ_R16_ON
+int main(void) { puts("test_gq_r16: no AVX2 in this build, nothing to check (the forms are made only where their kernels are)"); return 0; }
 #else
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static uint64_t rng = 88172645463325252ULL;

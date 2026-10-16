@@ -1196,11 +1196,11 @@ static void q38_gg_read_f32(const gguf_tensor *t,float *dst) {
     if(gguf_read_f32(q38_gg_ctx_of(t),t,dst)){fprintf(stderr,"GGUF %s: read failed (type %s)\n",t->name,gq_type_name(t->type));exit(1);}
 }
 /* The type a matrix of a GGUF block type is held in for the CPU: its rows interleaved by 16
- * (gq_r16_*, GQ_*_R16), the same bytes or a few percent more, on an AVX-512 VNNI build, when
+ * (gq_r16_*, GQ_*_R16), the same bytes or a few percent more, on an AVX2 or AVX-512 build, when
  * the type has that form and the matrix whole groups; else the file's rows. Q38_ILV16=0
  * keeps the file's rows, as GQ_EXACT=1 does. */
 static int q38_gg_held_type(int type,int rows,int cols) {
-#ifdef GQ_VNNI512
+#ifdef GQ_R16_ON
     static int on=-1;
     if(on<0){const char *e=getenv("Q38_ILV16");on=!(e&&!strcmp(e,"0"))&&!gq_exact_mode();}
     const int r=gq_r16_of(type);
@@ -3909,7 +3909,7 @@ static void q38_rows(float *y,int ys,const Q38Weight *w,int I,int r0,int r1,
                      const float *const *xr,const int8_t *xq,const float *dx,const gq_act *ga,int n) {
     if(w->kind==Q38_WEIGHT_GGML){   /* gq_matmul_act's rows */
         const int64_t rb=gq_row_bytes(w->gq_type,I);
-#ifdef GQ_VNNI512
+#ifdef GQ_R16_ON
         if(gq_r16_base(w->gq_type)>=0){   /* whole groups: the callers' blocks start and end on 16 */
             for(int o=r0;o<r1;o+=16)gq_r16_rows(w->gq_type,y+o,ys,(const uint8_t*)w->data+(int64_t)o*rb,ga,I);
             return;
