@@ -427,6 +427,41 @@ class InklingConfig(unittest.TestCase):
         self.assertEqual((cfg["unpadded_vocab_size"], cfg["eos_token_id"]), (200058, 200006))
 
 
+class GlmDsaConfig(unittest.TestCase):
+    """llama.cpp's glm-dsa as the colibri engine's config.json, from unsloth's GLM-5.3 header:
+    MLA's head dims from the _mla lengths, the NextN block past the model's layers, every
+    layer's indexer its own when its weights are in the file."""
+    def test_glm53_metadata(self):
+        import tools.gguf_import as gi
+        p = "glm-dsa."
+        meta = {p + k: v for k, v in {
+            "block_count": 79, "context_length": 1048576, "embedding_length": 6144, "feed_forward_length": 12288,
+            "attention.head_count": 64, "attention.head_count_kv": 1, "rope.freq_base": 8000000.0,
+            "attention.layer_norm_rms_epsilon": 1e-5, "expert_count": 256, "expert_used_count": 8,
+            "expert_group_count": 1, "expert_group_used_count": 1, "expert_gating_func": 2,
+            "attention.key_length": 576, "attention.value_length": 512, "leading_dense_block_count": 3,
+            "vocab_size": 154880, "attention.q_lora_rank": 2048, "attention.kv_lora_rank": 512,
+            "attention.key_length_mla": 256, "attention.value_length_mla": 256, "expert_feed_forward_length": 2048,
+            "expert_shared_count": 1, "expert_weights_scale": 2.5, "expert_weights_norm": True,
+            "rope.dimension_count": 64, "nextn_predict_layers": 1, "attention.indexer.head_count": 32,
+            "attention.indexer.key_length": 128, "attention.indexer.top_k": 2048}.items()}
+        meta["tokenizer.ggml.eos_token_id"] = 154820
+        tensors = {"token_embd.weight": {"dims": [6144, 154880]}, "output.weight": {"dims": [6144, 154880]},
+                   "blk.78.nextn.eh_proj.weight": {"dims": [12288, 6144]},
+                   **{f"blk.{i}.indexer.attn_q_b.weight": {"dims": [2048, 4096]} for i in range(79) if i != 7}}
+        cfg, layers = gi.glmdsa_config(meta, tensors)
+        self.assertEqual((layers, cfg["model_type"], cfg["num_nextn_predict_layers"]), (78, "glm_moe_dsa", 1))
+        self.assertEqual((cfg["qk_nope_head_dim"], cfg["qk_rope_head_dim"], cfg["v_head_dim"]), (192, 64, 256))
+        self.assertEqual((cfg["q_lora_rank"], cfg["kv_lora_rank"], cfg["first_k_dense_replace"]), (2048, 512, 3))
+        self.assertEqual((cfg["routed_scaling_factor"], cfg["rope_parameters"]["rope_theta"]), (2.5, 8000000.0))
+        self.assertEqual(len(cfg["indexer_types"]), 78)
+        self.assertEqual(cfg["indexer_types"][7], "shared")
+        self.assertEqual(cfg["indexer_types"].count("full"), 77)
+        self.assertFalse(cfg["tie_word_embeddings"])
+        del tensors["blk.78.nextn.eh_proj.weight"]   # a file without its NextN block: every block a layer
+        self.assertEqual(gi.glmdsa_config(meta, tensors)[1], 79)
+
+
 class Qwen4ExpLayers(unittest.TestCase):
     """Which layers attend, from either way a qwen4exp GGUF says it: unsloth's Qwen3.8-Flash-Next
     files give full_attention_interval (no attention.recurrent_layers), newer llama.cpp
