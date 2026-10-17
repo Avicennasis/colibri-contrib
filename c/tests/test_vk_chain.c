@@ -2819,12 +2819,14 @@ static void bench_moe(void) {
  * Qwen3.8's and Qwen3.6's dense matrices, random blocks (the time does not depend on the
  * values). COLI_VK_BENCH_FMTS="123 121" picks the formats (100 + ggml type). */
 static void bench_bd(void) {
-    int shapes[4][2] = {{2560, 10240}, {6144, 2560}, {2560, 640}, {2560, 32768}};
+    int shapes[4][2] = {{2560, 10240}, {6144, 2560}, {2560, 640}, {2560, 32768}}, nsh = 4;
+    const char *she = getenv("COLI_VK_BENCH_SHAPE");   /* "O I": one shape of your own */
+    if (she && *she) { int o = 0, i = 0; if (sscanf(she, "%d %d", &o, &i) == 2 && o > 0 && i > 0) { shapes[0][0] = i; shapes[0][1] = o; nsh = 1; } }
     int fmts[16] = {108, 112, 113, 114, 116, 120, 121, 122, 123, 142}, nf = 10;
     const char *e = getenv("COLI_VK_BENCH_FMTS");
     if (e && *e) { nf = 0; for (char *p = (char *)e; *p && nf < 16;) { long v = strtol(p, &p, 10); if (v) fmts[nf++] = (int)v; while (*p == ' ') p++; } }
-    for (int f = 0; f < nf; f++) for (int k = 0; k < 4; k++) {
-        int I = shapes[k][0], O = shapes[k][1], fmt = fmts[f], nm = k == 3 ? 4 : 24;
+    for (int f = 0; f < nf; f++) for (int k = 0; k < nsh; k++) {
+        int I = shapes[k][0], O = shapes[k][1], fmt = fmts[f], nm = (size_t)O * I > (64u << 20) ? 2 : k == 3 ? 4 : 24;
         if (!coli_vk_block_elems(fmt) || I % coli_vk_block_elems(fmt)) { printf("bench fmt %d: not a block format here\n", fmt); break; }
         size_t rb = coli_vk_tensor_row_bytes(fmt, I);
         ColiVkTensor **t = calloc(nm, sizeof *t);
