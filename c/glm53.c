@@ -685,6 +685,9 @@ enum { G53_GGML = 32 };
 /* out[S][rows] = W[row0 .. row0+rows) x[S] for a GGUF matrix, on ggml_quants.h */
 static void g53_gq(float *out, const Mat *w, const float *x, int S, int row0, int rows) {
     const int64_t rb = gq_row_bytes(w->gs, w->columns);
+    if (gq_r16_base(w->gs) >= 0 && row0 % 16) {   /* held interleaved: whole groups of 16 rows */
+        fprintf(stderr, "GGUF %s matrix read from row %d, inside a group of 16\n", gq_type_name(w->gs), row0); exit(1);
+    }
     ColiTensorView v = { COLI_TENSOR_GGML, COLI_SCALE_NONE, w->q4 + (size_t)row0 * (size_t)rb, NULL,
                          (size_t)rb * (size_t)rows, 0, rows, w->columns, 1, (uint32_t)w->gs, NULL };
     if (coli_ggml_matmul(out, &v, x, S)) {
@@ -756,6 +759,8 @@ typedef struct {
     int gx;                               /* GGUF experts (st_gguf.h): pieces 0/2/4 gate/up/down of */
     int *gx_t;                            /* each layer's ggml types, gx_t[3 * layer + k] ... */
     int64_t *gx_len;                      /* ... and bytes; no scale pieces (1/3/5 stay empty) */
+    int *gx_h;                            /* ... as the slots hold them: interleaved by 16 rows where
+                                           * coli_ggml_held_type says so (G53_ILV16=0: the file's) */
     uint64_t clock, ebytes;
     long hits, miss;
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
@@ -981,7 +986,21 @@ static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, .
         uint8_t *blocks = malloc((size_t)t->nbytes);
         if (!blocks) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
         st_pread_full(t->fd, blocks, t->nbytes, t->off, name);
-        mat.fmt = G53_GGML; mat.q4 = blocks; mat.gs = type;
+        /* its rows interleaved by 16 for the products (coli_ggml_held_type) */
+        const int held = coli_ggml_held_type(type, rows, columns, "G53_ILV16");
+        if (held != type) {
+            const int64_t hb = gq_row_bytes(held, columns);
+            uint8_t *p = malloc((size_t)(hb * rows));
+            if (!p) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int64_t g = 0; g < rows / 16; g++)
+                gq_r16_pack(held, p + g * 16 * hb, blocks + g * 16 * rb, 16, (int)columns);
+            free(blocks);
+            blocks = p;
+        }
+        mat.fmt = G53_GGML; mat.q4 = blocks; mat.gs = held;
         mat.rows = (int)rows; mat.columns = (int)columns;
         return mat;
     }
@@ -1533,6 +1552,8 @@ typedef struct {
     size_t own_len;
     int metal_registered;
     uint64_t used;
+    uint8_t *vk_rows;                     /* a GGUF expert held interleaved: the file's rows for the
+                                           * Vulkan tier while it reads them (glm53_slot_src) */
 } Slot;
 typedef struct LCache { Slot *s; int n, cap; } LCache;
 
@@ -1544,6 +1565,12 @@ typedef struct LCache { Slot *s; int n, cap; } LCache;
 static inline int64_t e_len_at(const GModel *m, int layer, int p) {
     return m->gx ? ((p & 1) ? 0 : m->gx_len[3 * layer + p / 2]) : m->e_len[p];
 }
+/* 1 when the slots hold a GGUF layer's experts interleaved: they own their bytes (no mapped
+ * view of the file), and the device tier reads the file's rows back. */
+static inline int g53_gx_ilv(const GModel *m, int layer) {
+    for (int k = 0; m->gx && k < 3; k++) if (m->gx_h[3 * layer + k] != m->gx_t[3 * layer + k]) return 1;
+    return 0;
+}
 
 static void expert_geometry(GModel *m) {
     const int64_t hidden = m->c.hidden, inter = m->c.moe_inter;
@@ -1551,8 +1578,9 @@ static void expert_geometry(GModel *m) {
         const Cfg *c = &m->c;
         static const char *k3[3] = {"gate_proj.weight", "up_proj.weight", "down_proj.weight"};
         m->gx_t = calloc((size_t)c->n_layers * 3, sizeof(int));
+        m->gx_h = calloc((size_t)c->n_layers * 3, sizeof(int));
         m->gx_len = calloc((size_t)c->n_layers * 3, sizeof(int64_t));
-        if (!m->gx_t || !m->gx_len) { fprintf(stderr, "OOM\n"); exit(1); }
+        if (!m->gx_t || !m->gx_h || !m->gx_len) { fprintf(stderr, "OOM\n"); exit(1); }
         int64_t most[3] = {0, 0, 0};
         const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
         for (int i = from; i < m->layer_end; i++)
@@ -1567,8 +1595,14 @@ static void expert_geometry(GModel *m) {
                     fprintf(stderr, "%s: not %lld rows of %lld in a ggml type\n", name, (long long)rows, (long long)cols); exit(1);
                 }
                 m->gx_t[3 * i + k] = type; m->gx_len[3 * i + k] = t->nbytes;
-                if (t->nbytes > most[k]) most[k] = t->nbytes;
+                m->gx_h[3 * i + k] = coli_ggml_held_type(type, rows, cols, "G53_ILV16");
+                const int64_t held = gq_row_bytes(m->gx_h[3 * i + k], cols) * rows;
+                if (held > most[k]) most[k] = held;
             }
+        int ilv = 0;
+        for (int i = from; i < m->layer_end; i++) ilv += g53_gx_ilv(m, i);
+        if (ilv) fprintf(stderr, "glm53: GGUF experts interleaved by 16 rows on %d of %d layers (G53_ILV16=0: the file's rows)\n",
+                         ilv, m->layer_end - from);
         const int64_t length[GLM53_EXPERT_PIECES] = { most[0], 0, most[1], 0, most[2], 0 };
         int64_t at = 0;
         for (int p = 0; p < GLM53_EXPERT_PIECES; p++) { m->e_len[p] = length[p]; m->e_at[p] = at; at += length[p]; }
@@ -1999,13 +2033,14 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
 #endif
 
     int rep = glm53_expert_read_replica(m, ref, layer, eid);
+    const int ilv = g53_gx_ilv(m, layer);   /* interleaved at the read: the slot's own bytes */
 
     /* The batched Metal MoE uses resolve() on expert pointers.
      * st_map_shard_range() may return a pointer inside an mmap rather than its
      * 16-KiB-aligned base, so those views cannot be registered safely.
      * Metal-active slots therefore own one stable aligned slab; CPU-only runs
      * retain the zero-copy mmap fast path, using the selected replica. */
-    if (!metal_slot) {
+    if (!metal_slot && !ilv) {
         int mapped_ok = 1;
         for (int p = 0; p < GLM53_EXPERT_PIECES && mapped_ok; p++) {
             if (!e_len_at(m, layer, p)) { slot->piece[p] = NULL; continue; }   /* a GGUF's empty scale piece */
@@ -2061,6 +2096,19 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
         for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
             if (!e_len_at(m, layer, p)) continue;
             int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[p], rep) : ref->fd[p];
+            const int k = p / 2;
+            if (m->gx && m->gx_h[3 * layer + k] != m->gx_t[3 * layer + k]) {   /* through a copy, interleaved */
+                static __thread uint8_t *raw; static __thread int64_t raw_n;
+                const int64_t n = e_len_at(m, layer, p);
+                if (raw_n < n) {
+                    free(raw); raw = malloc((size_t)n); raw_n = raw ? n : 0;
+                    if (!raw) { fprintf(stderr, "OOM reading a GGUF expert\n"); exit(1); }
+                }
+                st_pread_full(fd, raw, n, ref->off[p], "expert piece");
+                const int rows = k == 2 ? m->c.hidden : m->c.moe_inter, cols = k == 2 ? m->c.moe_inter : m->c.hidden;
+                gq_r16_pack(m->gx_h[3 * layer + k], slot->own + m->e_at[p], raw, rows, cols);
+                continue;
+            }
 
             st_pread_full(fd,
                           slot->own + m->e_at[p],
@@ -2113,8 +2161,8 @@ static Slot *expert_slot(GModel *m, int layer, int eid) {
 /* Le tre matrici di un esperto, che puntano dentro al suo slot. */
 static void expert_mats(const GModel *m, int layer, const Slot *slot, Mat *gate, Mat *up, Mat *down) {
     const int hidden = m->c.hidden, inter = m->c.moe_inter;
-    if (m->gx) {   /* a GGUF expert: three ggml matrices of the layer's types */
-        const int *t = m->gx_t + 3 * layer;
+    if (m->gx) {   /* a GGUF expert: three ggml matrices of the layer's types, as held */
+        const int *t = m->gx_h + 3 * layer;
         memset(gate, 0, sizeof *gate); memset(up, 0, sizeof *up); memset(down, 0, sizeof *down);
         gate->fmt = up->fmt = down->fmt = G53_GGML;
         gate->q4 = slot->piece[0]; gate->gs = t[0]; gate->rows = inter; gate->columns = hidden;
@@ -2200,10 +2248,29 @@ static void expert_block_read(GModel *m, int index, const int *ids, int here,
  * swiglu_clamped does only for swiglu_limit > 0 (the CPU clamps at 0 too, the shader
  * does not), so the tier runs only then. Without COLI_VULKAN nothing here runs. */
 #define GLM53_VK_ROWS 64
-static VktExpertSrc glm53_slot_src(const Slot *slot) {
+/* An expert's bytes as the tier reads them: a GGUF's blocks as the file has them (no scale
+ * pieces), the ones a slot holds interleaved back to rows in slot->vk_rows, kept until
+ * glm53_drop_rows (the tier's release, or right after a note). */
+static VktExpertSrc glm53_slot_src(const GModel *m, int layer, Slot *slot) {
+    if (m->gx) {
+        if (!g53_gx_ilv(m, layer)) return (VktExpertSrc){slot->piece[0], slot->piece[2], slot->piece[4], NULL, NULL, NULL};
+        const int64_t D = m->c.hidden, I = m->c.moe_inter;
+        const int64_t b[3] = { m->gx_len[3 * layer], m->gx_len[3 * layer + 1], m->gx_len[3 * layer + 2] };
+        if (!slot->vk_rows && !(slot->vk_rows = malloc((size_t)(b[0] + b[1] + b[2])))) {
+            fprintf(stderr, "OOM GGUF expert for the Vulkan tier\n"); exit(1);
+        }
+        uint8_t *dst[3] = { slot->vk_rows, slot->vk_rows + b[0], slot->vk_rows + b[0] + b[1] };
+        for (int k = 0; k < 3; k++) {
+            const int h = m->gx_h[3 * layer + k];
+            if (h != m->gx_t[3 * layer + k]) gq_r16_unpack(h, dst[k], slot->piece[2 * k], (int)(k == 2 ? D : I), (int)(k == 2 ? I : D));
+            else memcpy(dst[k], slot->piece[2 * k], (size_t)b[k]);
+        }
+        return (VktExpertSrc){dst[0], dst[1], dst[2], NULL, NULL, NULL};
+    }
     return (VktExpertSrc){slot->piece[0], slot->piece[2], slot->piece[4],
                           slot->piece[1], slot->piece[3], slot->piece[5]};
 }
+static void glm53_drop_rows(Slot *slot) { free(slot->vk_rows); slot->vk_rows = NULL; }
 /* The tier's streaming (a big prompt chunk's cold experts on the device): a group of
  * experts read as ffn_vk_cpu reads them (expert_block_read: the layer cache, the misses
  * in parallel), up to the cache's capacity, each valid until the next read. */
@@ -2217,14 +2284,14 @@ static int glm53_vk_load_batch(void *ctx, int index, const int *e, int n, VktExp
     for (int u = 0; u < n; u++) {
         Slot *slot = &cache->s[slot_of[u]];
         slot->used = ++m->clock;
-        srcs[u] = glm53_slot_src(slot); h[u] = slot;
+        srcs[u] = glm53_slot_src(m, index, slot); h[u] = slot;
     }
     return n;
 }
 static int glm53_vk_load(void *ctx, int index, int e, VktExpertSrc *src, void **h) {
     return glm53_vk_load_batch(ctx, index, &e, 1, src, h) == 1;
 }
-static void glm53_vk_unhold(void *ctx, void *h) { (void)ctx; (void)h; }
+static void glm53_vk_unhold(void *ctx, void *h) { (void)ctx; glm53_drop_rows((Slot *)h); }
 /* Pairs i of one block that want[i] marks, on the CPU: their experts in first-seen
  * order, in blocks of the layer's cache slots as ffn_layer reads them, each computed
  * once for all its rows into ctb[i]. note: offer each to the tier. */
@@ -2261,7 +2328,11 @@ static void ffn_vk_cpu(GModel *m, int index, const float *x, int rows, int K, co
             mlp3_rows(tmp, xg, R, &gate, &up, &down, c->swiglu_limit, sg, su);
             for (int r = 0; r < R; r++)
                 memcpy(ctb + (size_t)rws[r] * D, tmp + (size_t)r * D, (size_t)D * sizeof(float));
-            if (note) { VktExpertSrc src = glm53_slot_src(slot); vkt_note(index, eid, &src); }
+            if (note && (!g53_gx_ilv(m, index) || vkt_wants(index, eid))) {   /* converted only for the tier to take */
+                VktExpertSrc src = glm53_slot_src(m, index, slot);
+                vkt_note(index, eid, &src);
+                glm53_drop_rows(slot);
+            }
         }
     }
     free(uq); free(rws); free(slot_of); free(to_read);
@@ -3609,7 +3680,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
          * expert tier (glm53_vk_tier_start, once the history is read); while it will
          * be tried, a device that shares the CPU's RAM keeps the resident matrices on
          * the CPU (coli_vk_dense_decide, COLI_VK_DENSE overrides). */
-        const int tier = vkt_wanted() && m->streaming && !m->gx && m->c.n_experts > 0 && m->c.swiglu_limit > 0.f;
+        const int tier = vkt_wanted() && m->streaming && m->c.n_experts > 0 && m->c.swiglu_limit > 0.f;
         g_vk_ready = coli_vk_init_env_tier("glm53", tier);
         g_vk_dense = g_vk_ready && coli_vk_dense();
         if (g_vk_ready) coli_vk_set_swiglu_limit(m->c.swiglu_limit);
@@ -5318,9 +5389,48 @@ static void glm53_vk_tier_start(GModel *m) {
         const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
         const int sparse = m->layer_end > from ? m->layer_end - from : 0;
         const int cap = m->ecache && sparse ? m->ecache[from].cap : 0;
+        VktFmt gu = {VKT_SRC_I4U_PAIRS_GS, 64}, dn = gu, *lgu = NULL, *ldn = NULL;
+        const char *no = NULL;
+        if (m->gx) {
+            /* a GGUF's experts go to the device as the file has them (shaders/blockdec.glsl),
+             * each layer its types as published files mix them; the layers without experts
+             * take the first sparse layer's */
+            const int L = c->n_layers;
+            lgu = malloc((size_t)L * sizeof *lgu); ldn = malloc((size_t)L * sizeof *ldn);
+            if (!lgu || !ldn) no = "out of memory";
+            for (int l = from; !no && l < m->layer_end; l++) {
+                const int *t3 = m->gx_t + 3 * l;
+                const int bg = coli_vk_block_elems(100 + t3[0]), bd = coli_vk_block_elems(100 + t3[2]);
+                if (t3[0] != t3[1]) no = "gate and up differ in type";
+                else if (!bg || !bd || c->hidden % bg || c->moe_inter % bd) no = "a type without a device form";
+                lgu[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + t3[0]), 0};
+                ldn[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + t3[2]), 0};
+            }
+            int best = from, bestn = 0, forms = 0;
+            for (int l = from; !no && l < m->layer_end; l++) {
+                int n = 0, seen = 0;
+                for (int j = from; j < m->layer_end; j++)
+                    if (lgu[j].kind == lgu[l].kind && ldn[j].kind == ldn[l].kind) { n++; if (j < l) seen = 1; }
+                forms += !seen;
+                if (n > bestn) { bestn = n; best = l; }
+            }
+            if (!no && forms > VKT_FORMS - 1) no = "more distinct types than the tier holds";
+            if (!no) {
+                for (int l = 0; l < L; l++) if (l < from || l >= m->layer_end) { lgu[l] = lgu[best]; ldn[l] = ldn[best]; }
+                gu = lgu[best]; dn = ldn[best];
+                fprintf(stderr, "[VK] tier glm53: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down",
+                        gq_type_name(m->gx_t[3 * best]), gq_type_name(m->gx_t[3 * best + 2]));
+                if (forms > 1) fprintf(stderr, " on %d of %d layers, the others their own types", bestn, sparse);
+                fprintf(stderr, ")\n");
+                if (forms == 1) { free(lgu); free(ldn); lgu = ldn = NULL; }
+            } else {
+                free(lgu); free(ldn); lgu = ldn = NULL;
+                fprintf(stderr, "[VK] tier glm53: the GGUF's experts: %s; the routed experts stay on the CPU\n", no);
+            }
+        }
         VktConfig vc = {.engine = "glm53", .layers = c->n_layers, .experts = c->n_experts,
                         .hidden = c->hidden, .inter = c->moe_inter, .topk = c->topk,
-                        .gate_up = {VKT_SRC_I4U_PAIRS_GS, 64}, .down = {VKT_SRC_I4U_PAIRS_GS, 64},
+                        .gate_up = gu, .down = dn, .layer_gate_up = lgu, .layer_down = ldn,
                         .act = VKT_ACT_SWIGLU, .act_limit = c->swiglu_limit,
                         .max_rows = GLM53_VK_ROWS * c->topk,
                         .ram_reserve = (size_t)cap * (size_t)sparse * (size_t)m->e_slot,
@@ -5332,7 +5442,9 @@ static void glm53_vk_tier_start(GModel *m) {
                         .load = glm53_vk_load, .release = glm53_vk_unhold, .load_ctx = m,
                         .load_batch = glm53_vk_load_batch};
         atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
-        if (vkt_init(&vc, rt_counts_all())) {
+        const int tier_on = !no && vkt_init(&vc, rt_counts_all());
+        free(lgu); free(ldn);   /* read during vkt_init only */
+        if (tier_on) {
             atexit(vkt_shutdown);
             const int all = c->n_layers * c->n_experts;
             int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
@@ -5348,9 +5460,9 @@ static void glm53_vk_tier_start(GModel *m) {
                 for (int i = 0; i < n; i++) {
                     Slot tmp; memset(&tmp, 0, sizeof tmp); tmp.eid = -1;
                     expert_read(m, pl[i], pe[i], &tmp);
-                    VktExpertSrc src = glm53_slot_src(&tmp);
+                    VktExpertSrc src = glm53_slot_src(m, pl[i], &tmp);
                     vkt_put(pl[i], pe[i], &src);
-                    free(tmp.own);
+                    free(tmp.own); free(tmp.vk_rows);
                 }
                 vkt_put_done();
                 m->hits = hits; m->miss = miss; m->ebytes = eb;
