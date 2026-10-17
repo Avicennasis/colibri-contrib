@@ -13759,7 +13759,7 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                 vkt_put(pl[i], pe[i], &src);
             else vkt_put(pl[i], pe[i], NULL);   /* no read: the planned slot is given back */
             free(rows);
-            free(buffer);
+            compat_aligned_free(buffer);   /* posix_memalign is _aligned_malloc on Windows (compat.h) */
         }
         vkt_put_done();
         clock_gettime(CLOCK_MONOTONIC, &t1);

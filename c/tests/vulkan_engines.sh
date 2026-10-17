@@ -3169,7 +3169,7 @@ dho_rss_gate() {
   $PY - "$a" "$b" "$mib" <<'PY' || { grep '^\[VK\].*dense' host.log vk.log; fail "$tag: the resident set did not fall"; }
 import sys
 a, b, mib = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
-print(f"RSS at exit {a:.2f} GiB with the host copies, {b:.2f} GiB on the device only")
+print(f"RSS at exit {a:.3f} GiB with the host copies, {b:.3f} GiB on the device only: {(a - b) * 1024:.1f} MiB less, {mib:.0f} wanted")
 sys.exit(0 if (a - b) * 1024 >= mib else 1)
 PY
   echo "OK $tag: $(grep -o 'given back.*' vk.log | head -1)"
