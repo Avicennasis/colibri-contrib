@@ -1024,6 +1024,30 @@ int coli_v4_layer_load(ColiV4Engine *engine,
             coli_v4_layer_free(NULL, weights);
             return set_error(error, error_size, "cannot read tensor: %s", spec->name);
         }
+#ifdef GQ_R16_ON
+        if (st_is_ggml(spec->dtype) && spec->rank == 2 && !gq_exact_mode()) {
+            /* a GGUF matrix whose type has a 16-row interleaved form of the same size
+             * (Q8_0, Q4_0, IQ4_NL): packed once here, every product then reads 16 rows'
+             * blocks together (ggml_quants.h gq_r16_rows). GQ_EXACT=1 keeps the rows. */
+            const int type = st_ggml_type(spec->dtype), r16 = gq_r16_of(type);
+            const int64_t rows = spec->shape[0], cols = spec->shape[1];
+            if (r16 >= 0 && rows % 16 == 0 && cols % GQ_TYPES[type].blck == 0 &&
+                gq_r16_group_bytes(r16) == 16 * GQ_TYPES[type].bytes) {
+                const int64_t rb = gq_row_bytes(type, cols), gb = 16 * rb;
+                unsigned char *copy = malloc((size_t)(rb * rows));
+                if (!copy) {
+                    coli_v4_layer_free(NULL, weights);
+                    return set_error(error, error_size, "out of memory interleaving %s", spec->name);
+                }
+                memcpy(copy, weights->data[i], (size_t)(rb * rows));
+                #pragma omp parallel for schedule(static)
+                for (int64_t g = 0; g < rows / 16; g++)
+                    gq_r16_pack(r16, (uint8_t *)weights->data[i] + g * gb, copy + g * gb, 16, (int)cols);
+                free(copy);
+                weights->plan.tensors[i].dtype = ST_GGML_BASE + r16;
+            }
+        }
+#endif
         if (spec->dtype == COLI_ST_F8_E4M3 && spec->rank == 2) {
             int packed = v4_fp8_pack_rows8_inplace(
                 weights->data[i], spec->shape[0], spec->shape[1]);
