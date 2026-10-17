@@ -1298,6 +1298,10 @@ static int g_v41c_decision = -1;
 static int v41c_decide(Model *m) {   /* once: early when the trunk may live on the device only */
     if (g_v41c_decision >= 0) return g_v41c_decision;
     if (!g_vk_ready) return 0;
+    if (m->gguf) {   /* the chain's matrices are the checkpoint's fp8 and bf16 */
+        fprintf(stderr, "[VK] deepseek_v41: a GGUF: the dense chain stays off (its matrices are ggml blocks)\n");
+        return g_v41c_decision = 0;
+    }
     int tier_on = vkt_wanted() && m->c.n_routed > 0;
     g_v41c_decision = coli_vk_chain_decide("deepseek_v41", tier_on, COLI_VK_CHAIN_UNMEASURED);
     if (g_v41c_decision && g_v41_mux_slots > 1) {
