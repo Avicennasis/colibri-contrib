@@ -23,7 +23,7 @@ Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine), qwe
 dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engine), qwen3 (the dense
 Qwen3 -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
 Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
-glm53 engine).
+glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine).
 
 Usage:
   python3 tools/gguf_import.py MODEL.gguf OUT_DIR [--mode link|copy]
@@ -411,6 +411,51 @@ def glm5next_config(meta, tensors, overrides=None):
     return {"architectures": ["Glm5NextForConditionalGeneration"], "model_type": "glm5_next", "text_config": text}, layers
 
 
+def glmdsa_config(meta, tensors, overrides=None):
+    """GLM-5.2 / GLM-5.3 (llama.cpp's glm-dsa) as the colibri engine's config.json, the shape
+    of zai-org's (GlmMoeDsaForCausalLM). The NextN block counts in block_count only where the
+    file holds it; a layer whose indexer weights are in the file indexes on its own ("full"),
+    one without reuses the previous selection ("shared")."""
+    p = "glm-dsa."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    blocks = int(need("block_count"))
+    nextn = int(meta.get(p + "nextn_predict_layers", 0))
+    has_mtp = nextn > 0 and f"blk.{blocks - 1}.nextn.eh_proj.weight" in tensors
+    layers = blocks - nextn if has_mtp else blocks
+    heads = int(need("attention.head_count"))
+    rope = int(need("rope.dimension_count"))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    if int(meta.get(p + "expert_group_count", 1)) != 1:
+        sys.exit("glm-dsa: expert groups other than 1 are not this model")
+    cfg = {
+        "architectures": ["GlmMoeDsaForCausalLM"], "model_type": "glm_moe_dsa",
+        "vocab_size": int(meta.get(p + "vocab_size", emb["dims"][1])),
+        "hidden_size": int(need("embedding_length")),
+        "intermediate_size": int(need("feed_forward_length")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "num_hidden_layers": layers, "num_attention_heads": heads, "num_key_value_heads": heads,
+        "n_routed_experts": int(need("expert_count")), "num_experts_per_tok": int(need("expert_used_count")),
+        "n_shared_experts": int(meta.get(p + "expert_shared_count", 1)),
+        "first_k_dense_replace": int(meta.get(p + "leading_dense_block_count", 0)),
+        "q_lora_rank": int(need("attention.q_lora_rank")), "kv_lora_rank": int(need("attention.kv_lora_rank")),
+        "qk_rope_head_dim": rope, "qk_nope_head_dim": int(need("attention.key_length_mla")) - rope,
+        "v_head_dim": int(need("attention.value_length_mla")),
+        "n_group": 1, "topk_group": 1, "topk_method": "noaux_tc", "scoring_func": "sigmoid",
+        "norm_topk_prob": bool(meta.get(p + "expert_weights_norm", True)),
+        "routed_scaling_factor": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-5)),
+        "rope_parameters": {"rope_type": "default", "rope_theta": float(meta.get(p + "rope.freq_base", 10000.0))},
+        "max_position_embeddings": int(meta.get(p + "context_length", 202752)),
+        "index_topk": int(need("attention.indexer.top_k")), "index_n_heads": int(need("attention.indexer.head_count")),
+        "index_head_dim": int(need("attention.indexer.key_length")),
+        "indexer_types": ["full" if f"blk.{i}.indexer.attn_q_b.weight" in tensors else "shared" for i in range(layers)],
+        "num_nextn_predict_layers": nextn if has_mtp else 0,
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "bos_token_id": meta.get("tokenizer.ggml.bos_token_id"), "eos_token_id": meta.get("tokenizer.ggml.eos_token_id"),
+    }
+    return cfg, layers
+
+
 def qwen4exp_config(meta, tensors, overrides=None):
     """Qwen3.8-Flash-Next (llama.cpp's qwen4exp) as the qwen38 engine's config.json. The
     PLE table is one tensor here (per_layer_token_embd), so split_ngram_parts is 1; its
@@ -493,7 +538,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 
 COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the
