@@ -886,7 +886,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
                 }
             }
         }
-        int ok = 1, pending = 0, prev_dev = 0, from = lo;   /* prev_dev: the layer before summed its experts here */
+        int ok = 1, pending = 0, prev_dev = 0, from = lo, sent = 0;   /* prev_dev: the layer before summed its experts here */
         for (int i = lo; i < hi && ok; i++) {
             Layer *l = &m->L[i];
             if (pending) {
@@ -907,6 +907,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
                 ok = vkc_matmul(vk_qw_tensor(&l->gate), ch->h2, 0, ch->lg, 0, n) && q36c_shared(ch, m, l, i, n) &&
                      vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->h2, &rp, &mp);
                 prev_dev = 1; pending = 1;
+                if (ok && i + 1 < hi) ok = vkc_layer_recorded(&sent);   /* the device starts on these layers */
                 continue;
             }
             if (ok && E > 0) {

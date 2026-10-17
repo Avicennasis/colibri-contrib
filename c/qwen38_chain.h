@@ -1095,7 +1095,7 @@ static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int p
             }
         }
         if (c->ple_layer >= lo && c->ple_layer < hi) q38c_ple_rows(m, ids, c0, n, ch->host_emb);
-        int ok = 1, pending = 0, prev_dev = 0, from = lo;   /* prev_dev: the layer before summed its experts here */
+        int ok = 1, pending = 0, prev_dev = 0, from = lo, sent = 0;   /* prev_dev: the layer before summed its experts here */
         for (int i = lo; i < hi && ok; i++) {
             Layer *l = &m->L[i];
             if (pending) ok = q38c_moe_apply(ch, m, n, prev_dev ? ch->dm.y : ch->routed);
@@ -1110,6 +1110,7 @@ static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int p
                 ok = vkc_matmul(q38c_t(&l->router), ch->mixed, 0, ch->lg, 0, n) && q38c_shared(ch, m, l, i, n) &&
                      vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->mixed, &rp, &mp);
                 prev_dev = 1; pending = 1;
+                if (ok && i + 1 < hi) ok = vkc_layer_recorded(&sent);   /* the device starts on these layers */
                 continue;
             }
             ok = ok && vkc_matmul(q38c_t(&l->router), ch->mixed, 0, ch->lg, 0, n) &&
