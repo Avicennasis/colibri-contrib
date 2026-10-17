@@ -2758,6 +2758,7 @@ static int q36_vision_attach(Model *m, const float *patches, int grid_h, int gri
  * come through this loader. */
 static float *load_norm_n(Model *m, const char *name, int64_t want) {
     float *w = load_t_n(m, name, want);
+    if (!w) return NULL;   /* GGUF_CHECK=1: shapes checked, nothing read */
     if (!m->c.zero_centered_norms)
         for (int64_t i = 0; i < want; i++) w[i] -= 1.0f;
     return w;

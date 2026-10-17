@@ -148,6 +148,15 @@ class GgufImport(unittest.TestCase):
                 self.assertEqual(engine_tokens(self.dir / "link", self.ref, env), a)
                 self.assertEqual(engine_tokens(self.dir / "copy", self.ref, env), a)
 
+    def test_header_check(self):
+        """GGUF_CHECK=1 checks every tensor the loader wants without reading one: it used to
+        crash on the final norm, whose 1 it took off a weight it had not read."""
+        p = subprocess.run([str(ENGINE), "2", "8", str(self.ref)], env=dict(os.environ, SNAP=str(self.src), GGUF_CHECK="1",
+                           OMP_NUM_THREADS="2", COLI_NO_OMP_TUNE="1"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        out = p.stdout.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 0, out[-2000:])
+        self.assertIn("GGUF CHECK OK", out)
+
     def test_container_slots_are_4k_aligned(self):
         r = gguf.GGUFReader(str(self.dir / "copy" / "model.colibri.gguf"))
         self.assertEqual(r.fields["colibri.layout"].contents(), "expert-packed-v1")
