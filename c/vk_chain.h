@@ -416,7 +416,7 @@ typedef struct {
     int S, K, D, I, act;
     float limit, a, b;
     int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row;
-    int rpw;   /* outputs a workgroup: 0 = 64; a GGUF's experts (block formats) 32, measured faster */
+    int rpw;   /* outputs a workgroup: 0 = 64 (measured best for the block formats too: tests and benches set it) */
 } VkcMoe;
 int vkc_moe_ready(void);
 int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p);

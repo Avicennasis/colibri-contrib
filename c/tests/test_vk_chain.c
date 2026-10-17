@@ -2738,9 +2738,10 @@ static void test_bd(void) {
  * Qwen3.8-Flash-Next's shapes, a GGUF's experts (IQ2_S gate/up, Q2_0 down; COLI_VK_BENCH_FMTS
  * "122 142" sets them), random blocks, S rows of K = 10 experts of 64. */
 static void bench_moe(void) {
-    int D = 2560, I = 640, E = 64, K = 10, fg = 122, fd = 142;
-    const char *fe = getenv("COLI_VK_BENCH_FMTS");
+    int D = 2560, I = 640, E = 64, K = 10, fg = 122, fd = 142, rpw = 32;
+    const char *fe = getenv("COLI_VK_BENCH_FMTS"), *sh = getenv("COLI_VK_BENCH_MOE");   /* "D I K rpw" */
     if (fe && *fe) sscanf(fe, "%d %d", &fg, &fd);
+    if (sh && *sh) sscanf(sh, "%d %d %d %d", &D, &I, &K, &rpw);
     if (!vkc_moe_ready() || !coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { printf("bench moe: no expert batch here\n"); return; }
     ColiVkTensor **tg = calloc(E, sizeof *tg), **tu = calloc(E, sizeof *tu), **td = calloc(E, sizeof *td);
     ColiVkExpert **ex = calloc(E, sizeof *ex);
@@ -2763,7 +2764,7 @@ static void bench_moe(void) {
         VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DEV), *wb = vkc_buf((size_t)S * K * 4, VKC_DEV);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * D * 4, VKC_DEV);
         VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 1, K, 1, 1, 1, 1.f, 1.f, 0.f};
-        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 32};   /* the GGUF engines' 32 outputs a workgroup */
+        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, rpw};   /* the GGUF engines' 32 outputs a workgroup */
         vkc_begin(); ok = vkc_route(lb, NULL, ib, wb, &rp) && vkc_submit(1);
         double best = 1e9; int nl = 48;   /* a forward's layers in one frame */
         for (int r = 0; r < 4 && ok; r++) {
