@@ -34,7 +34,9 @@
 #endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
+#define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+#include "ggml_view.h"
 #include "tok.h"
 #ifdef _OPENMP
 #include <omp.h>
@@ -135,6 +137,7 @@ typedef struct { float *f; uint16_t *h; void *dev;
                  uint8_t *q4;        /* int4 nibble-packed (qbits=4) o int8 (qbits=8) */
                  float *qs;          /* scale: [rows*ng] se qbits=4, [rows] se qbits=8 */
                  int gs, qbits; int64_t qn;   /* qn = byte in q4, per il guard OOB */
+                 const uint8_t *gq; int gqt;  /* a GGUF matrix's blocks (st_gguf.h) and their ggml type */
 #ifdef COLI_VULKAN
                  void *vk;           /* InkVk of the loaded tensor, shared by its wt_off_i
                                       * views (NULL = CPU only) */
@@ -192,6 +195,9 @@ typedef struct {
     int64_t q_bytes;
     int quant_bits;                       /* 0 = f32 experts (oracle mode) */
     int xq;                               /* experts on disk are a colibri container (U8 + .qs) */
+    int gx;                               /* ... or a GGUF's (xq too, for the slabs): gate and up rows
+                                           * of an expert in p13, down in p2, of each layer's types */
+    int *gx_t;                            /* [layer][gate, up, down]: their ggml types */
     Wt embed, lm_head;
     float *embed_norm, *final_norm;
     Wt audio_enc;                         /* [mel_bins*mel_vocab, D] embedding table */
@@ -230,6 +236,21 @@ static double rss_gb(void) { struct rusage r; getrusage(RUSAGE_SELF, &r); return
 static float *falloc(int64_t n) { float *p = malloc(n*sizeof(float)); if(!p){fprintf(stderr,"OOM %ld\n",(long)n);exit(1);} return p; }
 static float sigmoidf(float x) { return 1.f / (1.f + expf(-x)); }
 static float siluf(float x) { return x / (1.f + expf(-x)); }
+
+/* A GGUF expert in its slot (m->gx): gate and up rows on one quantization of x into
+ * g[0..I) and g[I..2I), the SwiGLU into g, then hh = down g; ggml_quants.h kernels. */
+static void ink_gx_expert(const Model *m, int layer, const Slot *e, const float *xs, float *g, float *hh) {
+    const int64_t D = m->c.hidden, I = m->c.moe_inter;
+    const int *t3 = m->gx_t + 3 * layer;
+    ColiTensorView vg = { COLI_TENSOR_GGML, COLI_SCALE_NONE, e->p13, NULL, 0, 0, I, D, 1, (uint32_t)t3[0], NULL };
+    ColiTensorView vu = vg;
+    vu.data = e->p13 + I * gq_row_bytes(t3[0], D); vu.block_columns = (uint32_t)t3[1];
+    ColiTensorView vd = { COLI_TENSOR_GGML, COLI_SCALE_NONE, e->p2, NULL, 0, 0, D, I, 1, (uint32_t)t3[2], NULL };
+    if (coli_ggml_matmul2(g, &vg, g + I, &vu, xs, 1)) { fprintf(stderr, "layer %d: GGUF expert gate/up failed\n", layer); exit(1); }
+    for (int64_t k = 0; k < I; k++) g[k] = siluf(g[k]) * g[I + k];
+    if (coli_ggml_matmul(hh, &vd, g, 1)) { fprintf(stderr, "layer %d: GGUF expert down failed\n", layer); exit(1); }
+}
+
 /* TOPP=p (0..1): top-p adattivo sui routed — tieni gli esperti fino al peso
  * cumulato p. 0 = spento (default): tutti i topk, calcolo invariato. */
 static float g_topp = 0.f;
@@ -562,6 +583,14 @@ static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
         fprintf(stderr, "cuda matmul failed and host copy was freed\n"); exit(1);
     }
 #endif
+    if (W.gq) {   /* GGUF: ggml_quants.h, the activations quantized once per call */
+        ColiTensorView v = { COLI_TENSOR_GGML, COLI_SCALE_NONE, W.gq, NULL, (size_t)W.qn, 0, O, I, 1, (uint32_t)W.gqt, NULL };
+        if (gq_row_bytes(W.gqt, I) * (int64_t)O > W.qn || coli_ggml_matmul(y, &v, x, S)) {
+            fprintf(stderr, "GGUF matmul: %s rows of %d do not fit %lld bytes (O=%d)\n",
+                    gq_type_name(W.gqt), I, (long long)W.qn, O); exit(1);
+        }
+        return;
+    }
     if (W.q4) {
         /* guard: il container e' un file, non un invariante — se la geometria non
          * torna si esce invece di leggere fuori dal buffer. */
@@ -958,6 +987,14 @@ static Wt load_w(Model *m, const char *name, int gpu_ok) {
     Wt w = {0};
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (st_is_ggml(t->dtype)) {   /* a GGUF matrix: its blocks as the file has them */
+        uint8_t *b = malloc((size_t)t->nbytes);
+        if (!b) { fprintf(stderr, "OOM %s\n", name); exit(1); }
+        pread_all(t->fd, b, t->nbytes, t->off);
+        w.gq = b; w.gqt = st_ggml_type(t->dtype); w.qn = t->nbytes;
+        (void)gpu_ok;
+        return w;
+    }
 #ifdef COLI_VULKAN
     if (load_w_quant(m, name, t->numel, &w)) { w.vk_name = ink_name_keep(name); return w; }
     w.vk_name = ink_name_keep(name);
@@ -993,6 +1030,10 @@ static Wt wt_off_i(Wt w, int64_t off, int I) {
     r.f = w.f ? w.f + off : NULL;
     r.h = w.h ? w.h + off : NULL;
     r.dev = w.dev ? (char*)w.dev + off*2 : NULL;    /* dev is always bf16 */
+    if (w.gq) {   /* GGUF blocks: whole rows of the type's bytes */
+        int64_t rb = gq_row_bytes(w.gqt, I), rows = off / I;
+        r.gq = w.gq + rows * rb; r.qn = w.qn - rows * rb;
+    }
     if (w.q4) {
         int64_t row = off / I;
         if (w.qbits == 8) { r.q4 = w.q4 + off;        r.qs = w.qs + row; r.qn = w.qn - off; }
@@ -1018,6 +1059,13 @@ static void wt_deq_row(Wt w, int64_t row, float *out, int I) {
     }
 }
 static void wt_row_f32(Wt w, int64_t off, float *out, int n) {
+    if (w.gq) {   /* a GGUF table's row (the embedding), dequantized */
+        int64_t rb = gq_row_bytes(w.gqt, n);
+        if (rb < 0 || (off / n + 1) * rb > w.qn || gq_dequant_row(w.gqt, w.gq + (off / n) * rb, out, n)) {
+            fprintf(stderr, "GGUF row %lld of %s rows of %d: outside the tensor\n", (long long)(off / n), gq_type_name(w.gqt), n); exit(1);
+        }
+        return;
+    }
     if (w.q4) { wt_deq_row(w, off / n, out, n); return; }   /* n = dim di contrazione */
     if (w.f) memcpy(out, w.f + off, n * sizeof(float));
     else for (int i = 0; i < n; i++) { union { uint32_t u; float f; } v = { (uint32_t)w.h[off + i] << 16 }; out[i] = v.f; }
@@ -1405,10 +1453,35 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     /* container detection: converted snapshots store experts as U8 + .qs.
      * rb13/rb2 = bytes per packed row (D/2|D and I/2|I for int4|int8) */
     int64_t I = c->moe_inter, E = c->n_experts;
+    /* a GGUF (st_gguf.h): mlp.experts.gate_proj / up_proj / down_proj in ggml types, each
+     * layer its own; the slabs are sized for the largest (rb13 = half a gate+up row pair) */
+    for (int i = layer_begin; i < layer_end; i++) if (c->sparse[i]) {
+        const char *k3[3] = {"gate_proj", "up_proj", "down_proj"};
+        st_tensor *tt[3];
+        for (int k = 0; k < 3; k++) {
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%s", i, k3[k]);
+            tt[k] = st_find(&m->S, nm);
+        }
+        if (!tt[0]) break;   /* the checkpoint's gate_up_proj: not a GGUF */
+        if (!m->gx_t) { m->gx_t = calloc((size_t)c->n_layers * 3, sizeof(int)); if (!m->gx_t) { fprintf(stderr, "OOM\n"); exit(1); } }
+        for (int k = 0; k < 3; k++) {
+            if (!tt[k] || st_ggml_type_any(tt[k]->dtype) < 0) { fprintf(stderr, "layer %d: GGUF experts without mlp.experts.%s\n", i, k3[k]); exit(1); }
+            m->gx_t[3 * i + k] = st_ggml_type_any(tt[k]->dtype);
+        }
+        int64_t rbg = gq_row_bytes(m->gx_t[3 * i], D), rbu = gq_row_bytes(m->gx_t[3 * i + 1], D),
+                rbd = gq_row_bytes(m->gx_t[3 * i + 2], I);
+        if (rbg < 0 || rbu < 0 || rbd < 0 || tt[0]->nbytes != E * I * rbg || tt[1]->nbytes != E * I * rbu ||
+            tt[2]->nbytes != E * D * rbd) {
+            fprintf(stderr, "layer %d: GGUF experts are not [%lld][%lld][%lld] of their types\n", i, (long long)E, (long long)I, (long long)D); exit(1);
+        }
+        m->gx = m->xq = 1;
+        if ((rbg + rbu + 1) / 2 > m->rb13) m->rb13 = (rbg + rbu + 1) / 2;
+        if (rbd > m->rb2) m->rb2 = rbd;
+    }
     for (int i = layer_begin; i < layer_end; i++) if (c->sparse[i]) {
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",i);
         st_tensor *t = st_find(&m->S, nm);
-        if (t && t->dtype == 3) {
+        if (!m->gx && t && t->dtype == 3) {
             m->xq = 1;
             m->rb13 = t->nbytes / (E * 2*I);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.down_proj",i);
@@ -1592,6 +1665,20 @@ static void slot_fill(Model *m, int layer, Slot *s) {
     int64_t D = c->hidden, I = c->moe_inter, n13 = 2*I*D, n2 = D*I;
     int64_t eid = s->eid;
     char nm[320], qs[340];
+    if (m->gx) {   /* GGUF: the expert's gate rows, then its up rows, then down: three slices */
+        const int *t3 = m->gx_t + 3 * layer;
+        const int64_t rb[3] = { gq_row_bytes(t3[0], D), gq_row_bytes(t3[1], D), gq_row_bytes(t3[2], I) };
+        const int64_t rows[3] = { I, I, D };
+        uint8_t *dst[3] = { s->p13, s->p13 + I * rb[0], s->p2 };
+        const char *k3[3] = {"gate_proj", "up_proj", "down_proj"};
+        for (int k = 0; k < 3; k++) {
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%s", layer, k3[k]);
+            st_tensor *t = st_find(&m->S, nm);
+            pread_all(t->fd, dst[k], rows[k] * rb[k], t->off + eid * rows[k] * rb[k]);
+        }
+        s->filled = 1;
+        return;
+    }
     if (m->xq) {
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.gate_up_proj",layer);
         read_u8_slice(&m->S, nm, s->p13, eid*2*I*m->rb13, 2*I*m->rb13);
@@ -1912,6 +1999,7 @@ static void shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
  * moe() reads down with gate/up's kernel, so the two share one kind. 0: none. */
 static int ink_vk_fmt_of(const Model *m, VktFmt *f) {
     int D = m->c.hidden, I = m->c.moe_inter;
+    if (m->gx) return 0;   /* GGUF experts: the CPU's ggml_quants.h kernels only, for now */
     if (m->xq) {
         int q4 = m->rb13 * 2 == D;
         if (q4 ? m->rb2 * 2 != I : m->rb2 != I) return 0;
@@ -1922,6 +2010,7 @@ static int ink_vk_fmt_of(const Model *m, VktFmt *f) {
 }
 static VktExpertSrc ink_vk_slot_src(const Model *m, const Slot *e) {
     int64_t D = m->c.hidden, I = m->c.moe_inter;
+    if (m->gx) return (VktExpertSrc){0};
     if (m->xq) return (VktExpertSrc){e->p13, e->p13 + I * m->rb13, e->p2, e->s13, e->s13 + I, e->s2};
     if (m->quant_bits) return (VktExpertSrc){e->q13, e->q13 + I * D, e->q2, e->s13, e->s13 + I, e->s2};
     return (VktExpertSrc){e->f13, e->f13 + I * D, e->f2, NULL, NULL, NULL};
@@ -2122,7 +2211,8 @@ static void ink_vk_cpu_pairs(Model *m, int layer, const float *x, int n, const i
             Slot *e = use[r];
             const float *xs = x + (int64_t)(pi[r] / K) * D;
             float *hh = ctb + (int64_t)pi[r] * D;
-            if (m->xq) {
+            if (m->gx) ink_gx_expert(m, layer, e, xs, g, hh);
+            else if (m->xq) {
                 if (q4) {
                     matmul_q4(g, xs, e->p13, e->s13, D, 2*I);   /* gate rows then up rows */
                     for (int k = 0; k < I; k++) g[k] = siluf(g[k]) * u[k];
@@ -2304,7 +2394,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
      * ~135ms of useResource churn and CPU won — INK_METAL_MIN_S=2 restores
      * the prefill-only gate if that regime ever returns. */
     int metal_min_s = getenv("INK_METAL_MIN_S") ? atoi(getenv("INK_METAL_MIN_S")) : 1;
-    if (g_metal && m->xq && S >= metal_min_s) {
+    if (g_metal && m->xq && !m->gx && S >= metal_min_s) {
         mxg = falloc((int64_t)cap*D); mrw = falloc(cap);
         mgp = malloc(cap*sizeof(void*)); mup = malloc(cap*sizeof(void*)); mdp = malloc(cap*sizeof(void*));
         mgs = malloc(cap*sizeof(float*)); mus = malloc(cap*sizeof(float*)); mds = malloc(cap*sizeof(float*));
@@ -2452,7 +2542,8 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out, c
             const float *xs = x + (int64_t)s*D;
             float *os = out + (int64_t)s*D;
             float *w = wgt + (int64_t)s*(K+ns);
-            if (m->xq) {
+            if (m->gx) ink_gx_expert(m, layer, e, xs, g, hh);
+            else if (m->xq) {
                 if (q4) {
                     matmul_q4(g, xs, e->p13, e->s13, D, 2*I);   /* gate rows then up rows */
                     for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];

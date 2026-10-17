@@ -300,6 +300,56 @@ def deepseek4_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
+def inkling_config(meta, tensors, overrides=None):
+    """Inkling (llama.cpp's inkling: Inkling-Small and the full model) as the inkling engine's
+    config.json, in the shape of transformers' port (inkling_text), whose tensor names
+    st_gguf.h gives the GGUF's. Local (sliding) and global layers differ in their KV heads:
+    the GGUF's per-layer head_count_kv with its sliding_window_pattern gives both."""
+    p = "inkling."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    local = [bool(x) for x in need("attention.sliding_window_pattern")][:layers]
+    kv = need("attention.head_count_kv")
+    kv = [int(x) for x in kv][:layers] if isinstance(kv, (list, tuple)) else [int(kv)] * layers
+    kv_local = next((kv[i] for i in range(layers) if local[i]), kv[0])
+    kv_global = next((kv[i] for i in range(layers) if not local[i]), kv[0])
+    heads, head_dim = int(need("attention.head_count")), int(need("attention.key_length"))
+    dense = int(meta.get(p + "dense_block_count", 0))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    vocab = int(meta.get(p + "vocab_size", emb["dims"][1]))
+    eos = int(meta.get("tokenizer.ggml.eos_token_id", 200006))
+    cfg = {
+        "architectures": ["InklingForCausalLM"],
+        "model_type": "inkling",   # the checkpoint's, which the family registry knows
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "intermediate_size": int(need("feed_forward_length")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "num_attention_heads": heads, "swa_num_attention_heads": heads,
+        "num_key_value_heads": kv_global, "swa_num_key_value_heads": kv_local,
+        "head_dim": head_dim, "swa_head_dim": head_dim,
+        "sliding_window_size": int(need("attention.sliding_window")),
+        "local_layer_ids": [i for i in range(layers) if local[i]],
+        "d_rel": int(need("d_rel")), "rel_extent": int(need("rel_extent")),
+        "conv_kernel_size": int(need("shortconv_kernel")), "sconv_kernel_size": int(need("shortconv_kernel")),
+        "dense_mlp_idx": dense, "mlp_layer_types": ["dense"] * dense + ["sparse"] * (layers - dense),
+        "n_routed_experts": int(need("expert_count")), "n_shared_experts": int(meta.get(p + "expert_shared_count", 0)),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "route_scale": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "shared_expert_sink": True,
+        "logits_mup_width_multiplier": float(need("logit_scale_denom")),
+        "log_scaling_n_floor": int(meta.get(p + "log_scaling_n_floor", 0)),
+        "log_scaling_alpha": float(meta.get(p + "log_scaling_alpha", 0.0)),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-6)),
+        "vocab_size": vocab,
+        "unpadded_vocab_size": int(meta.get(p + "unpadded_vocab_size", vocab)),
+        "max_position_embeddings": int(meta.get(p + "context_length", 1048576)),
+        "hidden_act": "silu",
+        "eos_token_id": eos, "bos_token_id": eos,
+    }
+    return cfg, layers
+
+
 def qwen4exp_config(meta, tensors, overrides=None):
     """Qwen3.8-Flash-Next (llama.cpp's qwen4exp) as the qwen38 engine's config.json. The
     PLE table is one tensor here (per_layer_token_embd), so split_ngram_parts is 1; its
@@ -381,7 +431,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the
@@ -430,8 +480,16 @@ def mtp_head_ok(path, meta, layers):
 DEEPSEEK_SPLITS = ["\\p{N}{1,3}", "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
                    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+|"
                    " ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"]
+# o200k (GPT-4o's), as Inkling's tokenizer.json has it; llama.cpp's "inkling" pre-type is the
+# same split written with lookaheads
+O200K_SPLITS = ["[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+                "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+                "\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"]
 PRE_SPLITS = {"deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
-              "hunyuan-dense": DEEPSEEK_SPLITS, "hy_v4": DEEPSEEK_SPLITS}
+              "hunyuan-dense": DEEPSEEK_SPLITS, "hy_v4": DEEPSEEK_SPLITS,
+              "inkling": O200K_SPLITS, "gpt-4o": O200K_SPLITS}
+# BPE options of the tokenizer.json a family ships (the GGUF does not carry them)
+PRE_MODEL = {"inkling": {"ignore_merges": True}, "gpt-4o": {"ignore_merges": True}}
 
 
 def pre_tokenizer(pre):
@@ -473,6 +531,7 @@ def tokenizer_files(meta):
            "decoder": {"type": "ByteLevel", "add_prefix_space": True, "trim_offsets": True, "use_regex": True},
            "model": {"type": "BPE", "dropout": None, "unk_token": None, "continuing_subword_prefix": None,
                      "end_of_word_suffix": None, "fuse_unk": False, "byte_fallback": False,
+                     **PRE_MODEL.get(meta.get("tokenizer.ggml.pre") or "", {}),
                      "vocab": vocab, "merges": merges}}
     ids = {k: meta.get(f"tokenizer.ggml.{k}_token_id") for k in ("bos", "eos", "padding")}
     name = lambda i: toks[int(i)] if i is not None and int(i) < len(toks) else None

@@ -2104,12 +2104,12 @@ def display_for(resolved):
             if all(config.get(key) == value for key, value in geometry):
                 return head.display_name, scale
         return head.display_name, ""
-    if not family.display_variants:
-        return family.display_name, family.display_scale
+    name, size = _gguf_name(resolved)
+    if not family.display_variants:   # an imported GGUF says which model it is (Inkling-Small)
+        return (name, size) if name else (family.display_name, family.display_scale)
     for variant in family.display_variants:
         if all(config.get(key) == value for key, value in variant.geometry):
             return variant.display_name, variant.display_scale
-    name, size = _gguf_name(resolved)
     if name:   # an imported GGUF: the name its file gives
         return name, size
     return resolved.model_type, ""

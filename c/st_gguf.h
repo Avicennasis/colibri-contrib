@@ -20,6 +20,11 @@
 #define ST_GGML_BASE 32
 static inline int st_is_ggml(int dtype) { return dtype >= ST_GGML_BASE; }
 static inline int st_ggml_type(int dtype) { return dtype - ST_GGML_BASE; }
+/* the ggml type of any dtype the ggml_quants.h kernels compute (the float ones too), or -1 */
+static inline int st_ggml_type_any(int dtype) {
+    if (dtype >= ST_GGML_BASE) return dtype - ST_GGML_BASE;
+    return dtype == 2 ? GQ_F32 : dtype == 1 ? GQ_F16 : dtype == 0 ? GQ_BF16 : -1;
+}
 
 typedef struct { const char *gg, *hf; } st_gg_name;
 typedef struct {
@@ -65,8 +70,38 @@ static const st_gg_name st_gg_dsv4_layer[] = {
     {"ffn_up_exps.weight", "ffn.experts.%d.w3.weight"},
     {NULL, NULL}};
 
+/* Inkling (inkling): conversion/inkling.py of llama.cpp's PR (TML checkpoint names), here
+ * under the names of transformers' port, which inkling.c reads. The port keeps gate and up
+ * of a routed expert in one tensor (gate_up_proj, gate rows then up rows); the GGUF has them
+ * apart, so they come as mlp.experts.gate_proj / up_proj and inkling.c reads the two slices.
+ * ffn_gscale is a dense layer's mlp.global_scale and a sparse one's mlp.gate.global_scale:
+ * both names (one tensor, the layer's kind decides which is read). */
+static const st_gg_name st_gg_ink_glob[] = {
+    {"token_embd.weight", "model.embed_tokens.weight"}, {"token_embd_norm.weight", "model.embed_norm.weight"},
+    {"output_norm.weight", "model.norm.weight"}, {"output.weight", "lm_head.weight"},
+    {NULL, NULL}};
+static const st_gg_name st_gg_ink_layer[] = {
+    {"attn_norm.weight", "input_layernorm.weight"}, {"ffn_norm.weight", "post_attention_layernorm.weight"},
+    {"attn_q.weight", "self_attn.q_proj.weight"}, {"attn_k.weight", "self_attn.k_proj.weight"},
+    {"attn_v.weight", "self_attn.v_proj.weight"}, {"attn_output.weight", "self_attn.o_proj.weight"},
+    {"attn_r.weight", "self_attn.r_proj.weight"},
+    {"attn_q_norm.weight", "self_attn.q_norm.weight"}, {"attn_k_norm.weight", "self_attn.k_norm.weight"},
+    {"attn_rel_proj.weight", "self_attn.rel_logits_proj.proj"},
+    {"shortconv_k.weight", "self_attn.k_sconv.conv1d.weight"}, {"shortconv_v.weight", "self_attn.v_sconv.conv1d.weight"},
+    {"shortconv_attn.weight", "attn_sconv.conv1d.weight"}, {"shortconv_mlp.weight", "mlp_sconv.conv1d.weight"},
+    {"ffn_gate.weight", "mlp.gate_proj.weight"}, {"ffn_up.weight", "mlp.up_proj.weight"},
+    {"ffn_down.weight", "mlp.down_proj.weight"},
+    {"ffn_gscale.weight", "mlp.global_scale|mlp.gate.global_scale"},
+    {"ffn_gate_inp.weight", "mlp.gate.weight"}, {"exp_probs_b.bias", "mlp.gate.e_score_correction_bias"},
+    {"ffn_gate_shexp.weight", "mlp.shared_experts.gate_proj"}, {"ffn_up_shexp.weight", "mlp.shared_experts.up_proj"},
+    {"ffn_down_shexp.weight", "mlp.shared_experts.down_proj"},
+    {"ffn_gate_exps.weight", "mlp.experts.gate_proj"}, {"ffn_up_exps.weight", "mlp.experts.up_proj"},
+    {"ffn_down_exps.weight", "mlp.experts.down_proj"},
+    {NULL, NULL}};
+
 static const st_gg_map st_gguf_maps[] = {
     {"deepseek4", "layers.%d.", st_gg_dsv4_glob, st_gg_dsv4_layer},
+    {"inkling", "model.layers.%d.", st_gg_ink_glob, st_gg_ink_layer},
 };
 
 static const st_gg_map *st_gguf_map(const char *arch) {
@@ -139,6 +174,14 @@ static int st_init_gguf(shards *S, const char *snap_dir) {
         for (const st_gg_name *e = map->globals; e->gg && !hf; e++) if (!strcmp(t->name, e->gg)) hf = e->hf;
         if (!hf && sscanf(t->name, "blk.%d.%n", &L, &off) == 1 && L >= 0 && off)
             for (const st_gg_name *e = map->layer; e->gg && !hf; e++) if (!strcmp(t->name + off, e->gg)) hf = e->hf;
+        char alias[256];   /* "a|b": the tensor under each name (st_gg_ink_layer's ffn_gscale) */
+        const char *rest_names = NULL;
+        if (hf && strchr(hf, '|')) {
+            snprintf(alias, sizeof alias, "%s", hf);
+            char *bar = strchr(alias, '|'); *bar = 0;
+            hf = alias; rest_names = bar + 1;
+        }
+again:;
         const int per_expert = hf && strstr(hf, "%d") != NULL;
         const int dims = per_expert ? 2 : t->n_dims;
         const int E = per_expert ? (int)t->ne[2] : 1;
@@ -159,6 +202,12 @@ static int st_init_gguf(shards *S, const char *snap_dir) {
             for (int d = 0; d < dims; d++) { s->shape[d] = t->ne[dims - 1 - d]; s->numel *= s->shape[d]; }
         }
         if (per_expert) experts++; else if (hf) renamed++; else kept++;
+        if (rest_names) {
+            char *bar = strchr((char *)rest_names, '|');
+            if (bar) *bar = 0;
+            hf = rest_names; rest_names = bar ? bar + 1 : NULL;
+            goto again;
+        }
     }
     S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
     S->hidx = (int *)malloc((size_t)S->hcap * sizeof(int));

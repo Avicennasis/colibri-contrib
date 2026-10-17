@@ -296,6 +296,68 @@ class Qwen3DenseConfig(unittest.TestCase):
             self.assertEqual(default_model_id(r), "qwen3-coder-30b-a3b-colibri")
 
 
+class DeepSeekV4Config(unittest.TestCase):
+    """llama.cpp's deepseek4 as the deepseek_v4 engine's config.json, from unsloth's
+    DeepSeek-V4-Flash-0731 header numbers; layers counted by the attention blocks (antirez's
+    main files say nextn_predict_layers 1 and keep the MTP head apart)."""
+    def test_flash_metadata(self):
+        import tools.gguf_import as gi
+        p = "deepseek4."
+        meta = {p + k: v for k, v in {
+            "block_count": 43, "context_length": 1048576, "embedding_length": 4096, "attention.head_count": 64,
+            "attention.head_count_kv": 1, "attention.key_length": 512, "rope.dimension_count": 64,
+            "attention.q_lora_rank": 1024, "attention.output_group_count": 8, "attention.output_lora_rank": 1024,
+            "attention.sliding_window": 128, "attention.indexer.head_count": 64, "attention.indexer.key_length": 128,
+            "attention.indexer.top_k": 512, "expert_count": 256, "expert_used_count": 6, "expert_shared_count": 1,
+            "expert_feed_forward_length": 2048, "hash_layer_count": 3, "hyper_connection.count": 4,
+            "hyper_connection.sinkhorn_iterations": 20, "expert_weights_scale": 1.5, "expert_gating_func": 4,
+            "attention.compress_ratios": [0, 0] + [4, 128] * 21 + [0], "attention.compress_rope_freq_base": 160000.0,
+            "swiglu_clamp_exp": [10.0] * 43, "nextn_predict_layers": 1, "rope.scaling.factor": 16.0,
+            "rope.scaling.original_context_length": 65536}.items()}
+        tensors = {"token_embd.weight": {"dims": [4096, 129280]}}
+        tensors.update({f"blk.{b}.attn_q_a.weight": {} for b in range(43)})
+        cfg, layers = gi.deepseek4_config(meta, tensors)
+        self.assertEqual(layers, 43)
+        self.assertEqual((cfg["model_type"], cfg["scoring_func"], cfg["num_hash_layers"]), ("deepseek_v4", "sqrtsoftplus", 3))
+        self.assertEqual((cfg["o_groups"], cfg["q_lora_rank"], cfg["head_dim"]), (8, 1024, 512))
+        self.assertEqual(cfg["compress_ratios"][:4], [0, 0, 4, 128])
+        self.assertEqual(cfg["num_nextn_predict_layers"], 0)
+        self.assertEqual(cfg["rope_scaling"]["original_max_position_embeddings"], 65536)
+
+    def test_pre_tokenizers(self):
+        import tools.gguf_import as gi
+        ds = gi.pre_tokenizer("joyai-llm")
+        self.assertEqual([x["type"] for x in ds["pretokenizers"]], ["Split", "Split", "Split", "ByteLevel"])
+        self.assertIn("][A-Za-z]+|", ds["pretokenizers"][2]["pattern"]["Regex"])   # what tok.h keys DeepSeek on
+        self.assertIn("\\p{Lu}", gi.pre_tokenizer("inkling")["pretokenizers"][0]["pattern"]["Regex"])   # o200k
+        self.assertEqual(gi.pre_tokenizer("qwen2"), {"type": "ByteLevel", "add_prefix_space": False, "use_regex": True})
+
+
+class InklingConfig(unittest.TestCase):
+    """llama.cpp's inkling as the inkling engine's config.json, from unsloth's Inkling-Small
+    header: global layers every sixth, two dense blocks, KV heads from the per-layer array."""
+    def test_small_metadata(self):
+        import tools.gguf_import as gi
+        p = "inkling."
+        local = [i % 6 != 5 for i in range(42)]
+        meta = {p + k: v for k, v in {
+            "block_count": 42, "context_length": 1048576, "embedding_length": 4096, "feed_forward_length": 16384,
+            "attention.head_count": 32, "attention.head_count_kv": [4 if l else 8 for l in local],
+            "attention.key_length": 128, "vocab_size": 201024, "expert_count": 256, "expert_used_count": 6,
+            "expert_feed_forward_length": 2048, "expert_shared_count": 2, "expert_weights_scale": 8.0,
+            "attention.sliding_window": 512, "attention.sliding_window_pattern": local, "d_rel": 16,
+            "rel_extent": 1024, "shortconv_kernel": 4, "dense_block_count": 2, "logit_scale_denom": 16.0,
+            "log_scaling_n_floor": 128000, "log_scaling_alpha": 0.1, "unpadded_vocab_size": 200058}.items()}
+        meta["tokenizer.ggml.eos_token_id"] = 200006
+        cfg, layers = gi.inkling_config(meta, {"token_embd.weight": {"dims": [4096, 201024]}})
+        self.assertEqual((layers, cfg["model_type"]), (42, "inkling"))
+        self.assertEqual((cfg["num_key_value_heads"], cfg["swa_num_key_value_heads"]), (8, 4))
+        self.assertEqual(cfg["local_layer_ids"], [i for i in range(42) if i % 6 != 5])
+        self.assertEqual(cfg["mlp_layer_types"][:3], ["dense", "dense", "sparse"])
+        self.assertEqual((cfg["intermediate_size"], cfg["moe_intermediate_size"], cfg["n_shared_experts"]), (16384, 2048, 2))
+        self.assertEqual((cfg["unpadded_vocab_size"], cfg["eos_token_id"]), (200058, 200006))
+
+
 class Qwen4ExpLayers(unittest.TestCase):
     """Which layers attend, from either way a qwen4exp GGUF says it: unsloth's Qwen3.8-Flash-Next
     files give full_attention_interval (no attention.recurrent_layers), newer llama.cpp
