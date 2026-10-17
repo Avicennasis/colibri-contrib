@@ -878,6 +878,21 @@ jobs:
               ./qwen36 "$cap" 8 qwen3_coder_tiny/ref_full.json
             echo "::endgroup::"
           done
+      - name: "Qwen3-8B geometry: the dense Qwen3"
+        run: |
+          cd c
+          # Qwen/Qwen3-8B is Qwen3ForCausalLM: the Qwen3-Coder layer above (all
+          # attention, plain RMSNorm, full rotary) with one SwiGLU MLP and no router,
+          # run as the dense Qwen3.8-27B's MLP below.
+          python3 tools/make_qwen36_tiny.py --geometry qwen3-8b-dense \
+                  --out qwen3_8b_tiny --ref-mode full \
+                  --emit-ref qwen3_8b_tiny/ref_full.json
+          python3 tools/convert_qwen36.py --model qwen3_8b_tiny \
+                  --out qwen3_8b_tiny_c --ebits 8
+          python3 -c "import json; m = json.load(open('qwen3_8b_tiny_c/qwen36_meta.json')); \
+                      assert (m['num_experts'], m['shared_inter'], m['zero_centered_norms'], \
+                              set(m['layer_types'])) == (0, 128, False, {'full_attention'}), m"
+          COLI_DENSE_I8=0 SNAP=qwen3_8b_tiny_c ./qwen36 8 8 qwen3_8b_tiny/ref_full.json
       - name: "Qwen3.8-27B geometry: a dense checkpoint of the same architecture (#1757)"
         run: |
           cd c

@@ -54,7 +54,9 @@
 #include "cli_args.h"
 #include "compat.h"
 #include "json.h"
+#define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+#include "ggml_view.h"   /* coli_mxfp4_unblock: a GGUF's MXFP4 experts */
 #include "quant.h"
 #include "omp_tune.h"
 #include "kv_prefix.h"
@@ -210,7 +212,9 @@ static void load_cfg(Cfg *c, const char *dir) {
     c->image_token_id = (int)jnum(root, "image_token_id", -1);
     c->vision_start_id = (int)jnum(root, "vision_start_token_id", -1);
     c->vision_end_id = (int)jnum(root, "vision_end_token_id", -1);
-    c->chunks = c->kv_heads[0];
+    /* the qkv pre-shard count: the release's num_key_value_heads chunks; a GGUF's qkv is one
+     * (llama.cpp's converter writes [Q|K|V], gguf_import says so) */
+    c->chunks = (int)jnum(root, "qkv_shards", c->kv_heads[0]);
     /* MIMO_LAYERS=N: only the first N layers, then the final norm and head. A
      * checking aid (tools/mimo_real_check.py compares it with Xiaomi's code on
      * the real weights), never an answer anyone should read. */
@@ -447,6 +451,15 @@ static void dw_note(DW *d, const char *name, int kind) {
 #endif
 
 static void dw_load_bf16(DW *d, shards *S, const char *name, int O, int I) {
+    st_tensor *t0 = st_find(S, name);
+    if (t0 && t0->dtype == 2) {   /* F32 (a GGUF converted at full precision): into the configured form */
+        need(S, name, 2, O, I);
+        DW_NOTE(d, name, DWK_BF16);
+        float *w = xmalloc((size_t)O * I * sizeof(float), name);
+        st_read_f32(S, name, w, 1);
+        dw_from_f32(d, w, O, I);
+        return;
+    }
     st_tensor *t = need(S, name, 0, O, I);
     DW_NOTE(d, name, DWK_BF16);
     if (g_dense_bits == 0) {
@@ -519,6 +532,12 @@ static void load_qkv(DW *d, shards *S, const Cfg *c, int li) {
     int per_chunk = (rpc + 127) / 128, continuous = (O + 127) / 128;
     char name[512], sname[600];
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.qkv_proj.weight", li);
+    st_tensor *qt = st_find(S, name);
+    if (qt && (qt->dtype == 0 || qt->dtype == 2)) {   /* BF16 or F32 (a GGUF's), one [Q|K|V] chunk */
+        if (T != 1) { fprintf(stderr, "[mimo] %s: BF16 qkv in %d pre-shard chunks -- refusing\n", name, T); exit(1); }
+        dw_load_bf16(d, S, name, O, c->hidden);
+        return;
+    }
     snprintf(sname, sizeof(sname), "%s_scale_inv", name);
     st_tensor *st = st_find(S, sname);
     if (!st) st_die_missing(S, sname);
@@ -581,7 +600,7 @@ static void dw_reload(DW *d) {
 
 typedef struct { int eid; uint64_t used; uint8_t *base, *buf; } Slot;
 typedef struct { Slot *s; int n, cap; int *by_expert; } LCache;
-typedef struct { int fd[6]; int64_t off[6]; int contig; } ERef;
+typedef struct { int fd[6]; int64_t off[6]; int contig; } ERef;   /* a GGUF's: down, gate, up blocks in fd/off[0..2] */
 
 typedef struct {
     float *ln1, *ln2, *sink;
@@ -623,6 +642,8 @@ typedef struct {
     uint64_t clock, hits, miss, bytes_read, forwards;
     double t_disk, t_expert, t_attn;
     int idot, direct;
+    int gx;                      /* the routed experts are a GGUF's MXFP4 blocks (st_gguf.h): laid out
+                                  * as the release's at the read (coli_mxfp4_unblock) */
     uint8_t **ehit;              /* [layer][expert] routed this turn, for HITS */
 #ifdef COLI_VULKAN
     void *vkchain;               /* the dense chain's device state (mimo_chain.h), NULL until it runs */
@@ -644,6 +665,35 @@ static void expert_table_init(Model *m) {
     m->eref = xcalloc((size_t)c->n_layers * c->n_experts, sizeof(ERef), "expert table");
     static const char *mat[3] = {"down_proj", "gate_proj", "up_proj"};
     int missing = 0, split = 0;
+    for (int li = 0; li < c->n_layers && !m->gx; li++) if (c->moe[li]) {
+        char nm[512]; snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.0.down_proj.weight", li);
+        st_tensor *t = st_find(&m->S, nm);
+        m->gx = t && st_is_ggml(t->dtype);
+        break;
+    }
+    if (m->gx) {   /* a GGUF: each matrix its MXFP4 blocks, 17 bytes per 32 values */
+        for (int li = 0; li < c->n_layers; li++) {
+            if (!c->moe[li]) continue;
+            for (int e = 0; e < c->n_experts; e++) {
+                ERef *er = &m->eref[(int64_t)li * c->n_experts + e];
+                for (int k = 0; k < 3; k++) {
+                    char nm[512];
+                    snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.%s.weight", li, e, mat[k]);
+                    st_tensor *t = st_find(&m->S, nm);
+                    const int64_t want = m->part[2 * k] / 16 * 17;
+                    if (!t || !st_is_ggml(t->dtype) || st_ggml_type(t->dtype) != GQ_MXFP4 || t->nbytes != want) {
+                        fprintf(stderr, "[mimo] %s: not %lld bytes of MXFP4 blocks (a GGUF's routed experts must be MXFP4) "
+                                        "-- refusing\n", nm, (long long)want);
+                        exit(1);
+                    }
+                    er->fd[k] = t->fd; er->off[k] = t->off;
+                }
+                er->contig = 0;
+            }
+        }
+        fprintf(stderr, "[mimo] GGUF experts: MXFP4 blocks, laid out as the release's at the read\n");
+        return;
+    }
     for (int li = 0; li < c->n_layers; li++) {
         if (!c->moe[li]) continue;
         for (int e = 0; e < c->n_experts; e++) {
@@ -694,6 +744,23 @@ static void expert_read(Model *m, int li, int eid, Slot *s) {
         fprintf(stderr, "[mimo] out of memory for an expert slot\n"); exit(1);
     }
     ERef *er = &m->eref[(int64_t)li * m->c.n_experts + eid];
+    if (m->gx) {   /* a GGUF's three MXFP4 matrices, each into its codes and scales */
+        static __thread uint8_t *raw; static __thread int64_t raw_n;
+        const int64_t need = m->part[0] / 16 * 17;   /* the biggest matrix: all three have H x MI values */
+        if (raw_n < need) {
+            free(raw); raw = malloc((size_t)need); raw_n = raw ? need : 0;
+            if (!raw) { fprintf(stderr, "[mimo] out of memory reading an expert\n"); exit(1); }
+        }
+        uint8_t *dst = s->base;
+        for (int k = 0; k < 3; k++) {
+            const int64_t nb = m->part[2 * k] / 16;
+            st_pread_full(er->fd[k], raw, nb * 17, er->off[k], "pread expert");
+            coli_mxfp4_unblock(dst + m->part[2 * k], dst, raw, nb);
+            dst += m->part[2 * k] + m->part[2 * k + 1];
+        }
+        s->buf = s->base;
+        return;
+    }
     if (er->fd[0] < 0) { fprintf(stderr, "[mimo] expert L%d E%d missing on disk\n", li, eid); exit(1); }
     if (er->contig) {
         int dfd = m->direct ? st_direct_fd(&m->S, er->fd[0]) : -1;
@@ -802,9 +869,22 @@ static void model_load(Model *m, const char *dir, int cap) {
     m->idot = env_int("MIMO_IDOT", 0);
     m->direct = env_int("MIMO_DIRECT", 1);
     int H = c->hidden;
-    need(&m->S, "model.embed_tokens.weight", 0, c->vocab, H);
     m->embed = xmalloc((size_t)c->vocab * H * sizeof(uint16_t), "embeddings");
-    st_read_raw_cap(&m->S, "model.embed_tokens.weight", m->embed, (int64_t)c->vocab * H * 2, 1);
+    st_tensor *et = st_find(&m->S, "model.embed_tokens.weight");
+    if (et && et->dtype == 2) {   /* F32 (a GGUF converted at full precision): to bf16, nearest even */
+        need(&m->S, "model.embed_tokens.weight", 2, c->vocab, H);
+        float *all = xmalloc((size_t)c->vocab * H * sizeof(float), "embeddings f32");
+        st_read_f32(&m->S, "model.embed_tokens.weight", all, 1);
+        for (int64_t i = 0; i < (int64_t)c->vocab * H; i++) {
+            uint32_t b; memcpy(&b, &all[i], 4);
+            b += 0x7fffu + ((b >> 16) & 1u);
+            m->embed[i] = (uint16_t)(b >> 16);
+        }
+        free(all);
+    } else {
+        need(&m->S, "model.embed_tokens.weight", 0, c->vocab, H);
+        st_read_raw_cap(&m->S, "model.embed_tokens.weight", m->embed, (int64_t)c->vocab * H * 2, 1);
+    }
     m->norm = load_vec(&m->S, "model.norm.weight", H);
     dw_load_bf16(&m->head, &m->S, "lm_head.weight", c->vocab, H);
     for (int li = 0; li < c->n_layers; li++) {
@@ -822,16 +902,20 @@ static void model_load(Model *m, const char *dir, int cap) {
             snprintf(nm, sizeof(nm), "model.layers.%d.self_attn.attention_sink_bias", li);
             l->sink = load_vec(&m->S, nm, c->heads[k]);
         }
-        if (!c->moe[li]) {
-            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate_proj.weight", li);
-            dw_load_fp8(&l->gate, &m->S, nm, c->dense_inter, H, NULL, 0, NULL);
-            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.up_proj.weight", li);
-            dw_load_fp8(&l->up, &m->S, nm, c->dense_inter, H, NULL, 0, NULL);
-            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.down_proj.weight", li);
-            dw_load_fp8(&l->down, &m->S, nm, H, c->dense_inter, NULL, 0, NULL);
+        if (!c->moe[li]) {   /* FP8 in the release, BF16 in a GGUF */
+            DW *mlp[3] = {&l->gate, &l->up, &l->down};
+            const char *mn[3] = {"gate_proj", "up_proj", "down_proj"};
+            for (int k = 0; k < 3; k++) {
+                const int O = k < 2 ? c->dense_inter : H, I = k < 2 ? H : c->dense_inter;
+                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.%s.weight", li, mn[k]);
+                st_tensor *t = st_find(&m->S, nm);
+                if (t && (t->dtype == 0 || t->dtype == 2)) dw_load_bf16(mlp[k], &m->S, nm, O, I);
+                else dw_load_fp8(mlp[k], &m->S, nm, O, I, NULL, 0, NULL);
+            }
         } else {
             snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.weight", li);
-            need(&m->S, nm, 0, c->n_experts, H);
+            st_tensor *rt = st_find(&m->S, nm);
+            need(&m->S, nm, rt && rt->dtype == 2 ? 2 : 0, c->n_experts, H);   /* BF16, or a GGUF's F32 */
             l->router = xmalloc((size_t)c->n_experts * H * sizeof(float), nm);
             st_read_f32(&m->S, nm, l->router, 1);
             snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.e_score_correction_bias", li);

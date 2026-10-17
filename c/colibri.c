@@ -64,7 +64,9 @@
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
 #include "oracle.h"
+#define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+#include "ggml_view.h"   /* a GGUF's matrices (QT_GGML) on ggml_quants.h */
 #ifdef __linux__
 #include "uring.h"
 #endif
@@ -263,8 +265,22 @@ typedef struct {
  * 100+ ordinal as a public default/committed-upstream value -- the real
  * ordinal is only settled when the format MERGES into dev, exactly as fmt=8's
  * two renumbers demonstrate. */
+/* fmt QT_GGML (a private ordinal, see the convention below): a GGUF matrix (st_gguf.h) as the
+ * file has it, its blocks in q4, its ggml type in gt -- the file's, or its rows interleaved
+ * by 16 (GQ_*_R16, coli_ggml_held_type) -- and no scale array; ggml_quants.h computes it on
+ * the CPU, no device takes it. */
+#define QT_GGML 101
+/* fmt QT_KVB: kv_b_proj of a GGUF, kept as the file splits it (llama.cpp's glm-dsa): k_b =
+ * W_k transposed per head [H][kv_lora][nope] and v_b = W_v [H][v_head][kv_lora], two QT_GGML
+ * in t->kvb (QtKvb). It stands for the checkpoint's [H*(nope+v_head)][kv_lora] in matmul_qt
+ * (the prefill's reconstruction), qt_matvec_rows (the value rows) and qt_kvb_absorb (the
+ * absorbed query), at the file's bytes instead of f32. */
+#define QT_KVB 102
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
+    int gt;      /* fmt QT_GGML: the ggml type of q4's blocks */
+    int64_t gcap;   /* fmt QT_GGML: bytes q4 holds (a slot reused across layers of other types) */
+    struct QtKvb *kvb;   /* fmt QT_KVB: its k_b and v_b */
     int planar;  /* K1: fmt=2 con nibble a PIANI (vedi quant.h) — i kernel *_i4p; 0 = coppie classiche */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
@@ -298,8 +314,11 @@ typedef struct {
      * q8/q4/s; they are interior pointers into g_maps[] shard mappings. */
     int mmap_view;
 } QT;
+typedef struct QtKvb { QT kb, vb; int H, nope, V, L; } QtKvb;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
+    if(t->fmt==QT_GGML) return gq_row_bytes(t->gt,t->I)*(int64_t)t->O;   /* scales inside the blocks */
+    if(t->fmt==QT_KVB) return qt_bytes(&t->kvb->kb)+qt_bytes(&t->kvb->vb);
     if(t->fmt==0) return n*4;
     if(t->fmt==1) return n + (int64_t)t->O*4;
     if(t->fmt==3) return (int64_t)t->O*((t->I+3)/4) + (int64_t)t->O*4;
@@ -386,6 +405,7 @@ static int64_t qt_rb(const QT *t){ return t->mmap_view ? 0 : qt_bytes(t); }
  * 4-byte allocation. UNVERIFIED at runtime (same static/arithmetic-only
  * caveat as the fmt=4/5/8 fix above -- no model run performed). */
 static int64_t qt_scale_bytes(const QT *t){
+    if(t->fmt==QT_GGML || t->fmt==QT_KVB) return 0;   /* in the blocks */
     if(t->fmt==4){ int ng=(t->I+t->gs-1)/t->gs; return (int64_t)t->O*ng*4; }
     if(t->fmt==5){ int64_t ng=((int64_t)t->I+63)/64; return (int64_t)t->O*ng*4; }
     if(t->fmt==6) return 4;   /* E8/IQ3: FIXED 4-byte tag (qsalloc(1)), not O*4 -- see this
@@ -670,6 +690,8 @@ static struct {
     int on;                       /* vkt_init accepted the experts */
     int nl;                       /* the model's layers; the MTP head's (index nl) is [1] below */
     int gu_fmt[2], gu_gs[2], dn_fmt[2], dn_gs[2];   /* the QT formats it was given (gate = up) */
+    int *gt;                      /* a GGUF's experts (QT_GGML): each layer's file types, gate/up then
+                                   * down, gt[2 * layer + {0,1}] (the MTP head's at index nl) */
     size_t exp_bytes;             /* one expert on the device */
 } g_vkt;
 static int vk_tier_resident_count(Model *m);
@@ -788,6 +810,7 @@ static int vk_matmul_pair_qt(QT *a, float *ya, QT *b, float *yb, const float *x,
 #endif
 #ifdef COLI_CUDA
 static int qt_cuda_upload(QT *t){
+    if(t->fmt==QT_GGML) return 0;   /* a GGUF matrix: ggml_quants.h on the CPU */
     if(t->fmt==5) return 0;   /* int3-g64: no CUDA kernel yet — tensor stays CPU-side */
     if(t->fmt==6 && !g_cuda_e8_ready) return 0;   /* E8 without its codebook would decode garbage */
     if(t->fmt==8 && !g_cuda_fp8_ready) return 0;  /* same idiom: fp8 without its e4m3 LUT stays
@@ -1292,7 +1315,57 @@ static inline int pq_want(const QT *g,const QT *u,int nr){
  * EN: allow_idot=0 forces the EXACT int4/int8 kernel (f32 activations). The attention
  * projections need it: IDOT's int8 activation quantization costs +0.117 nats/token there
  * (~+12% perplexity), measured. Every other prefill matmul keeps IDOT as before. */
+/* A GGUF matrix's product (QT_GGML): rows [r0, r0+n) of it times x[S], into y[S][n]. An
+ * interleaved one starts at a group of 16 rows. */
+static void qt_ggml_rows(const QT *w, int r0, int n, const float *x, float *y, int S){
+    const int64_t rb=gq_row_bytes(w->gt,w->I);
+    if(gq_r16_base(w->gt)>=0 && r0%16){
+        fprintf(stderr,"GGUF %s matrix read from row %d, inside a group of 16\n",gq_type_name(w->gt),r0); exit(1);
+    }
+    ColiTensorView v={COLI_TENSOR_GGML,COLI_SCALE_NONE,w->q4+(int64_t)r0*rb,NULL,(size_t)(rb*n),0,n,w->I,1,(uint32_t)w->gt,NULL};
+    if(coli_ggml_matmul(y,&v,x,S)){
+        fprintf(stderr,"GGUF matmul failed: %s rows of %d\n",gq_type_name(w->gt),w->I); exit(1);
+    }
+}
+/* Row `row` of a QT_GGML matrix in f32 (an interleaved one from its group). */
+static void qt_ggml_row_f32(const QT *w, int row, float *out){
+    if(gq_r16_base(w->gt)>=0) gq_r16_dequant_row(w->gt,w->q4,row,out,w->I);
+    else gq_dequant_row(w->gt,w->q4+(int64_t)row*gq_row_bytes(w->gt,w->I),out,w->I);
+}
+/* y[n] = rows [r0, r0+n) of a QT_GGML times x, in f32: the attention's own products on kv_b,
+ * which take their input as it is (no int8 activations; the rows dequantized as they are
+ * read). No parallel region of its own: the attention calls it per head. */
+static void qt_ggml_rows_f32(const QT *w, int r0, int n, const float *x, float *y){
+    float row[4096];
+    if(w->I>4096){ fprintf(stderr,"GGUF kv_b rows of %d: too wide\n",w->I); exit(1); }
+    for(int j=0;j<n;j++){ qt_ggml_row_f32(w,r0+j,row); y[j]=gq_dot_f32(row,x,w->I); }
+}
+/* y[S][H*(nope+V)] = kv_b x for a QT_KVB, in f32 like the checkpoint's: per head its nope
+ * rows (k_b transposed: each head's k_b dequantized once, then x times it) and its V rows. */
+static void qt_kvb_matmul(float *y, const float *x, const QT *w, int S){
+    const QtKvb *k=w->kvb; const int H=k->H, nope=k->nope, V=k->V, L=k->L, R=nope+V;
+    #pragma omp parallel for schedule(static)
+    for(int h=0;h<H;h++){
+        float *kb=malloc((size_t)L*nope*sizeof(float)), *vb=malloc((size_t)V*L*sizeof(float));   /* k_b[h], v_b[h] */
+        if(!kb||!vb){ fprintf(stderr,"OOM kv_b product\n"); exit(1); }
+        for(int l=0;l<L;l++) qt_ggml_row_f32(&k->kb,h*L+l,kb+(int64_t)l*nope);
+        for(int v=0;v<V;v++) qt_ggml_row_f32(&k->vb,h*V+v,vb+(int64_t)v*L);
+        for(int s=0;s<S;s++){
+            float *ys=y+(int64_t)s*H*R+(int64_t)h*R; const float *xs=x+(int64_t)s*L;
+            for(int d=0;d<nope;d++) ys[d]=0.f;
+            for(int l=0;l<L;l++){ const float a=xs[l], *kr=kb+(int64_t)l*nope; for(int d=0;d<nope;d++) ys[d]+=a*kr[d]; }
+            for(int v=0;v<V;v++) ys[nope+v]=gq_dot_f32(vb+(int64_t)v*L,xs,L);
+        }
+        free(kb); free(vb);
+    }
+}
+/* The absorbed query of head h, q_lat = W_k[h]^T q_nope: k_b[h] times q_nope, for a QT_KVB. */
+static void qt_kvb_absorb(const QT *w, int h, const float *q_nope, float *q_lat){
+    qt_ggml_rows_f32(&w->kvb->kb,h*w->kvb->L,w->kvb->L,q_nope,q_lat);
+}
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
+    if(w->fmt==QT_GGML){ (void)allow_idot; qt_ggml_rows(w,0,w->O,x,y,S); return; }   /* the CPU's, no device */
+    if(w->fmt==QT_KVB){ qt_kvb_matmul(y,x,w,S); return; }
 #ifdef COLI_VULKAN
     if(__atomic_load_n(&w->vk_gone, __ATOMIC_ACQUIRE)){
         if(qt_dho_matmul(w, y, x, S)) return;
@@ -2257,6 +2330,33 @@ static void *map_of_fd(int fd);   /* definita sotto, zona COLI_MMAP (shard mmap 
  * drop=1 -> fadvise DONTNEED (streaming expert). */
 static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int drop, QT *t){
     t->planar=0;   /* K1: il flag non sopravvive mai a un refill */
+    st_tensor *gg=st_find(&m->S,name);
+    if(gg && st_is_ggml(gg->dtype)){
+        /* a GGUF matrix (st_gguf.h): its blocks as the file has them, its rows interleaved by
+         * 16 where coli_ggml_held_type says so (GLM_ILV16=0: the file's rows) */
+        const int type=st_ggml_type(gg->dtype);
+        const int64_t rb=gq_row_bytes(type,I);
+        if(rb<0 || gg->nbytes!=rb*O){
+            fprintf(stderr,"%s: %lld bytes of %s, not [%d x %d] of it\n",name,(long long)gg->nbytes,gq_type_name(type),O,I); exit(1); }
+        const int held=coli_ggml_held_type(type,O,I,"GLM_ILV16");
+        const int64_t hb=gq_row_bytes(held,I)*O;
+        if(t->fmt!=QT_GGML || t->gcap<hb){
+            if(t->fmt==QT_GGML) free(t->q4);
+            if(!(t->q4=qalloc((size_t)hb))){ fprintf(stderr,"OOM %s\n",name); exit(1); }
+            t->gcap=hb;
+        }
+        t->fmt=QT_GGML; t->gt=held; t->O=O; t->I=I; t->gs=0; t->qf=NULL; t->q8=NULL; t->s=NULL;
+        if(held==type){ st_read_raw(&m->S,name,t->q4,drop); return; }
+        uint8_t *raw=malloc((size_t)gg->nbytes);
+        if(!raw){ fprintf(stderr,"OOM reading %s\n",name); exit(1); }
+        st_read_raw(&m->S,name,raw,drop);
+        if(O>=4096 && !omp_in_parallel()){   /* a dense matrix at load: its groups on the threads */
+            #pragma omp parallel for schedule(static)
+            for(int g=0;g<O/16;g++) gq_r16_pack(held,t->q4+(int64_t)g*16*gq_row_bytes(held,I),raw+(int64_t)g*16*rb,16,I);
+        } else gq_r16_pack(held,t->q4,raw,O,I);
+        free(raw);
+        return;
+    }
     char sn[300]; snprintf(sn,sizeof(sn),"%s.qs",name);
     if(st_has(&m->S,sn)){
         int64_t nb=st_nbytes(&m->S,name);
@@ -2365,7 +2465,7 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     if(!(t.vk_name=strdup(name))){ fprintf(stderr,"OOM tensor name\n"); exit(1); }
 #endif
 #ifdef COLI_CUDA
-    if(g_cuda_enabled&&g_cuda_dense){
+    if(g_cuda_enabled&&g_cuda_dense&&t.fmt!=QT_GGML){   /* a GGUF matrix stays the CPU's */
         t.cuda_eligible=1;
         int slot=g_cuda_rr++%g_cuda_ndev; t.cuda_device=g_cuda_devices[slot];
         g_cuda_dense_projected[slot]+=qt_bytes(&t);
@@ -2385,6 +2485,46 @@ static QT qt_load_ex(Model *m, const char *name, int O, int I, int bits, int mma
     return qt_load(m,name,O,I,bits);
 }
 
+/* kv_b_proj of a GGUF (llama.cpp's glm-dsa splits it): k_b is W_k transposed per head
+ * [H][kv_lora][nope], v_b is W_v [H][v_head][kv_lora]. Block-quantized ones stay the file's
+ * blocks (QT_KVB); float ones are put back as the checkpoint's [H*(nope+v_head)][kv_lora] in
+ * f32, their values exactly. prefix: "model.layers.<i>.". */
+static QT qt_kvb_gguf(Model *m, const char *prefix, int H, int nope, int V, int L){
+    char kn[300], vn[300];
+    snprintf(kn,sizeof kn,"%sself_attn.k_b_proj.weight",prefix); snprintf(vn,sizeof vn,"%sself_attn.v_b_proj.weight",prefix);
+    st_tensor *kb=st_find(&m->S,kn), *vb=st_find(&m->S,vn);
+    if(!kb||!vb) { fprintf(stderr,"%s: no kv_b_proj, nor GGUF k_b / v_b\n",prefix); exit(1); }
+    if(st_is_ggml(kb->dtype) && st_is_ggml(vb->dtype)){
+        QT t; memset(&t,0,sizeof t);
+        QtKvb *k=calloc(1,sizeof *k);
+        if(!k){ fprintf(stderr,"OOM %skv_b\n",prefix); exit(1); }
+        qt_from_disk(m,kn,H*L,nope,8,0,&k->kb); qt_from_disk(m,vn,H*V,L,8,0,&k->vb);
+        k->H=H; k->nope=nope; k->V=V; k->L=L;
+        t.fmt=QT_KVB; t.O=H*(nope+V); t.I=L; t.kvb=k;
+        return t;
+    }
+    const int tk=st_ggml_type_any(kb->dtype), tv=st_ggml_type_any(vb->dtype);
+    const int64_t rk=tk>=0?gq_row_bytes(tk,nope):-1, rv=tv>=0?gq_row_bytes(tv,L):-1;
+    if(rk<0||rv<0||kb->nbytes!=rk*H*L||vb->nbytes!=rv*H*V){
+        fprintf(stderr,"%s: GGUF k_b / v_b are not [%d][%d][%d] / [%d][%d][%d]\n",prefix,H,L,nope,H,V,L); exit(1); }
+    uint8_t *kraw=malloc((size_t)kb->nbytes), *vraw=malloc((size_t)vb->nbytes);
+    QT t; memset(&t,0,sizeof t);
+    t.fmt=0; t.O=H*(nope+V); t.I=L; t.qf=(float*)qalloc((size_t)t.O*L*sizeof(float));
+    if(!kraw||!vraw||!t.qf){ fprintf(stderr,"OOM building %skv_b\n",prefix); exit(1); }
+    st_pread_full(kb->fd,kraw,kb->nbytes,kb->off,kn); st_pread_full(vb->fd,vraw,vb->nbytes,vb->off,vn);
+    #pragma omp parallel for schedule(static)
+    for(int h=0;h<H;h++){
+        float row[4096];
+        float *kv=t.qf+(int64_t)h*(nope+V)*L;
+        for(int l=0;l<L;l++){   /* row l of k_b's head: W_k[h][.][l] */
+            gq_dequant_row(tk,kraw+((int64_t)h*L+l)*rk,row,nope);
+            for(int d=0;d<nope;d++) kv[(int64_t)d*L+l]=row[d];
+        }
+        for(int v=0;v<V;v++) gq_dequant_row(tv,vraw+((int64_t)h*V+v)*rv,kv+(int64_t)(nope+v)*L,L);
+    }
+    free(kraw); free(vraw);
+    return t;   /* no vk_name: no tensor to read it back from, so it keeps its host copy */
+}
 static float *ld(Model *m, const char *name){   /* tensore 1D f32 residente (norme/bias) */
     int64_t n=st_numel(&m->S,name); if(n<0) st_die_missing(&m->S,name);
     float *p=(float*)qalloc((size_t)n*sizeof(float));   /* registrato per la GPU sotto METAL */
@@ -2621,7 +2761,10 @@ static void model_init_range(Model *m, const char *snap, int cap,
         l->q_b   = qt_load_ex(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits,mmap_ok);
         l->kv_a  = qt_load_ex(m,P("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits,mmap_ok);
         l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
-        l->kv_b  = qt_load_ex(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits,mmap_ok);
+        if(st_has(&m->S,P("self_attn.kv_b_proj.weight")))
+            l->kv_b  = qt_load_ex(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits,mmap_ok);
+        else { char pre[64]; snprintf(pre,sizeof pre,"model.layers.%d.",i);   /* a GGUF's k_b / v_b */
+            l->kv_b = qt_kvb_gguf(m,pre,H,c->qk_nope,c->v_head,c->kv_lora); }
         l->o     = qt_load_ex(m,P("self_attn.o_proj.weight"), D, H*c->v_head, dbits,mmap_ok);
 #ifdef COLI_CUDA
         qt_cuda_colocate(&l->o,&l->kv_b);
@@ -2677,6 +2820,8 @@ static void model_init_range(Model *m, const char *snap, int cap,
         char mn[256]; m->has_mtp=1;
         for(unsigned q=0;q<sizeof(req)/sizeof(req[0]);q++){
             snprintf(mn,sizeof(mn),"model.layers.%d.%s",c->n_layers,req[q]);
+            if(!st_has(&m->S,mn) && !strcmp(req[q],"self_attn.kv_b_proj.weight"))   /* a GGUF's k_b / v_b instead */
+                snprintf(mn,sizeof(mn),"model.layers.%d.self_attn.k_b_proj.weight",c->n_layers);
             if(!st_has(&m->S,mn)){ m->has_mtp=0; break; }
         }
         /* probe the LAST expert by index, not a fixed 255: REAP-pruned
@@ -2695,7 +2840,10 @@ static void model_init_range(Model *m, const char *snap, int cap,
             l->q_b   = qt_load(m,PM("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
             l->kv_a  = qt_load(m,PM("self_attn.kv_a_proj_with_mqa.weight"), c->kv_lora+c->qk_rope, D, dbits);
             l->kv_a_ln= ld(m,PM("self_attn.kv_a_layernorm.weight"));
-            l->kv_b  = qt_load(m,PM("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
+            if(st_has(&m->S,PM("self_attn.kv_b_proj.weight")))
+                l->kv_b  = qt_load(m,PM("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
+            else { char pre[64]; snprintf(pre,sizeof pre,"model.layers.%d.",i);   /* a GGUF's k_b / v_b */
+                l->kv_b = qt_kvb_gguf(m,pre,H,c->qk_nope,c->v_head,c->kv_lora); }
             l->o     = qt_load(m,PM("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
             l->sparse=1;
             l->router=ld(m,PM("mlp.gate.weight"));
@@ -2788,6 +2936,11 @@ static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
     if(tok<0 || tok>=e->O){ memset(x,0,(size_t)D*sizeof(float)); return; }   /* #SEC-5: out-of-range token id -> zero row, never OOB */
     if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
+    if(e->fmt==QT_GGML){   /* a GGUF table's row, dequantized */
+        if(gq_r16_base(e->gt)>=0 ? gq_r16_dequant_row(e->gt,e->q4,tok,x,D)
+                                 : gq_dequant_row(e->gt,e->q4+(int64_t)tok*gq_row_bytes(e->gt,D),x,D)){
+            fprintf(stderr,"GGUF embedding row %d of %s not readable\n",tok,gq_type_name(e->gt)); exit(1); }
+        return; }
     if(e->fmt==4){ /* grouped int4: per-group scale (embed/lm_head at io_bits, usually fmt 0/1) */
         const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); int gs=e->gs,ng=(D+gs-1)/gs;
         const float *scl=e->s+(int64_t)tok*ng;
@@ -4102,6 +4255,23 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
 #endif
     int I=t->I;
     if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=coef*w[i]; return; }
+    if(t->fmt==QT_KVB){   /* row d of head h's keys: column d of k_b[h] (qt_kvb_absorb is the fast form) */
+        const QtKvb *k=t->kvb; const int R=k->nope+k->V, h=row/R, d=row%R;
+        if(d>=k->nope){ fprintf(stderr,"qt_addrow: a value row of a GGUF's kv_b (qt_matvec_rows reads those)\n"); exit(1); }
+        float kr[4096];
+        for(int l=0;l<k->L;l++){
+            const int r=h*k->L+l;
+            if(gq_r16_base(k->kb.gt)>=0) gq_r16_dequant_row(k->kb.gt,k->kb.q4,r,kr,k->nope);
+            else gq_dequant_row(k->kb.gt,k->kb.q4+(int64_t)r*gq_row_bytes(k->kb.gt,k->nope),kr,k->nope);
+            acc[l]+=coef*kr[d];
+        }
+        return; }
+    if(t->fmt==QT_GGML){ float wr[4096];   /* the row dequantized (an interleaved one from its group) */
+        if(I>4096 || (gq_r16_base(t->gt)>=0 ? gq_r16_dequant_row(t->gt,t->q4,row,wr,I)
+                                            : gq_dequant_row(t->gt,t->q4+(int64_t)row*gq_row_bytes(t->gt,I),wr,I))){
+            fprintf(stderr,"qt_addrow: GGUF %s row of %d not readable\n",gq_type_name(t->gt),I); exit(1); }
+        for(int i=0;i<I;i++) acc[i]+=coef*wr[i];
+        return; }
     /* fmt=4 PRIMA del calcolo di c: s[] e' [O,ng] per-gruppo, s[row] sarebbe la scala
      * sbagliata. Senza questo ramo il fall-through int2 decodificava i nibble int4 come
      * coppie di valori a 2 bit — lo stesso bug di #298 sui kernel absorb CUDA, lato CPU.
@@ -4177,6 +4347,12 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
     if(__atomic_load_n(&t->vk_gone, __ATOMIC_ACQUIRE)) qt_dho_reload((QT *)t);
 #endif
     int I=t->I;
+    if(t->fmt==QT_GGML){ qt_ggml_rows(t,r0,n,x,y,1); return; }
+    if(t->fmt==QT_KVB){   /* a head's value rows: v_b's */
+        const QtKvb *k=t->kvb; const int R=k->nope+k->V, h=r0/R, d=r0%R;
+        if(d<k->nope || d+n>R){ fprintf(stderr,"qt_matvec_rows: kv_b rows %d..%d are not one head's value rows\n",r0,r0+n); exit(1); }
+        qt_ggml_rows_f32(&k->vb,h*k->V+(d-k->nope),n,x,y);
+        return; }
     for(int j=0;j<n;j++){ int row=r0+j; double a=0;
         if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) a+=(double)w[i]*x[i]; }
         else if(t->fmt==4){ /* grouped int4: per-group scale */
@@ -5022,7 +5198,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             const float *qr=qp+c->qk_nope;
             int rbase=h*(c->qk_nope+vh);
             float qabs[512]; memset(qabs,0,kvl*sizeof(float));
-            for(int d=0;d<c->qk_nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
+            if(l->kv_b.fmt==QT_KVB) qt_kvb_absorb(&l->kv_b,h,qp,qabs);   /* a GGUF's k_b, as the file has it */
+            else for(int d=0;d<c->qk_nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
             float *sc = sc_all + (int64_t)omp_get_thread_num()*sc_cap;
             int st0=ks->kv_start[layer];
             int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;    /* DSA: lista top-k o range pieno */
@@ -5625,6 +5802,27 @@ static const void *vk_qt_codes(const QT *t){
 /* An expert slot of `layer` as the tier reads it, or 0 when its tensors are not in the
  * format the tier was configured with for that layer (the model's, or the MTP head's:
  * int8 beside int4; a mixed container): such an expert stays on the CPU. */
+/* The file's ggml type of a QT_GGML matrix (an interleaved one's base type). */
+static inline int qt_ggml_file_type(const QT *t){ return gq_r16_base(t->gt)>=0 ? gq_r16_base(t->gt) : t->gt; }
+/* A GGUF expert for the tier: the file's rows of its three matrices, from the slot or, held
+ * interleaved by 16, unpacked into *buf (the caller frees it). 0 when the slot holds another
+ * expert form than the tier was given for this layer. */
+static int vk_slot_src_ggml(const ESlot *e, int layer, VktExpertSrc *src, uint8_t **buf){
+    const QT *q[3]={&e->g,&e->u,&e->d};
+    *buf=NULL;
+    if(!g_vkt.gt || layer<0 || layer>g_vkt.nl) return 0;
+    for(int k=0;k<3;k++) if(q[k]->fmt!=QT_GGML || !q[k]->q4 || qt_ggml_file_type(q[k])!=g_vkt.gt[2*layer+(k==2)]) return 0;
+    int ilv=0; int64_t fb[3], tot=0;
+    for(int k=0;k<3;k++){ ilv|=q[k]->gt!=qt_ggml_file_type(q[k]); fb[k]=gq_row_bytes(qt_ggml_file_type(q[k]),q[k]->I)*q[k]->O; tot+=fb[k]; }
+    if(!ilv){ *src=(VktExpertSrc){e->g.q4,e->u.q4,e->d.q4,NULL,NULL,NULL}; return 1; }
+    uint8_t *b=*buf=malloc((size_t)tot), *at[3];
+    if(!b) return 0;
+    for(int k=0,o=0;k<3;k++){ at[k]=b+o; o+=(int)fb[k];
+        if(q[k]->gt!=qt_ggml_file_type(q[k])) gq_r16_unpack(q[k]->gt,at[k],q[k]->q4,q[k]->O,q[k]->I);
+        else memcpy(at[k],q[k]->q4,(size_t)fb[k]); }
+    *src=(VktExpertSrc){at[0],at[1],at[2],NULL,NULL,NULL};
+    return 1;
+}
 static int vk_slot_src(const ESlot *e, int layer, VktExpertSrc *src){
     int k = layer>=g_vkt.nl;
     if(!g_vkt.on || e->g.fmt!=g_vkt.gu_fmt[k] || e->u.fmt!=g_vkt.gu_fmt[k] || e->g.gs!=g_vkt.gu_gs[k] ||
@@ -5702,7 +5900,11 @@ static void vk_cpu_pairs(Model *m,int layer,const float *x,int rows,int K,const 
             if(g_prof){ m->t_ecpu+=dt; m->cpu_expert_rows+=(uint64_t)nr;
                 m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d); }
             VktExpertSrc vs;
-            if(note && vk_slot_src(e,layer,&vs)) vkt_note(layer,eid,&vs);   /* may promote it to the device */
+            if(note && e->g.fmt==QT_GGML){   /* a GGUF expert: back to the file's rows only for the tier to take */
+                uint8_t *buf=NULL;
+                if((e->g.gt==qt_ggml_file_type(&e->g) || vkt_wants(layer,eid)) && vk_slot_src_ggml(e,layer,&vs,&buf)) vkt_note(layer,eid,&vs);
+                free(buf);
+            } else if(note && vk_slot_src(e,layer,&vs)) vkt_note(layer,eid,&vs);   /* may promote it to the device */
         }
         ecache_promote_ws(m,layer,nmiss);
     }
@@ -10914,6 +11116,7 @@ static int vk_expert_fmt(Model *m,int layer,int eid,int k,int *gs){
     *gs=0;
     st_tensor *tw=st_find(&m->S,nm);
     if(!tw) return -1;
+    if(st_is_ggml(tw->dtype)) return QT_GGML;   /* a GGUF's: the tier takes its blocks by layer (vk_tier_start) */
     if(st_has(&m->S,q0)){                       /* expert_load_impl's own test */
         st_tensor *tq=st_find(&m->S,qn);
         if(!tq) return -1;
@@ -10944,9 +11147,11 @@ static int vk_in_ram(void *ctx,int layer,int eid){
  * misses then join the LRU as vk_cpu_pairs's do, when the group's last one is given
  * back (before anything else can reuse the working set). */
 static int g_vks_layer=-1, g_vks_nmiss=0, g_vks_held=0;
+static uint8_t *g_vks_buf[64];   /* a group's GGUF experts unpacked to the file's rows (vk_slot_src_ggml) */
 static void vk_stream_promote(Model *m){
     if(g_vks_nmiss>0 && g_vks_layer>=0) ecache_promote_ws(m,g_vks_layer,g_vks_nmiss);
     g_vks_nmiss=0; g_vks_layer=-1; g_vks_held=0;
+    for(int i=0;i<64;i++){ free(g_vks_buf[i]); g_vks_buf[i]=NULL; }
 }
 static int vk_load_batch(void *ctx,int layer,const int *e,int n,VktExpertSrc *srcs,void **h){
     Model *m=ctx;
@@ -10966,7 +11171,10 @@ static int vk_load_batch(void *ctx,int layer,const int *e,int n,VktExpertSrc *sr
         for(int q=0;q<nmiss;q++) expert_load(m,layer,e[miss[q]],&m->ws[q],1,1);
         m->t_ewait += now_s()-t0; }
     int k=0;
-    for(;k<n;k++){ if(!vk_slot_src(use[k],layer,&srcs[k])) break; h[k]=m; }
+    for(;k<n;k++){
+        int ok = use[k]->g.fmt==QT_GGML ? vk_slot_src_ggml(use[k],layer,&srcs[k],&g_vks_buf[k]) : vk_slot_src(use[k],layer,&srcs[k]);
+        if(!ok) break;
+        h[k]=m; }
     g_vks_layer=layer; g_vks_nmiss=nmiss; g_vks_held=k;
     if(!k) vk_stream_promote(m);
     return k;
@@ -11008,7 +11216,53 @@ static void vk_tier_start(Model *m){
     int pl=-1; for(int i=0;i<NL;i++) if(m->L[i].sparse){ pl=i; break; }
     if(pl<0) return;
     int f[3], gs[3]; for(int k=0;k<3;k++) f[k]=vk_expert_fmt(m,pl,0,k,&gs[k]);
-    VktFmt gu, dn;
+    VktFmt gu, dn, *lgu=NULL, *ldn=NULL;
+    int gguf=0;
+    { char gn[288]; snprintf(gn,sizeof gn,"model.layers.%d.mlp.experts.0.gate_proj.weight",pl);
+      st_tensor *g0=st_find(&m->S,gn); gguf = g0 && st_is_ggml(g0->dtype); }
+    if(gguf){
+        /* a GGUF's experts go to the device as the file has them (shaders/blockdec.glsl), each
+         * layer its types as published files mix them (the dense layers take the main form;
+         * the MTP head's, index NL, is the tier's extra layer); gate and up share a type and
+         * every type has a device form, or the routed experts stay on the CPU */
+        const char suf[3][16]={"gate_proj","up_proj","down_proj"};
+        const char *no=NULL; int best=pl, bestn=0, forms=0;
+        g_vkt.gt=calloc((size_t)2*(NL+1),sizeof(int));
+        lgu=malloc((size_t)NL*sizeof *lgu); ldn=malloc((size_t)NL*sizeof *ldn);
+        if(!g_vkt.gt||!lgu||!ldn) no="out of memory";
+        for(int l=0;!no && l<=NL;l++){
+            if(l<NL && !m->L[l].sparse) continue;
+            if(l==NL && !m->has_mtp) break;
+            int t[3];
+            for(int k=0;k<3;k++){ char nm[288]; snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.0.%s.weight",l,suf[k]);
+                st_tensor *tt=st_find(&m->S,nm); t[k]=tt&&st_is_ggml(tt->dtype)?st_ggml_type(tt->dtype):-1; }
+            const int bg=t[0]>=0?coli_vk_block_elems(100+t[0]):0, bd=t[2]>=0?coli_vk_block_elems(100+t[2]):0;
+            if(t[0]!=t[1] || !bg || !bd || c->hidden%bg || c->moe_inter%bd){
+                if(l<NL) no="a type without a device form, or gate and up of two types";
+                else { fprintf(stderr,"[VK] tier colibri: the MTP head's GGUF experts have no device form, they stay on the CPU\n");
+                       g_vkt.gt[2*NL]=g_vkt.gt[2*NL+1]=-1; }
+                continue; }
+            g_vkt.gt[2*l]=t[0]; g_vkt.gt[2*l+1]=t[2];
+            if(l<NL){ lgu[l]=(VktFmt){(VktSrc)(VKT_SRC_GGML+t[0]),0}; ldn[l]=(VktFmt){(VktSrc)(VKT_SRC_GGML+t[2]),0}; }
+        }
+        for(int l=0;!no && l<NL;l++) if(m->L[l].sparse){
+            int nsame=0, seen=0;
+            for(int j=0;j<NL;j++) if(m->L[j].sparse && lgu[j].kind==lgu[l].kind && ldn[j].kind==ldn[l].kind){ nsame++; if(j<l) seen=1; }
+            forms+=!seen; if(nsame>bestn){ bestn=nsame; best=l; }
+        }
+        if(!no && forms>VKT_FORMS-1) no="more distinct types than the tier holds";
+        if(no){ fprintf(stderr,"[VK] tier colibri: the GGUF's experts: %s; the routed experts stay on the CPU\n",no);
+                free(lgu); free(ldn); free(g_vkt.gt); g_vkt.gt=NULL; return; }
+        for(int l=0;l<NL;l++) if(!m->L[l].sparse){ lgu[l]=lgu[best]; ldn[l]=ldn[best]; }
+        gu=lgu[best]; dn=ldn[best];
+        int sparse=0; for(int l=0;l<NL;l++) sparse+=m->L[l].sparse;
+        fprintf(stderr,"[VK] tier colibri: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down",
+                gq_type_name(g_vkt.gt[2*best]),gq_type_name(g_vkt.gt[2*best+1]));
+        if(forms>1) fprintf(stderr," on %d of %d layers, the others their own types",bestn,sparse);
+        fprintf(stderr,")\n");
+        if(forms==1){ free(lgu); free(ldn); lgu=ldn=NULL; }
+        f[0]=f[1]=f[2]=QT_GGML; gs[0]=gs[1]=gs[2]=0;
+    } else
     if(f[0]!=f[1] || gs[0]!=gs[1] || !vk_src_kind(f[0],gs[0],&gu) || !vk_src_kind(f[2],gs[2],&dn)){
         fprintf(stderr,"[VK] tier colibri: experts in fmt %d/%d/%d (gate/up/down) have no device form "
                 "(int2, E8/IQ3 fmt=6 and fp8 stay on the CPU, gate and up must match), the routed experts stay on the CPU\n",f[0],f[1],f[2]);
@@ -11033,7 +11287,12 @@ static void vk_tier_start(Model *m){
     VktFmt xgu={VKT_SRC_NONE,0}, xdn={VKT_SRC_NONE,0}; int xf[3]={0,0,0}, xgs[3]={0,0,0};
     { const char *tm=getenv("COLI_VK_TIER_MTP");
       int want = tm&&*tm ? *tm!='0' : !coli_vk_device_shares_ram();
-      if(m->has_mtp && want){
+      if(m->has_mtp && want && gguf){
+          if(g_vkt.gt[2*NL]>0){
+              xgu=(VktFmt){(VktSrc)(VKT_SRC_GGML+g_vkt.gt[2*NL]),0}; xdn=(VktFmt){(VktSrc)(VKT_SRC_GGML+g_vkt.gt[2*NL+1]),0};
+              xf[0]=xf[1]=xf[2]=QT_GGML;
+          }
+      } else if(m->has_mtp && want){
           for(int k=0;k<3;k++) xf[k]=vk_expert_fmt(m,NL,0,k,&xgs[k]);
           if(xf[0]!=xf[1] || xgs[0]!=xgs[1] || !vk_src_kind(xf[0],xgs[0],&xgu) || !vk_src_kind(xf[2],xgs[2],&xdn)){
               fprintf(stderr,"[VK] tier colibri: the MTP head's experts in fmt %d/%d/%d have no device form, they stay on the CPU\n",
@@ -11049,9 +11308,12 @@ static void vk_tier_start(Model *m){
                   .dense_bytes=(size_t)dense,
                   .in_ram=vk_in_ram, .ram_ctx=m,
                   .max_experts=g_vk_experts>0 ? g_vk_experts : 0,
-                  .load=vk_load, .release=vk_unhold, .load_ctx=m, .load_batch=vk_load_batch};
+                  .load=vk_load, .release=vk_unhold, .load_ctx=m, .load_batch=vk_load_batch,
+                  .layer_gate_up=lgu, .layer_down=ldn};
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
-    if(!vkt_init(&vc,m->eusage)) return;
+    const int tier_on=vkt_init(&vc,m->eusage);
+    free(lgu); free(ldn);   /* read during vkt_init only */
+    if(!tier_on) return;
     g_vkt.on=1; g_vkt.nl=NL; g_vkt.gu_fmt[0]=f[0]; g_vkt.gu_gs[0]=gs[0]; g_vkt.dn_fmt[0]=f[2]; g_vkt.dn_gs[0]=gs[2];
     g_vkt.gu_fmt[1]=xf[0]; g_vkt.gu_gs[1]=xgs[0]; g_vkt.dn_fmt[1]=xf[2]; g_vkt.dn_gs[1]=xgs[2];
     g_vkt.exp_bytes=vkt_expert_bytes(c->hidden,c->moe_inter,gu,dn);
@@ -11068,11 +11330,14 @@ static void vk_tier_start(Model *m){
         for(int t=0;t<nt;t++) tmp[t].eid=-1;
         #pragma omp parallel for schedule(dynamic,4)
         for(int i=0;i<n;i++){
-            VktExpertSrc vs; ESlot *p=pin_indexed(m,ql[i],qe[i]);
-            if(p && vk_slot_src(p,ql[i],&vs)){ vkt_put(ql[i],qe[i],&vs); continue; }
+            VktExpertSrc vs; ESlot *p=pin_indexed(m,ql[i],qe[i]); uint8_t *buf=NULL;
+            if(p && (p->g.fmt==QT_GGML ? vk_slot_src_ggml(p,ql[i],&vs,&buf) : vk_slot_src(p,ql[i],&vs))){
+                vkt_put(ql[i],qe[i],&vs); free(buf); continue; }
             ESlot *t=&tmp[omp_get_thread_num()];
-            int ok = expert_load(m,ql[i],qe[i],t,0,0)==0 && vk_slot_src(t,ql[i],&vs);   /* demand=0: startup */
+            int ok = expert_load(m,ql[i],qe[i],t,0,0)==0 &&   /* demand=0: startup */
+                     (t->g.fmt==QT_GGML ? vk_slot_src_ggml(t,ql[i],&vs,&buf) : vk_slot_src(t,ql[i],&vs));
             vkt_put(ql[i],qe[i],ok?&vs:NULL);   /* NULL: planned but not placed (a mixed container) */
+            free(buf);
         }
         vkt_put_done();
         for(int t=0;t<nt;t++) vk_tmp_slot_free(&tmp[t],vk_experts_rtq(m,pl));

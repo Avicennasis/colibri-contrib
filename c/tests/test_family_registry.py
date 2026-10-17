@@ -189,8 +189,17 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(geometry.configured_experts, 8)
         self.assertEqual(geometry.context_state_bytes, 16_384)
         self.assertEqual(geometry.fixed_state_bytes, 6 * (8 * 8 * 8 + 128 * 3) * 4)
-        for model_type in ("qwen2", "qwen3", "my_qwen_model"):
+        for model_type in ("qwen2", "qwen3_next", "my_qwen_model"):
             self.assertNotIn(model_type, by_type)
+        # the dense Qwen3 is claimed by name (qwen36 runs it, GGUF or converted): every
+        # layer holds KV, nothing is routed
+        self.assertEqual(by_type["qwen3"], by_id["qwen36"])
+        dense = {"model_type": "qwen3", "num_hidden_layers": 4, "num_key_value_heads": 2,
+                 "head_dim": 16, "intermediate_size": 128}
+        resolved = type("R", (), {"descriptor": family, "family_config": dense, "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        self.assertEqual((geometry.configured_experts, geometry.fixed_state_bytes), (0, 0))
+        self.assertEqual(geometry.context_state_bytes, 4 * 32 * 2 * 16 * 2 * 4)
 
     def test_qwen38_fixture_resolves_nested_text_config_and_sizes_all_state(self):
         config = {

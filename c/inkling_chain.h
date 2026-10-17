@@ -1015,7 +1015,6 @@ static void inkc_report(Model *m) {
  * priority; the chain's pipelines, and its teardown registered after the tier's so
  * that it runs first at exit. */
 static void inkc_start(Model *m) {
-    (void)m;
     if (!g_vk_ready) return;
     const char *e = getenv("COLI_VK_CHAIN");
 #ifdef COLI_CUDA
@@ -1026,6 +1025,11 @@ static void inkc_start(Model *m) {
 #endif
     (void)e;
     g_vk_chain = coli_vk_chain_decide("inkling", vkt_ready(), INKLING_CHAIN_IGPU);
+    if (g_vk_chain && ink_is_gguf(m)) {
+        g_vk_chain = 0;
+        fprintf(stderr, "[VK] inkling: the dense chain is off for a GGUF (its dense matrices are ggml blocks, kept on the CPU); "
+                        "the expert tier runs\n");
+    }
     if (g_vk_chain && g_ink_mux_slots > 1) {
         g_vk_chain = 0;
         fprintf(stderr, "[VK] inkling: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "

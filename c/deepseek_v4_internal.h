@@ -15,7 +15,10 @@
 #include "native_quant_batch.h"
 #include "native_quant_dual.h"
 #include "native_quant_fp4_rows16.h"
+#define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+
+#include "ggml_view.h"   /* the FP8 and FP4 entries hand a GGUF matrix to coli_ggml_matmul */
 
 /* Worker count for the persistent expert-loader pool in the block pipeline
  * (deepseek_v4_block_pipeline.c). Shared here so the CLI can size the OpenMP
@@ -207,7 +210,41 @@ typedef struct {
      * This is an in-memory execution layout only; checkpoint bytes and scales
      * remain unchanged. */
     int packed_rows8;
+    /* A GGUF index holds the tensor as another dtype the loader converts back, losslessly
+     * (coli_v4_layer_plan_index): 1 = F32 values of a BF16 tensor, 2 = I32 of an I64. */
+    unsigned char convert;
 } ColiDeepSeekV4TensorSpec;
+
+/* The view of a resident GGUF matrix (a ggml-typed spec, st_gguf.h): its blocks as the file
+ * has them, no scale tensor beside them. A BF16 / F32 matrix gets the same view (its ggml
+ * type), for code that takes either kind. */
+static inline int coli_v4_ggml_view(ColiTensorView *view, const void *data,
+                                    const ColiDeepSeekV4TensorSpec *spec) {
+    const int type = st_is_ggml(spec->dtype) ? st_ggml_type(spec->dtype)
+                   : spec->dtype == COLI_ST_BF16 ? GQ_BF16 : spec->dtype == COLI_ST_F32 ? GQ_F32 : -1;
+    if (type < 0) return -1;
+    const int64_t row = gq_row_bytes(type, spec->shape[1]);
+    if (!data || spec->rank != 2 || row < 0) return -1;
+    *view = (ColiTensorView){
+        COLI_TENSOR_GGML, COLI_SCALE_NONE, data, NULL, (size_t)(row * spec->shape[0]), 0,
+        spec->shape[0], spec->shape[1], 1, (uint32_t)type, NULL
+    };
+    return 0;
+}
+
+/* The type a GGUF expert matrix is held in for the CPU (coli_ggml_held_type): interleaved by
+ * 16 rows unless COLI_V4_ROWS16=0, as the FP4 experts' rows16. The device tier gets the file's
+ * rows back. */
+static inline int coli_v4_gguf_held_type(int type, int64_t rows, int64_t cols) {
+    return coli_ggml_held_type(type, rows, cols, "COLI_V4_ROWS16");
+}
+
+/* 1 when the index is a GGUF read in place (st_gguf.h): some tensor carries a ggml type. */
+static inline int coli_v4_index_gguf(const ColiSafetensorsIndex *index) {
+    for (int i = 0; index && i < index->n; i++)
+        if (st_is_ggml(index->t[i].dtype)) return 1;
+    return 0;
+}
 
 typedef struct {
     int layer;
@@ -273,6 +310,9 @@ static inline uint64_t coli_v4_dense_tensor_bytes(const ColiDeepSeekV4TensorSpec
 int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
                        const ColiDeepSeekV4Config *config, int layer,
                        char *error, size_t error_size);
+/* Fit a plan to what a GGUF index holds (st_gguf.h); a safetensors one comes back as it is. */
+int coli_v4_layer_plan_index(ColiDeepSeekV4LayerPlan *plan,
+                             const ColiSafetensorsIndex *index);
 int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
                            const ColiSafetensorsIndex *index,
                            ColiDeepSeekV4LayerStats *stats,
@@ -734,6 +774,10 @@ void coli_v4_expert_store_note_routed(ColiExpertStore *store, ColiExpertKey key)
 uint32_t *const *coli_v4_expert_store_history(ColiExpertStore *store);
 int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key);
 uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store);
+/* A GGUF store's experts at `layer` (st_gguf.h): 1 with the ggml types of gate (w1), up
+ * (w3) and down (w2) as the file has them, *mx = 1 when the store lays them out as the
+ * checkpoint's FP4 (all three MXFP4); 0 for a checkpoint's store, -1 without one. */
+int coli_v4_expert_store_gguf_form(ColiExpertStore *store, int layer, int types[3], int *mx);
 int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
                                       unsigned char *buffer, ColiExpertView *view);
 extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);

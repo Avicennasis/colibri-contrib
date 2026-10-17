@@ -305,8 +305,8 @@ def _qwen36_layer_types(config, layers, model_dir):
             kinds = meta.get("layer_types")
             if isinstance(kinds, list) and len(kinds) == layers:
                 return kinds
-    if config.get("model_type") == "qwen3_moe":
-        # Qwen3 MoE (Qwen3-Coder-30B-A3B): every layer is attention, no DeltaNet.
+    if config.get("model_type") in ("qwen3_moe", "qwen3"):
+        # Qwen3 MoE (Qwen3-Coder-30B-A3B) and the dense Qwen3: every layer is attention, no DeltaNet.
         return ["full_attention"] * layers
     interval = config.get("full_attention_interval")
     if isinstance(interval, int) and not isinstance(interval, bool) and interval >= 1:
@@ -1467,7 +1467,8 @@ FAMILIES = (
         # expert and routes nothing.
         # qwen3_moe: Qwen3-Coder-30B-A3B and its REAP prunes, every layer attention,
         # no shared expert (tools/convert_qwen36.py writes their container).
-        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text", "qwen3_moe"),
+        # qwen3: the dense Qwen3 (0.6B to 32B), qwen3_moe's layers with one MLP each.
+        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text", "qwen3_moe", "qwen3"),
         display_name="Qwen3.6-35B-A3B",
         display_scale="35B",
         # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
@@ -2053,17 +2054,36 @@ def resolve_model(model_dir):
                           config, family_config, str(model), head)
 
 
+def _gguf_name(resolved):
+    """(name, size label) of a model folder tools/gguf_import.py wrote: the GGUF's own
+    general.name, e.g. ("Qwen3-0.6B", "0.6B"); ("", "") for anything else."""
+    gg = (getattr(resolved, "config", None) or {}).get("colibri_gguf")
+    if not isinstance(gg, dict) or not isinstance(gg.get("name"), str):
+        return "", ""
+    size = gg.get("size")
+    return gg["name"].strip(), size.strip() if isinstance(size, str) else ""
+
+
 def default_model_id(resolved):
     """The API model id for what was actually loaded: its display variant's, if it has
-    one of its own, else the family's."""
+    one of its own; for an imported GGUF that matches no variant, its own name
+    (Qwen3-0.6B: qwen3-0.6b-colibri) rather than a sibling's id; else the family's."""
     family = resolved.descriptor
     config = resolved.family_config
     head = decision_head_of(resolved)
     if head:
         return head.model_id
+    matched = False
     for variant in family.display_variants:
-        if variant.model_id and all(config.get(key) == value for key, value in variant.geometry):
-            return variant.model_id
+        if all(config.get(key) == value for key, value in variant.geometry):
+            if variant.model_id:
+                return variant.model_id
+            matched = True
+            break
+    name, _ = _gguf_name(resolved)
+    slug = re.sub(r"[^a-z0-9.]+", "-", name.lower()).strip("-.")
+    if slug and family.display_variants and not matched:   # one-model families keep their id
+        return slug + "-colibri"
     return family.default_model_id
 
 
@@ -2084,11 +2104,14 @@ def display_for(resolved):
             if all(config.get(key) == value for key, value in geometry):
                 return head.display_name, scale
         return head.display_name, ""
-    if not family.display_variants:
-        return family.display_name, family.display_scale
+    name, size = _gguf_name(resolved)
+    if not family.display_variants:   # an imported GGUF says which model it is (Inkling-Small)
+        return (name, size) if name else (family.display_name, family.display_scale)
     for variant in family.display_variants:
         if all(config.get(key) == value for key, value in variant.geometry):
             return variant.display_name, variant.display_scale
+    if name:   # an imported GGUF: the name its file gives
+        return name, size
     return resolved.model_type, ""
 
 

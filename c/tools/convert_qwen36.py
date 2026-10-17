@@ -431,8 +431,9 @@ def main():
 
     # Qwen3 MoE (qwen3_moe, e.g. Qwen3-Coder-30B-A3B): every layer is plain attention,
     # full rotary, ordinary RMSNorm weights and no shared expert. Qwen3.5/3.6 differ on
-    # each of those, so the defaults below branch on it.
-    plain_qwen3 = cfg_full.get("model_type") == "qwen3_moe"
+    # each of those, so the defaults below branch on it. The dense Qwen3 (qwen3) is the
+    # same layer with one MLP, loaded like the dense Qwen3.5's.
+    plain_qwen3 = cfg_full.get("model_type") in ("qwen3_moe", "qwen3")
     layer_types = mcfg.get("layer_types")
     if layer_types is None:
         n = mcfg.get("num_hidden_layers", n_layers_weight)
@@ -463,7 +464,10 @@ def main():
                  f"tensors for layer(s) {missing_layers[:8]}")
     globals_keys = [global_map[kind] for kind in ("embed_tokens.weight", "lm_head.weight",
                                                   "norm.weight") if kind in global_map]
-    if len(globals_keys) != 3:
+    # tied embeddings (the small dense Qwen3.5 checkpoints): no lm_head, the head is embed_tokens
+    tied = bool(cfg_full.get("tie_word_embeddings", mcfg.get("tie_word_embeddings", False))) and \
+        "lm_head.weight" not in global_map
+    if len(globals_keys) != 3 - tied:
         sys.exit(f"ERROR: expected embed_tokens, lm_head and final norm, found {sorted(global_map)}")
     for k in globals_keys:
         shard_layers.setdefault(wm[k], set()).add(-1)
@@ -543,6 +547,8 @@ def main():
             arr = get_tensor(k).half()
             newk = k.replace("model.language_model.", "model.")
             g_out[newk] = arr
+        if tied:   # written out: the engine reads lm_head.weight
+            g_out["lm_head.weight"] = g_out["model.embed_tokens.weight"].clone()
         gpath = out / "model-globals.safetensors"
         save_file(g_out, str(gpath))
         print(f"[globals] {gpath.name} ({len(g_out)} tensors)")
@@ -645,7 +651,7 @@ def main():
         "topk": int(mcfg.get("num_experts_per_tok", 0)) if mcfg.get("num_experts") else 0,
         "moe_inter": (int(mcfg.get("moe_intermediate_size", mcfg.get("intermediate_size", 0) // 2))
                       if mcfg.get("num_experts") else 0),
-        "shared_inter": (0 if plain_qwen3 else
+        "shared_inter": (0 if plain_qwen3 and mcfg.get("num_experts") else
                          int(mcfg.get("shared_expert_intermediate_size", mcfg.get("moe_intermediate_size", 0)))
                          if mcfg.get("num_experts") else int(mcfg["intermediate_size"])),
         "rms_eps": float(mcfg.get("rms_norm_eps", 1e-6)),
@@ -732,12 +738,16 @@ def main():
 
     # ---- README ----
     if not args.no_readme and plain_qwen3:
-        lines = ["---", "tags:", "  - colibri", "  - qwen3_moe", "  - moe",
-                 "library_name: colibri", "---", "",
-                 "colibri container for a Qwen3 MoE checkpoint (qwen3_moe, e.g. Qwen3-Coder-30B-A3B):",
+        moe = bool(mcfg.get("num_experts"))
+        what = (["colibri container for a Qwen3 MoE checkpoint (qwen3_moe, e.g. Qwen3-Coder-30B-A3B):",
                  f"{len(all_idx)} attention layers, no DeltaNet and no shared expert, routed experts",
-                 f"at {args.ebits} bits" + (f" with a scale per {args.gs} inputs." if args.gs else " with a scale per row."),
-                 "", "Engine: https://github.com/JustVugg/colibri (c/qwen36.c, docs/qwen36.md)"]
+                 f"at {args.ebits} bits" + (f" with a scale per {args.gs} inputs." if args.gs else " with a scale per row.")]
+                if moe else
+                ["colibri container for a dense Qwen3 checkpoint (qwen3, e.g. Qwen3-8B):",
+                 f"{len(all_idx)} attention layers, one MLP each, no DeltaNet."])
+        lines = ["---", "tags:", "  - colibri", "  - " + cfg_full.get("model_type")] + (["  - moe"] if moe else []) + \
+                ["library_name: colibri", "---", ""] + what + \
+                ["", "Engine: https://github.com/JustVugg/colibri (c/qwen36.c, docs/qwen36.md)"]
         (out / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     elif not args.no_readme:
         lines = ["---", "tags:", "  - colibri", "  - qwen3.6", "  - qwen3.6-35b-a3b", "  - moe",
