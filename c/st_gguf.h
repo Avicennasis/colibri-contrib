@@ -74,6 +74,42 @@ static const st_gg_name st_gg_dsv4_layer[] = {
     {"ffn_up_exps.weight", "ffn.experts.%d.w3.weight"},
     {NULL, NULL}};
 
+/* DeepSeek V4.1 (deepseek41, antirez's format): V4's names plus the engram's and the
+ * router's second bias, under the names of DeepSeek's checkpoint, which deepseek_v41.c reads.
+ * An engram table comes as one tensor of 264-byte rows (256 e4m3 then 8 e8m0), the
+ * checkpoint's embed.weight and embed.scale side by side; the engine reads both forms. */
+static const st_gg_name st_gg_dsv41_glob[] = {
+    {"token_embd.weight", "embed.weight"}, {"output_norm.weight", "norm.weight"},
+    {"output.weight", "head.weight"},
+    {NULL, NULL}};
+static const st_gg_name st_gg_dsv41_layer[] = {
+    {"hc_attn_fn.weight", "hc_attn_fn"}, {"hc_attn_base.weight", "hc_attn_base"},
+    {"hc_attn_scale.weight", "hc_attn_scale"}, {"hc_ffn_fn.weight", "hc_ffn_fn"},
+    {"hc_ffn_base.weight", "hc_ffn_base"}, {"hc_ffn_scale.weight", "hc_ffn_scale"},
+    {"attn_sinks.weight", "attn.attn_sink"},
+    {"attn_q_a.weight", "attn.wq_a.weight"}, {"attn_q_b.weight", "attn.wq_b.weight"},
+    {"attn_q_a_norm.weight", "attn.q_norm.weight"},
+    {"attn_kv.weight", "attn.wkv.weight"}, {"attn_kv_a_norm.weight", "attn.kv_norm.weight"},
+    {"attn_output_a.weight", "attn.wo_a.weight"}, {"attn_output_b.weight", "attn.wo_b.weight"},
+    {"attn_compressor_kv.weight", "attn.compressor.wkv.weight"},
+    {"attn_compressor_gate.weight", "attn.compressor.wgate.weight"},
+    {"attn_compressor_norm.weight", "attn.compressor.norm.weight"},
+    {"indexer.attn_k.weight", "attn.indexer.wk.weight"}, {"indexer.k_norm.weight", "attn.indexer.k_norm.weight"},
+    {"indexer.attn_q_b.weight", "attn.indexer.wq_b.weight"},
+    {"indexer.proj.weight", "attn.indexer.weights_proj.weight"},
+    {"attn_norm.weight", "attn_norm.weight"}, {"ffn_norm.weight", "ffn_norm.weight"},
+    {"ffn_gate_inp.weight", "ffn.gate.weight"}, {"exp_probs_b.bias", "ffn.gate.bias"},
+    {"exp_probs_b_vl.bias", "ffn.gate.bias_vl"},
+    {"ffn_gate_shexp.weight", "ffn.shared_experts.w1.weight"},
+    {"ffn_down_shexp.weight", "ffn.shared_experts.w2.weight"},
+    {"ffn_up_shexp.weight", "ffn.shared_experts.w3.weight"},
+    {"ffn_gate_exps.weight", "ffn.experts.%d.w1.weight"},
+    {"ffn_down_exps.weight", "ffn.experts.%d.w2.weight"},
+    {"ffn_up_exps.weight", "ffn.experts.%d.w3.weight"},
+    {"engram_q_norm.weight", "engram.q_weight"}, {"engram_k_norm.weight", "engram.k_weight"},
+    {"engram_kv.weight", "engram.wkv.weight"}, {"engram_embd.weight", "engram.embed.weight"},
+    {NULL, NULL}};
+
 /* Inkling (inkling): conversion/inkling.py of llama.cpp's PR (TML checkpoint names), here
  * under the names of transformers' port, which inkling.c reads. The port keeps gate and up
  * of a routed expert in one tensor (gate_up_proj, gate rows then up rows); the GGUF has them
@@ -190,6 +226,7 @@ static const st_gg_map st_gguf_maps[] = {
     {"glm-dsa", "model.layers.%d.", st_gg_gdsa_glob, st_gg_gdsa_layer},
     {"glm5-next", "model.language_model.layers.%d.", st_gg_g5n_glob, st_gg_g5n_layer},
     {"deepseek4", "layers.%d.", st_gg_dsv4_glob, st_gg_dsv4_layer},
+    {"deepseek41", "layers.%d.", st_gg_dsv41_glob, st_gg_dsv41_layer},
     {"inkling", "model.layers.%d.", st_gg_ink_glob, st_gg_ink_layer},
 };
 

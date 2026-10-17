@@ -500,6 +500,49 @@ class Mimo2Config(unittest.TestCase):
         self.assertEqual((cfg["rope_theta"], cfg["swa_rope_theta"], cfg["sliding_window"]), (10000000.0, 10000.0, 128))
 
 
+class DeepSeek41Config(unittest.TestCase):
+    """antirez's deepseek41: the checkpoint's config.json from deepseek41.config as it is, and
+    the engram sidecar (dsv41_engram.json, which tools/prepare_dsv41.py builds from the
+    checkpoint) from the file's engram metadata; the planner keeps the tables out of RAM."""
+    TEXT = {"num_hidden_layers": 2, "engram_layer_ids": [1], "engram_max_ngram_size": 3,
+            "engram_n_heads": 2, "engram_head_dim": 32, "engram_pad_token_id": 2}
+
+    def meta(self, **over):
+        p = "deepseek41.engram."
+        m = {"deepseek41.config": json.dumps({"model_type": "deepseek_v41", "text_config": self.TEXT}),
+             p + "encoding": "e4m3_e8m0_32_row264", p + "layer_ids": [1], p + "rows": [97 + 101 + 103 + 107],
+             p + "primes": [97, 101, 103, 107], p + "multipliers": [76632096046245, 4839876093313, 35959672319349],
+             p + "token_map": [0, 1, 5, 3]}
+        m.update({p + k: v for k, v in over.items()})
+        return m
+
+    def test_config_and_sidecar(self):
+        import tools.gguf_import as gi
+        tensors = {f"blk.{b}.attn_q_a.weight": {} for b in range(2)}
+        cfg, layers = gi.deepseek41_config(self.meta(), tensors)
+        self.assertEqual((layers, cfg["model_type"], cfg["text_config"]), (2, "deepseek_v41", self.TEXT))
+        e = gi.deepseek41_engram(self.meta(), cfg)
+        self.assertEqual(e["primes"], [[[97, 101], [103, 107]]])
+        self.assertEqual(e["offsets"], [[0, 97, 198, 301]])
+        self.assertEqual(e["multipliers"], [["76632096046245", "4839876093313", "35959672319349"]])   # past a double's 53 bits: strings
+        self.assertEqual((e["pad_id"], e["head_dim"], e["num_embeddings"]), (5, 32, [408]))   # the pad token's compressed id
+
+    def test_inconsistent_metadata_is_refused(self):
+        import tools.gguf_import as gi
+        cfg = json.loads(self.meta()["deepseek41.config"])
+        for over in ({"layer_ids": [0]}, {"encoding": "e4m3_row256"}, {"rows": [400]}, {"primes": [97, 101, 103]}):
+            with self.assertRaises(SystemExit, msg=over):
+                gi.deepseek41_engram(self.meta(**over), cfg)
+        with self.assertRaises(SystemExit):   # a block short of the config's layers
+            gi.deepseek41_config(self.meta(), {"blk.0.attn_q_a.weight": {}})
+
+    def test_planner_keeps_the_tables_on_disk(self):
+        from family_registry import _dsv41_resident_inventory as resident
+        self.assertEqual(resident("blk.1.engram_embd.weight", 10 ** 11, {}), 0)          # a GGUF's table
+        self.assertEqual(resident("layers.1.engram.embed.weight", 10 ** 11, {}), 0)      # the checkpoint's
+        self.assertEqual(resident("blk.1.engram_kv.weight", 1000, {}), 1000)             # its projection is resident
+
+
 class Qwen4ExpLayers(unittest.TestCase):
     """Which layers attend, from either way a qwen4exp GGUF says it: unsloth's Qwen3.8-Flash-Next
     files give full_attention_interval (no attention.recurrent_layers), newer llama.cpp

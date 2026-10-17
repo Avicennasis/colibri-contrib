@@ -77,7 +77,7 @@ class _CgroupMount:
 # sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
 # straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
 _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
-_ANALYSIS_CACHE_VERSION = 13   # 13: a GGUF's experts counted for every family (V4, Inkling)
+_ANALYSIS_CACHE_VERSION = 14   # 13: a GGUF's experts counted for every family (V4, Inkling); 14: V4.1's engram tables out of a GGUF's dense bytes
 
 
 def _dense_in_ram(descriptor, on_disk_bytes):
@@ -102,7 +102,8 @@ def _dense_in_ram(descriptor, on_disk_bytes):
 
 # A token embedding table: "embed_tokens", DeepSeek's "embed", "tok_embeddings",
 # "wte"; not a vision tower's patch or position embedding.
-_EMBED_TABLE = re.compile(r"(^|\.)(embed_tokens|embed|tok_embeddings|wte|word_embeddings)\.weight$")
+# token_embd: a GGUF's (_gguf_tensor_sizes keeps the file's names but the experts')
+_EMBED_TABLE = re.compile(r"(^|\.)(embed_tokens|embed|tok_embeddings|wte|word_embeddings|token_embd)\.weight$")
 
 
 def _vk_flag(env, name):

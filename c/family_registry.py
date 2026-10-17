@@ -1022,7 +1022,9 @@ def _dsv41_expert_inventory(name, size, config, _dtype=None):
     return ((layers + int(match.group(1)), int(match.group(2)), size),)
 
 
-_DSV41_ENGRAM = re.compile(r"^layers\.(\d+)\.engram\.embed\.(weight|scale)$")
+# a table as the checkpoint's two tensors, or a GGUF's one (blk.N.engram_embd, each row its
+# e4m3 then its scales: _gguf_tensor_sizes renames only the experts)
+_DSV41_ENGRAM = re.compile(r"^(?:layers\.(\d+)\.engram\.embed\.(weight|scale)|blk\.(\d+)\.engram_embd\.weight)$")
 
 
 def _dsv41_resident_inventory(name, size, _config, _dtype=None):
