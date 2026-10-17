@@ -2730,6 +2730,8 @@ static void test_bd(void) {
         test_matmul_bd(t, 3, 1280, 33);     /* rows not a multiple of the workgroup's */
         test_matmul_bd(t, 2, 2560, 130);    /* Qwen3.8's width */
         test_matmul_bd(t, 1, 16640, 9);     /* x past the staging (16 KiB floats at most): read from the buffer */
+        test_matmul_bd(t, 70, 1280, 33);    /* a prompt's rows: the tiled GEMM, partial tiles both ways */
+        test_matmul_bd(t, 130, 2560, 160);
     }
     printf("matmul_bd: %zu block types\n", sizeof types / sizeof *types);
 }

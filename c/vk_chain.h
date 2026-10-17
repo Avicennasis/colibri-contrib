@@ -420,6 +420,9 @@ typedef struct {
     int blocks;   /* 1: the experts are block formats (a GGUF's): the pipeline with their decoders */
 } VkcMoe;
 int vkc_moe_ready(void);
+/* 1 = a GGUF's block-format matrices take a prompt's rows through the tiled GEMM
+ * (qmatmul_gemm_bd.comp), else only the GEMV's few rows a step suit them */
+int vkc_gemm_bd_ready(void);
 int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p);
 
 /* ---- attention residuals and SiTU-GLU (chain_ares.comp) ----------------------------

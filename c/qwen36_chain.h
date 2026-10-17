@@ -997,11 +997,11 @@ static int q36c_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int 
     if (!g_vk_chain || qt_ready() || qq_active() || g_pilot) return 0;
     /* prompts only: decode and verifies on the CPU */
     if (g_vk_chain == COLI_VK_CHAIN_PREFILL && (S <= 2 || g_q36_rowwise)) return 0;
-    /* A GGUF's dense matrices run on the block formats' GEMV, a row at a time: decode and
-     * verifies here, a prompt's longer chunks through the CPU and the expert tier (measured
-     * on an RTX PRO 4000, Qwen3.6-35B-A3B: a 456-token prompt 37-42 tok/s on the chain,
-     * 45 the other way) */
-    if (g_gguf && S > Q36C_GGUF_ROWS) return 0;
+    /* A GGUF's dense matrices: decode and verifies on the block formats' GEMV, a prompt's
+     * chunks on their tiled GEMM (vkc_gemm_bd_ready); without it those chunks go through the
+     * CPU and the expert tier (measured on an RTX PRO 4000, Qwen3.6-35B-A3B: a 456-token
+     * prompt 37-42 tok/s on the GEMV, 45 the other way) */
+    if (g_gguf && S > Q36C_GGUF_ROWS && !vkc_gemm_bd_ready()) return 0;
     Q36Chain *ch = q36c_setup(m), *ch2 = q36c_of(m, 1);
     if (!ch || ch->failed) return 0;
     if (ch2 && (!ch2->ok || ch2->failed || ch2->lo != ch->lo + ch->n)) ch2 = NULL;

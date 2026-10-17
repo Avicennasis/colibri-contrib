@@ -102,6 +102,7 @@ typedef struct {
     VkShaderModule mod_gv2; VkPipeline gv2; int gv2_floats;   /* chain_gemv2.comp: int8 decode GEMVs (COLI_VK_CHAIN_GEMV2), x staged up to gv2_floats */
     VkShaderModule mod_bd; VkPipeline bd;   /* qmatmul_bd.comp: the block formats (a GGUF's matrices, blockdec.glsl); none without the file */
     VkShaderModule mod_bdv; VkPipeline bdv[4][64]; uint8_t bdv_tried[4][64]; int bdv_xs;   /* chain_gemv_bd.comp: a pipeline per (rows, ggml type), made on first use */
+    VkShaderModule mod_bdg; VkPipeline bdg[64]; uint8_t bdg_tried[64];   /* qmatmul_gemm_bd.comp: a prompt's rows, a pipeline per ggml type */
     VkShaderModule mod_moe; VkPipeline moe, moe_bd;           /* chain_moe.comp: the routed experts, by address (bufferDeviceAddress);
                                                                  moe_bd with the block formats' paths (BD = 1) */
     int moe_xs, moe_xs_bd, moe_tried, moe_bd_tried;           /* their staging floats (0: the device cannot); built once asked for */
@@ -438,6 +439,10 @@ int vkc_init(void) {
         if (xs > 4096) xs = 4096;
         if (KC.bd && !(e && *e == '0') && xs >= 256 && (KC.mod_bdv = load_module(KC.core.spv_path, "chain_gemv_bd.spv")))
             KC.bdv_xs = xs;
+        /* the tiled GEMM for a prompt's rows: its tiles and bdstep's tables, 43.5 KiB */
+        const char *g = getenv("COLI_VK_CHAIN_GEMM_BD");
+        if (KC.bd && !(g && *g == '0') && pp.limits.maxComputeSharedMemorySize >= 44544)
+            KC.mod_bdg = load_module(KC.core.spv_path, "qmatmul_gemm_bd.spv");
     }
     /* the routed experts by address (chain_moe.comp): a device with bufferDeviceAddress
      * and clustered subgroup adds; the input rows staged in what shared memory allows */
@@ -882,12 +887,35 @@ static VkPipeline bdv_pipe(int t, int nr, int rowWords) {
     }
     return KC.bdv[nr - 1][t];
 }
+int vkc_gemm_bd_ready(void) { return vkc_ready() && KC.mod_bdg != VK_NULL_HANDLE; }
+/* qmatmul_gemm_bd.comp's pipeline for ggml type t, made on first use */
+static VkPipeline bdg_pipe(int t, int rowWords) {
+    if (!KC.mod_bdg || t < 0 || t >= 64 || !(t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 20 || t == 21 ||
+        t == 22 || t == 23 || t == 42) || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
+    if (!KC.bdg_tried[t]) {
+        KC.bdg_tried[t] = 1;
+        int32_t v = t;
+        VkSpecializationMapEntry me = {0, 0, 4};
+        VkSpecializationInfo si = {1, &me, 4, &v};
+        KC.bdg[t] = make_pipe(KC.mod_bdg, &si);
+    }
+    return KC.bdg[t];
+}
 static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y, size_t yb, int S) {
     VkBuffer tab = (VkBuffer)coli_vk_block_table_dev(g_kd);
     if (!KC.bd || !tab) return 0;
     VkcBind bd[4] = {{x->buf, xb, 0, 0}, {(VkBuffer)ti->wbuf, 0, 0, 0}, {tab, 0, 0, 0}, {y->buf, yb, 0, 1}};
     x->last_frame = y->last_frame = KC.serial;
     KC.kind = PK_GEMV;
+    /* a prompt's rows: the tiled GEMM, each weight decoded once for 64 rows of x */
+    VkPipeline gp = S > 4 && ti->fmt < 164 && ti->I % 64 == 0 ? bdg_pipe(ti->fmt - 100, ti->rowWords) : VK_NULL_HANDLE;
+    if (gp) {
+        struct VkcPC pc = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs};
+        KC.kind = PK_GEMM;
+        int ok = record(gp, bd, 4, &pc, sizeof pc, (uint32_t)((ti->O + 63) / 64), (uint32_t)((S + 63) / 64), 1);
+        KC.st.matmuls += ok; KC.st.gemms += ok;
+        return ok;
+    }
     /* a speculative verify's rows (S <= 4) share each weight's decode */
     int nr = S <= 4 ? S : 1;
     VkPipeline v = ti->fmt < 164 && ti->I % 32 == 0 ? bdv_pipe(ti->fmt - 100, nr, ti->rowWords) : VK_NULL_HANDLE;
@@ -2034,6 +2062,8 @@ void vkc_shutdown(void) {
     if (KC.mod_gv2) vkDestroyShaderModule(KC.dev, KC.mod_gv2, NULL);
     if (KC.bd) vkDestroyPipeline(KC.dev, KC.bd, NULL);
     for (int r = 0; r < 4; r++) for (int t = 0; t < 64; t++) if (KC.bdv[r][t]) vkDestroyPipeline(KC.dev, KC.bdv[r][t], NULL);
+    for (int t = 0; t < 64; t++) if (KC.bdg[t]) vkDestroyPipeline(KC.dev, KC.bdg[t], NULL);
+    if (KC.mod_bdg) vkDestroyShaderModule(KC.dev, KC.mod_bdg, NULL);
     if (KC.mod_bdv) vkDestroyShaderModule(KC.dev, KC.mod_bdv, NULL);
     if (KC.mod_bd) vkDestroyShaderModule(KC.dev, KC.mod_bd, NULL);
     if (KC.moe) vkDestroyPipeline(KC.dev, KC.moe, NULL);
