@@ -890,11 +890,13 @@ static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y
     VkPipeline v = ti->fmt < 164 && ti->I % 32 == 0 ? bdv_pipe(ti->fmt - 100, nr, ti->rowWords) : VK_NULL_HANDLE;
     int ok;
     if (v) {
-        /* lanes per row: about four 32-weight steps each, at most a subgroup (the shader
-         * caps it at its own); rows a workgroup 256 / lanes, a grid-stride beyond 65535 */
+        /* lanes per row: about six 32-weight steps each, at most a subgroup (the shader
+         * caps it at its own); rows a workgroup 256 / lanes, a grid-stride beyond 65535.
+         * Measured on an RTX PRO 4000 against four and eight: 10240 x 2560 Q4_K 53 -> 46 us
+         * for one row, 108 -> 82 us for three; 2560 x 6144 stays at 32 lanes, 31 us */
         const char *e = getenv("COLI_VK_CHAIN_GEMV_LPR");
         int steps = ti->I / 32, lpr = 1;
-        if (e && *e) lpr = atoi(e); else while (lpr < 32 && lpr * 4 < steps) lpr *= 2;
+        if (e && *e) lpr = atoi(e); else while (lpr < 32 && lpr * 6 < steps) lpr *= 2;
         if (lpr < 1) lpr = 1;
         struct { int fmt, S, I, O, rowWords, gs, lpr, nr; } pc = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, lpr, nr};
         /* at most 256 workgroups, the rest by grid-stride: each stages x once for more rows
