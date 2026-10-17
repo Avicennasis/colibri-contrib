@@ -200,7 +200,14 @@ typedef struct {
 void coli_vk_pool_stats(int pool, ColiVkPoolStats *st);
 /* The expert tier's budget: its pool never holds more block bytes than this. */
 void coli_vk_tier_pool_limit(size_t bytes);
-void coli_vk_tier_pool_limit_dev(int dev, size_t bytes);   /* dev 1: COLI_VK_DEV2's pool (3) */
+void coli_vk_tier_pool_limit_dev(int dev, size_t bytes);   /* dev 1: COLI_VK_DEV2's pool (3); dev 2: the host pool (5) */
+/* The tier's host pool (pool 5): system RAM the primary device reads by address over PCIe,
+ * for the experts its own memory has no room for, so the dense chain computes a layer's
+ * routed experts in its frame with none on the host (vk_dmoe.h). A tensor in it is
+ * coli_vk_tier_tensor_pad's with dev 2: the primary device's (its dev is 0), filled
+ * through its mapping, never staged. 1 when the device can: a discrete card with
+ * bufferDeviceAddress and a host-visible type in system RAM. */
+int  coli_vk_tier_host_pool(void);
 /* The tier's extra layers (an MTP head's experts, another size than the main ones'):
  * a pool of their own on the primary device (pool 4), its budget, and a tensor in it
  * (as coli_vk_tier_tensor). */
