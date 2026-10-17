@@ -23,7 +23,7 @@ Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine), qwe
 dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engine), qwen3 (the dense
 Qwen3 -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
 Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
-glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine).
+glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine).
 
 Usage:
   python3 tools/gguf_import.py MODEL.gguf OUT_DIR [--mode link|copy]
@@ -456,6 +456,58 @@ def glmdsa_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
+def mimo2_config(meta, tensors, overrides=None):
+    """MiMo-V2 (llama.cpp's mimo2) as the mimo engine's config.json, the shape of Xiaomi's
+    (MiMoV2FlashForCausalLM): the layer kinds from the sliding-window pattern, the MoE layers
+    from the files' expert tensors, each kind's KV heads and attention sinks from its layers.
+    The converter writes qkv_proj as one [Q|K|V] (qkv_shards 1); the NextN blocks past the
+    model's layers are not this engine's."""
+    p = "mimo2."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count")) - int(meta.get(p + "nextn_predict_layers", 0))
+    pattern = [int(x) for x in need("attention.sliding_window_pattern")][:layers]
+    kv = need("attention.head_count_kv")
+    kv = [int(x) for x in kv] if isinstance(kv, list) else [int(kv)] * layers
+    moe = [int(f"blk.{i}.ffn_gate_exps.weight" in tensors) for i in range(layers)]
+    head_dim, rope = int(need("attention.key_length")), int(need("rope.dimension_count"))
+    kinds = {k: [i for i in range(layers) if pattern[i] == k] for k in (0, 1)}
+    if not kinds[0] or not kinds[1]:
+        sys.exit("mimo2: the GGUF has no full-attention or no sliding-window layer")
+    kv_of = {k: {kv[i] for i in kinds[k]} for k in (0, 1)}
+    if len(kv_of[0]) != 1 or len(kv_of[1]) != 1:
+        sys.exit("mimo2: a layer kind with two KV head counts")
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    sink = {k: f"blk.{kinds[k][0]}.attn_sinks.weight" in tensors for k in (0, 1)}
+    heads = int(need("attention.head_count"))
+    cfg = {
+        "architectures": ["MiMoV2FlashForCausalLM"], "model_type": "mimo_v2",
+        "vocab_size": int(meta.get(p + "vocab_size", emb["dims"][1])),
+        "hidden_size": int(need("embedding_length")), "intermediate_size": int(need("feed_forward_length")),
+        "num_hidden_layers": layers, "hybrid_layer_pattern": pattern, "moe_layer_freq": moe,
+        "num_attention_heads": heads, "num_key_value_heads": kv_of[0].pop(),
+        "head_dim": head_dim, "v_head_dim": int(need("attention.value_length")),
+        "swa_num_attention_heads": heads, "swa_num_key_value_heads": kv_of[1].pop(),
+        "swa_head_dim": head_dim, "swa_v_head_dim": int(need("attention.value_length")),
+        "sliding_window": int(need("attention.sliding_window")),
+        "add_full_attention_sink_bias": sink[0], "add_swa_attention_sink_bias": sink[1],
+        "attention_value_scale": float(meta.get(p + "attention.value_scale", 1.0)),
+        # int(head_dim * factor) is the rotary width the engine takes
+        "partial_rotary_factor": (rope + 0.5) / head_dim,
+        "rope_theta": float(meta.get(p + "rope.freq_base", 10000.0)),
+        "swa_rope_theta": float(meta.get(p + "rope.freq_base_swa", meta.get(p + "rope.freq_base", 10000.0))),
+        "n_routed_experts": int(need("expert_count")), "num_experts_per_tok": int(need("expert_used_count")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "n_group": 1, "topk_group": 1, "topk_method": "noaux_tc", "scoring_func": "sigmoid",
+        "norm_topk_prob": bool(meta.get(p + "expert_weights_norm", True)),
+        "routed_scaling_factor": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "layernorm_epsilon": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-6)),
+        "max_position_embeddings": int(meta.get(p + "context_length", 262144)),
+        "qkv_shards": 1, "tie_word_embeddings": "output.weight" not in tensors,
+        "bos_token_id": meta.get("tokenizer.ggml.bos_token_id"), "eos_token_id": meta.get("tokenizer.ggml.eos_token_id"),
+    }
+    return cfg, layers
+
+
 def qwen4exp_config(meta, tensors, overrides=None):
     """Qwen3.8-Flash-Next (llama.cpp's qwen4exp) as the qwen38 engine's config.json. The
     PLE table is one tensor here (per_layer_token_embd), so split_ngram_parts is 1; its
@@ -538,7 +590,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 
 COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mimo2": mimo2_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the

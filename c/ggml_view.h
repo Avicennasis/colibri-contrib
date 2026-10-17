@@ -36,6 +36,24 @@ static inline int coli_ggml_held_type(int type, int64_t rows, int64_t cols, cons
     return type;
 }
 
+/* MXFP4 blocks as a GGUF holds them (one e8m0 byte, then 16 bytes of codes: value j in the low
+ * nibble of byte j and j+16 in its high one) into the layout of the checkpoints that ship MXFP4
+ * (one e8m0 byte per 32 values in `scales`, values 2i and 2i+1 in the low and high nibble of
+ * byte i of `codes`): the same codes and the same scale bytes, block after block. */
+static inline void coli_mxfp4_unblock(uint8_t *scales, uint8_t *codes, const uint8_t *blocks, int64_t nblocks) {
+    for (int64_t b = 0; b < nblocks; b++) {
+        const uint8_t *src = blocks + b * 17;
+        uint8_t *dst = codes + b * 16;
+        scales[b] = src[0];
+        for (int i = 0; i < 16; i++) {
+            const int e0 = 2 * i, e1 = 2 * i + 1;   /* source byte e % 16, nibble e / 16 */
+            const unsigned lo = e0 < 16 ? src[1 + e0] & 15u : src[1 + e0 - 16] >> 4;
+            const unsigned hi = e1 < 16 ? src[1 + e1] & 15u : src[1 + e1 - 16] >> 4;
+            dst[i] = (uint8_t)(lo | hi << 4);
+        }
+    }
+}
+
 /* The activations quantized once per call into a buffer each thread keeps (gq_matmul
  * would allocate and free one per matrix: thousands a token). */
 static inline gq_act *coli_ggml_act(const float *x, int S, int I) {

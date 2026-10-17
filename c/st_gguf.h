@@ -168,7 +168,25 @@ static const st_gg_name st_gg_gdsa_layer[] = {
     {"nextn.shared_head_norm.weight", "shared_head.norm.weight"},
     {NULL, NULL}};
 
+/* MiMo-V2 (mimo2): conversion/mimo.py MimoV2Model. qkv_proj comes as one [Q|K|V] (the release
+ * pre-shards it; the converter regroups it), the dense matrices dequantized; the NextN blocks
+ * past the model's layers keep their GGUF names (mimo.c does not read them). */
+static const st_gg_name st_gg_mimo_glob[] = {
+    {"token_embd.weight", "model.embed_tokens.weight"}, {"output_norm.weight", "model.norm.weight"},
+    {"output.weight", "lm_head.weight"},
+    {NULL, NULL}};
+static const st_gg_name st_gg_mimo_layer[] = {
+    {"attn_norm.weight", "input_layernorm.weight"}, {"ffn_norm.weight", "post_attention_layernorm.weight"},
+    {"attn_qkv.weight", "self_attn.qkv_proj.weight"}, {"attn_output.weight", "self_attn.o_proj.weight"},
+    {"attn_sinks.weight", "self_attn.attention_sink_bias"},
+    {"ffn_gate.weight", "mlp.gate_proj.weight"}, {"ffn_up.weight", "mlp.up_proj.weight"}, {"ffn_down.weight", "mlp.down_proj.weight"},
+    {"ffn_gate_inp.weight", "mlp.gate.weight"}, {"exp_probs_b.bias", "mlp.gate.e_score_correction_bias"},
+    {"ffn_gate_exps.weight", "mlp.experts.%d.gate_proj.weight"}, {"ffn_up_exps.weight", "mlp.experts.%d.up_proj.weight"},
+    {"ffn_down_exps.weight", "mlp.experts.%d.down_proj.weight"},
+    {NULL, NULL}};
+
 static const st_gg_map st_gguf_maps[] = {
+    {"mimo2", "model.layers.%d.", st_gg_mimo_glob, st_gg_mimo_layer},
     {"glm-dsa", "model.layers.%d.", st_gg_gdsa_glob, st_gg_gdsa_layer},
     {"glm5-next", "model.language_model.layers.%d.", st_gg_g5n_glob, st_gg_g5n_layer},
     {"deepseek4", "layers.%d.", st_gg_dsv4_glob, st_gg_dsv4_layer},
