@@ -462,6 +462,35 @@ class GlmDsaConfig(unittest.TestCase):
         self.assertEqual(gi.glmdsa_config(meta, tensors)[1], 79)
 
 
+class Mimo2Config(unittest.TestCase):
+    """llama.cpp's mimo2 as the mimo engine's config.json, from MiMo-V2.6-Flash's header: the
+    layer kinds and their KV heads from the pattern, the sinks from the sliding layers'
+    tensors, qkv as one [Q|K|V], the rotary width the engine rounds to 64."""
+    def test_flash_metadata(self):
+        import tools.gguf_import as gi
+        p = "mimo2."
+        pattern = [0] + [1, 1, 1, 1, 0] * 9 + [1, 1] + [1, 1, 1]   # 48 layers + 3 NextN
+        meta = {p + k: v for k, v in {
+            "block_count": 51, "context_length": 1048576, "embedding_length": 4096, "feed_forward_length": 16384,
+            "attention.head_count": 64, "attention.head_count_kv": [4 if x == 0 else 8 for x in pattern],
+            "rope.freq_base": 10000000.0, "rope.freq_base_swa": 10000.0, "expert_count": 256, "expert_used_count": 8,
+            "attention.key_length": 192, "attention.value_length": 128, "attention.sliding_window": 128,
+            "attention.sliding_window_pattern": pattern, "expert_feed_forward_length": 2048,
+            "rope.dimension_count": 64, "attention.layer_norm_rms_epsilon": 1e-6,
+            "attention.value_scale": 0.707, "nextn_predict_layers": 3}.items()}
+        tensors = {"token_embd.weight": {"dims": [4096, 152576]}, "output.weight": {"dims": [4096, 152576]},
+                   **{f"blk.{i}.ffn_gate_exps.weight": {} for i in range(1, 48)},
+                   **{f"blk.{i}.attn_sinks.weight": {} for i in range(48) if pattern[i] == 1}}
+        cfg, layers = gi.mimo2_config(meta, tensors)
+        self.assertEqual((layers, cfg["model_type"], cfg["qkv_shards"]), (48, "mimo_v2", 1))
+        self.assertEqual((cfg["num_key_value_heads"], cfg["swa_num_key_value_heads"]), (4, 8))
+        self.assertEqual(cfg["hybrid_layer_pattern"], pattern[:48])
+        self.assertEqual(cfg["moe_layer_freq"], [0] + [1] * 47)
+        self.assertEqual((cfg["add_full_attention_sink_bias"], cfg["add_swa_attention_sink_bias"]), (False, True))
+        self.assertEqual(int(cfg["head_dim"] * cfg["partial_rotary_factor"]), 64)
+        self.assertEqual((cfg["rope_theta"], cfg["swa_rope_theta"], cfg["sliding_window"]), (10000000.0, 10000.0, 128))
+
+
 class Qwen4ExpLayers(unittest.TestCase):
     """Which layers attend, from either way a qwen4exp GGUF says it: unsloth's Qwen3.8-Flash-Next
     files give full_attention_interval (no attention.recurrent_layers), newer llama.cpp
