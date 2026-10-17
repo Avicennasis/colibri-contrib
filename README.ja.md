@@ -25,6 +25,10 @@ $ ./coli chat
   ◆ Ciao! Come posso aiutarti oggi?
 ```
 
+<p align="center">
+  <a href="https://www.buymeacoffee.com/justvugg"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=justvugg&button_colour=FFDD00&font_colour=000000&font_family=Poppins&outline_colour=000000&coffee_colour=ffffff" alt="Buy me a coffee" height="40"></a>
+</p>
+
 <a id="get-started"></a>
 <a id="the-one-step-way"></a>
 
