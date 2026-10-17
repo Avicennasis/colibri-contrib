@@ -1209,9 +1209,13 @@ int vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, c
 static VkPipeline dnrec_pipe(int KD) {
     for (int i = 0; i < KC.ndnrec; i++) if (KC.dnrec_kd[i] == KD) return KC.dnrec[i];
     if (KC.ndnrec == VKC_DNREC_MAX) return VK_NULL_HANDLE;
-    int32_t kd = KD;
-    VkSpecializationMapEntry me = {0, 0, 4};
-    VkSpecializationInfo si = {1, &me, 4, &kd};
+    /* lanes a column: each thread's part of it at most 16 values (more spilled: 73 us a
+     * layer for KD 128 in one lane, 21 in eight) */
+    int nspl = 1;
+    while (nspl < 8 && KD / nspl > 16 && KD % (2 * nspl) == 0) nspl *= 2;
+    int32_t v[3] = {KD, nspl, 128 * nspl};
+    VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+    VkSpecializationInfo si = {3, me, sizeof v, v};
     VkPipeline p = make_pipe(KC.mod_dnrec, &si);
     if (!p) return VK_NULL_HANDLE;
     KC.dnrec[KC.ndnrec] = p; KC.dnrec_kd[KC.ndnrec++] = KD;
