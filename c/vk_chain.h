@@ -81,6 +81,15 @@ VkcBuf *vkc_host(const void *ptr, size_t bytes, size_t *off);
 int  vkc_begin(void);
 int  vkc_submit(int wait);
 int  vkc_finish(void);        /* wait for every submitted frame */
+/* A forward whose layers all run in the frame (the routed experts there too, vk_dmoe.h)
+ * is one long frame: the device would start only once the host had recorded all of it.
+ * After each such layer an engine calls vkc_layer_recorded(layers): every
+ * vkc_split_layers() of them the frame so far goes to the device and a new one opens
+ * (vkc_begin's barrier orders it after them), so the device runs the first layers while
+ * the host records the next. 1, or 0 on a lost device. COLI_VK_CHAIN_SPLIT=0 keeps one
+ * frame a forward, n sends every n layers. */
+int  vkc_split_layers(void);
+int  vkc_layer_recorded(int *layers);
 
 /* transfers, recorded into the open frame (offsets and counts in floats) */
 int  vkc_copy(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t n);

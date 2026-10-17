@@ -538,7 +538,7 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
                 float ang = (pb + s) * inv;
                 cs[(s * half + j) * 2] = cosf(ang); cs[(s * half + j) * 2 + 1] = sinf(ang);
             }
-        int ok = 1, prev_dev = 0, from = lo;   /* prev_dev: the layer before ran its experts here; from: this frame's first layer */
+        int ok = 1, prev_dev = 0, from = lo, sent = 0;   /* prev_dev: the layer before ran its experts here; from: this frame's first layer */
         for (int i = lo; i < hi && ok; i++) {
             Layer *l = &m->L[i];
             int dl = dmoe && vkc_dmoe_on(&ch->dm, i);
@@ -559,6 +559,7 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
                 VkcMoe mp = {.D = D, .I = c->inter, .act = 0};
                 ok = ok && vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->h2, &rp, &mp);
                 prev_dev = 1;
+                if (ok && i + 1 < hi) ok = vkc_layer_recorded(&sent);   /* the device starts on these layers */
                 continue;
             }
             ok = ok && vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);

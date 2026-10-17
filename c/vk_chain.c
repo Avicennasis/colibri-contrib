@@ -635,6 +635,21 @@ int vkc_submit(int wait) {
     return wait ? frame_wait(f) : 1;
 }
 
+/* Measured on an RTX PRO 4000 (Qwen3.6-35B-A3B int4-g64, every expert on the device, 128
+ * tokens): one frame a forward 44.4 tok/s, a frame every 1, 2 or 4 layers 58.3, every 8
+ * 52.0, every 20 48.8; the same text in every case. */
+int vkc_split_layers(void) {
+    static int n = -1;
+    if (n < 0) { const char *e = getenv("COLI_VK_CHAIN_SPLIT"); n = e && *e ? atoi(e) : 4; if (n < 0) n = 0; }
+    return n;
+}
+int vkc_layer_recorded(int *layers) {
+    const int every = vkc_split_layers();
+    if (every < 1 || ++*layers < every) return 1;
+    *layers = 0;
+    return vkc_submit(0) && vkc_begin();
+}
+
 /* ---- recording helpers ----------------------------------------------------------- */
 static VkcFrame *open_frame(void) { return KC.cur >= 0 ? &KC.fr[KC.cur] : NULL; }
 
