@@ -543,6 +543,29 @@ class DeepSeek41Config(unittest.TestCase):
         self.assertEqual(resident("blk.1.engram_kv.weight", 1000, {}), 1000)             # its projection is resident
 
 
+class OlmoeConfig(unittest.TestCase):
+    """llama.cpp's olmoe as the olmoe engine's config.json, from the metadata llama.cpp's
+    converter writes for OLMoE-1B-7B: no norm_topk_prob in the file, so false, as the official
+    checkpoints have it and as llama.cpp computes them."""
+    META = {"olmoe.block_count": 16, "olmoe.context_length": 4096, "olmoe.embedding_length": 2048,
+            "olmoe.feed_forward_length": 1024, "olmoe.attention.head_count": 16,
+            "olmoe.attention.head_count_kv": 16, "olmoe.rope.freq_base": 10000.0,
+            "olmoe.attention.layer_norm_rms_epsilon": 1e-5, "olmoe.expert_count": 64,
+            "olmoe.expert_used_count": 8, "tokenizer.ggml.eos_token_id": 50279}
+
+    def test_1b_7b_metadata(self):
+        import tools.gguf_import as gi
+        tensors = {"token_embd.weight": {"dims": [2048, 50304]}, "output.weight": {"dims": [2048, 50304]}}
+        cfg, layers = gi.olmoe_config(self.META, tensors)
+        self.assertEqual((layers, cfg["model_type"], cfg["vocab_size"], cfg["tie_word_embeddings"]), (16, "olmoe", 50304, False))
+        self.assertEqual((cfg["num_experts"], cfg["num_experts_per_tok"], cfg["intermediate_size"]), (64, 8, 1024))
+        self.assertIs(cfg["norm_topk_prob"], False)
+        cfg, _ = gi.olmoe_config({**self.META, "olmoe.expert_weights_norm": True}, tensors)
+        self.assertIs(cfg["norm_topk_prob"], True)
+        with self.assertRaises(SystemExit):
+            gi.olmoe_config({k: v for k, v in self.META.items() if k != "olmoe.expert_count"}, tensors)
+
+
 class Qwen4ExpLayers(unittest.TestCase):
     """Which layers attend, from either way a qwen4exp GGUF says it: unsloth's Qwen3.8-Flash-Next
     files give full_attention_interval (no attention.recurrent_layers), newer llama.cpp

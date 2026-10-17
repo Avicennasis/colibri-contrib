@@ -24,7 +24,8 @@ dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engin
 Qwen3 -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
 Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
 glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine),
-deepseek41 (DeepSeek V4.1 Flash in antirez's format -> deepseek_v41 engine).
+deepseek41 (DeepSeek V4.1 Flash in antirez's format -> deepseek_v41 engine), olmoe (OLMoE ->
+olmoe engine).
 
 Usage:
   python3 tools/gguf_import.py MODEL.gguf OUT_DIR [--mode link|copy]
@@ -561,6 +562,35 @@ def deepseek41_engram(meta, cfg):
             "token_map": token_map}
 
 
+def olmoe_config(meta, tensors, overrides=None):
+    """OLMoE (llama.cpp's olmoe: OLMoE-1B-7B) as the olmoe engine's config.json. The converter
+    keeps q and k in the checkpoint's layout and writes no norm_topk_prob: false, as the
+    official checkpoints have it, unless the file says expert_weights_norm."""
+    p = "olmoe."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    cfg = {
+        "model_type": "olmoe", "architectures": ["OlmoeForCausalLM"],
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "num_attention_heads": int(need("attention.head_count")),
+        "num_key_value_heads": int(meta.get(p + "attention.head_count_kv", need("attention.head_count"))),
+        "num_experts": int(need("expert_count")),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "intermediate_size": int(meta.get(p + "expert_feed_forward_length", need("feed_forward_length"))),
+        "norm_topk_prob": bool(meta.get(p + "expert_weights_norm", False)),
+        "vocab_size": int(emb["dims"][1]),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-5)),
+        "max_position_embeddings": int(meta.get(p + "context_length", 4096)),
+        "rope_theta": float(meta.get(p + "rope.freq_base", 10000.0)),
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "hidden_act": "silu",
+        "bos_token_id": meta.get("tokenizer.ggml.bos_token_id"), "eos_token_id": meta.get("tokenizer.ggml.eos_token_id"),
+    }
+    return cfg, layers
+
+
 def qwen4exp_config(meta, tensors, overrides=None):
     """Qwen3.8-Flash-Next (llama.cpp's qwen4exp) as the qwen38 engine's config.json. The
     PLE table is one tensor here (per_layer_token_embd), so split_ngram_parts is 1; its
@@ -643,7 +673,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 
 COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the

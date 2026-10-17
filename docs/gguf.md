@@ -29,6 +29,7 @@ colibri runs the GGUF files people already have on disk. The ggml blocks are com
 | `glm5-next` | GLM-5.3-Flash | glm53 |
 | `glm-dsa` | GLM-5.2, GLM-5.3 | colibri |
 | `mimo2` | MiMo-V2.6 | mimo |
+| `olmoe` | OLMoE | olmoe |
 
 A GGUF of another architecture is refused by `coli import` with the list above.
 
@@ -52,9 +53,11 @@ Both are lossless: the same blocks, the same tokens.
   | inkling | `INK_ILV16=0` |
   | glm53 | `G53_ILV16=0` |
   | colibri | `GLM_ILV16=0` |
+  | olmoe | `OLM_ILV16=0` (dense matrices; its experts keep the file's rows) |
 
 - **The Vulkan expert tier** (`COLI_VULKAN=1`) takes a GGUF's experts as the file has them. Each layer keeps its own types, since published files mix them.
 - **MXFP4 experts** (DeepSeek V4 and V4.1, MiMo) are laid out as their checkpoints' FP4, so they run on those engines' own kernels and device forms.
+- **OLMoE's experts keep the file's rows**: they fit in RAM, and interleaving one at its read cost more than the 16-row kernels gave back on its matrices. llama.cpp's `olmoe` files carry no `norm_topk_prob`; the import writes false, as the official checkpoints have it and as llama.cpp computes them.
 - **DeepSeek V4.1's engram tables** are read a row at a time, as from the checkpoint: a `deepseek41` file holds each row's e4m3 values and their scales together. These files carry no DSpark head, so nothing drafts.
 - **GLM's MLA**: `k_b` / `v_b` (llama.cpp splits `kv_b_proj`) stay the file's blocks.
 - **Dense matrices stay on the CPU.** The dense chains and CUDA take none of a GGUF's ggml matrices; the routed experts are where a device helps most.

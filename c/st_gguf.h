@@ -221,7 +221,24 @@ static const st_gg_name st_gg_mimo_layer[] = {
     {"ffn_down_exps.weight", "mlp.experts.%d.down_proj.weight"},
     {NULL, NULL}};
 
+/* OLMoE (olmoe): conversion/olmo.py OlmoeModel, the checkpoint's names; q and k as the
+ * checkpoint has them (no rotary permutation). */
+static const st_gg_name st_gg_olmoe_glob[] = {
+    {"token_embd.weight", "model.embed_tokens.weight"}, {"output_norm.weight", "model.norm.weight"},
+    {"output.weight", "lm_head.weight"},
+    {NULL, NULL}};
+static const st_gg_name st_gg_olmoe_layer[] = {
+    {"attn_norm.weight", "input_layernorm.weight"}, {"ffn_norm.weight", "post_attention_layernorm.weight"},
+    {"attn_q.weight", "self_attn.q_proj.weight"}, {"attn_k.weight", "self_attn.k_proj.weight"},
+    {"attn_v.weight", "self_attn.v_proj.weight"}, {"attn_output.weight", "self_attn.o_proj.weight"},
+    {"attn_q_norm.weight", "self_attn.q_norm.weight"}, {"attn_k_norm.weight", "self_attn.k_norm.weight"},
+    {"ffn_gate_inp.weight", "mlp.gate.weight"},
+    {"ffn_gate_exps.weight", "mlp.experts.%d.gate_proj.weight"}, {"ffn_up_exps.weight", "mlp.experts.%d.up_proj.weight"},
+    {"ffn_down_exps.weight", "mlp.experts.%d.down_proj.weight"},
+    {NULL, NULL}};
+
 static const st_gg_map st_gguf_maps[] = {
+    {"olmoe", "model.layers.%d.", st_gg_olmoe_glob, st_gg_olmoe_layer},
     {"mimo2", "model.layers.%d.", st_gg_mimo_glob, st_gg_mimo_layer},
     {"glm-dsa", "model.layers.%d.", st_gg_gdsa_glob, st_gg_gdsa_layer},
     {"glm5-next", "model.language_model.layers.%d.", st_gg_g5n_glob, st_gg_g5n_layer},
