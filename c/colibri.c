@@ -270,10 +270,17 @@ typedef struct {
  * by 16 (GQ_*_R16, coli_ggml_held_type) -- and no scale array; ggml_quants.h computes it on
  * the CPU, no device takes it. */
 #define QT_GGML 101
+/* fmt QT_KVB: kv_b_proj of a GGUF, kept as the file splits it (llama.cpp's glm-dsa): k_b =
+ * W_k transposed per head [H][kv_lora][nope] and v_b = W_v [H][v_head][kv_lora], two QT_GGML
+ * in t->kvb (QtKvb). It stands for the checkpoint's [H*(nope+v_head)][kv_lora] in matmul_qt
+ * (the prefill's reconstruction), qt_matvec_rows (the value rows) and qt_kvb_absorb (the
+ * absorbed query), at the file's bytes instead of f32. */
+#define QT_KVB 102
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
     int gt;      /* fmt QT_GGML: the ggml type of q4's blocks */
     int64_t gcap;   /* fmt QT_GGML: bytes q4 holds (a slot reused across layers of other types) */
+    struct QtKvb *kvb;   /* fmt QT_KVB: its k_b and v_b */
     int planar;  /* K1: fmt=2 con nibble a PIANI (vedi quant.h) — i kernel *_i4p; 0 = coppie classiche */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
@@ -307,9 +314,11 @@ typedef struct {
      * q8/q4/s; they are interior pointers into g_maps[] shard mappings. */
     int mmap_view;
 } QT;
+typedef struct QtKvb { QT kb, vb; int H, nope, V, L; } QtKvb;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
     if(t->fmt==QT_GGML) return gq_row_bytes(t->gt,t->I)*(int64_t)t->O;   /* scales inside the blocks */
+    if(t->fmt==QT_KVB) return qt_bytes(&t->kvb->kb)+qt_bytes(&t->kvb->vb);
     if(t->fmt==0) return n*4;
     if(t->fmt==1) return n + (int64_t)t->O*4;
     if(t->fmt==3) return (int64_t)t->O*((t->I+3)/4) + (int64_t)t->O*4;
@@ -396,7 +405,7 @@ static int64_t qt_rb(const QT *t){ return t->mmap_view ? 0 : qt_bytes(t); }
  * 4-byte allocation. UNVERIFIED at runtime (same static/arithmetic-only
  * caveat as the fmt=4/5/8 fix above -- no model run performed). */
 static int64_t qt_scale_bytes(const QT *t){
-    if(t->fmt==QT_GGML) return 0;   /* in the blocks */
+    if(t->fmt==QT_GGML || t->fmt==QT_KVB) return 0;   /* in the blocks */
     if(t->fmt==4){ int ng=(t->I+t->gs-1)/t->gs; return (int64_t)t->O*ng*4; }
     if(t->fmt==5){ int64_t ng=((int64_t)t->I+63)/64; return (int64_t)t->O*ng*4; }
     if(t->fmt==6) return 4;   /* E8/IQ3: FIXED 4-byte tag (qsalloc(1)), not O*4 -- see this
@@ -1318,8 +1327,45 @@ static void qt_ggml_rows(const QT *w, int r0, int n, const float *x, float *y, i
         fprintf(stderr,"GGUF matmul failed: %s rows of %d\n",gq_type_name(w->gt),w->I); exit(1);
     }
 }
+/* Row `row` of a QT_GGML matrix in f32 (an interleaved one from its group). */
+static void qt_ggml_row_f32(const QT *w, int row, float *out){
+    if(gq_r16_base(w->gt)>=0) gq_r16_dequant_row(w->gt,w->q4,row,out,w->I);
+    else gq_dequant_row(w->gt,w->q4+(int64_t)row*gq_row_bytes(w->gt,w->I),out,w->I);
+}
+/* y[n] = rows [r0, r0+n) of a QT_GGML times x, in f32: the attention's own products on kv_b,
+ * which take their input as it is (no int8 activations; the rows dequantized as they are
+ * read). No parallel region of its own: the attention calls it per head. */
+static void qt_ggml_rows_f32(const QT *w, int r0, int n, const float *x, float *y){
+    float row[4096];
+    if(w->I>4096){ fprintf(stderr,"GGUF kv_b rows of %d: too wide\n",w->I); exit(1); }
+    for(int j=0;j<n;j++){ qt_ggml_row_f32(w,r0+j,row); y[j]=gq_dot_f32(row,x,w->I); }
+}
+/* y[S][H*(nope+V)] = kv_b x for a QT_KVB, in f32 like the checkpoint's: per head its nope
+ * rows (k_b transposed: each head's k_b dequantized once, then x times it) and its V rows. */
+static void qt_kvb_matmul(float *y, const float *x, const QT *w, int S){
+    const QtKvb *k=w->kvb; const int H=k->H, nope=k->nope, V=k->V, L=k->L, R=nope+V;
+    #pragma omp parallel for schedule(static)
+    for(int h=0;h<H;h++){
+        float *kb=malloc((size_t)L*nope*sizeof(float)), *vb=malloc((size_t)V*L*sizeof(float));   /* k_b[h], v_b[h] */
+        if(!kb||!vb){ fprintf(stderr,"OOM kv_b product\n"); exit(1); }
+        for(int l=0;l<L;l++) qt_ggml_row_f32(&k->kb,h*L+l,kb+(int64_t)l*nope);
+        for(int v=0;v<V;v++) qt_ggml_row_f32(&k->vb,h*V+v,vb+(int64_t)v*L);
+        for(int s=0;s<S;s++){
+            float *ys=y+(int64_t)s*H*R+(int64_t)h*R; const float *xs=x+(int64_t)s*L;
+            for(int d=0;d<nope;d++) ys[d]=0.f;
+            for(int l=0;l<L;l++){ const float a=xs[l], *kr=kb+(int64_t)l*nope; for(int d=0;d<nope;d++) ys[d]+=a*kr[d]; }
+            for(int v=0;v<V;v++) ys[nope+v]=gq_dot_f32(vb+(int64_t)v*L,xs,L);
+        }
+        free(kb); free(vb);
+    }
+}
+/* The absorbed query of head h, q_lat = W_k[h]^T q_nope: k_b[h] times q_nope, for a QT_KVB. */
+static void qt_kvb_absorb(const QT *w, int h, const float *q_nope, float *q_lat){
+    qt_ggml_rows_f32(&w->kvb->kb,h*w->kvb->L,w->kvb->L,q_nope,q_lat);
+}
 static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot){
     if(w->fmt==QT_GGML){ (void)allow_idot; qt_ggml_rows(w,0,w->O,x,y,S); return; }   /* the CPU's, no device */
+    if(w->fmt==QT_KVB){ qt_kvb_matmul(y,x,w,S); return; }
 #ifdef COLI_VULKAN
     if(__atomic_load_n(&w->vk_gone, __ATOMIC_ACQUIRE)){
         if(qt_dho_matmul(w, y, x, S)) return;
@@ -2440,14 +2486,23 @@ static QT qt_load_ex(Model *m, const char *name, int O, int I, int bits, int mma
 }
 
 /* kv_b_proj of a GGUF (llama.cpp's glm-dsa splits it): k_b is W_k transposed per head
- * [H][kv_lora][nope], v_b is W_v [H][v_head][kv_lora]. Put back as the checkpoint's
- * [H*(nope+v_head)][kv_lora], in f32: the GGUF's values exactly, which every attention path
- * reads (the absorbed rows, the prefill's reconstruction). prefix: "model.layers.<i>.". */
+ * [H][kv_lora][nope], v_b is W_v [H][v_head][kv_lora]. Block-quantized ones stay the file's
+ * blocks (QT_KVB); float ones are put back as the checkpoint's [H*(nope+v_head)][kv_lora] in
+ * f32, their values exactly. prefix: "model.layers.<i>.". */
 static QT qt_kvb_gguf(Model *m, const char *prefix, int H, int nope, int V, int L){
     char kn[300], vn[300];
     snprintf(kn,sizeof kn,"%sself_attn.k_b_proj.weight",prefix); snprintf(vn,sizeof vn,"%sself_attn.v_b_proj.weight",prefix);
     st_tensor *kb=st_find(&m->S,kn), *vb=st_find(&m->S,vn);
     if(!kb||!vb) { fprintf(stderr,"%s: no kv_b_proj, nor GGUF k_b / v_b\n",prefix); exit(1); }
+    if(st_is_ggml(kb->dtype) && st_is_ggml(vb->dtype)){
+        QT t; memset(&t,0,sizeof t);
+        QtKvb *k=calloc(1,sizeof *k);
+        if(!k){ fprintf(stderr,"OOM %skv_b\n",prefix); exit(1); }
+        qt_from_disk(m,kn,H*L,nope,8,0,&k->kb); qt_from_disk(m,vn,H*V,L,8,0,&k->vb);
+        k->H=H; k->nope=nope; k->V=V; k->L=L;
+        t.fmt=QT_KVB; t.O=H*(nope+V); t.I=L; t.kvb=k;
+        return t;
+    }
     const int tk=st_ggml_type_any(kb->dtype), tv=st_ggml_type_any(vb->dtype);
     const int64_t rk=tk>=0?gq_row_bytes(tk,nope):-1, rv=tv>=0?gq_row_bytes(tv,L):-1;
     if(rk<0||rv<0||kb->nbytes!=rk*H*L||vb->nbytes!=rv*H*V){
@@ -4200,6 +4255,17 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
 #endif
     int I=t->I;
     if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) acc[i]+=coef*w[i]; return; }
+    if(t->fmt==QT_KVB){   /* row d of head h's keys: column d of k_b[h] (qt_kvb_absorb is the fast form) */
+        const QtKvb *k=t->kvb; const int R=k->nope+k->V, h=row/R, d=row%R;
+        if(d>=k->nope){ fprintf(stderr,"qt_addrow: a value row of a GGUF's kv_b (qt_matvec_rows reads those)\n"); exit(1); }
+        float kr[4096];
+        for(int l=0;l<k->L;l++){
+            const int r=h*k->L+l;
+            if(gq_r16_base(k->kb.gt)>=0) gq_r16_dequant_row(k->kb.gt,k->kb.q4,r,kr,k->nope);
+            else gq_dequant_row(k->kb.gt,k->kb.q4+(int64_t)r*gq_row_bytes(k->kb.gt,k->nope),kr,k->nope);
+            acc[l]+=coef*kr[d];
+        }
+        return; }
     if(t->fmt==QT_GGML){ float wr[4096];   /* the row dequantized (an interleaved one from its group) */
         if(I>4096 || (gq_r16_base(t->gt)>=0 ? gq_r16_dequant_row(t->gt,t->q4,row,wr,I)
                                             : gq_dequant_row(t->gt,t->q4+(int64_t)row*gq_row_bytes(t->gt,I),wr,I))){
@@ -4282,6 +4348,11 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
 #endif
     int I=t->I;
     if(t->fmt==QT_GGML){ qt_ggml_rows(t,r0,n,x,y,1); return; }
+    if(t->fmt==QT_KVB){   /* a head's value rows: v_b's */
+        const QtKvb *k=t->kvb; const int R=k->nope+k->V, h=r0/R, d=r0%R;
+        if(d<k->nope || d+n>R){ fprintf(stderr,"qt_matvec_rows: kv_b rows %d..%d are not one head's value rows\n",r0,r0+n); exit(1); }
+        qt_ggml_rows_f32(&k->vb,h*k->V+(d-k->nope),n,x,y);
+        return; }
     for(int j=0;j<n;j++){ int row=r0+j; double a=0;
         if(t->fmt==0){ const float *w=t->qf+(int64_t)row*I; for(int i=0;i<I;i++) a+=(double)w[i]*x[i]; }
         else if(t->fmt==4){ /* grouped int4: per-group scale */
@@ -5127,7 +5198,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             const float *qr=qp+c->qk_nope;
             int rbase=h*(c->qk_nope+vh);
             float qabs[512]; memset(qabs,0,kvl*sizeof(float));
-            for(int d=0;d<c->qk_nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
+            if(l->kv_b.fmt==QT_KVB) qt_kvb_absorb(&l->kv_b,h,qp,qabs);   /* a GGUF's k_b, as the file has it */
+            else for(int d=0;d<c->qk_nope;d++) qt_addrow(&l->kv_b, rbase+d, qp[d], qabs);
             float *sc = sc_all + (int64_t)omp_get_thread_num()*sc_cap;
             int st0=ks->kv_start[layer];
             int ns = (dnsel && dnsel[s]>0) ? dnsel[s] : 0;    /* DSA: lista top-k o range pieno */
