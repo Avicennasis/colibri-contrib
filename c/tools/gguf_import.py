@@ -56,9 +56,9 @@ def split_parts(path):
     return parts
 
 
-def open_model(path):
+def open_model(path, header_only=False):
     parts = split_parts(path)
-    readers = [GGUFReader(str(p)) for p in parts]
+    readers = [GGUFReader(str(p), header_only=header_only) for p in parts]
     meta = readers[0].metadata
     tensors = {}
     for i, r in enumerate(readers):
@@ -233,7 +233,10 @@ def deepseek4_config(meta, tensors, overrides=None):
     the GGUF of the model carries no MTP head (llama.cpp writes it to its own mtp-*.gguf)."""
     p = "deepseek4."
     need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
-    layers = int(need("block_count")) - int(meta.get(p + "nextn_predict_layers", 0))
+    # block_count counts the MTP blocks only where the file holds them (llama.cpp's mtp files;
+    # antirez's main files say nextn_predict_layers 1 and keep the head apart): the layers are
+    # the blocks with attention
+    layers = sum(1 for b in range(int(need("block_count"))) if f"blk.{b}.attn_q_a.weight" in tensors)
     gating = int(meta.get(p + "expert_gating_func", 4))
     if gating != 4:
         sys.exit(f"{p}expert_gating_func {gating}: the engine routes with sqrt(softplus) (4) only")
@@ -422,6 +425,24 @@ def mtp_head_ok(path, meta, layers):
 
 
 # ------------------------------------------------------------- tokenizer
+# The pre-tokenizer of a GGUF tokenizer, by llama.cpp's name for it (tokenizer.ggml.pre ->
+# llama-vocab.cpp's regex_exprs), in the shape the checkpoint's tokenizer.json gives it.
+DEEPSEEK_SPLITS = ["\\p{N}{1,3}", "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
+                   "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+|"
+                   " ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"]
+PRE_SPLITS = {"deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
+              "hunyuan-dense": DEEPSEEK_SPLITS, "hy_v4": DEEPSEEK_SPLITS}
+
+
+def pre_tokenizer(pre):
+    splits = PRE_SPLITS.get(pre or "")
+    if not splits:   # the default: ByteLevel's own (GPT-2) regex
+        return {"type": "ByteLevel", "add_prefix_space": False, "use_regex": True}
+    return {"type": "Sequence", "pretokenizers":
+            [{"type": "Split", "pattern": {"Regex": r}, "behavior": "Isolated", "invert": False} for r in splits] +
+            [{"type": "ByteLevel", "add_prefix_space": False, "trim_offsets": True, "use_regex": False}]}
+
+
 def tokenizer_files(meta):
     """tokenizer.json in HF's shape: added tokens (token_type 3 CONTROL = special,
     4 USER_DEFINED = not special) live only in added_tokens, the rest in
@@ -433,19 +454,26 @@ def tokenizer_files(meta):
     if model != "gpt2":
         sys.exit(f"tokenizer model {model!r} is not byte-level BPE (gpt2): not supported")
     types = meta.get("tokenizer.ggml.token_type") or [1] * len(toks)
+    kinds = [int(types[i]) if i < len(types) else 1 for i in range(len(toks))]
+    # the added tokens past the BPE vocabulary; one inside it (DeepSeek's <｜begin▁of▁sentence｜>)
+    # is in model.vocab as well, as the checkpoint has it
+    tail = len(toks)
+    while tail > 0 and kinds[tail - 1] in (3, 4):
+        tail -= 1
     vocab, added = {}, []
     for i, t in enumerate(toks):
-        kind = int(types[i]) if i < len(types) else 1
-        if kind in (3, 4):
+        if kinds[i] in (3, 4):
             added.append({"id": i, "content": t, "single_word": False, "lstrip": False, "rstrip": False,
-                          "normalized": False, "special": kind == 3})
-        else:
+                          "normalized": False, "special": kinds[i] == 3})
+        if kinds[i] not in (3, 4) or i < tail:
             vocab[t] = i
     merges = list(meta.get("tokenizer.ggml.merges") or [])
     tok = {"version": "1.0", "added_tokens": added,
-           "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": False, "use_regex": True},
-           "decoder": {"type": "ByteLevel"},
-           "model": {"type": "BPE", "vocab": vocab, "merges": merges}}
+           "pre_tokenizer": pre_tokenizer(meta.get("tokenizer.ggml.pre")),
+           "decoder": {"type": "ByteLevel", "add_prefix_space": True, "trim_offsets": True, "use_regex": True},
+           "model": {"type": "BPE", "dropout": None, "unk_token": None, "continuing_subword_prefix": None,
+                     "end_of_word_suffix": None, "fuse_unk": False, "byte_fallback": False,
+                     "vocab": vocab, "merges": merges}}
     ids = {k: meta.get(f"tokenizer.ggml.{k}_token_id") for k in ("bos", "eos", "padding")}
     name = lambda i: toks[int(i)] if i is not None and int(i) < len(toks) else None
     tcfg = {"chat_template": meta.get("tokenizer.chat_template"),
@@ -582,7 +610,9 @@ def main():
                          "that read the layers as qwen_sparse_attention)")
     args = ap.parse_args()
     src = args.gguf.resolve()
-    parts, readers, meta, tensors = open_model(src)
+    # GGUF_CHECK=1: the file is a header fetched by tools/gguf_header.py, the folder is for the
+    # engine's check of it (no tensor is read)
+    parts, readers, meta, tensors = open_model(src, header_only=bool(os.environ.get("GGUF_CHECK")))
     arch = meta.get("general.architecture")
     if arch not in ARCHES:
         sys.exit(f"architecture {arch!r} is not supported yet (supported: {', '.join(ARCHES)})")

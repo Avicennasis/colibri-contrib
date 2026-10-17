@@ -766,15 +766,24 @@ int coli_v4_layer_plan_index(ColiDeepSeekV4LayerPlan *plan,
             if (length > 6 && !strcmp(spec.name + length - 6, ".scale")) {
                 snprintf(weight, sizeof weight, "%.*s.weight", (int)(length - 6), spec.name);
                 const ColiSafetensorsTensor *w = coli_st_find(index, weight);
-                if (!t && w && st_is_ggml(w->dtype)) continue;
+                if (!t && w && (st_is_ggml(w->dtype) || w->dtype == COLI_ST_F16 ||
+                                w->dtype == COLI_ST_BF16 || w->dtype == COLI_ST_F32)) continue;
             }
         } else if (t && st_is_ggml(t->dtype) &&
                    (spec.dtype == COLI_ST_F8_E4M3 || (spec.dtype == COLI_ST_BF16 && spec.rank == 2))) {
             spec.dtype = t->dtype;
+        } else if (t && spec.dtype == COLI_ST_F8_E4M3 &&
+                   (t->dtype == COLI_ST_F16 || t->dtype == COLI_ST_BF16 || t->dtype == COLI_ST_F32)) {
+            /* a matrix the converter kept in floats (antirez's F16 indexer): a ggml float view */
+            spec.dtype = ST_GGML_BASE + (t->dtype == COLI_ST_F16 ? GQ_F16 : t->dtype == COLI_ST_BF16 ? GQ_BF16 : GQ_F32);
         } else if (t && spec.dtype == COLI_ST_BF16 && t->dtype == COLI_ST_F32) {
             spec.convert = 1;
         } else if (t && spec.dtype == COLI_ST_I64 && t->dtype == 7) {
             spec.convert = 2;
+        } else if (t && spec.dtype == COLI_ST_BF16 && t->dtype == COLI_ST_F16) {
+            spec.convert = 3;   /* BF16 values a converter wrote as F16 (exact both ways in range) */
+        } else if (t && spec.dtype == COLI_ST_F32 && t->dtype == COLI_ST_F16) {
+            spec.convert = 4;
         }
         plan->tensors[kept++] = spec;
     }
@@ -784,14 +793,26 @@ int coli_v4_layer_plan_index(ColiDeepSeekV4LayerPlan *plan,
 
 /* The dtype the index holds for spec: what the loader reads before any conversion. */
 static int v4_spec_stored_dtype(const ColiDeepSeekV4TensorSpec *spec) {
-    return spec->convert == 1 ? COLI_ST_F32 : spec->convert == 2 ? 7 : spec->dtype;
+    if (st_is_ggml(spec->dtype)) {   /* a float matrix in a ggml view is stored as that float */
+        const int g = st_ggml_type(spec->dtype);
+        if (g == GQ_F16) return COLI_ST_F16;
+        if (g == GQ_BF16) return COLI_ST_BF16;
+        if (g == GQ_F32) return COLI_ST_F32;
+    }
+    switch (spec->convert) {
+        case 1: return COLI_ST_F32;
+        case 2: return 7;
+        case 3: case 4: return COLI_ST_F16;
+        default: return spec->dtype;
+    }
 }
 /* Its bytes in RAM once loaded: E8M0 scales as float, conversions at the planned width. */
 static uint64_t v4_spec_resident_bytes(const ColiDeepSeekV4TensorSpec *spec,
                                        const ColiSafetensorsTensor *tensor) {
     if (tensor->dtype == COLI_ST_F8_E8M0) return (uint64_t)tensor->numel * sizeof(float);
-    if (spec->convert == 1) return (uint64_t)tensor->numel * 2;
+    if (spec->convert == 1 || spec->convert == 3) return (uint64_t)tensor->numel * 2;
     if (spec->convert == 2) return (uint64_t)tensor->numel * 8;
+    if (spec->convert == 4) return (uint64_t)tensor->numel * 4;
     return (uint64_t)tensor->nbytes;
 }
 
@@ -977,15 +998,17 @@ int coli_v4_layer_load(ColiV4Engine *engine,
             return set_error(error, error_size, "out of memory loading: %s", spec->name);
         }
         int read_failed;
-        if (spec->convert) {   /* GGUF: F32 back to the BF16 it was, I32 to I64 */
+        if (spec->convert) {   /* GGUF: F32 / F16 back to the BF16 they were, I32 to I64, F16 to F32 */
             void *stored = malloc((size_t)tensor->nbytes);
             read_failed = !stored || coli_st_read_tensor(index, tensor, stored) != 0;
             for (int64_t k = 0; !read_failed && k < tensor->numel; k++) {
-                if (spec->convert == 1) {
-                    uint32_t bits; memcpy(&bits, (const float *)stored + k, 4);
-                    bits += 0x7fffu + ((bits >> 16) & 1u);   /* round to nearest even: exact on BF16 values */
-                    ((uint16_t *)weights->data[i])[k] = (uint16_t)(bits >> 16);
-                } else ((int64_t *)weights->data[i])[k] = ((const int32_t *)stored)[k];
+                if (spec->convert == 2) { ((int64_t *)weights->data[i])[k] = ((const int32_t *)stored)[k]; continue; }
+                float value = spec->convert == 1 ? ((const float *)stored)[k]
+                                                 : f16_to_f32(((const uint16_t *)stored)[k]);
+                if (spec->convert == 4) { ((float *)weights->data[i])[k] = value; continue; }
+                uint32_t bits; memcpy(&bits, &value, 4);
+                bits += 0x7fffu + ((bits >> 16) & 1u);   /* round to nearest even: exact on BF16 values */
+                ((uint16_t *)weights->data[i])[k] = (uint16_t)(bits >> 16);
             }
             free(stored);
         } else read_failed = tensor->dtype == COLI_ST_F8_E8M0
@@ -1402,7 +1425,8 @@ static int find_head(const ColiSafetensorsIndex *index,
                      const ColiSafetensorsTensor **head,
                      char *error, size_t error_size) {
     *head = coli_st_find(index, "head.weight");
-    if (!*head || (*head)->dtype != COLI_ST_BF16 || (*head)->rank != 2) {
+    if (!*head || ((*head)->dtype != COLI_ST_BF16 && (*head)->dtype != COLI_ST_F16 && (*head)->dtype != COLI_ST_F32 &&
+                   !st_is_ggml((*head)->dtype)) || (*head)->rank != 2) {
         snprintf(error, error_size, "missing or invalid BF16 head.weight");
         return -1;
     }
@@ -1500,6 +1524,21 @@ static double v4_open_now_s(void) {
 #define GIB UINT64_C(1073741824)
 
 static uint64_t expert_record_bytes(const ColiSafetensorsIndex *index) {
+    const ColiSafetensorsTensor *w0 = coli_st_find(index, "layers.0.ffn.experts.0.w1.weight");
+    if (w0 && st_is_ggml(w0->dtype)) {   /* a GGUF types its experts per layer: the largest */
+        uint64_t largest = 0;
+        for (int layer = 0;; layer++) {
+            uint64_t total = 0;
+            for (int m = 1; m <= 3; m++) {
+                char name[96];
+                snprintf(name, sizeof name, "layers.%d.ffn.experts.0.w%d.weight", layer, m);
+                const ColiSafetensorsTensor *t = coli_st_find(index, name);
+                if (!t) return m == 1 && layer > 0 ? largest : 0;
+                total += (uint64_t)t->nbytes;
+            }
+            if (total > largest) largest = total;
+        }
+    }
     static const char *parts[] = {
         "layers.0.ffn.experts.0.w1.weight", "layers.0.ffn.experts.0.w1.scale",
         "layers.0.ffn.experts.0.w2.weight", "layers.0.ffn.experts.0.w2.scale",
@@ -3616,6 +3655,26 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return set_error(error, error_size, "missing compressor tensor for %s", state->prefix);
     float *kv_row = state->kv_state + (size_t)state_row * projection;
     float *score_row = state->score_state + (size_t)state_row * projection;
+    {   /* a GGUF that quantized the projections (Q8_0 in unsloth's files): ggml_quants.h */
+        char name[COLI_V4_MAX_TENSOR_NAME];
+        const ColiDeepSeekV4TensorSpec *kv_spec = NULL, *gate_spec = NULL;
+        snprintf(name, sizeof(name), "layers.%d.%s.wkv.weight", state->weights->plan.layer, state->prefix);
+        coli_v4_layer_data(state->weights, name, &kv_spec);
+        snprintf(name, sizeof(name), "layers.%d.%s.wgate.weight", state->weights->plan.layer, state->prefix);
+        coli_v4_layer_data(state->weights, name, &gate_spec);
+        if ((kv_spec && st_is_ggml(kv_spec->dtype)) || (gate_spec && st_is_ggml(gate_spec->dtype))) {
+            ColiTensorView kv_view, gate_view;
+            if (!kv_spec || !gate_spec || coli_v4_ggml_view(&kv_view, wkv, kv_spec) ||
+                coli_v4_ggml_view(&gate_view, wgate, gate_spec) ||
+                coli_ggml_matmul(kv_row, &kv_view, input, 1) ||
+                coli_ggml_matmul(score_row, &gate_view, input, 1))
+                return set_error(error, error_size, "GGUF compressor projection failed for %s", state->prefix);
+            for (int row = 0; row < projection; row++)
+                score_row[row] += ape[(size_t)slot * projection + row];
+            return compressor_pool_and_emit(state, output, produced, position,
+                                            error, error_size);
+        }
+    }
 #ifdef COLI_VULKAN
     /* wkv and wgate on the Vulkan device (bf16, fmt 11) when it takes both; the
      * ape bias is added here exactly as the loop below adds it. */
@@ -7035,6 +7094,26 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return set_error(error, error_size, "missing compressor tensor for %s", state->prefix);
     float *kv_row = state->kv_state + (size_t)state_row * projection;
     float *score_row = state->score_state + (size_t)state_row * projection;
+    {   /* a GGUF that quantized the projections (Q8_0 in unsloth's files): ggml_quants.h */
+        char name[COLI_V4_MAX_TENSOR_NAME];
+        const ColiDeepSeekV4TensorSpec *kv_spec = NULL, *gate_spec = NULL;
+        snprintf(name, sizeof(name), "layers.%d.%s.wkv.weight", state->weights->plan.layer, state->prefix);
+        coli_v4_layer_data(state->weights, name, &kv_spec);
+        snprintf(name, sizeof(name), "layers.%d.%s.wgate.weight", state->weights->plan.layer, state->prefix);
+        coli_v4_layer_data(state->weights, name, &gate_spec);
+        if ((kv_spec && st_is_ggml(kv_spec->dtype)) || (gate_spec && st_is_ggml(gate_spec->dtype))) {
+            ColiTensorView kv_view, gate_view;
+            if (!kv_spec || !gate_spec || coli_v4_ggml_view(&kv_view, wkv, kv_spec) ||
+                coli_v4_ggml_view(&gate_view, wgate, gate_spec) ||
+                coli_ggml_matmul(kv_row, &kv_view, input, 1) ||
+                coli_ggml_matmul(score_row, &gate_view, input, 1))
+                return set_error(error, error_size, "GGUF compressor projection failed for %s", state->prefix);
+            for (int row = 0; row < projection; row++)
+                score_row[row] += ape[(size_t)slot * projection + row];
+            return compressor_pool_and_emit(state, output, produced, position,
+                                            error, error_size);
+        }
+    }
 #ifdef COLI_VULKAN
     /* wkv and wgate on the Vulkan device (bf16, fmt 11) when it takes both; the
      * ape bias is added here exactly as the loop below adds it. */
@@ -13043,6 +13122,21 @@ static int load_embedding(float *state, const ColiSafetensorsIndex *index,
     const ColiSafetensorsTensor *embed = coli_st_find(index, "embed.weight");
     int d = config->hidden_size, hc = config->hc_mult;
     int shard = coli_st_tensor_shard(index, embed);
+    if (embed && (st_is_ggml(embed->dtype) || embed->dtype == COLI_ST_F16 || embed->dtype == COLI_ST_F32)) {
+        /* a GGUF embedding: the token's row, dequantized */
+        const int type = st_is_ggml(embed->dtype) ? st_ggml_type(embed->dtype) : embed->dtype == COLI_ST_F16 ? GQ_F16 : GQ_F32;
+        const int64_t rb = gq_row_bytes(type, d);
+        unsigned char *raw = rb > 0 ? malloc((size_t)rb) : NULL;
+        int failed = !raw || token < 0 || token >= config->vocab_size ||
+                     embed->nbytes != rb * (int64_t)config->vocab_size ||
+                     coli_st_read_at(index, shard, (uint64_t)embed->off + (uint64_t)token * (uint64_t)rb,
+                                     (size_t)rb, raw) ||
+                     gq_dequant_row(type, raw, state, d);
+        free(raw);
+        if (failed) return -1;
+        for (int copy = 1; copy < hc; copy++) memcpy(state + (size_t)copy * d, state, (size_t)d * sizeof(*state));
+        return 0;
+    }
     uint16_t *row = malloc((size_t)d * sizeof(*row));
     if (!embed || embed->dtype != COLI_ST_BF16 || !row || token < 0 ||
         token >= config->vocab_size ||
@@ -13779,8 +13873,8 @@ static int head_argmax(ColiV4Engine *engine, const float *hidden,
  * logprobs=k, docs/systemone.md) needs the whole row, so the row is computed here
  * once and the argmax is a scan over it. Same head_bf16_dot per row, same scan
  * order: the token picked and its logit do not change. */
-#ifdef COLI_VULKAN
-/* DUMP=<path> (VK=1 builds): every logits row the head computes, for the Vulkan gates */
+/* DUMP=<path>: every logits row the head computes, f32 in order (the Vulkan gates, and
+ * the GGUF checks against transformers) */
 static void v4_dump_logits(const float *scores, size_t count) {
     static FILE *dump;
     static int dump_init;
@@ -13788,14 +13882,47 @@ static void v4_dump_logits(const float *scores, size_t count) {
     if (dump) { fwrite(scores, sizeof(float), count, dump); fflush(dump); }
 }
 #define V4_DUMP_LOGITS(scores, count) v4_dump_logits((scores), (count))
-#else
-#define V4_DUMP_LOGITS(scores, count) ((void)0)
-#endif
+/* A GGUF head (any ggml type, st_gguf.h): the logits of `batch` rows of hidden into
+ * scores[batch][vocab], from the resident copy when the plan kept one, else read from the
+ * file a tile of rows at a time. */
+static int head_scores_ggml(ColiV4Engine *engine, const ColiSafetensorsTensor *head,
+                            const ColiSafetensorsIndex *index, int d, int vocab,
+                            const float *hidden, int batch, float *scores) {
+    const int type = st_is_ggml(head->dtype) ? st_ggml_type(head->dtype) : head->dtype == COLI_ST_F16 ? GQ_F16 : GQ_F32;
+    const int64_t rb = gq_row_bytes(type, d);
+    if (rb < 0 || head->nbytes != rb * (int64_t)vocab || batch < 1) return -1;
+    int shard = coli_st_tensor_shard(index, head);
+    const void *resident = coli_v4_head_cache_data(engine, shard, (uint64_t)head->off, (size_t)head->nbytes);
+    ColiTensorView view = { COLI_TENSOR_GGML, COLI_SCALE_NONE, resident, NULL, (size_t)head->nbytes, 0,
+                            vocab, d, 1, (uint32_t)type, NULL };
+    if (resident) return coli_ggml_matmul(scores, &view, hidden, batch);
+    enum { ROWS = 1024 };
+    unsigned char *raw = malloc((size_t)rb * ROWS);
+    float *tile = malloc((size_t)ROWS * batch * sizeof(*tile));
+    int failed = !raw || !tile;
+    for (int start = 0; !failed && start < vocab; start += ROWS) {
+        int rows = vocab - start < ROWS ? vocab - start : ROWS;
+        view.data = raw; view.rows = rows; view.data_bytes = (size_t)rb * rows;
+        failed = coli_st_read_at_engine(engine, index, shard, (uint64_t)head->off + (uint64_t)start * (uint64_t)rb,
+                                        (size_t)rb * rows, raw) ||
+                 coli_ggml_matmul(tile, &view, hidden, batch);
+        for (int item = 0; !failed && item < batch; item++)
+            memcpy(scores + (size_t)item * vocab + start, tile + (size_t)item * rows, (size_t)rows * sizeof(*tile));
+    }
+    free(tile); free(raw);
+    return failed ? -1 : 0;
+}
+
 static int head_scores_impl(ColiV4Engine *engine, const float *hidden,
                             const ColiSafetensorsIndex *index,
                             const ColiDeepSeekV4Config *config, float *scores) {
     const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
     int d = config->hidden_size, vocab = config->vocab_size;
+    if (head && (st_is_ggml(head->dtype) || head->dtype == COLI_ST_F16 || head->dtype == COLI_ST_F32) && scores) {
+        int result = head_scores_ggml(engine, head, index, d, vocab, hidden, 1, scores);
+        if (!result) V4_DUMP_LOGITS(scores, (size_t)vocab);
+        return result;
+    }
     if (!head || head->dtype != COLI_ST_BF16 || d < 1 || vocab < 1 || !scores)
         return -1;
     int shard = coli_st_tensor_shard(index, head);
@@ -13894,6 +14021,15 @@ static int head_argmax_batch(ColiV4Engine *engine, const float *hidden,
                            best_logits);
     const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
     int d = config->hidden_size, vocab = config->vocab_size;
+    if (head && (st_is_ggml(head->dtype) || head->dtype == COLI_ST_F16 || head->dtype == COLI_ST_F32)) {   /* a GGUF head: every row's logits, then each argmax */
+        float *scores = malloc((size_t)vocab * batch * sizeof(*scores));
+        int result = !scores || head_scores_ggml(engine, head, index, d, vocab, hidden, batch, scores);
+        for (int item = 0; !result && item < batch; item++)
+            result = head_scores_argmax(scores + (size_t)item * vocab, vocab, &best_tokens[item], &best_logits[item]);
+        if (!result) V4_DUMP_LOGITS(scores, (size_t)batch * vocab);
+        free(scores);
+        return result ? -1 : 0;
+    }
     if (!head || head->dtype != COLI_ST_BF16) return -1;
     int shard = coli_st_tensor_shard(index, head);
     const uint16_t *resident = coli_v4_head_cache_data(
@@ -15866,6 +16002,12 @@ static int head_scores_batch(ColiV4Engine *engine, const float *hidden,
     double t0 = spec_now();
     const ColiSafetensorsTensor *head = coli_st_find(index, "head.weight");
     int d = config->hidden_size, vocab = config->vocab_size;
+    if (head && (st_is_ggml(head->dtype) || head->dtype == COLI_ST_F16 || head->dtype == COLI_ST_F32) && batch >= 1) {   /* a GGUF head */
+        int result = head_scores_ggml(engine, head, index, d, vocab, hidden, batch, scores);
+        if (!result) V4_DUMP_LOGITS(scores, (size_t)batch * vocab);
+        g_v4_prof_head_s += spec_now() - t0;
+        return result;
+    }
     if (!head || head->dtype != COLI_ST_BF16 || batch < 1) return -1;
     const uint16_t *resident = coli_v4_head_cache_data(
         engine, coli_st_tensor_shard(index, head), (uint64_t)head->off,
@@ -17008,7 +17150,87 @@ static int v4_omp_reserve_loader_cpus(void) {
 }
 #endif
 
+/* GGUF_CHECK=1 ./deepseek_v4 <gguf_import folder>: the GGUF's header against everything the
+ * engine loads, without reading a tensor (the header tools/gguf_header.py fetches is enough):
+ * every layer's plan fitted to the file and validated, the three matrices of every expert,
+ * the head, the embedding and the final mixes; then the tensors of the file the engine would
+ * not read. 0 = OK, 3 = the file holds tensors the engine ignores, 1 = a mismatch. */
+static int v4_gguf_check(const char *dir) {
+    char error[512] = {0};
+    ColiDeepSeekV4Config config;
+    ColiSafetensorsIndex *index = NULL;
+    if (coli_v4_config_load(&config, dir, error, sizeof(error)) ||
+        coli_st_index_open(&index, dir, error, sizeof(error))) {
+        printf("GGUF CHECK FAIL: %s | %s\n", dir, error);
+        return 1;
+    }
+    unsigned char *used = calloc((size_t)index->n + 1, 1);
+    int failed = !used;
+#define V4_MARK(x) do { if (x) used[(x) - index->t] = 1; } while (0)
+    for (int layer = 0; !failed && layer < config.num_hidden_layers; layer++) {
+        ColiDeepSeekV4LayerPlan plan;
+        ColiDeepSeekV4LayerStats stats;
+        if (coli_v4_layer_plan(&plan, &config, layer, error, sizeof(error)) ||
+            coli_v4_layer_plan_index(&plan, index) ||
+            coli_v4_layer_validate(&plan, index, &stats, error, sizeof(error))) {
+            printf("GGUF CHECK FAIL: %s | layer %d: %s\n", dir, layer, error);
+            failed = 1; break;
+        }
+        for (size_t i = 0; i < plan.tensor_count; i++) V4_MARK(coli_st_find(index, plan.tensors[i].name));
+        for (int e = 0; !failed && e < config.n_routed_experts; e++)
+            for (int m = 1; m <= 3; m++) {
+                char name[160];
+                snprintf(name, sizeof(name), "layers.%d.ffn.experts.%d.w%d.weight", layer, e, m);
+                const ColiSafetensorsTensor *w = coli_st_find(index, name);
+                snprintf(name, sizeof(name), "layers.%d.ffn.experts.%d.w%d.scale", layer, e, m);
+                const ColiSafetensorsTensor *sc = coli_st_find(index, name);
+                const int64_t rows = m == 2 ? config.hidden_size : config.moe_intermediate_size;
+                const int64_t cols = m == 2 ? config.moe_intermediate_size : config.hidden_size;
+                int ok = w && w->rank == 2 && w->shape[0] == rows &&
+                         (st_is_ggml(w->dtype) ? !sc && w->shape[1] == cols &&
+                                                 gq_row_bytes(st_ggml_type(w->dtype), cols) * rows == w->nbytes
+                                               : sc && w->dtype == COLI_ST_I8 && w->shape[1] * 2 == cols);
+                if (!ok) {
+                    printf("GGUF CHECK FAIL: %s | layer %d expert %d w%d: missing, or not [%lld x %lld]\n",
+                           dir, layer, e, m, (long long)rows, (long long)cols);
+                    failed = 1; break;
+                }
+                V4_MARK(w); V4_MARK(sc);
+            }
+    }
+    static const char *globals[] = {"embed.weight", "head.weight", "norm.weight",
+                                    "hc_head_fn", "hc_head_base", "hc_head_scale"};
+    for (size_t g = 0; !failed && g < sizeof(globals) / sizeof(*globals); g++) {
+        const ColiSafetensorsTensor *t = coli_st_find(index, globals[g]);
+        int matrix = g < 2;
+        int ok = t && (!matrix || (t->rank == 2 && t->shape[0] == config.vocab_size &&
+                                   t->shape[1] == config.hidden_size &&
+                                   (t->dtype == COLI_ST_BF16 || t->dtype == COLI_ST_F16 ||
+                                    t->dtype == COLI_ST_F32 || st_is_ggml(t->dtype))));
+        if (!ok) { printf("GGUF CHECK FAIL: %s | %s missing or not [vocab x hidden] BF16 / ggml\n", dir, globals[g]); failed = 1; }
+        V4_MARK(t);
+    }
+#undef V4_MARK
+    int unused = 0;
+    double bytes = 0;
+    for (int i = 0; !failed && i < index->n; i++) {
+        bytes += (double)index->t[i].nbytes;
+        if (used[i]) continue;
+        if (++unused <= 20) fprintf(stderr, "  not read by the engine: %s\n", index->t[i].name);
+    }
+    if (!failed && unused)
+        printf("GGUF CHECK FAIL: %s | %d tensors the engine would not read (listed above)\n", dir, unused);
+    else if (!failed)
+        printf("GGUF CHECK OK: %s | DeepSeek V4: %d layers, %d experts top-%d, hidden %d, vocab %d, %d tensors, %.2f GB\n",
+               dir, config.num_hidden_layers, config.n_routed_experts, config.num_experts_per_tok,
+               config.hidden_size, config.vocab_size, index->n, bytes / 1e9);
+    free(used);
+    coli_st_index_close(index);
+    return failed ? 1 : unused ? 3 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (getenv("GGUF_CHECK") && argc >= 2) return v4_gguf_check(argv[1]);
 #ifdef _OPENMP
     if (!v4_omp_reserve_loader_cpus())
         fprintf(stderr, "[OMP] deepseek-v4: effective team size %d\n",
