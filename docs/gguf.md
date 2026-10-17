@@ -54,7 +54,8 @@ Both are lossless: the same blocks, the same tokens.
 - **The Vulkan expert tier** (`COLI_VULKAN=1`) takes a GGUF's experts as the file has them. Each layer keeps its own types, since published files mix them.
 - **MXFP4 experts** (DeepSeek V4, MiMo) are laid out as their checkpoints' FP4, so they run on those engines' own kernels and device forms.
 - **GLM's MLA**: `k_b` / `v_b` (llama.cpp splits `kv_b_proj`) stay the file's blocks.
-- **Dense matrices stay on the CPU.** The dense chains and CUDA take none of a GGUF's ggml matrices; the routed experts are where a device helps most.
+- **The Vulkan dense chain** (qwen36, qwen38) takes a GGUF's dense matrices as the file has them too. Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, IQ3_S, IQ4_NL and IQ4_XS run on a GEMV with one decoder per type (`shaders/chain_gemv_bd.comp`), and the other types on the general block decoder. The routed experts run inside the same frame when the tier holds every expert of a layer. A decode step or a verify of up to 16 rows runs there; a prompt's longer chunks go through the CPU and the expert tier.
+- **The other engines' dense matrices stay on the CPU**, and CUDA takes none of a GGUF's ggml matrices.
 
 ## Checking a GGUF before downloading it
 

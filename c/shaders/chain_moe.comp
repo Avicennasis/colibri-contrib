@@ -16,7 +16,10 @@
 // b*tanh(u/b) (expert_act.comp's formulas).
 // Weight formats as qmatmul.comp lays them out: 1 int8 and 2 int4 with a scale per row,
 // 4 int4 and 7 MXFP4 per gs inputs, 5 int3-g64, 10 f32, 11 bf16, 12 FP8 E4M3 and 13 int8
-// per gs inputs. The input row sits in shared memory, zero past its end up to the rows'
+// per gs inputs; and the block formats (100 + a ggml type, a GGUF's experts as the file has
+// them, its table at binding 6): the types bdstep.glsl decodes a row over lpr lanes (a power
+// of two, about four 32-weight steps a lane, the subgroup's other lanes on other rows),
+// every other type blockdec.glsl's, a row a subgroup, 32 weights a lane a step. The input row sits in shared memory, zero past its end up to the rows'
 // padded length; a row of 16-byte steps (row words % 4 == 0, every format but int3) is
 // spread over lpr lanes (a power of two up to the subgroup and the row's steps), each lane
 // reading a 16-byte step of RPS rows at once, the lanes' sums joined by clustered adds:
@@ -43,6 +46,7 @@ layout(std430, binding = 2) readonly buffer RW { float rw[]; };
 layout(std430, binding = 3) readonly buffer T { uint tab[]; };
 layout(std430, binding = 4) buffer H { float hid[]; };
 layout(std430, binding = 5) writeonly buffer Y { float y[]; };
+layout(std430, binding = 6) readonly buffer TB { uint bdtab[]; };   // the block formats' table (blockdec_table.h)
 
 layout(push_constant) uniform P {
     int mode, S, K, D, I, act;
@@ -165,10 +169,37 @@ float xin(int i) {
     if (g_staged) return xs4[min(i >> 2, XS / 4 - 1)][i & 3];
     return g_src == 0 ? x[g_base + i] : hid[g_base + i];
 }
+// the block formats (blockdec.glsl): the weights of the matrix g_bdw names, the staged row
+WRef g_bdw;
+#define BD_P bd_
+#define BD_W(i) g_bdw.v[i]
+#define BD_X(i) xin(int(i))
+#define BD_G(i) bdtab[i]
+#include "blockdec.glsl"
+// the types bdstep.glsl decodes: the matrix g_bw names (g_b16: its address 16-byte aligned,
+// so a uvec4 is one load), the staged row
+WRef g_bw; WRef4 g_bw4; bool g_b16;
+shared float bs_kvt[16];
+#define BS_W1(i) g_bw.v[i]
+#define BS_W4(i) (g_b16 ? g_bw4.v[i] : uvec4(g_bw.v[4u * (i)], g_bw.v[4u * (i) + 1u], g_bw.v[4u * (i) + 2u], g_bw.v[4u * (i) + 3u]))
+#define BS_X(i) xv4(i)
+#define BS_G(i) bdtab[i]
+#include "bdstep.glsl"
+void bs_mat(uint at) { uvec2 a = uvec2(tab[at], tab[at + 1u]); g_bw = WRef(a); g_bw4 = WRef4(a); g_b16 = (a.x & 15u) == 0u; }
+float bs_row(int t, uint rb, uint jj, uint lpr, uint nst) {
+    float a = 0.0;
+    for (uint q = jj; q < nst; q += lpr) a += bs_step(t, rb, q);
+    return a;
+}
 float rowdot(WRef W, SRef Sc, int fmt, int rowWords, int gs, int o, int lane, int sgs) {
     int n = g_n;
     uint rb = uint(o) * uint(rowWords);
     float sum = 0.0;
+    if (fmt >= 100) {   // a unit of 32 weights a lane (the host checks n % 32 == 0)
+        g_bdw = W;
+        for (int u = lane; u < n / 32; u += sgs) sum += bd_unit(fmt, rb * 4u, uint(u), uint(n));
+        return sum;
+    }
     if (fmt == 10) {
         for (int i = lane; i < n; i += sgs) sum += xin(i) * uintBitsToFloat(W.v[rb + uint(min(i, n - 1))]);
     } else if (fmt == 11) {
@@ -255,7 +286,7 @@ void stage(int src, int base, int n, int pad, int tid) {
 }
 // whether a matrix of rowWords words a row takes the 16-byte way, and its padded inputs
 bool wide(int fmt, int rowWords, int n) {
-    return fmt != 5 && rowWords % 4 == 0 && rowWords * int(vpw(fmt)) <= XS && rowWords * int(vpw(fmt)) >= n;
+    return fmt != 5 && fmt < 100 && rowWords % 4 == 0 && rowWords * int(vpw(fmt)) <= XS && rowWords * int(vpw(fmt)) >= n;
 }
 
 void main() {
@@ -287,9 +318,29 @@ void main() {
     int fmt = int(tab[eb + fo]), rws = int(tab[eb + fo + 1u]), gs = int(tab[eb + fo + 2u]);
     bool wd = wide(fmt, rws, n);
     stage(p.mode == 0 ? 0 : 1, p.mode == 0 ? p.x_off + s * p.x_row : j * p.I, n, wd ? rws * int(vpw(fmt)) : n, tid);
+    if (fmt >= 100) bs_kv_fill(tid);
     barrier();
     wd = wd && g_staged;
     uint o0 = uint(t * rpw);
+    if (fmt >= 100 && fmt < 164 && bs_has(fmt - 100) && n % 32 == 0 && g_staged) {
+        uint steps = uint(n) / 32u, lpr = 1u;
+        while (lpr * 2u <= uint(sgs) && lpr * 4u < steps) lpr *= 2u;
+        uint rg = uint(sgs) / lpr, rr = uint(lane) / lpr, jj = uint(lane) % lpr;
+        for (uint base = uint(sg) * rg; base < uint(rpw); base += uint(nsg) * rg) {   // uniform in the subgroup
+            uint r = base + rr, o = o0 + r, oc = min(o, uint(O) - 1u);
+            bool live = r < uint(rpw) && o < uint(O);
+            uint rb = oc * uint(rws) * 4u, nst = live ? steps : 0u;
+            float g, u = 0.0;
+            if (p.mode == 0) {
+                bs_mat(eb); g = red(bs_row(fmt - 100, rb, jj, lpr, nst), lpr);
+                bs_mat(eb + 4u); u = red(bs_row(fmt - 100, rb, jj, lpr, nst), lpr);
+            } else { bs_mat(eb + 8u); g = red(bs_row(fmt - 100, rb, jj, lpr, nst), lpr); }
+            if (jj != 0u || !live) continue;
+            if (p.mode == 0) hid[j * p.I + int(o)] = act(g, u);
+            else hid[yko + j * p.D + int(o)] = g;
+        }
+        return;
+    }
     if (wd) {
         uint W4 = uint(rws) / 4u, cap = min(min(uint(sgs), W4), 64u), lpr = 1u;
         while (lpr * 2u <= cap) lpr *= 2u;

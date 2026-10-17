@@ -1,0 +1,80 @@
+#version 450
+// The dense chain's GEMV for a GGUF's block formats (vk_chain.c, matmul_bd): y[s,o] =
+// sum_i x[s,i] * w[o,i], the rows as the file stores them (100 + ggml type T, the
+// qmatmul.comp contract: row o at o * rowWords words, its padding zero). One pipeline per
+// type (T a specialization constant), so a lane runs only its type's decoder:
+//   12 Q4_K, 13 Q5_K   16-byte loads (their blocks, 144 and 176 bytes, keep 16-byte alignment)
+//   23 IQ4_XS          8-byte aligned blocks of 136, word loads
+//   8 Q8_0, 14 Q6_K, 20 IQ4_NL, 21 IQ3_S, 22 IQ2_S, 16 IQ2_XXS
+//                      blocks of 34, 210, 18, 110, 82, 66 bytes: their fields start at any
+//                      even byte, so a word comes from two (ldu)
+// A step is 32 weights. A row is spread over lpr lanes (a power of two up to the
+// subgroup, from the host: a few steps per lane), so a subgroup works on subgroup/lpr
+// rows at once. A workgroup takes nr rows of x (up to 4: a speculative verify's), each
+// lane's steps against all of them, so the weights are read once for the nr; those rows
+// sit in shared memory when they fit XS vec4s (a specialization constant from the
+// device's shared-memory limit), else they are read from the buffer.
+// The sums are the CPU's float decoders' in another order: per run of 16 weights, a
+// scale times sum(w * x), minus a min times sum(x) where the type has one.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const int XS = 2048;
+layout(constant_id = 1) const int T = 12;
+
+layout(std430, binding = 0) readonly buffer X4 { vec4 x4[]; };
+layout(std430, binding = 1) readonly buffer W1 { uint w1[]; };
+layout(std430, binding = 1) readonly buffer W4 { uvec4 w4[]; };
+layout(std430, binding = 2) readonly buffer G { uint gt[]; };   // blockdec_table.h's table
+layout(std430, binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt, S, I, O, rowWords, gs;
+    int lpr;            // lanes per row, a power of two
+    int nr;             // rows of x a workgroup (1..4)
+} p;
+
+shared vec4 xs[XS];
+shared float bs_kvt[16];   // IQ4_NL / IQ4_XS: kvalues_iq4nl
+
+bool staged; uint xrow, xr;   // xr: the row of x the step reads (of the workgroup's nr)
+vec4 X(uint i4) { return staged ? xs[xr * uint(p.I / 4) + i4] : x4[xrow + xr * uint(p.I / 4) + i4]; }
+#define BS_W1(i) w1[i]
+#define BS_W4(i) w4[i]
+#define BS_X(i) X(i)
+#define BS_G(i) gt[i]
+#include "bdstep.glsl"
+
+void main() {
+    int s0 = int(gl_WorkGroupID.y) * p.nr, nr = min(p.nr, p.S - s0);
+    int tid = int(gl_LocalInvocationID.x);
+    int i4 = p.I / 4;
+    staged = nr * i4 <= XS;
+    xrow = uint(s0 * i4);
+    if (staged) for (int k = tid; k < nr * i4; k += 256) xs[k] = x4[s0 * i4 + k];
+    if (T == 20 || T == 23) bs_kv_fill(tid);
+    barrier();
+    int sg = int(gl_SubgroupID), sgs = int(gl_SubgroupSize);
+    int lpr = min(p.lpr, sgs), rps = sgs / lpr;
+    int sub = int(gl_SubgroupInvocationID) / lpr, lane = int(gl_SubgroupInvocationID) % lpr;
+    int nsg = 256 / sgs, stride = int(gl_NumWorkGroups.x) * nsg * rps;
+    uint steps = uint(p.I) / 32u;
+    for (int o0 = (int(gl_WorkGroupID.x) * nsg + sg) * rps; o0 < p.O; o0 += stride) {
+        int o = o0 + sub;
+        bool live = o < p.O;
+        uint rb = uint(min(o, p.O - 1)) * uint(p.rowWords) * 4u, n = live ? steps : 0u;
+        float a[4] = float[4](0.0, 0.0, 0.0, 0.0);
+        for (uint q = uint(lane); q < n; q += uint(lpr)) {
+            uint qc = min(q, steps - 1u);
+            [[unroll]] for (int r = 0; r < 4; r++) if (r < nr) { xr = uint(r); a[r] += bs_step(T, rb, qc); }
+        }
+        [[unroll]] for (int r = 0; r < 4; r++) {
+            if (r >= nr) break;   // uniform
+            float v = a[r];
+            for (int off = lpr / 2; off > 0; off >>= 1) v += subgroupShuffleXor(v, uint(off));
+            if (lane == 0 && live) y[(s0 + r) * p.O + o] = v;
+        }
+    }
+}
