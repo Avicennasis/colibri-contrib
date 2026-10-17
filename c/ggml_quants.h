@@ -2480,13 +2480,24 @@ static inline int gq_int_ok(int t, int I) {
     return !gq_exact_mode() && gq_has_int(t) && I % 32 == 0;
 }
 
-/* y = W x on an already quantized activation block (types with an integer form). */
+/* y = W x on an already quantized activation block (types with an integer form). An
+ * interleaved W holds whole groups of 16 rows; O may stop inside the last one (a caller
+ * reading the first O rows of a matrix packed whole, an unpadded vocabulary): that group
+ * goes through a buffer of its own. */
 static void gq_matmul_act(float *y, const gq_act *a, const uint8_t *W, int t, int O) {
     const int I = a->I; const int64_t rb = gq_row_bytes(t, I);
 #ifdef GQ_R16_ON
-    if (gq_r16_base(t) >= 0) {   /* whole groups of 16 rows */
+    if (gq_r16_base(t) >= 0) {
+        const int G = O / 16, tail = O % 16;
         #pragma omp parallel for schedule(static)
-        for (int g = 0; g < O / 16; g++) gq_r16_rows(t, y + 16 * g, O, W + (int64_t)16 * g * rb, a, I);
+        for (int g = 0; g < G; g++) gq_r16_rows(t, y + 16 * g, O, W + (int64_t)16 * g * rb, a, I);
+        if (tail) {
+            float *y16 = (float *)malloc((size_t)a->S * 16 * sizeof(float));
+            if (!y16) abort();
+            gq_r16_rows(t, y16, 16, W + (int64_t)16 * G * rb, a, I);
+            for (int r = 0; r < a->S; r++) memcpy(y + (int64_t)r * O + 16 * G, y16 + 16 * r, (size_t)tail * sizeof(float));
+            free(y16);
+        }
         return;
     }
 #endif

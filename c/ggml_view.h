@@ -7,6 +7,7 @@
 #define GGML_VIEW_H
 
 #include <stdint.h>
+#include <stdlib.h>
 #include "tensor.h"
 #include "ggml_quants.h"
 
@@ -16,6 +17,23 @@ static inline int coli_ggml_view_ok(const ColiTensorView *w) {
     return w && w->format == COLI_TENSOR_GGML && w->data && w->rows >= 1 && w->columns >= 1 &&
            w->rows <= INT32_MAX && w->columns <= INT32_MAX &&
            gq_row_bytes(coli_ggml_view_type(w), w->columns) >= 0;
+}
+
+/* The type a GGUF matrix of block type `type` is held in for the CPU: its rows interleaved by
+ * 16 (ggml_quants.h GQ_*_R16, the same bytes or a few percent more) when the type has that form,
+ * the matrix whole groups of 16 rows and the build has their kernels; else `type`, the file's
+ * rows. `env` names the engine's switch: set to 0, like GQ_EXACT=1, it keeps the file's rows. A
+ * device or a row reader gets the file's rows back (gq_r16_unpack, gq_r16_dequant_row). */
+static inline int coli_ggml_held_type(int type, int64_t rows, int64_t cols, const char *env) {
+#ifdef GQ_R16_ON
+    const char *e = env ? getenv(env) : NULL;
+    const int r = gq_r16_of(type);
+    if (!(e && *e == '0') && !gq_exact_mode() && r >= 0 && rows % 16 == 0 && cols % GQ_TYPES[type].blck == 0)
+        return r;
+#else
+    (void)rows; (void)cols; (void)env;
+#endif
+    return type;
 }
 
 /* The activations quantized once per call into a buffer each thread keeps (gq_matmul
