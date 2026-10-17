@@ -23,13 +23,14 @@ jobs:
   linux:
     name: Linux
     runs-on: ubuntu-latest
-    # make check takes about 14 minutes here now (14.9 at worst this week);
-    # at 15 the job was cut off with nothing failed.
-    timeout-minutes: 25
+    # make check built serially and took 23 minutes on 2026-10-17, then past 25 with two
+    # more engines' GGUF code: the builds now use every core (make test runs the C and
+    # Python suites one after the other, so only the compiling is parallel).
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: make check
-        run: make -C c check
+        run: make -C c -j"$(nproc)" check
 
   windows:
     # The job that would have caught #68/#137 pre-merge: native MinGW-w64
