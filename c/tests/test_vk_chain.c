@@ -1638,7 +1638,7 @@ static void test_moe(const char *what, int D, int I, int E, int S, int K, int fg
     VkcBuf *ib = vkc_buf((size_t)S * irow * 4, VKC_DEV), *wb = vkc_buf((size_t)S * wrow * 4, VKC_DEV);
     VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * yrow * 4, VKC_DEV);
     VkcRoute rp = {S, E, K, 0, 0, lrow, 0, 0, 0, irow, 1, wrow, 1, 1, 1, 1.f, 1.f, 0.f};
-    VkcMoe mp = {S, K, D, I, act, limit, a, b, t_off, 2, xrow, 0, irow, 1, wrow, 1, yrow};
+    VkcMoe mp = {S, K, D, I, act, limit, a, b, t_off, 2, xrow, 0, irow, 1, wrow, 1, yrow, 0};
     /* the route and the experts in frames of their own, timed: a frame past the fence
      * wait's 20 s loses the device, and the line says which of the two took the time */
     struct timespec ts0, ts1, ts2;
@@ -2723,7 +2723,7 @@ static void test_matmul_bd(int t, int S, int I, int O) {
 }
 static void test_bd(void) {
     const int types[] = {GQ_Q8_0, GQ_Q4_K, GQ_Q5_K, GQ_Q6_K, GQ_IQ2_XXS, GQ_IQ4_NL, GQ_IQ3_S, GQ_IQ2_S, GQ_IQ4_XS,
-                         GQ_Q2_K, GQ_IQ2_XS};   /* the last two: qmatmul_bd.comp's */
+                         GQ_Q2_0, GQ_Q2_K, GQ_IQ2_XS};   /* the last two: qmatmul_bd.comp's */
     for (size_t k = 0; k < sizeof types / sizeof *types; k++) {
         int t = types[k];
         test_matmul_bd(t, 1, 256, 70);      /* one block a row, short rows, lanes past the row */
@@ -2732,6 +2732,54 @@ static void test_bd(void) {
         test_matmul_bd(t, 1, 16640, 9);     /* x past the staging (16 KiB floats at most): read from the buffer */
     }
     printf("matmul_bd: %zu block types\n", sizeof types / sizeof *types);
+}
+
+/* COLI_VK_CHAIN_BENCH=moe: the routed experts in the frame (vkc_route + vkc_moe) at
+ * Qwen3.8-Flash-Next's shapes, a GGUF's experts (IQ2_S gate/up, Q2_0 down; COLI_VK_BENCH_FMTS
+ * "122 142" sets them), random blocks, S rows of K = 10 experts of 64. */
+static void bench_moe(void) {
+    int D = 2560, I = 640, E = 64, K = 10, fg = 122, fd = 142;
+    const char *fe = getenv("COLI_VK_BENCH_FMTS");
+    if (fe && *fe) sscanf(fe, "%d %d", &fg, &fd);
+    if (!vkc_moe_ready() || !coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { printf("bench moe: no expert batch here\n"); return; }
+    ColiVkTensor **tg = calloc(E, sizeof *tg), **tu = calloc(E, sizeof *tu), **td = calloc(E, sizeof *td);
+    ColiVkExpert **ex = calloc(E, sizeof *ex);
+    uint32_t *tab = calloc((size_t)E * COLI_VK_XB_ENTRY, 4);
+    size_t rg = coli_vk_tensor_row_bytes(fg, D), rd = coli_vk_tensor_row_bytes(fd, I);
+    uint8_t *wg = malloc(rg * I), *wd = malloc(rd * D);
+    for (size_t i = 0; i < rg * I; i++) wg[i] = (uint8_t)rnd();
+    for (size_t i = 0; i < rd * D; i++) wd[i] = (uint8_t)rnd();
+    int ok = 1;
+    for (int e = 0; e < E && ok; e++)
+        ok = coli_vk_tensor_ensure(&tg[e], wg, NULL, fg, D, I, 0) && coli_vk_tensor_ensure(&tu[e], wg, NULL, fg, D, I, 0) &&
+             coli_vk_tensor_ensure(&td[e], wd, NULL, fd, I, D, 0) && (ex[e] = coli_vk_xb_expert(tg[e], tu[e], td[e])) &&
+             coli_vk_xb_expert_entry(ex[e], tab + (size_t)e * COLI_VK_XB_ENTRY);
+    if (!ok) { printf("bench moe: the experts did not go up (fmt %d/%d)\n", fg, fd); return; }
+    VkcBuf *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
+    vkc_begin(); vkc_write(tb, 0, tab, (size_t)E * COLI_VK_XB_ENTRY * 4); vkc_submit(1);
+    for (int S = 1; S <= 3; S++) {
+        float *lg = fvec((size_t)S * E, 3.f), *x = fvec((size_t)S * D, 1.f);
+        VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D);
+        VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DEV), *wb = vkc_buf((size_t)S * K * 4, VKC_DEV);
+        VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * D * 4, VKC_DEV);
+        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 1, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 32};   /* the GGUF engines' 32 outputs a workgroup */
+        vkc_begin(); ok = vkc_route(lb, NULL, ib, wb, &rp) && vkc_submit(1);
+        double best = 1e9; int nl = 48;   /* a forward's layers in one frame */
+        for (int r = 0; r < 4 && ok; r++) {
+            vkc_begin();
+            for (int l = 0; l < nl && ok; l++) ok = vkc_moe(xb, ib, wb, tb, hb, yb, &mp);
+            double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+            if (dt < best) best = dt;
+        }
+        double bytes = (double)S * K * (2.0 * rg * I + (double)rd * D);   /* every pair's weights once */
+        if (ok) printf("bench moe fmt %d/%d S %d K %d [D %d I %d]: %.1f us per layer, %.1f GB/s of pair weights\n",
+                       fg, fd, S, K, D, I, best * 1e6 / nl, bytes * nl / best / 1e9);
+        vkc_free(lb); vkc_free(xb); vkc_free(ib); vkc_free(wb); vkc_free(hb); vkc_free(yb); free(lg); free(x);
+    }
+    vkc_free(tb);
+    for (int e = 0; e < E; e++) { if (ex[e]) coli_vk_xb_expert_free(ex[e]); }
+    free(tg); free(tu); free(td); free(ex); free(tab); free(wg); free(wd);
 }
 
 /* COLI_VK_CHAIN_BENCH=bd: the block formats' GEMV (a GGUF's matrices) at the shapes of
@@ -2751,12 +2799,14 @@ static void bench_bd(void) {
         for (size_t i = 0; i < rb * O; i++) w[i] = (uint8_t)rnd();
         int ok = 1;
         for (int j = 0; j < nm && ok; j++) ok = coli_vk_tensor_ensure(&t[j], w, NULL, fmt, I, O, 0);
-        float *x = fvec(I, 1.f);
-        VkcBuf *xb = up(x, I), *yb = vkc_buf((size_t)O * 4 * nm, VKC_DEV);
+        const char *se = getenv("COLI_VK_BENCH_S");   /* rows of x: a verify's 2 to 4 */
+        int S = se && atoi(se) > 0 ? atoi(se) : 1;
+        float *x = fvec((size_t)S * I, 1.f);
+        VkcBuf *xb = up(x, (size_t)S * I), *yb = vkc_buf((size_t)O * 4 * nm * S, VKC_DEV);
         double best = 1e9;
         for (int r = 0; r < 5 && ok && xb && yb; r++) {
             vkc_begin();
-            for (int j = 0; j < nm; j++) ok = ok && vkc_matmul(t[j], xb, 0, yb, (size_t)j * O, 1);
+            for (int j = 0; j < nm; j++) ok = ok && vkc_matmul(t[j], xb, 0, yb, (size_t)j * O * S, S);
             double t0 = bnow(); vkc_submit(1); double dt = bnow() - t0;
             if (dt < best) best = dt;
         }
@@ -2874,7 +2924,9 @@ int main(int argc, char **argv) {
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
     if (!vkc_init()) { printf("FAIL: the chain's pipelines did not come up\n"); return 1; }
     if (getenv("COLI_VK_CHAIN_BENCH")) {
-        if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "bd")) bench_bd(); else bench_gemv();
+        if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "bd")) bench_bd();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "moe")) bench_moe();
+        else bench_gemv();
         vkc_shutdown(); coli_vk_shutdown(); return 0;
     }
     int fmts[4] = {1, 4, 10, 11};
@@ -2886,7 +2938,7 @@ int main(int argc, char **argv) {
         test_matmul(fmts[k], 1, 100, 33, 0, 0);          /* rows that are not whole 16-byte steps */
         test_matmul(fmts[k], 2, 3072, 40, 0, 0);         /* a long row (chain_gemv's staging) */
     }
-    test_bd();
+    { unsigned keep = rng; test_bd(); rng = keep; }   /* the later tests' data as before */
     /* int8 and int4 prompt GEMMs whose shapes chain_gemm.comp takes (I % 64, O % 128), on
      * a device with cooperative matrices at subgroup size 64: full and partial row tiles,
      * bindable offsets; its x is rounded to f16, hence the bound */

@@ -101,7 +101,7 @@ typedef struct {
     VkShaderModule mod[P_NPIPE], mod_gemm, mod_dnrec;
     VkShaderModule mod_gv2; VkPipeline gv2; int gv2_floats;   /* chain_gemv2.comp: int8 decode GEMVs (COLI_VK_CHAIN_GEMV2), x staged up to gv2_floats */
     VkShaderModule mod_bd; VkPipeline bd;   /* qmatmul_bd.comp: the block formats (a GGUF's matrices, blockdec.glsl); none without the file */
-    VkShaderModule mod_bdv; VkPipeline bdv[64]; uint8_t bdv_tried[64]; int bdv_xs;   /* chain_gemv_bd.comp: a pipeline per ggml type, made on first use */
+    VkShaderModule mod_bdv; VkPipeline bdv[4][64]; uint8_t bdv_tried[4][64]; int bdv_xs;   /* chain_gemv_bd.comp: a pipeline per (rows, ggml type), made on first use */
     VkShaderModule mod_moe; VkPipeline moe;                   /* chain_moe.comp: the routed experts, by address (bufferDeviceAddress) */
     int moe_xs, moe_tried;                                    /* its staging floats (0: the device cannot); built once asked for */
     VkPipeline pipe[P_NPIPE];
@@ -433,7 +433,7 @@ int vkc_init(void) {
     {
         const char *e = getenv("COLI_VK_CHAIN_GEMV_BD");
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
-        int xs = (int)((pp.limits.maxComputeSharedMemorySize - 64) / 16);
+        int xs = (int)((pp.limits.maxComputeSharedMemorySize - 64 - 2176 * 4) / 16);   /* past bdstep.glsl's tables */
         if (xs > 4096) xs = 4096;
         if (KC.bd && !(e && *e == '0') && xs >= 256 && (KC.mod_bdv = load_module(KC.core.spv_path, "chain_gemv_bd.spv")))
             KC.bdv_xs = xs;
@@ -449,7 +449,8 @@ int vkc_init(void) {
      * Lavapipe, no longer fell by what its dense weights gave back */
     if (KC.core.bda && (msg.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) &&
         (msg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
-        int32_t xs = (int32_t)(kc_shared_limit() / 4) & ~3;
+        /* past bdstep.glsl's tables (2192 words) */
+        int32_t xs = (int32_t)((kc_shared_limit() > 8768 ? kc_shared_limit() - 8768 : 0) / 4) & ~3;
         KC.moe_xs = xs > 8192 ? 8192 : xs >= 1024 ? xs : 0;
     }
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
@@ -861,21 +862,22 @@ struct VkcPC { int fmt, S, I, O, rowWords, gs; };
 /* A block-format matrix (fmt >= 100, a GGUF's): qmatmul_bd.comp, its table at binding 2,
  * one row of outputs per workgroup row as the expert batch dispatches it; every row's
  * products as a decode step's. */
-/* chain_gemv_bd.comp's pipeline for ggml type t, made on first use; NULL for a type it
- * does not decode (Q4_K and Q5_K also want rows of whole 16-byte steps) */
-static VkPipeline bdv_pipe(int t, int rowWords) {
-    static const int types[] = {8, 12, 13, 14, 16, 20, 21, 22, 23};
+/* chain_gemv_bd.comp's pipeline for ggml type t and nr rows of x (1..4), made on first
+ * use; NULL for a type it does not decode (Q4_K and Q5_K also want rows of whole 16-byte
+ * steps) */
+static VkPipeline bdv_pipe(int t, int nr, int rowWords) {
+    static const int types[] = {8, 12, 13, 14, 16, 20, 21, 22, 23, 42};
     int on = 0;
     for (size_t k = 0; k < sizeof types / sizeof *types; k++) on |= types[k] == t;
-    if (!on || !KC.mod_bdv || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
-    if (!KC.bdv_tried[t]) {
-        KC.bdv_tried[t] = 1;
-        int32_t v[2] = {KC.bdv_xs, t};
-        VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
-        VkSpecializationInfo si = {2, me, sizeof v, v};
-        KC.bdv[t] = make_pipe(KC.mod_bdv, &si);
+    if (!on || !KC.mod_bdv || nr < 1 || nr > 4 || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
+    if (!KC.bdv_tried[nr - 1][t]) {
+        KC.bdv_tried[nr - 1][t] = 1;
+        int32_t v[3] = {KC.bdv_xs, t, nr};
+        VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+        VkSpecializationInfo si = {3, me, sizeof v, v};
+        KC.bdv[nr - 1][t] = make_pipe(KC.mod_bdv, &si);
     }
-    return KC.bdv[t];
+    return KC.bdv[nr - 1][t];
 }
 static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y, size_t yb, int S) {
     VkBuffer tab = (VkBuffer)coli_vk_block_table_dev(g_kd);
@@ -883,7 +885,9 @@ static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y
     VkcBind bd[4] = {{x->buf, xb, 0, 0}, {(VkBuffer)ti->wbuf, 0, 0, 0}, {tab, 0, 0, 0}, {y->buf, yb, 0, 1}};
     x->last_frame = y->last_frame = KC.serial;
     KC.kind = PK_GEMV;
-    VkPipeline v = ti->fmt < 164 && ti->I % 32 == 0 ? bdv_pipe(ti->fmt - 100, ti->rowWords) : VK_NULL_HANDLE;
+    /* a speculative verify's rows (S <= 4) share each weight's decode */
+    int nr = S <= 4 ? S : 1;
+    VkPipeline v = ti->fmt < 164 && ti->I % 32 == 0 ? bdv_pipe(ti->fmt - 100, nr, ti->rowWords) : VK_NULL_HANDLE;
     int ok;
     if (v) {
         /* lanes per row: about four 32-weight steps each, at most a subgroup (the shader
@@ -892,11 +896,11 @@ static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y
         int steps = ti->I / 32, lpr = 1;
         if (e && *e) lpr = atoi(e); else while (lpr < 32 && lpr * 4 < steps) lpr *= 2;
         if (lpr < 1) lpr = 1;
-        /* a speculative verify's rows (S <= 4) share each weight load */
-        int nr = S <= 4 ? S : 1;
         struct { int fmt, S, I, O, rowWords, gs, lpr, nr; } pc = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, lpr, nr};
+        /* at most 256 workgroups, the rest by grid-stride: each stages x once for more rows
+         * (an RTX PRO 4000: Q4_K 10240 x 2560 65 -> 57 us, IQ2_S 116 -> 95) */
         int rows_wg = 256 / lpr, wg = (ti->O + rows_wg - 1) / rows_wg;
-        if (wg > 65535) wg = 65535;
+        if (wg > 256) wg = 256;
         ok = record(v, bd, 4, &pc, sizeof pc, (uint32_t)wg, (uint32_t)((S + nr - 1) / nr), 1);
     } else {
         struct VkcPC pc = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs};
@@ -922,7 +926,8 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
     /* the vectorized GEMV where the row is whole 16-byte steps and fits the staging */
     int per = ti->fmt == 1 ? 16 : ti->fmt == 4 ? 32 : ti->fmt == 11 || ti->fmt == 14 ? 8 : ti->fmt == 10 ? 4 : 0;
     int v4 = path < 0 && KC.gemv4 && per && ti->rowWords % 4 == 0 && ti->I % 4 == 0 &&
-             (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) && (ti->rowWords / 4) * per / 4 <= KC.gemv4_xs;
+             (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) &&
+             (ti->rowWords / 4) * per / 4 + (ti->rowWords / 4) * per / 32 <= KC.gemv4_xs;   /* the row staged with its pads */
     KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
     int g2 = path < 0 && KC.gv2 && S <= 4 && ti->fmt == 1 &&   /* int4 measured slower than chain_gemv here */
              ti->I % 32 == 0 && ti->I <= KC.gv2_floats && ti->rowWords % 4 == 0;
@@ -1401,17 +1406,19 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
     struct { int mode, S, K, D, I, act; float limit, a, b;
              int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row, rpw; } pc =
         {0, p->S, p->K, p->D, p->I, p->act, p->limit, p->a, p->b,
-         p->t_off, p->x_off, p->x_row, p->i_off, p->i_row, p->w_off, p->w_row, p->y_off, p->y_row, 64};
-    /* gate and up, then down, each (pair, 64 outputs) a workgroup; then the rank-order sum.
+         p->t_off, p->x_off, p->x_row, p->i_off, p->i_row, p->w_off, p->w_row, p->y_off, p->y_row,
+         p->rpw > 0 && p->rpw <= 256 ? p->rpw : 64};
+    const int rpw = pc.rpw;
+    /* gate and up, then down, each (pair, rpw outputs) a workgroup; then the rank-order sum.
      * Binding 6: the block formats' table (a GGUF's experts), a dummy without one. */
     VkBuffer tabbuf = (VkBuffer)coli_vk_block_table_dev(g_kd);
     VkcBind bt = tabbuf ? (VkcBind){tabbuf, 0, 0, 0} : B(NULL, 0);
     VkcBind bd[7] = {B(x, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 1), B(NULL, 0), bt};
     uint32_t gx, gy;
-    grid((uint64_t)p->S * p->K * ((p->I + 63) / 64), &gx, &gy);
+    grid((uint64_t)p->S * p->K * ((p->I + rpw - 1) / rpw), &gx, &gy);
     if (!record(KC.moe, bd, 7, &pc, sizeof pc, gx, gy, 1)) return 0;
     pc.mode = 1;
-    grid((uint64_t)p->S * p->K * ((p->D + 63) / 64), &gx, &gy);
+    grid((uint64_t)p->S * p->K * ((p->D + rpw - 1) / rpw), &gx, &gy);
     if (!record(KC.moe, bd, 7, &pc, sizeof pc, gx, gy, 1)) return 0;
     pc.mode = 2;
     VkcBind bd2[7] = {B(NULL, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 0), B(y, 1), bt};
@@ -2016,7 +2023,7 @@ void vkc_shutdown(void) {
     if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
     if (KC.mod_gv2) vkDestroyShaderModule(KC.dev, KC.mod_gv2, NULL);
     if (KC.bd) vkDestroyPipeline(KC.dev, KC.bd, NULL);
-    for (int t = 0; t < 64; t++) if (KC.bdv[t]) vkDestroyPipeline(KC.dev, KC.bdv[t], NULL);
+    for (int r = 0; r < 4; r++) for (int t = 0; t < 64; t++) if (KC.bdv[r][t]) vkDestroyPipeline(KC.dev, KC.bdv[r][t], NULL);
     if (KC.mod_bdv) vkDestroyShaderModule(KC.dev, KC.mod_bdv, NULL);
     if (KC.mod_bd) vkDestroyShaderModule(KC.dev, KC.mod_bd, NULL);
     if (KC.moe) vkDestroyPipeline(KC.dev, KC.moe, NULL);
