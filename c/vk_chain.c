@@ -102,8 +102,9 @@ typedef struct {
     VkShaderModule mod_gv2; VkPipeline gv2; int gv2_floats;   /* chain_gemv2.comp: int8 decode GEMVs (COLI_VK_CHAIN_GEMV2), x staged up to gv2_floats */
     VkShaderModule mod_bd; VkPipeline bd;   /* qmatmul_bd.comp: the block formats (a GGUF's matrices, blockdec.glsl); none without the file */
     VkShaderModule mod_bdv; VkPipeline bdv[4][64]; uint8_t bdv_tried[4][64]; int bdv_xs;   /* chain_gemv_bd.comp: a pipeline per (rows, ggml type), made on first use */
-    VkShaderModule mod_moe; VkPipeline moe;                   /* chain_moe.comp: the routed experts, by address (bufferDeviceAddress) */
-    int moe_xs, moe_tried;                                    /* its staging floats (0: the device cannot); built once asked for */
+    VkShaderModule mod_moe; VkPipeline moe, moe_bd;           /* chain_moe.comp: the routed experts, by address (bufferDeviceAddress);
+                                                                 moe_bd with the block formats' paths (BD = 1) */
+    int moe_xs, moe_xs_bd, moe_tried, moe_bd_tried;           /* their staging floats (0: the device cannot); built once asked for */
     VkPipeline pipe[P_NPIPE];
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
@@ -449,9 +450,11 @@ int vkc_init(void) {
      * Lavapipe, no longer fell by what its dense weights gave back */
     if (KC.core.bda && (msg.supportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT) &&
         (msg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
-        /* past bdstep.glsl's tables (2192 words) */
-        int32_t xs = (int32_t)((kc_shared_limit() > 8768 ? kc_shared_limit() - 8768 : 0) / 4) & ~3;
+        int32_t xs = (int32_t)(kc_shared_limit() / 4) & ~3;
         KC.moe_xs = xs > 8192 ? 8192 : xs >= 1024 ? xs : 0;
+        /* the block formats' pipeline: past bdstep.glsl's tables (2192 words) */
+        xs = (int32_t)((kc_shared_limit() > 8768 ? kc_shared_limit() - 8768 : 0) / 4) & ~3;
+        KC.moe_xs_bd = xs > 8192 ? 8192 : xs >= 1024 ? xs : 0;
     }
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
     for (int i = 0; i < PM_N; i++) {
@@ -1385,23 +1388,27 @@ int vkc_route(VkcBuf *logits, VkcBuf *bias, VkcBuf *ids, VkcBuf *w, const VkcRou
 }
 /* the routed experts (chain_moe.comp): gate and up of every (row, slot), then down and
  * the weighted sum of each row's slots */
-static int moe_build(void) {
-    if (KC.moe || KC.moe_tried || !KC.moe_xs) return KC.moe != VK_NULL_HANDLE;
-    KC.moe_tried = 1;
-    if (!(KC.mod_moe = load_module(KC.core.spv_path, "chain_moe.spv"))) return 0;
-    int32_t xs = KC.moe_xs;
-    VkSpecializationMapEntry me = {0, 0, 4};
-    VkSpecializationInfo si = {1, &me, 4, &xs};
+/* chain_moe's pipeline (bd: the one with the block formats' paths), made on first use */
+static int moe_build_bd(int bd) {
+    VkPipeline *pp = bd ? &KC.moe_bd : &KC.moe;
+    int *tried = bd ? &KC.moe_bd_tried : &KC.moe_tried, xs0 = bd ? KC.moe_xs_bd : KC.moe_xs;
+    if (*pp || *tried || !xs0) return *pp != VK_NULL_HANDLE;
+    *tried = 1;
+    if (!KC.mod_moe && !(KC.mod_moe = load_module(KC.core.spv_path, "chain_moe.spv"))) return 0;
+    int32_t v[2] = {xs0, bd};
+    VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+    VkSpecializationInfo si = {2, me, sizeof v, v};
     double t0 = vkc_now_ms();
-    KC.moe = make_pipe(KC.mod_moe, &si);
+    *pp = make_pipe(KC.mod_moe, &si);
     double dt = vkc_now_ms() - t0;
-    if (dt > 5000.0) fprintf(stderr, "[VK] chain: chain_moe.spv took %.1f s to build\n", dt / 1e3);
-    return KC.moe != VK_NULL_HANDLE;
+    if (dt > 5000.0) fprintf(stderr, "[VK] chain: chain_moe.spv%s took %.1f s to build\n", bd ? " (block formats)" : "", dt / 1e3);
+    return *pp != VK_NULL_HANDLE;
 }
+static int moe_build(void) { return moe_build_bd(0); }
 int vkc_moe_ready(void) { return vkc_ready() && moe_build(); }
 int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p) {
     KC.kind = PK_MOE;
-    if (!moe_build() || p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || p->D < 1 || p->I < 1 || p->act < 0 || p->act > 1 ||
+    if (!moe_build_bd(p->blocks != 0) || p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || p->D < 1 || p->I < 1 || p->act < 0 || p->act > 1 ||
         (p->act == 1 && !(p->a > 0.0f && p->b > 0.0f)) || p->t_off < 0 || !x || !ids || !w || !table || !hid || !y ||
         hid == x || hid == y || y == x) return 0;
     if ((size_t)p->S * p->K * ((size_t)p->I + p->D) * sizeof(float) > hid->bytes) return 0;
@@ -1413,19 +1420,20 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
     const int rpw = pc.rpw;
     /* gate and up, then down, each (pair, rpw outputs) a workgroup; then the rank-order sum.
      * Binding 6: the block formats' table (a GGUF's experts), a dummy without one. */
-    VkBuffer tabbuf = (VkBuffer)coli_vk_block_table_dev(g_kd);
+    VkPipeline mp = p->blocks ? KC.moe_bd : KC.moe;
+    VkBuffer tabbuf = p->blocks ? (VkBuffer)coli_vk_block_table_dev(g_kd) : VK_NULL_HANDLE;   /* made with the first block tensor */
     VkcBind bt = tabbuf ? (VkcBind){tabbuf, 0, 0, 0} : B(NULL, 0);
     VkcBind bd[7] = {B(x, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 1), B(NULL, 0), bt};
     uint32_t gx, gy;
     grid((uint64_t)p->S * p->K * ((p->I + rpw - 1) / rpw), &gx, &gy);
-    if (!record(KC.moe, bd, 7, &pc, sizeof pc, gx, gy, 1)) return 0;
+    if (!record(mp, bd, 7, &pc, sizeof pc, gx, gy, 1)) return 0;
     pc.mode = 1;
     grid((uint64_t)p->S * p->K * ((p->D + rpw - 1) / rpw), &gx, &gy);
-    if (!record(KC.moe, bd, 7, &pc, sizeof pc, gx, gy, 1)) return 0;
+    if (!record(mp, bd, 7, &pc, sizeof pc, gx, gy, 1)) return 0;
     pc.mode = 2;
     VkcBind bd2[7] = {B(NULL, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 0), B(y, 1), bt};
     grid((uint64_t)p->S * ((p->D + 255) / 256), &gx, &gy);
-    return record(KC.moe, bd2, 7, &pc, sizeof pc, gx, gy, 1);
+    return record(mp, bd2, 7, &pc, sizeof pc, gx, gy, 1);
 }
 int vkc_ares_ready(void) { return vkc_ready() && KC.mpipe[PM_ARES]; }
 int vkc_ares_mix(VkcBuf *x, VkcBuf *blk, VkcBuf *prm, VkcBuf *y, const VkcAres *p) {
@@ -2029,6 +2037,7 @@ void vkc_shutdown(void) {
     if (KC.mod_bdv) vkDestroyShaderModule(KC.dev, KC.mod_bdv, NULL);
     if (KC.mod_bd) vkDestroyShaderModule(KC.dev, KC.mod_bd, NULL);
     if (KC.moe) vkDestroyPipeline(KC.dev, KC.moe, NULL);
+    if (KC.moe_bd) vkDestroyPipeline(KC.dev, KC.moe_bd, NULL);
     if (KC.mod_moe) vkDestroyShaderModule(KC.dev, KC.mod_moe, NULL);
     if (KC.mod_gemm) vkDestroyShaderModule(KC.dev, KC.mod_gemm, NULL);
     if (KC.mod_dnrec) vkDestroyShaderModule(KC.dev, KC.mod_dnrec, NULL);

@@ -905,7 +905,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
             if (ok && E > 0 && dmoe && vkc_dmoe_on(&ch->dm, i)) {   /* everything here, and on to the next layer */
                 int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1;
                 VkcRoute rp = {.kind = 0, .n_group = ng, .topk_group = ng > 1 ? c->topk_group : 1, .norm = 1, .temp = 1.f, .scale = 1.f};
-                VkcMoe mp = {.D = D, .I = c->inter, .act = 0};
+                VkcMoe mp = {.D = D, .I = c->inter, .act = 0, .blocks = g_gguf};
                 ok = vkc_matmul(vk_qw_tensor(&l->gate), ch->h2, 0, ch->lg, 0, n) && q36c_shared(ch, m, l, i, n) &&
                      vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->h2, &rp, &mp);
                 prev_dev = 1; pending = 1;

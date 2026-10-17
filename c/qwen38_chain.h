@@ -1108,7 +1108,7 @@ static int q38c_forward_seg(Model *m, Q38Chain *ch, const int *ids, int S, int p
             ok = ok && q38c_gr_read(ch, m, &l->mlp_gr, ch->o_mn[i], n, ch->inj_m);
             if (ok && dmoe && vkc_dmoe_on(&ch->dm, i)) {   /* everything here, and on to the next layer */
                 VkcRoute rp = {.kind = 0, .n_group = 1, .topk_group = 1, .norm = c->norm_topk ? 1 : 0, .temp = 1.f, .scale = 1.f};
-                VkcMoe mp = {.D = H, .I = c->inter, .act = 0};
+                VkcMoe mp = {.D = H, .I = c->inter, .act = 0, .blocks = g_q38_gguf};
                 ok = vkc_matmul(q38c_t(&l->router), ch->mixed, 0, ch->lg, 0, n) && q38c_shared(ch, m, l, i, n) &&
                      vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->mixed, &rp, &mp);
                 prev_dev = 1; pending = 1;

@@ -35,6 +35,10 @@
 #extension GL_EXT_buffer_reference_uvec2 : require
 layout(local_size_x = 256) in;
 layout(constant_id = 0) const int XS = 4096;   // staged input floats (a multiple of 4)
+// 1 = the block formats' paths are compiled in (a GGUF's experts: vk_chain.c's second
+// pipeline); 0 leaves them out, so the other formats' pipeline stays as small as it was
+// (a software device compiles and runs every path it holds)
+layout(constant_id = 1) const int BD = 0;
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WRef4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer WRef { uint v[]; };
@@ -213,7 +217,7 @@ float rowdot(WRef W, SRef Sc, int fmt, int rowWords, int gs, int o, int lane, in
     int n = g_n;
     uint rb = uint(o) * uint(rowWords);
     float sum = 0.0;
-    if (fmt >= 100) {   // a unit of 32 weights a lane (the host checks n % 32 == 0)
+    if (BD != 0 && fmt >= 100) {   // a unit of 32 weights a lane (the host checks n % 32 == 0)
         g_bdw = W;
         for (int u = lane; u < n / 32; u += sgs) sum += bd_unit(fmt, rb * 4u, uint(u), uint(n));
         return sum;
@@ -336,11 +340,11 @@ void main() {
     int fmt = int(tab[eb + fo]), rws = int(tab[eb + fo + 1u]), gs = int(tab[eb + fo + 2u]);
     bool wd = wide(fmt, rws, n);
     stage(p.mode == 0 ? 0 : 1, p.mode == 0 ? p.x_off + s * p.x_row : j * p.I, n, wd ? rws * int(vpw(fmt)) : n, tid);
-    if (fmt >= 100 && fmt < 164) bs_tables_fill(fmt - 100, tid);
+    if (BD != 0 && fmt >= 100 && fmt < 164) bs_tables_fill(fmt - 100, tid);
     barrier();
     wd = wd && g_staged;
     uint o0 = uint(t * rpw);
-    if (fmt >= 100 && fmt < 164 && bs_has(fmt - 100) && n % 32 == 0 && g_staged) {
+    if (BD != 0 && fmt >= 100 && fmt < 164 && bs_has(fmt - 100) && n % 32 == 0 && g_staged) {
         /* about eight steps a lane (measured: the latency of a step's loads wants work beside it) */
         uint steps = uint(n) / 32u, lpr = 1u;
         while (lpr * 2u <= uint(sgs) && lpr * 8u < steps) lpr *= 2u;
