@@ -2417,7 +2417,7 @@ static double dho_rss_gib(void) {
 static void dho_exit_report(void) {
     double rss = dho_rss_gib();
     char r[48] = "";
-    if (rss >= 0) snprintf(r, sizeof r, "; RSS %.2f GiB", rss);
+    if (rss >= 0) snprintf(r, sizeof r, "; RSS %.3f GiB", rss);   /* to the MiB: the gates compare tens of MiB */
     if (!g_dho) {   /* the same line with the host copies kept, for a comparison of the two */
         fprintf(stderr, "[VK] %s: dense weights at exit: on the device and in host RAM%s\n", g_dho_engine, r);
         return;
@@ -2484,7 +2484,7 @@ void coli_vk_dense_host_placed(const char *engine, const char *kept) {
     if (!g_dho) return;
     double rss = dho_rss_gib();
     char r[48] = "";
-    if (rss >= 0) snprintf(r, sizeof r, "; RSS now %.2f GiB", rss);
+    if (rss >= 0) snprintf(r, sizeof r, "; RSS now %.3f GiB", rss);
     char a[32], ln[96];
     fprintf(stderr, "[VK] %s: %llu dense matrices on the device only, %s of host RAM given back%s%s%s%s\n",
             engine, __atomic_load_n(&g_dho_drop_n, __ATOMIC_RELAXED),
