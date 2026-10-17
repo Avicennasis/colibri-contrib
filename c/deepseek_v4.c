@@ -281,8 +281,9 @@ int coli_tensor_load_f32(ColiFloatTensor *output,
         return set_error(error, error_size, "invalid float tensor arguments");
     memset(output, 0, sizeof(*output));
     const ColiSafetensorsTensor *tensor = coli_st_find(index, name);
-    if (!tensor || (tensor->dtype != COLI_ST_F32 && tensor->dtype != COLI_ST_BF16))
-        return set_error(error, error_size, "missing BF16/F32 tensor: %s", name);
+    if (!tensor || (tensor->dtype != COLI_ST_F32 && tensor->dtype != COLI_ST_BF16 &&
+                    tensor->dtype != COLI_ST_F16))   /* F16: a GGUF's (antirez's mixes) */
+        return set_error(error, error_size, "missing BF16/F16/F32 tensor: %s", name);
     void *raw = malloc((size_t)tensor->nbytes);
     output->data = malloc((size_t)tensor->numel * sizeof(*output->data));
     if (!raw || !output->data) {
@@ -297,7 +298,11 @@ int coli_tensor_load_f32(ColiFloatTensor *output,
     }
     if (tensor->dtype == COLI_ST_F32)
         memcpy(output->data, raw, (size_t)tensor->nbytes);
-    else {
+    else if (tensor->dtype == COLI_ST_F16) {
+        const uint16_t *values = raw;
+        for (uint64_t i = 0; i < (uint64_t)tensor->numel; i++)
+            output->data[i] = f16_to_f32(values[i]);
+    } else {
         const uint16_t *values = raw;
         for (uint64_t i = 0; i < (uint64_t)tensor->numel; i++)
             output->data[i] = coli_bf16_decode(values[i]);
@@ -2472,6 +2477,13 @@ static int attention_token_impl(float *output,
             group_view.data_bytes = (size_t)o_rank * group_width;
             group_view.scale_bytes =
                 (size_t)scale_rows_per_group * scale_columns * sizeof(float);
+            if (wo_a.format == COLI_TENSOR_GGML) {   /* a GGUF matrix: rows of its type's bytes */
+                const size_t row = (size_t)gq_row_bytes(coli_ggml_view_type(&wo_a), group_width);
+                group_view.data = (const uint8_t *)wo_a.data + (size_t)group * o_rank * row;
+                group_view.data_bytes = (size_t)o_rank * row;
+                group_view.scales = NULL;
+                group_view.scale_bytes = 0;
+            }
             result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
                                          attended + (size_t)group * group_width);
         }
@@ -2911,6 +2923,13 @@ static int attention_token_impl(float *output,
             group_view.data_bytes = (size_t)o_rank * group_width;
             group_view.scale_bytes =
                 (size_t)scale_rows_per_group * scale_columns * sizeof(float);
+            if (wo_a.format == COLI_TENSOR_GGML) {   /* a GGUF matrix: rows of its type's bytes */
+                const size_t row = (size_t)gq_row_bytes(coli_ggml_view_type(&wo_a), group_width);
+                group_view.data = (const uint8_t *)wo_a.data + (size_t)group * o_rank * row;
+                group_view.data_bytes = (size_t)o_rank * row;
+                group_view.scales = NULL;
+                group_view.scale_bytes = 0;
+            }
             result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
                                          attended + (size_t)group * group_width);
         }
@@ -3480,6 +3499,13 @@ int coli_v4_attention_window_batch_ref(
         group_view.data_bytes = (size_t)o_rank * group_width;
         group_view.scale_bytes =
             (size_t)scale_rows * scale_columns * sizeof(float);
+        if (wo_a.format == COLI_TENSOR_GGML) {   /* a GGUF matrix: rows of its type's bytes */
+            const size_t row = (size_t)gq_row_bytes(coli_ggml_view_type(&wo_a), group_width);
+            group_view.data = (const uint8_t *)wo_a.data + (size_t)group * o_rank * row;
+            group_view.data_bytes = (size_t)o_rank * row;
+            group_view.scales = NULL;
+            group_view.scale_bytes = 0;
+        }
         result = coli_fp8_matmul_batch_ref(
             group_outputs, &group_view, group_inputs, batch);
         for (int item = 0; !result && item < batch; item++)
@@ -5587,6 +5613,11 @@ static int moe_token_pipeline(float *output,
                 route_weights, indices, input, raw_gate, bias,
                 weights->plan.uses_hash_router ? indices : NULL,
                 n, d, topk, config->routed_scaling_factor);
+        if (result && !moe_reason()[0])
+            moe_fail("layer %d: the router (bf16, %d experts top-%d%s) failed: gate %s, first index %d",
+                     weights->plan.layer, n, topk,
+                     weights->plan.uses_hash_router ? ", hash table" : bias ? ", bias" : ", no bias",
+                     raw_gate ? "present" : "missing", weights->plan.uses_hash_router ? indices[0] : -1);
     }
 #else
     if (!result) result = coli_v4_route(
@@ -5672,6 +5703,8 @@ static int moe_token_pipeline(float *output,
                           weights->plan.layer);
     if (!result && V4_SHARED_HERE) result = coli_v4_shared_expert_forward_ref(
         shared_output, &w1, &w2, &w3, input, config->swiglu_limit);
+    if (result && !moe_reason()[0])
+        moe_fail("layer %d: the shared expert failed", weights->plan.layer);
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
@@ -8140,6 +8173,13 @@ static int attention_token_impl(float *output,
             group_view.data_bytes = (size_t)o_rank * group_width;
             group_view.scale_bytes =
                 (size_t)scale_rows_per_group * scale_columns * sizeof(float);
+            if (wo_a.format == COLI_TENSOR_GGML) {   /* a GGUF matrix: rows of its type's bytes */
+                const size_t row = (size_t)gq_row_bytes(coli_ggml_view_type(&wo_a), group_width);
+                group_view.data = (const uint8_t *)wo_a.data + (size_t)group * o_rank * row;
+                group_view.data_bytes = (size_t)o_rank * row;
+                group_view.scales = NULL;
+                group_view.scale_bytes = 0;
+            }
             result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
                                          attended + (size_t)group * group_width);
         }
@@ -9489,6 +9529,12 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
                                            &used_direct, &used_fallback) != 0)
                 return -1;
             cursor += record->m_weight_bytes[matrix];
+        }
+        if (used_direct && !used_fallback) {
+            __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
+            __atomic_fetch_add(&v4_direct_payload_bytes, record->record_bytes, __ATOMIC_RELAXED);
+        } else if (used_fallback) {
+            __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1), __ATOMIC_RELAXED);
         }
         return record->mx ? v4_mxfp4_layout(record, slot->slab) : 0;
     }
@@ -19933,6 +19979,8 @@ int coli_fp4_dual_matvec_ref(float *output_a, float *output_b,
                              const ColiTensorView *a,
                              const ColiTensorView *b,
                              const float *input) {
+    if (a && b && a->format == COLI_TENSOR_GGML && b->format == COLI_TENSOR_GGML)
+        return coli_ggml_matmul2(output_a, a, output_b, b, input, 1);
     if (a && b && (a->format == COLI_TENSOR_GGML || b->format == COLI_TENSOR_GGML))
         return coli_fp4_matvec_ref(output_a, a, input) || coli_fp4_matvec_ref(output_b, b, input) ? -1 : 0;
     if (!output_a || !output_b || !input || !dual_same_shape(a, b) ||
@@ -19982,6 +20030,8 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
                              const ColiTensorView *a,
                              const ColiTensorView *b,
                              const float *input) {
+    if (a && b && a->format == COLI_TENSOR_GGML && b->format == COLI_TENSOR_GGML)
+        return coli_ggml_matmul2(output_a, a, output_b, b, input, 1);
     if (a && b && (a->format == COLI_TENSOR_GGML || b->format == COLI_TENSOR_GGML))
         return coli_fp8_matvec_ref(output_a, a, input) || coli_fp8_matvec_ref(output_b, b, input) ? -1 : 0;
     if (!output_a || !output_b || !input || !dual_same_shape(a, b) ||
