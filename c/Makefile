@@ -3027,7 +3027,11 @@ test-c: $(TEST_BINS)
 test-python: $(RANSLIB) tests/test_ggml_quants$(EXE) tests/test_gguf_c$(EXE) tests/test_gq_dot$(EXE)
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py'
 
-test: test-c test-python
+# One after the other, also under -j: the C binaries build in parallel, then run, and only
+# then the Python suite starts its engines and servers.
+test:
+	$(MAKE) test-c
+	$(MAKE) test-python
 
 # --- Efficiency / regression suite (issue: "test the program for inefficiencies") ---
 # The tiny-model assertions live in test_inefficiency.py and run as part of

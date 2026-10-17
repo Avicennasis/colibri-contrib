@@ -23,7 +23,9 @@ Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine), qwe
 dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engine), qwen3 (the dense
 Qwen3 -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
 Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
-glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine).
+glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine),
+deepseek41 (DeepSeek V4.1 Flash in antirez's format -> deepseek_v41 engine), olmoe (OLMoE ->
+olmoe engine).
 
 Usage:
   python3 tools/gguf_import.py MODEL.gguf OUT_DIR [--mode link|copy]
@@ -508,6 +510,87 @@ def mimo2_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
+def deepseek41_config(meta, tensors, overrides=None):
+    """DeepSeek V4.1 (antirez's deepseek41): the file carries the checkpoint's config.json
+    whole (deepseek41.config), and the engine reads it as it is. The model's layers are
+    the blocks with attention (no MTP block in these files)."""
+    raw = meta.get("deepseek41.config") or sys.exit("GGUF metadata lacks deepseek41.config")
+    cfg = json.loads(raw)
+    text = cfg.get("text_config", cfg)
+    layers = int(text["num_hidden_layers"])
+    present = sum(1 for b in range(layers + 8) if f"blk.{b}.attn_q_a.weight" in tensors)
+    if present != layers:
+        sys.exit(f"deepseek41: {present} blocks with attention, the config declares {layers}")
+    return cfg, layers
+
+
+def deepseek41_engram(meta, cfg):
+    """dsv41_engram.json, the sidecar the engine reads (tools/prepare_dsv41.py writes the same
+    from the checkpoint and its tokenizer), from the GGUF's engram metadata: the primes of
+    every (n-gram, head) bucket, their offsets, the hash multipliers (as decimal strings:
+    past the 53 bits a double keeps) and the compressed token map. None without engram."""
+    t = cfg.get("text_config", cfg)
+    ids = list(t.get("engram_layer_ids") or [])
+    if not ids:
+        return None
+    p = "deepseek41.engram."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    if list(need("layer_ids")) != ids:
+        sys.exit("deepseek41: the engram layers of the metadata and of the config differ")
+    if need("encoding") != "e4m3_e8m0_32_row264":
+        sys.exit(f"deepseek41: engram encoding {need('encoding')!r} is not one the engine reads")
+    n, heads = int(t["engram_max_ngram_size"]), int(t["engram_n_heads"])
+    primes_flat, mult_flat = [int(x) for x in need("primes")], [int(x) for x in need("multipliers")]
+    per = (n - 1) * heads
+    if len(primes_flat) != len(ids) * per or len(mult_flat) != len(ids) * n:
+        sys.exit("deepseek41: engram primes / multipliers are not one set per table")
+    primes, offsets = [], []
+    for i in range(len(ids)):
+        flat = primes_flat[i * per:(i + 1) * per]
+        if sum(flat) != int(need("rows")[i]):
+            sys.exit(f"deepseek41: engram table {i}: primes sum to {sum(flat)} rows, the file has {need('rows')[i]}")
+        primes.append([flat[k * heads:(k + 1) * heads] for k in range(n - 1)])
+        acc, off = 0, []
+        for v in flat:
+            off.append(acc); acc += v
+        offsets.append(off)
+    token_map = [int(x) for x in need("token_map")]
+    return {"max_ngram_size": n, "n_heads": heads, "head_dim": int(t["engram_head_dim"]),
+            "pad_id": token_map[int(t.get("engram_pad_token_id", 2))], "layer_ids": ids,
+            "num_embeddings": [int(x) for x in need("rows")], "primes": primes, "offsets": offsets,
+            "multipliers": [[str(v) for v in mult_flat[i * n:(i + 1) * n]] for i in range(len(ids))],
+            "token_map": token_map}
+
+
+def olmoe_config(meta, tensors, overrides=None):
+    """OLMoE (llama.cpp's olmoe: OLMoE-1B-7B) as the olmoe engine's config.json. The converter
+    keeps q and k in the checkpoint's layout and writes no norm_topk_prob: false, as the
+    official checkpoints have it, unless the file says expert_weights_norm."""
+    p = "olmoe."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    cfg = {
+        "model_type": "olmoe", "architectures": ["OlmoeForCausalLM"],
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "num_attention_heads": int(need("attention.head_count")),
+        "num_key_value_heads": int(meta.get(p + "attention.head_count_kv", need("attention.head_count"))),
+        "num_experts": int(need("expert_count")),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "intermediate_size": int(meta.get(p + "expert_feed_forward_length", need("feed_forward_length"))),
+        "norm_topk_prob": bool(meta.get(p + "expert_weights_norm", False)),
+        "vocab_size": int(emb["dims"][1]),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-5)),
+        "max_position_embeddings": int(meta.get(p + "context_length", 4096)),
+        "rope_theta": float(meta.get(p + "rope.freq_base", 10000.0)),
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "hidden_act": "silu",
+        "bos_token_id": meta.get("tokenizer.ggml.bos_token_id"), "eos_token_id": meta.get("tokenizer.ggml.eos_token_id"),
+    }
+    return cfg, layers
+
+
 def qwen4exp_config(meta, tensors, overrides=None):
     """Qwen3.8-Flash-Next (llama.cpp's qwen4exp) as the qwen38 engine's config.json. The
     PLE table is one tensor here (per_layer_token_embd), so split_ngram_parts is 1; its
@@ -590,7 +673,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 
 COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mimo2": mimo2_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the
@@ -878,6 +961,8 @@ def main():
     for name, obj in (("config.json", cfg), ("tokenizer.json", tok), ("tokenizer_config.json", tcfg),
                       ("generation_config.json", gen)):
         (args.out / name).write_text(json.dumps(obj, ensure_ascii=False, indent=1 if name != "tokenizer.json" else None))
+    if arch == "deepseek41" and (engram := deepseek41_engram(meta, cfg)):
+        (args.out / "dsv41_engram.json").write_text(json.dumps(engram))
     target = src
     if args.mode == "copy":
         target = args.out / "model.colibri.gguf"

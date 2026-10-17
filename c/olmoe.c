@@ -41,7 +41,9 @@
 #endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
+#define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+#include "ggml_view.h"
 #ifdef _OPENMP
 #include <omp.h>   /* omp_set_num_threads/omp_get_max_threads per omp_tune.h */
 #endif
@@ -98,9 +100,15 @@ typedef struct {
                                  * token flags via sample.h's stops_arm_tok */
 } Cfg;
 
+/* A GGUF's matrix (st_gguf.h): its ggml blocks as held, type t (its rows interleaved by 16
+ * where the type has that form: coli_ggml_held_type, OLM_ILV16=0 keeps the file's rows), on
+ * the ggml_quants.h kernels on the CPU; b is NULL for the checkpoint's f32 or half. */
+typedef struct { uint8_t *b; int t; } OlmGx;
+
 /* ---------- pesi densi per-layer ---------- */
 typedef struct {
     float *in_ln, *post_ln, *q, *k, *v, *o, *qn, *kn, *gate;
+    OlmGx gq, gk, gv, go, ggate;   /* a GGUF's: the f32 pointer is NULL when set */
     uint16_t *q_h, *k_h, *v_h, *o_h;   /* half-resident twins of q/k/v/o (COLI_DENSE_F16); the f32 pointer is NULL when set */
 #ifdef COLI_VULKAN
     void *vk_q, *vk_k, *vk_v, *vk_o, *vk_gate;   /* device copies, on first use */
@@ -118,7 +126,9 @@ typedef struct {
  * (under g_pilot_mx): neither eviction takes a busy slot. Without it the PILOT
  * worker could pick the slot the forward pass was multiplying with as its LRU
  * victim and read another expert into it mid-matmul (at cap 1 the only slot). */
-typedef struct { int eid; int pinned; int busy; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
+/* A GGUF's expert (Model.gx): g, u, d hold its ggml blocks as the file has them, of types gt[]. */
+typedef struct { int eid; int pinned; int busy; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used;
+                 int gt[3]; } Slot;
 typedef struct {
     Slot *slots;
     int *slot_by_expert;                  /* expert id -> resident slot, -1 if absent */
@@ -141,6 +151,14 @@ typedef struct {
     int quant_bits;
     float *embed, *lm_head, *final_norm;
     uint16_t *lm_head_h;    /* half-resident lm_head (COLI_DENSE_F16); lm_head is NULL when set */
+    /* A GGUF (st_gguf.h; zero for the checkpoint): the embedding and the head as ggml blocks
+     * (embed, lm_head NULL), and gx: the routed experts too, typed by layer, [layer * 3 + k]
+     * for k = gate, up, down: the file's type and bytes of one matrix; the slots are sized for
+     * the largest layer's (gx_part). */
+    OlmGx gembed, ghead;
+    int gx;
+    int *gx_t;
+    int64_t *gx_len, gx_part[3];
 #ifdef COLI_VULKAN
     void *vk_lm_head;
     void *vkchain;          /* the dense chain's device state (olmoe_chain.h), NULL until it runs */
@@ -677,11 +695,102 @@ static float *load_t_dense(Model *m, const char *name, int64_t rows, int64_t col
     return load_t(m, name, rows, columns);
 }
 
+/* load_t / load_t_dense for a matrix a GGUF holds in ggml blocks: those blocks, into *g
+ * (returned NULL), interleaved by 16 rows unless rows16 is 0 (the embedding, read a row at a
+ * time); a float tensor goes the checkpoint's way. */
+static float *load_t_gx(Model *m, const char *name, int64_t rows, int64_t columns, uint16_t **h,
+                        OlmGx *g, int rows16) {
+    g->b = NULL; g->t = -1;
+    st_tensor *t = st_find(&m->S, name);
+    if (t && st_is_ggml(t->dtype)) {
+        const int type = st_ggml_type(t->dtype);
+        const int64_t rb = gq_row_bytes(type, columns);
+        if (t->rank != 2 || t->shape[0] != rows || t->shape[1] != columns || rb < 0 || t->nbytes != rb * rows) {
+            fprintf(stderr, "%s: not [%lld, %lld] in ggml type %s, refusing (untrusted container)\n",
+                    name, (long long)rows, (long long)columns, gq_type_name(type)); exit(1); }
+        const int held = rows16 ? coli_ggml_held_type(type, rows, columns, "OLM_ILV16") : type;
+        g->b = malloc((size_t)(gq_row_bytes(held, columns) * rows));
+        if (!g->b) { fprintf(stderr, "OOM reading %s\n", name); exit(1); }
+        if (held == type) st_read_raw(&m->S, name, g->b, 0);
+        else {
+            uint8_t *raw = malloc((size_t)t->nbytes);
+            if (!raw) { fprintf(stderr, "OOM reading %s\n", name); exit(1); }
+            st_read_raw(&m->S, name, raw, 0);
+            gq_r16_pack(held, g->b, raw, (int)rows, (int)columns);
+            free(raw);
+        }
+        g->t = held;
+        if (h) *h = NULL;
+        return NULL;
+    }
+    return h ? load_t_dense(m, name, rows, columns, h) : load_t(m, name, rows, columns);
+}
+
+/* y[S, O] = x[S, I] W^T on a GGUF's blocks: the activations quantized once per call. */
+static void olm_gx_matmul(float *y, const float *x, const OlmGx *g, int S, int I, int O) {
+    ColiTensorView v = {.format = COLI_TENSOR_GGML, .data = g->b, .rows = O, .columns = I,
+                        .block_columns = (uint32_t)g->t};
+    if (coli_ggml_matmul(y, &v, x, S)) {
+        fprintf(stderr, "olmoe: no kernel for a GGUF matrix of type %s\n", gq_type_name(g->t)); exit(1); }
+}
+/* MATMUL_RES / MATMUL_RESH, or the GGUF's blocks when the matrix is held so. */
+#define OLM_MM(y, x, G, W, vk, S, I, O) \
+    do { if ((G).b) olm_gx_matmul(y, x, &(G), S, I, O); else MATMUL_RES(y, x, W, vk, S, I, O); } while (0)
+#define OLM_MMH(y, x, G, W, Wh, vk, S, I, O) \
+    do { if ((G).b) olm_gx_matmul(y, x, &(G), S, I, O); else MATMUL_RESH(y, x, W, Wh, vk, S, I, O); } while (0)
+/* Row `id` of the embedding as f32. */
+static void olm_embed_row(const Model *m, int id, float *dst) {
+    const int64_t D = m->c.hidden;
+    if (!m->gembed.b) { memcpy(dst, m->embed + (int64_t)id * D, (size_t)D * sizeof(float)); return; }
+    if (gq_dequant_row(m->gembed.t, m->gembed.b + (int64_t)id * gq_row_bytes(m->gembed.t, D), dst, D)) {
+        fprintf(stderr, "olmoe: no row reader for ggml type %s\n", gq_type_name(m->gembed.t)); exit(1); }
+}
+
+/* A GGUF's routed experts (Model.gx): their types by layer from each layer's expert 0 (one
+ * tensor in the file, so a layer's share them), checked, and the slots' sizes. The slots hold
+ * the file's rows: measured on OLMoE-1B-7B (Q8_0 and Q4_K_M, every expert in RAM), holding an
+ * expert interleaved by 16 rows costs about 0.3 ms at its read and the 16-row kernels give
+ * nothing back on its 2048 x 1024 matrices, so a 64-token turn ran 15-25% slower that way and a
+ * 320-token one 2%. The dense matrices, packed once at load, are interleaved (1-2% faster). */
+static void olm_gx_geometry(Model *m, int layer_begin, int layer_end) {
+    const Cfg *c = &m->c;
+    static const char *const k3[3] = {"gate_proj", "up_proj", "down_proj"};
+    st_tensor *t = st_find(&m->S, "model.layers.0.mlp.experts.0.gate_proj.weight");
+    if (!t) { char nm[128]; snprintf(nm, sizeof nm, "model.layers.%d.mlp.experts.0.gate_proj.weight", layer_begin); t = st_find(&m->S, nm); }
+    m->gx = t && st_ggml_type_any(t->dtype) >= 0;
+    if (!m->gx) return;
+    m->gx_t = calloc((size_t)c->n_layers * 3, sizeof(int));
+    m->gx_len = calloc((size_t)c->n_layers * 3, sizeof(int64_t));
+    if (!m->gx_t || !m->gx_len) { fprintf(stderr, "OOM\n"); exit(1); }
+    m->gx_part[0] = m->gx_part[1] = m->gx_part[2] = 0;
+    for (int i = layer_begin; i < layer_end; i++)
+        for (int k = 0; k < 3; k++) {
+            char nm[160];
+            const int64_t rows = k == 2 ? c->hidden : c->inter, cols = k == 2 ? c->inter : c->hidden;
+            snprintf(nm, sizeof nm, "model.layers.%d.mlp.experts.0.%s.weight", i, k3[k]);
+            t = st_find(&m->S, nm);
+            const int type = t ? st_ggml_type_any(t->dtype) : -1;
+            const int64_t rb = type >= 0 ? gq_row_bytes(type, cols) : -1;
+            if (!t || rb < 0 || t->nbytes != rb * rows) {
+                fprintf(stderr, "%s: not %lld rows of %lld in a ggml type\n", nm, (long long)rows, (long long)cols); exit(1); }
+            m->gx_t[3 * i + k] = type; m->gx_len[3 * i + k] = t->nbytes;
+            if (t->nbytes > m->gx_part[k]) m->gx_part[k] = t->nbytes;
+        }
+    fprintf(stderr, "olmoe: GGUF experts %s gate/up, %s down (layer %d)", gq_type_name(m->gx_t[3 * layer_begin]),
+            gq_type_name(m->gx_t[3 * layer_begin + 2]), layer_begin);
+    fprintf(stderr, "\n");
+}
+
 /* One slot holds one expert: three int8 matrices plus their row scales, the
  * same arithmetic the Segment adapter uses to turn a memory limit into a cap. */
 static int64_t slot_bytes(const Cfg *c) {
     return (int64_t)c->hidden * c->inter * 3 +
            (int64_t)(c->inter * 2 + c->hidden) * (int64_t)sizeof(float);
+}
+
+/* A slot's bytes: the checkpoint's int8 matrices and scales, or a GGUF's largest layer's blocks. */
+static int64_t olm_slot_bytes(const Model *m) {
+    return m->gx ? m->gx_part[0] + m->gx_part[1] + m->gx_part[2] : slot_bytes(&m->c);
 }
 
 static void model_init_range(Model *m, const char *snap, int cap, int bits,
@@ -700,9 +809,10 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         exit(1);
     }
     double t0 = now_s();
+    olm_gx_geometry(m, layer_begin, layer_end);
     if (load_boundaries) {
-        m->embed      = load_t(m, "model.embed_tokens.weight", c->vocab, c->hidden);
-        m->lm_head    = load_t_dense(m, "lm_head.weight", c->vocab, c->hidden, &m->lm_head_h);
+        m->embed      = load_t_gx(m, "model.embed_tokens.weight", c->vocab, c->hidden, NULL, &m->gembed, 0);
+        m->lm_head    = load_t_gx(m, "lm_head.weight", c->vocab, c->hidden, &m->lm_head_h, &m->ghead, 1);
         m->final_norm = load_t(m, "model.norm.weight", c->hidden, 0);
     }
     m->L = calloc(c->n_layers, sizeof(Layer));
@@ -714,13 +824,14 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t(m,nm,rows,columns)
         LD(in_ln,  "input_layernorm.weight", D, 0);
         LD(post_ln,"post_attention_layernorm.weight", D, 0);
-        #define LDD(field, hfield, suffix) \
-            snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t_dense(m,nm,D,D,&l->hfield)
-        LDD(q, q_h, "self_attn.q_proj.weight"); LDD(k, k_h, "self_attn.k_proj.weight");
-        LDD(v, v_h, "self_attn.v_proj.weight"); LDD(o, o_h, "self_attn.o_proj.weight");
+        #define LDD(field, hfield, gfield, suffix) \
+            snprintf(nm,sizeof(nm),"model.layers.%d." suffix,i); l->field = load_t_gx(m,nm,D,D,&l->hfield,&l->gfield,1)
+        LDD(q, q_h, gq, "self_attn.q_proj.weight"); LDD(k, k_h, gk, "self_attn.k_proj.weight");
+        LDD(v, v_h, gv, "self_attn.v_proj.weight"); LDD(o, o_h, go, "self_attn.o_proj.weight");
         #undef LDD
         LD(qn,"self_attn.q_norm.weight", D, 0); LD(kn,"self_attn.k_norm.weight", D, 0);
-        LD(gate, "mlp.gate.weight", c->n_experts, D);
+        snprintf(nm, sizeof(nm), "model.layers.%d.mlp.gate.weight", i);
+        l->gate = load_t_gx(m, nm, c->n_experts, D, NULL, &l->ggate, 1);
         #undef LD
     }
     /* cap <= 0 is "you decide", the sentinel the launcher sends when nobody
@@ -750,7 +861,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
          * aside the KV of the whole context (CTX, 1.07 GB at 4096 positions on
          * OLMoE-1B-7B) cost the cache that much even for a request that writes
          * a few hundred positions. */
-        double slot_gb = (double)slot_bytes(c) / 1e9;
+        double slot_gb = (double)olm_slot_bytes(m) / 1e9;
         int layers = layer_end - layer_begin;
         if (layers < 1) layers = 1;
         double room = budget - resident - 0.5;   /* 0.5 GB: activations */
@@ -881,23 +992,36 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
      * the expert tier will be tried (vk_tier.h step 0): on a device sharing the
      * CPU's RAM the dense matrices then stay on the CPU unless COLI_VK_DENSE=1. */
     if (!g_vk_ready) g_vk_ready = coli_vk_init_env_tier("olmoe", vkt_wanted() && m->c.n_experts > 0);
-    if (g_vk_ready) olc_fit_start(m);   /* COLI_VK_CHAIN: how many layers the chain places (vkc_fit), before any upload */
-    if (g_vk_ready) olm_dho_start(m);   /* COLI_VK_DENSE_HOST: the dense matrices on the device only, before the tier sizes its budget */
-    if (g_vk_ready) { olc_place(m); olm_dho_finish(m); }   /* the chain's layers on the device now, so the tier sizes after them */
+    /* a GGUF: its dense matrices are ggml blocks, which the chain and the dense weights on the
+     * device do not take; they stay on the CPU, the routed experts go to the tier */
+    const int gguf = m->ghead.b || m->L[0].gq.b;
+    if (gguf && g_vk_ready) fprintf(stderr, "[VK] olmoe: a GGUF: the dense chain and the dense matrices on the device stay off (ggml blocks)\n");
+    if (g_vk_ready && !gguf) olc_fit_start(m);   /* COLI_VK_CHAIN: how many layers the chain places (vkc_fit), before any upload */
+    if (g_vk_ready && !gguf) olm_dho_start(m);   /* COLI_VK_DENSE_HOST: the dense matrices on the device only, before the tier sizes its budget */
+    if (g_vk_ready && !gguf) { olc_place(m); olm_dho_finish(m); }   /* the chain's layers on the device now, so the tier sizes after them */
     if (g_vk_ready) olmoe_vk_tier_start(m);   /* after the history: COLI_USAGE, read above */
-    if (g_vk_ready && !vkt_ready() && !coli_vk_dense()) coli_vk_dense_decide("olmoe", 0, 1);   /* no tier after all */
-    if (g_vk_ready && coli_vk_dense())
+    if (g_vk_ready && !gguf && !vkt_ready() && !coli_vk_dense()) coli_vk_dense_decide("olmoe", 0, 1);   /* no tier after all */
+    if (g_vk_ready && !gguf && coli_vk_dense())
         fprintf(stderr, "[VK] olmoe: %d resident f32 matrices (attention q/k/v/o, router, lm_head) "
                 "go to the GPU on first use; %s\n", 5 * m->c.n_layers + 1,
                 vkt_ready() ? "routed experts go to the expert tier, the embedding lookup stays on the CPU"
                             : "routed experts and the embedding lookup stay on the CPU");
-    olc_start(m);   /* COLI_VK_CHAIN: every layer's dense part as one frame on the device */
+    if (!gguf) olc_start(m);   /* COLI_VK_CHAIN: every layer's dense part as one frame on the device */
 #endif
 }
 
 static void slot_ensure_allocated(Model *m, Slot *s) {
     if (s->g) return;
     Cfg *c = &m->c;
+    if (m->gx) {   /* a GGUF's: the three matrices' blocks, no scales */
+        uint8_t *w = malloc((size_t)(m->gx_part[0] + m->gx_part[1] + m->gx_part[2]));
+        if (!w) { fprintf(stderr, "Error: Out of memory allocating slot weights block\n"); exit(1); }
+        s->g = (int8_t *)w; s->u = (int8_t *)(w + m->gx_part[0]); s->d = (int8_t *)(w + m->gx_part[0] + m->gx_part[1]);
+        s->gs = s->us = s->ds = NULL;
+        s->gt[0] = s->gt[1] = s->gt[2] = -1;
+        s->pinned = 0;
+        return;
+    }
     int64_t ng = (int64_t)c->inter * c->hidden;
     int64_t nd = (int64_t)c->hidden * c->inter;
     int8_t *w_block = malloc(ng + ng + nd);
@@ -912,7 +1036,26 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
     s->gs = s_block;
     s->us = s_block + c->inter;
     s->ds = s_block + c->inter + c->inter;
+    s->gt[0] = s->gt[1] = s->gt[2] = -1;
     s->pinned = 0;
+}
+
+/* A GGUF's expert into its slot: the file's blocks (olm_gx_geometry). */
+static void load_expert_gguf(Model *m, int layer, int eid, Slot *s) {
+    static const char *const k3[3] = {"gate_proj", "up_proj", "down_proj"};
+    int8_t *dst[3] = {s->g, s->u, s->d};
+    double started = now_s();
+    for (int k = 0; k < 3; k++) {
+        char nm[160];
+        snprintf(nm, sizeof nm, "model.layers.%d.mlp.experts.%d.%s.weight", layer, eid, k3[k]);
+        st_tensor *t = st_find(&m->S, nm);
+        if (!t || st_ggml_type_any(t->dtype) != m->gx_t[3 * layer + k] || t->nbytes != m->gx_len[3 * layer + k]) {
+            fprintf(stderr, "%s: missing, or not the type and bytes of the layer's expert 0, "
+                            "refusing (untrusted container)\n", nm); exit(1); }
+        st_read_raw(&m->S, nm, dst[k], g_expert_drop);
+    }
+    for (int k = 0; k < 3; k++) s->gt[k] = m->gx_t[3 * layer + k];
+    __atomic_fetch_add(&m->disk_ns, (uint64_t)((now_s() - started) * 1e9), __ATOMIC_RELAXED);
 }
 
 #ifdef COLI_CACHE_INDEX_TEST
@@ -931,6 +1074,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
 #ifdef COLI_CACHE_INDEX_TEST
     if (g_test_expert_load) { g_test_expert_load(m, layer, eid, s); return; }
 #endif
+    if (m->gx) { load_expert_gguf(m, layer, eid, s); return; }
     char nm[256], qsnm[256];
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", layer, eid);
     snprintf(qsnm, sizeof(qsnm), "model.layers.%d.mlp.experts.%d.qs", layer, eid);
@@ -963,7 +1107,8 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
 
 #ifdef COLI_VULKAN
 #define OLMOE_VK_ROWS 64   /* rows per expert-tier step (moe_vk_run) */
-/* One expert as a slot holds it: int8 gate, up, down, one f32 scale per row. */
+/* One expert as a slot holds it: int8 gate, up, down, one f32 scale per row; or a GGUF's
+ * blocks as the file has them (no scales). */
 static VktExpertSrc olmoe_vk_src(const Slot *e) {
     return (VktExpertSrc){e->g, e->u, e->d, e->gs, e->us, e->ds};
 }
@@ -989,11 +1134,57 @@ static int olmoe_vk_load(void *ctx, int layer, int e, VktExpertSrc *src, void **
     return 1;
 }
 static void olmoe_vk_release(void *ctx, void *h) { (void)ctx; expert_put((Slot *)h); }
+/* A GGUF's experts on the tier as the file has them (shaders/blockdec.glsl), the forms by
+ * layer as published files mix them: gate and up share a type and every type has a device
+ * form, or the tier stays off (0). The most common pair is the main form; *lgu / *ldn are the
+ * layers' when they differ, else NULL. */
+static int olmoe_vk_gguf_forms(const Model *m, VktFmt *gu, VktFmt *dn, VktFmt **lgu_out, VktFmt **ldn_out) {
+    const Cfg *c = &m->c;
+    const int L = c->n_layers;
+    const char *no = NULL;
+    VktFmt *lgu = malloc((size_t)L * sizeof *lgu), *ldn = malloc((size_t)L * sizeof *ldn);
+    if (!lgu || !ldn) no = "out of memory";
+    for (int l = 0; !no && l < L; l++) {
+        const int *t = m->gx_t + 3 * l;
+        const int bg = coli_vk_block_elems(100 + t[0]), bd = coli_vk_block_elems(100 + t[2]);
+        if (t[0] != t[1]) no = "gate and up differ in type";
+        else if (!bg || !bd || c->hidden % bg || c->inter % bd) no = "a type without a device form";
+        lgu[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + t[0]), 0};
+        ldn[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + t[2]), 0};
+    }
+    int best = 0, bestn = 0, forms = 0;
+    for (int l = 0; !no && l < L; l++) {
+        int n = 0, first = 1;
+        for (int j = 0; j < L; j++) {
+            const int same = lgu[j].kind == lgu[l].kind && ldn[j].kind == ldn[l].kind;
+            n += same;
+            if (same && j < l) first = 0;
+        }
+        forms += first;
+        if (n > bestn) { bestn = n; best = l; }
+    }
+    if (!no && forms > VKT_FORMS - 1) no = "more distinct types than the tier holds";
+    if (no) {
+        fprintf(stderr, "[VK] tier olmoe: the GGUF's experts: %s; the tier stays off\n", no);
+        free(lgu); free(ldn);
+        return 0;
+    }
+    *gu = lgu[best]; *dn = ldn[best];
+    fprintf(stderr, "[VK] tier olmoe: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down",
+            gq_type_name(m->gx_t[3 * best]), gq_type_name(m->gx_t[3 * best + 2]));
+    if (forms > 1) fprintf(stderr, " on %d of %d layers, the others their own types", bestn, L);
+    fprintf(stderr, ")\n");
+    if (forms > 1) { *lgu_out = lgu; *ldn_out = ldn; }
+    else { free(lgu); free(ldn); }
+    return 1;
+}
 static void olmoe_vk_tier_start(Model *m) {
     Cfg *c = &m->c;
     if (!vkt_wanted() || c->n_experts < 1) return;
-    int64_t D = c->hidden, I = c->inter;
-    size_t slotb = (size_t)(3 * I * D + (2 * I + D) * 4);
+    int64_t D = c->hidden;
+    size_t slotb = (size_t)olm_slot_bytes(m);
+    VktFmt gu = {VKT_SRC_I8_ROW, 0}, dn = gu, *lgu = NULL, *ldn = NULL;   /* a GGUF's forms by layer, when they differ */
+    if (m->gx && !olmoe_vk_gguf_forms(m, &gu, &dn, &lgu, &ldn)) return;
     /* device only, or the chain set up already with its fit (olc_place: the CPU's layers
      * refused): placed already, or never going up */
     size_t dense = 0;
@@ -1007,13 +1198,15 @@ static void olmoe_vk_tier_start(Model *m) {
     }
     VktConfig vc = {.engine = "olmoe", .layers = c->n_layers, .experts = c->n_experts,
                     .hidden = c->hidden, .inter = c->inter, .topk = c->topk,
-                    .gate_up = {VKT_SRC_I8_ROW, 0}, .down = {VKT_SRC_I8_ROW, 0},
+                    .gate_up = gu, .down = dn, .layer_gate_up = lgu, .layer_down = ldn,
                     .act = VKT_ACT_SWIGLU, .max_rows = OLMOE_VK_ROWS * c->topk,
                     .ram_reserve = slotb * (size_t)m->cache[0].cap * (size_t)c->n_layers,
                     .dense_bytes = dense, .in_ram = olmoe_vk_in_ram, .ram_ctx = m,
                     .load = olmoe_vk_load, .release = olmoe_vk_release, .load_ctx = m};
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
-    if (!vkt_init(&vc, m->freq)) return;
+    const int tier_on = vkt_init(&vc, m->freq);
+    free(lgu); free(ldn);   /* read during vkt_init only */
+    if (!tier_on) return;
     atexit(vkt_shutdown);
     int all = c->n_layers * c->n_experts;
     int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
@@ -1162,7 +1355,7 @@ static void kv_room_fit(Model *m, int positions) {
     m->kv_room_t = positions;
     Cfg *c = &m->c;
     int64_t left = m->room_bytes - kv_room_bytes(m, positions);
-    int64_t fit = left > 0 ? left / slot_bytes(c) / c->n_layers : 0;
+    int64_t fit = left > 0 ? left / olm_slot_bytes(m) / c->n_layers : 0;
     int cap = fit < 1 ? 1 : fit > c->n_experts ? c->n_experts : (int)fit;
     int shrunk = 0;
     pthread_mutex_lock(&g_pilot_mx);
@@ -1299,9 +1492,9 @@ static void rope_head(float *x, int pos, const Cfg *c) {
 static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_base, float *out) {
     Cfg *c = &m->c; int H = c->n_heads, hd = c->head_dim, D = c->hidden;
     float *q = falloc((int64_t)S*D), *k = falloc((int64_t)S*D), *vv = falloc((int64_t)S*D);
-    MATMUL_RESH(q, x, l->q, l->q_h, l->vk_q, S, D, D);
-    MATMUL_RESH(k, x, l->k, l->k_h, l->vk_k, S, D, D);
-    MATMUL_RESH(vv, x, l->v, l->v_h, l->vk_v, S, D, D);
+    OLM_MMH(q, x, l->gq, l->q, l->q_h, l->vk_q, S, D, D);
+    OLM_MMH(k, x, l->gk, l->k, l->k_h, l->vk_k, S, D, D);
+    OLM_MMH(vv, x, l->gv, l->v, l->v_h, l->vk_v, S, D, D);
     /* qk-norm sull'intero vettore hidden, poi RoPE per testa */
     for (int s = 0; s < S; s++) {
         rmsnorm_row(q + (int64_t)s*D, q + (int64_t)s*D, l->qn, D, c->eps);
@@ -1344,7 +1537,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     (void)Tk;
-    MATMUL_RESH(out, ctx, l->o, l->o_h, l->vk_o, S, D, D);
+    OLM_MMH(out, ctx, l->go, l->o, l->o_h, l->vk_o, S, D, D);
     free(q); free(k); free(vv); free(ctx);
 }
 
@@ -1416,8 +1609,21 @@ static int moe_fused3(int D, int I) {
 #endif
 /* One routed expert on one row: hh[D] = down(silu(gate(xs)) * up(xs)); g, u are
  * scratch of I floats. */
+/* A GGUF expert on n rows (x[t] for t < n, contiguous when n > 1 through the caller's copy):
+ * gate and up on one quantization of the rows, then down, on ggml_quants.h's kernels. */
+static void moe_expert_rows_gx(const Model *m, const Slot *e, const float *x, int n, float *g, float *u, float *hh) {
+    const int D = m->c.hidden, I = m->c.inter;
+    ColiTensorView vg = {.format = COLI_TENSOR_GGML, .data = e->g, .rows = I, .columns = D, .block_columns = (uint32_t)e->gt[0]};
+    ColiTensorView vu = vg, vd = vg;
+    vu.data = e->u; vu.block_columns = (uint32_t)e->gt[1];
+    vd.data = e->d; vd.rows = D; vd.columns = I; vd.block_columns = (uint32_t)e->gt[2];
+    if (coli_ggml_matmul2(g, &vg, u, &vu, x, n)) { fprintf(stderr, "olmoe: no kernel for a GGUF expert of type %s\n", gq_type_name(e->gt[0])); exit(1); }
+    for (int64_t i = 0; i < (int64_t)n * I; i++) { float gv = g[i]; g[i] = (gv / (1.f + expf(-gv))) * u[i]; }
+    if (coli_ggml_matmul(hh, &vd, g, n)) { fprintf(stderr, "olmoe: no kernel for a GGUF expert of type %s\n", gq_type_name(e->gt[2])); exit(1); }
+}
 static void moe_expert_row(const Model *m, const Slot *e, const float *xs, float *g, float *u, float *hh) {
     const Cfg *c = &m->c; int D = c->hidden, I = c->inter;
+    if (m->gx) { moe_expert_rows_gx(m, e, xs, 1, g, u, hh); return; }   /* the model's, not the slot's: a zeroed slot reads as F32 */
 #if defined(__AVX2__)
     if (moe_fused3(D, I)) {
         matmul_q_idot_pair_v3(g, u, xs, e->g, e->gs, e->u, e->us, D, I);   /* gate+up share one quant of xs */
@@ -1437,6 +1643,16 @@ static void moe_expert_row(const Model *m, const Slot *e, const float *xs, float
 static void moe_expert_rows(const Model *m, const Slot *e, const float *const *xs, int n,
                             float *const *g, float *const *u, float *const *hh) {
     const Cfg *c = &m->c; int D = c->hidden, I = c->inter;
+    if (m->gx) {   /* a GGUF's: the rows gathered, one call each, then scattered */
+        float *xb = calloc((size_t)n * (2 * D + 2 * I), sizeof(float));   /* zeroed: gcc cannot see the gather write every row */
+        if (!xb) { fprintf(stderr, "OOM gathering an expert's rows\n"); exit(1); }
+        float *hb = xb + (int64_t)n * D, *gb = hb + (int64_t)n * D, *ub = gb + (int64_t)n * I;
+        for (int t = 0; t < n; t++) memcpy(xb + (int64_t)t * D, xs[t], (size_t)D * sizeof(float));
+        moe_expert_rows_gx(m, e, xb, n, gb, ub, hb);
+        for (int t = 0; t < n; t++) memcpy(hh[t], hb + (int64_t)t * D, (size_t)D * sizeof(float));
+        free(xb);
+        return;
+    }
 #if defined(__AVX2__)
     if (moe_fused3(D, I)) {
         for (int t = 0; t < n; t++) moe_expert_row(m, e, xs[t], g[t], u[t], hh[t]);
@@ -1617,7 +1833,7 @@ static void moe_routed(Model *m, int layer, float *x, int S, float *logits, floa
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts;
     float *logits = falloc((int64_t)S*E);
-    MATMUL_RES(logits, x, l->gate, l->vk_gate, S, D, E);
+    OLM_MM(logits, x, l->ggate, l->gate, l->vk_gate, S, D, E);
     moe_routed(m, layer, x, S, logits, out);
     free(logits);
 }
@@ -1831,7 +2047,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         pthread_mutex_unlock(&g_pilot_mx);
     }
     float *x = falloc((int64_t)S*D);
-    for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+    for (int s = 0; s < S; s++) olm_embed_row(m, ids[s], x + (int64_t)s*D);
 #ifdef COLI_VULKAN
     /* COLI_VK_CHAIN: the layers, the final norm and lm_head on the device; x comes
      * back only when the prefill read-out below needs every row */
@@ -1846,7 +2062,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             olc_cpu_step(m, pos_base);
             /* the primary's layers may have run before the second device's were lost: their
              * residual is in x, and the CPU redoes the whole step from the embedding */
-            for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+            for (int s = 0; s < S; s++) olm_embed_row(m, ids[s], x + (int64_t)s*D);
         } else if (rows_only) { free(chain_logit); chain_logit = NULL; }
     }
     if (!chain_logit) layers_forward_range(m, x, S, pos_base, chain_n, c->n_layers, 1);
@@ -1872,7 +2088,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
             olmoe_echo(g_echo_id, pos_base, ids[0], g_pin_logit, c->vocab, g_echo_k);
         for (int p = 0; p + 1 < S; p++) {
             rmsnorm_row(erow, x + (int64_t)p*D, m->final_norm, D, c->eps);
-            MATMUL_RESH(elog, erow, m->lm_head, m->lm_head_h, m->vk_lm_head, 1, D, c->vocab);
+            OLM_MMH(elog, erow, m->ghead, m->lm_head, m->lm_head_h, m->vk_lm_head, 1, D, c->vocab);
             olmoe_echo(g_echo_id, pos_base + p + 1, ids[p+1], elog, c->vocab, g_echo_k);
         }
         free(erow); free(elog);
@@ -1888,7 +2104,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     rmsnorm_row(last, x + (int64_t)(S-1)*D, m->final_norm, D, c->eps);
     float *logit = falloc(c->vocab);
     double t_head = now_s();
-    MATMUL_RESH(logit, last, m->lm_head, m->lm_head_h, m->vk_lm_head, 1, D, c->vocab);
+    OLM_MMH(logit, last, m->ghead, m->lm_head, m->lm_head_h, m->vk_lm_head, 1, D, c->vocab);
     g_prof_head_s += now_s() - t_head;
     g_prof_forwards += 1;   /* forward passes, not positions: a prefill of S rows is one */
     free(x); free(last);
@@ -1921,7 +2137,7 @@ static float *olm_step_rows(Model *m, const OlmRow *rows, const int *ids, int S)
         pthread_mutex_unlock(&g_pilot_mx);
     }
     float *x = falloc((int64_t)S*D);
-    for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+    for (int s = 0; s < S; s++) olm_embed_row(m, ids[s], x + (int64_t)s*D);
     m->mux_rows = rows;
     layers_forward_range(m, x, S, 0, 0, c->n_layers, 1);
     m->mux_rows = NULL;
@@ -1936,7 +2152,7 @@ static float *olm_step_rows(Model *m, const OlmRow *rows, const int *ids, int S)
     float *last = falloc((int64_t)S*D), *logit = falloc((int64_t)S * c->vocab);
     for (int s = 0; s < S; s++) rmsnorm_row(last + (int64_t)s*D, x + (int64_t)s*D, m->final_norm, D, c->eps);
     double t_head = now_s();
-    MATMUL_RESH(logit, last, m->lm_head, m->lm_head_h, m->vk_lm_head, S, D, c->vocab);
+    OLM_MMH(logit, last, m->ghead, m->lm_head, m->lm_head_h, m->vk_lm_head, S, D, c->vocab);
     g_prof_head_s += now_s() - t_head;
     g_prof_forwards += 1;
     free(x); free(last);
@@ -2034,7 +2250,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S) {
         rmsnorm_row(nrm_x + (int64_t)s * D, x + (int64_t)s * D, l->post_ln, D, c->eps);
     }
 
-    MATMUL_RES(logits, nrm_x, l->gate, l->vk_gate, S, D, E);
+    OLM_MM(logits, nrm_x, l->ggate, l->gate, l->vk_gate, S, D, E);
     free(nrm_x);
 
     for (int s = 0; s < S; s++) {
@@ -3099,6 +3315,7 @@ static void olmoe_segment_model_destroy(OlmoeSegmentEngine *engine) {
         free(weights->q); free(weights->k); free(weights->v); free(weights->o);
         free(weights->q_h); free(weights->k_h); free(weights->v_h); free(weights->o_h);
         free(weights->qn); free(weights->kn); free(weights->gate);
+        free(weights->gq.b); free(weights->gk.b); free(weights->gv.b); free(weights->go.b); free(weights->ggate.b);
         LCache *cache = &model->cache[layer];
         for (int slot = 0; slot < cache->n; slot++) {
             free(cache->slots[slot].g);
@@ -3110,6 +3327,7 @@ static void olmoe_segment_model_destroy(OlmoeSegmentEngine *engine) {
     free(model->last_access); free(model->is_queued); free(model->is_pinned);
     free(model->freq);
     free(model->momentum_logits);
+    free(model->gx_t); free(model->gx_len);
     free(model->cache); free(model->L);
     st_destroy(&model->S);
 }
