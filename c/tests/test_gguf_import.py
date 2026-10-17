@@ -166,6 +166,9 @@ class GgufImport(unittest.TestCase):
         for t in packed:
             self.assertEqual(t.data_offset % 4096, 0, t.name)
             self.assertEqual(int(t.shape[0]) % 4096, 0, t.name)      # slot stride
+        # each matrix's [cols, rows], which the engines reading through st_gguf.h need
+        dims = [int(x) for x in r.fields["colibri.expert_dims"].contents()]
+        self.assertEqual(dims, [H, I, H, I, I, H] * LAYERS)
         # the dense tensors are the source's, byte for byte
         src = gguf.GGUFReader(str(self.src))
         s = {t.name: t for t in src.tensors}
@@ -214,6 +217,47 @@ class GgufImportDense(unittest.TestCase):
         for env in ({}, {"GQ_EXACT": "1"}):
             with self.subTest(path="exact" if env else "integer"):
                 self.assertEqual(engine_tokens(self.dir / "link", self.ref, env), engine_tokens(self.src, self.ref, env))
+
+
+@unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+class ContainerLayers(unittest.TestCase):
+    """The container of a model whose first layers are dense (GLM-5.3-Flash, Inkling): those
+    layers have no slot and zeros in the layout keys, the others their packed experts; and an
+    engine that does not read containers (qwen4exp) is refused before anything is written."""
+    def test_dense_layers_get_no_slot(self):
+        import tools.gguf_import as gi
+        rng = np.random.default_rng(3)
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "m.gguf"
+            w = gguf.GGUFWriter(str(src), "glm5-next")
+            w.add_tensor("blk.0.ffn_gate.weight", blocks("Q8_0", (64, 64), rng), raw_dtype=QT["Q8_0"])
+            for k, shape in (("gate", (4, 32, 64)), ("up", (4, 32, 64)), ("down", (4, 64, 32))):
+                w.add_tensor(f"blk.1.ffn_{k}_exps.weight", blocks("Q8_0", shape, rng), raw_dtype=QT["Q8_0"])
+            w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+            parts, readers, meta, tensors = gi.open_model(src)
+            out = Path(d) / "c.gguf"
+            gi.write_packed(parts, readers, meta, tensors, 2, out)
+            for rd in readers:
+                rd.close()
+            r = gguf.GGUFReader(str(out))
+            self.assertEqual([t.name for t in r.tensors if t.name.endswith("ffn_exps_colibri")], ["blk.1.ffn_exps_colibri"])
+            stride = [int(x) for x in r.fields["colibri.expert_stride"].contents()]
+            self.assertEqual(stride[0], 0)
+            self.assertEqual(stride[1] % 4096, 0)
+            self.assertEqual([int(x) for x in r.fields["colibri.expert_dims"].contents()], [0] * 6 + [64, 32, 64, 32, 32, 64])
+            self.assertIn("blk.0.ffn_gate.weight", [t.name for t in r.tensors])
+
+    def test_no_container_for_qwen4exp(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "q.gguf"
+            w = gguf.GGUFWriter(str(src), "qwen4exp")
+            w.add_tensor("token_embd.weight", np.zeros((4, 32), np.float32))
+            w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+            p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(src), str(Path(d) / "out"), "--mode", "copy"],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("--mode link", p.stdout.decode())
+            self.assertFalse((Path(d) / "out").exists())
 
 
 class Qwen3MoeConfig(unittest.TestCase):

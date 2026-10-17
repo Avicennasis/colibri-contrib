@@ -10,6 +10,10 @@
  * (Q8_0, Q4_K, IQ2_XS, MXFP4, ...) gets ST_GGML_BASE + its ggml type, which the float readers
  * refuse and the engine computes with ggml_quants.h. No byte is copied or converted.
  *
+ * The colibri container gguf_import --mode copy writes (colibri.layout expert-packed-v1: each
+ * layer's routed experts in one tensor, an expert's gate | up | down in a 4 KiB-aligned slot)
+ * reads the same way: every expert's three matrices are entries at their place in the slot.
+ *
  * Opt-in: an engine defines ST_GGUF before including st.h; without it st.h is unchanged.
  * A GGUF tensor without a counterpart in the map keeps its GGUF name. */
 #ifndef ST_GGUF_H
@@ -73,7 +77,7 @@ static const st_gg_name st_gg_dsv4_layer[] = {
 /* Inkling (inkling): conversion/inkling.py of llama.cpp's PR (TML checkpoint names), here
  * under the names of transformers' port, which inkling.c reads. The port keeps gate and up
  * of a routed expert in one tensor (gate_up_proj, gate rows then up rows); the GGUF has them
- * apart, so they come as mlp.experts.gate_proj / up_proj and inkling.c reads the two slices.
+ * apart, so they come per expert as mlp.experts.<e>.gate_proj / up_proj / down_proj.
  * ffn_gscale is a dense layer's mlp.global_scale and a sparse one's mlp.gate.global_scale:
  * both names (one tensor, the layer's kind decides which is read). */
 static const st_gg_name st_gg_ink_glob[] = {
@@ -95,8 +99,8 @@ static const st_gg_name st_gg_ink_layer[] = {
     {"ffn_gate_inp.weight", "mlp.gate.weight"}, {"exp_probs_b.bias", "mlp.gate.e_score_correction_bias"},
     {"ffn_gate_shexp.weight", "mlp.shared_experts.gate_proj"}, {"ffn_up_shexp.weight", "mlp.shared_experts.up_proj"},
     {"ffn_down_shexp.weight", "mlp.shared_experts.down_proj"},
-    {"ffn_gate_exps.weight", "mlp.experts.gate_proj"}, {"ffn_up_exps.weight", "mlp.experts.up_proj"},
-    {"ffn_down_exps.weight", "mlp.experts.down_proj"},
+    {"ffn_gate_exps.weight", "mlp.experts.%d.gate_proj"}, {"ffn_up_exps.weight", "mlp.experts.%d.up_proj"},
+    {"ffn_down_exps.weight", "mlp.experts.%d.down_proj"},
     {NULL, NULL}};
 
 /* GLM-5.3-Flash (glm5-next): conversion/glm.py Glm5NextModel. MLA's kv_b comes split the way
@@ -180,6 +184,26 @@ static st_tensor *st_gguf_add(shards *S, const char *name) {
     return t;
 }
 
+/* The colibri container's layout keys: per layer the three matrices' ggml types and bytes, the
+ * slot's stride and each matrix's [cols, rows]; NULL when the GGUF is not one. */
+typedef struct { const uint32_t *types; const uint64_t *bytes, *stride, *dims; int layers; } st_gg_packed;
+static int st_gguf_packed(const gguf_ctx *G, st_gg_packed *p) {
+    const char *layout = gguf_get_str(G, "colibri.layout");
+    if (!layout) return 0;
+    if (strcmp(layout, "expert-packed-v1")) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF: colibri layout '%s' is not one this build reads", layout);
+    const gguf_kv *ty = gguf_get(G, "colibri.expert_types"), *by = gguf_get(G, "colibri.expert_bytes"),
+                  *st = gguf_get(G, "colibri.expert_stride"), *di = gguf_get(G, "colibri.expert_dims");
+    if (!di) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF: a colibri container without colibri.expert_dims (written before "
+                                                   "this engine read containers): import the GGUF again");
+    if (!ty || !by || !st || ty->type != GGUF_T_ARRAY || by->type != GGUF_T_ARRAY || st->type != GGUF_T_ARRAY ||
+        di->type != GGUF_T_ARRAY || ty->atype != GGUF_T_U32 || by->atype != GGUF_T_U64 || st->atype != GGUF_T_U64 ||
+        di->atype != GGUF_T_U64 || ty->n != 3 * st->n || by->n != 3 * st->n || di->n != 6 * st->n)
+        coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF: the colibri container's expert layout keys disagree");
+    *p = (st_gg_packed){ (const uint32_t *)ty->arr, (const uint64_t *)by->arr, (const uint64_t *)st->arr,
+                         (const uint64_t *)di->arr, (int)st->n };
+    return 1;
+}
+
 /* 1 when snap_dir is a gguf_import folder and S now indexes its GGUF, 0 when it is not one.
  * A broken GGUF or one of an architecture without a map is fatal (the folder says GGUF). */
 static int st_init_gguf(shards *S, const char *snap_dir) {
@@ -207,9 +231,42 @@ static int st_init_gguf(shards *S, const char *snap_dir) {
     if (!S->t) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "out of memory indexing the GGUF");
     int experts = 0, renamed = 0, kept = 0;
     char nm[512];
+    st_gg_packed pk = {0};
+    const int packed = st_gguf_packed(G, &pk);
     for (int i = 0; i < G->n_tensors; i++) {
         const gguf_tensor *t = &G->t[i];
         const char *hf = NULL; int L = -1, off = 0;
+        int pl = -1, pn = 0;
+        if (packed && sscanf(t->name, "blk.%d.ffn_exps_colibri%n", &pl, &pn) == 1 && !t->name[pn]) {
+            /* a layer's packed experts: each kind's matrices at their place in every slot */
+            static const char *kinds[3] = {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"};
+            if (pl < 0 || pl >= pk.layers || t->n_dims != 2 || (uint64_t)t->ne[0] != pk.stride[pl])
+                coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF %s: disagrees with the container's layout", t->name);
+            uint64_t inner = 0;
+            for (int k = 0; k < 3; k++) {
+                const char *kh = NULL;
+                for (const st_gg_name *e = map->layer; e->gg && !kh; e++) if (!strcmp(kinds[k], e->gg)) kh = e->hf;
+                if (!kh || !strstr(kh, "%d"))
+                    coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: this engine reads %s's routed experts as whole tensors, not "
+                                                          "a colibri container: import with --mode link", path, arch);
+                const uint64_t b = pk.bytes[3 * pl + k], cols = pk.dims[6 * pl + 2 * k], rows = pk.dims[6 * pl + 2 * k + 1];
+                const int64_t rb = gq_row_bytes((int)pk.types[3 * pl + k], (int64_t)cols);
+                if (rb < 0 || (uint64_t)rb * rows != b || inner + b > pk.stride[pl])
+                    coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF %s: matrix %d disagrees with the container's layout", t->name, k);
+                for (int64_t x = 0; x < t->ne[1]; x++) {
+                    char rest[256], pre[64];
+                    snprintf(rest, sizeof rest, kh, (int)x); snprintf(pre, sizeof pre, map->layer_fmt, pl);
+                    snprintf(nm, sizeof nm, "%s%s", pre, rest);
+                    st_tensor *s = st_gguf_add(S, nm);
+                    s->fd = fds[t->file]; s->off = (int64_t)(t->off + (uint64_t)x * pk.stride[pl] + inner); s->nbytes = (int64_t)b;
+                    s->dtype = st_gguf_dtype((int)pk.types[3 * pl + k]);
+                    s->rank = 2; s->shape[0] = (int64_t)rows; s->shape[1] = (int64_t)cols; s->numel = (int64_t)(rows * cols);
+                }
+                inner += b;
+                experts++;
+            }
+            continue;
+        }
         for (const st_gg_name *e = map->globals; e->gg && !hf; e++) if (!strcmp(t->name, e->gg)) hf = e->hf;
         if (!hf && sscanf(t->name, "blk.%d.%n", &L, &off) == 1 && L >= 0 && off)
             for (const st_gg_name *e = map->layer; e->gg && !hf; e++) if (!strcmp(t->name + off, e->gg)) hf = e->hf;
@@ -259,9 +316,10 @@ again:;
         S->hidx[h] = i;
     }
     st_gguf_active = 1;
-    fprintf(stderr, "[gguf] %s: %s, %d part(s), %d tensors under the checkpoint's names (%d renamed, %d fused expert "
-                    "tensors split per expert, %d kept as named), read in place\n",
-            path, arch, G->n_files, S->n, renamed, experts, kept);
+    fprintf(stderr, "[gguf] %s: %s, %d part(s), %d tensors under the checkpoint's names (%d renamed, %d %s per expert, "
+                    "%d kept as named), read in place\n",
+            path, arch, G->n_files, S->n, renamed, experts,
+            packed ? "matrices of the container's expert slots" : "fused expert tensors split", kept);
     return 1;
 }
 

@@ -12,14 +12,18 @@ Two modes, both lossless (the ggml blocks are used or copied as they are):
                    one expert per 4 KiB-aligned slot, gate | up | down
                    contiguous, so an expert is ONE aligned read instead of
                    three scattered ones. The original metadata is copied
-                   verbatim; colibri.* keys describe the new layout.
+                   verbatim; colibri.* keys describe the new layout. Every
+                   architecture with routed experts but qwen4exp (whose engine
+                   reads its GGUF in place only).
 
 Either way the directory is an ordinary colibri model: `coli chat`, `coli
 serve`, `coli web` and the planner treat it like any other.
 
 Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine), qwen35 (their
 dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engine), qwen3 (the dense
-Qwen3 -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine).
+Qwen3 -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
+Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
+glm53 engine).
 
 Usage:
   python3 tools/gguf_import.py MODEL.gguf OUT_DIR [--mode link|copy]
@@ -488,6 +492,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
+COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
 ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
@@ -614,17 +619,24 @@ def tokenizer_files(meta):
 def write_packed(parts, readers, meta, tensors, layers, out_path):
     n_exp = None
     kinds = ("gate", "up", "down")
-    per_layer = []
+    per_layer = []   # (tensors, bytes per expert, stride) of a layer with routed experts, else None
     for L in range(layers):
         ts = [tensors.get(f"blk.{L}.ffn_{k}_exps.weight") for k in kinds]
+        if all(t is None for t in ts):   # a dense layer: nothing to pack
+            per_layer.append(None)
+            continue
         if any(t is None for t in ts):
             sys.exit(f"layer {L}: fused expert tensors missing")
         e = int(ts[0]["dims"][2])
+        if n_exp and e != n_exp:
+            sys.exit(f"layer {L}: {e} experts, the layers before {n_exp}")
         n_exp = n_exp or e
         eb = [t["nbytes"] // e for t in ts]
         stride = (sum(eb) + ALIGN - 1) // ALIGN * ALIGN
         per_layer.append((ts, eb, stride))
-    expert_names = {f"blk.{L}.ffn_{k}_exps.weight" for L in range(layers) for k in kinds}
+    if not n_exp:
+        sys.exit("--mode copy: this model has no routed experts to pack; --mode link reads it in place")
+    expert_names = {f"blk.{L}.ffn_{k}_exps.weight" for L, pl in enumerate(per_layer) if pl for k in kinds}
     dense = [t for n, t in tensors.items() if n not in expert_names]
 
     kv, n_kv, _ = kv_section(parts[0])
@@ -640,9 +652,13 @@ def write_packed(parts, readers, meta, tensors, layers, out_path):
 
     extra.append(kv_str("colibri.layout", LAYOUT))
     extra.append(kv_str("colibri.source", os.path.basename(str(parts[0]))))
-    extra.append(kv_arr("colibri.expert_types", T_UINT32, "<I", [t["ggml_type"] for ts, _, _ in per_layer for t in ts]))
-    extra.append(kv_arr("colibri.expert_bytes", T_UINT64, "<Q", [b for _, eb, _ in per_layer for b in eb]))
-    extra.append(kv_arr("colibri.expert_stride", T_UINT64, "<Q", [s for _, _, s in per_layer]))
+    # per layer: the three matrices' types, bytes and [cols, rows]; a dense layer's are 0
+    none = ([None] * 3, [0] * 3, 0)
+    extra.append(kv_arr("colibri.expert_types", T_UINT32, "<I", [t["ggml_type"] if t else 0 for ts, _, _ in (pl or none for pl in per_layer) for t in ts]))
+    extra.append(kv_arr("colibri.expert_bytes", T_UINT64, "<Q", [b for _, eb, _ in (pl or none for pl in per_layer) for b in eb]))
+    extra.append(kv_arr("colibri.expert_stride", T_UINT64, "<Q", [s for _, _, s in (pl or none for pl in per_layer)]))
+    extra.append(kv_arr("colibri.expert_dims", T_UINT64, "<Q", [int(d) for ts, _, _ in (pl or none for pl in per_layer)
+                                                                for t in ts for d in ((t["dims"][0], t["dims"][1]) if t else (0, 0))]))
 
     # tensor infos: dense tensors as they were, then one packed tensor per layer
     infos, offsets, off = [], [], 0
@@ -650,7 +666,8 @@ def write_packed(parts, readers, meta, tensors, layers, out_path):
     for t in dense:
         off = align(off, ALIGN)
         infos.append((t["name"], t["dims"], t["ggml_type"])); offsets.append(off); off += t["nbytes"]
-    for L, (ts, eb, stride) in enumerate(per_layer):
+    packed = [(L, pl) for L, pl in enumerate(per_layer) if pl]
+    for L, (ts, eb, stride) in packed:
         off = align(off, ALIGN)
         infos.append((f"blk.{L}.ffn_exps_colibri", [stride, n_exp], GGML_I8)); offsets.append(off); off += stride * n_exp
     total = off
@@ -689,14 +706,14 @@ def write_packed(parts, readers, meta, tensors, layers, out_path):
         done = 0
         for t, o in zip(dense, offsets):
             copy(t["part"], t["abs_offset"], t["nbytes"], data0 + o)
-        for L, (ts, eb, stride) in enumerate(per_layer):
-            o = offsets[len(dense) + L]
+        for j, (L, (ts, eb, stride)) in enumerate(packed):
+            o = offsets[len(dense) + j]
             for e in range(n_exp):
                 slot = data0 + o + e * stride; inner = 0
                 for t, b in zip(ts, eb):
                     copy(t["part"], t["abs_offset"] + e * b, b, slot + inner); inner += b
             done += 1
-            print(f"\r  experts repacked: layer {done}/{layers}", end="", flush=True)
+            print(f"\r  experts repacked: layer {done}/{len(packed)}", end="", flush=True)
         out.truncate(data0 + total)
         for f in fds: f.close()
     print()
@@ -739,6 +756,8 @@ def main():
     arch = meta.get("general.architecture")
     if arch not in ARCHES:
         sys.exit(f"architecture {arch!r} is not supported yet (supported: {', '.join(ARCHES)})")
+    if args.mode == "copy" and arch in COPY_UNREAD:
+        sys.exit(f"--mode copy: the {arch} engine reads its GGUF in place only; --mode link (lossless, no copy) is the way")
     cfg, layers = ARCHES[arch](meta, tensors, {"indexer_compress_ratio": args.indexer_compress_ratio})
     mtp_file, mtp_where = None, None
     if arch == "qwen4exp" and not args.no_mtp:

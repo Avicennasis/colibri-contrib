@@ -1482,13 +1482,13 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     /* container detection: converted snapshots store experts as U8 + .qs.
      * rb13/rb2 = bytes per packed row (D/2|D and I/2|I for int4|int8) */
     int64_t I = c->moe_inter, E = c->n_experts;
-    /* a GGUF (st_gguf.h): mlp.experts.gate_proj / up_proj / down_proj in ggml types, each
+    /* a GGUF (st_gguf.h): mlp.experts.<e>.gate_proj / up_proj / down_proj in ggml types, each
      * layer its own; the slabs are sized for the largest (rb13 = half a gate+up row pair) */
     for (int i = layer_begin; i < layer_end; i++) if (c->sparse[i]) {
         const char *k3[3] = {"gate_proj", "up_proj", "down_proj"};
         st_tensor *tt[3];
         for (int k = 0; k < 3; k++) {
-            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%s", i, k3[k]);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.0.%s", i, k3[k]);
             tt[k] = st_find(&m->S, nm);
         }
         if (!tt[0]) break;   /* the checkpoint's gate_up_proj: not a GGUF */
@@ -1497,15 +1497,21 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             if (!m->gx_t || !m->gx_h) { fprintf(stderr, "OOM\n"); exit(1); }
         }
         for (int k = 0; k < 3; k++) {
-            if (!tt[k] || st_ggml_type_any(tt[k]->dtype) < 0) { fprintf(stderr, "layer %d: GGUF experts without mlp.experts.%s\n", i, k3[k]); exit(1); }
+            if (!tt[k] || st_ggml_type_any(tt[k]->dtype) < 0) { fprintf(stderr, "layer %d: GGUF experts without mlp.experts.0.%s\n", i, k3[k]); exit(1); }
             m->gx_t[3 * i + k] = st_ggml_type_any(tt[k]->dtype);
             m->gx_h[3 * i + k] = coli_ggml_held_type(m->gx_t[3 * i + k], k < 2 ? I : D, k < 2 ? D : I, "INK_ILV16");
         }
         int64_t rbg = gq_row_bytes(m->gx_t[3 * i], D), rbu = gq_row_bytes(m->gx_t[3 * i + 1], D),
                 rbd = gq_row_bytes(m->gx_t[3 * i + 2], I);
-        if (rbg < 0 || rbu < 0 || rbd < 0 || tt[0]->nbytes != E * I * rbg || tt[1]->nbytes != E * I * rbu ||
-            tt[2]->nbytes != E * D * rbd) {
-            fprintf(stderr, "layer %d: GGUF experts are not [%lld][%lld][%lld] of their types\n", i, (long long)E, (long long)I, (long long)D); exit(1);
+        if (rbg < 0 || rbu < 0 || rbd < 0 || tt[0]->nbytes != I * rbg || tt[1]->nbytes != I * rbu || tt[2]->nbytes != D * rbd) {
+            fprintf(stderr, "layer %d: GGUF experts are not [%lld][%lld] of their types\n", i, (long long)I, (long long)D); exit(1);
+        }
+        for (int64_t e = 1; e < E; e++) {   /* every expert there, of the layer's types */
+            for (int k = 0; k < 3; k++) {
+                snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%lld.%s", i, (long long)e, k3[k]);
+                const st_tensor *t = st_find(&m->S, nm);
+                if (!t || t->dtype != tt[k]->dtype || t->nbytes != tt[k]->nbytes) { fprintf(stderr, "layer %d: GGUF expert %lld missing or of another type\n", i, (long long)e); exit(1); }
+            }
         }
         m->gx = m->xq = 1;
         rbg = gq_row_bytes(m->gx_h[3 * i], D); rbu = gq_row_bytes(m->gx_h[3 * i + 1], D); rbd = gq_row_bytes(m->gx_h[3 * i + 2], I);
@@ -1708,15 +1714,15 @@ static void slot_fill(Model *m, int layer, Slot *s) {
         uint8_t *dst[3] = { s->p13, s->p13 + I * gq_row_bytes(h3[0], D), s->p2 };
         const char *k3[3] = {"gate_proj", "up_proj", "down_proj"};
         for (int k = 0; k < 3; k++) {
-            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%s", layer, k3[k]);
+            snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%lld.%s", layer, (long long)eid, k3[k]);
             st_tensor *t = st_find(&m->S, nm);
             const int64_t n = rows[k] * rb[k];
-            if (h3[k] == t3[k]) { pread_all(t->fd, dst[k], n, t->off + eid * n); continue; }
+            if (h3[k] == t3[k]) { pread_all(t->fd, dst[k], n, t->off); continue; }
             if (raw_n < n) {
                 free(raw); raw = malloc((size_t)n); raw_n = raw ? n : 0;
                 if (!raw) { fprintf(stderr, "OOM GGUF expert\n"); exit(1); }
             }
-            pread_all(t->fd, raw, n, t->off + eid * n);
+            pread_all(t->fd, raw, n, t->off);
             gq_r16_pack(h3[k], dst[k], raw, (int)rows[k], (int)cols[k]);
         }
         s->filled = 1;
