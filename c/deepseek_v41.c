@@ -75,7 +75,9 @@
 #include "cli_args.h"
 #include "compat.h"
 #include "json.h"
+#define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+#include "ggml_view.h"
 #include "quant.h"
 #include "sparse_attn.h"
 #include "omp_tune.h"
@@ -310,9 +312,14 @@ static void cfg_load(Cfg *c, const char *snap) {
 /* The dense trunk stays in the checkpoint's own formats: dequantizing fp8 to f32 at
  * load would turn 18 GB into 72 GB, which is the whole point of not doing it. Each
  * kernel below decodes as it multiplies. */
-typedef struct { uint8_t *q; uint8_t *s; int O, I; } W8;   /* e4m3 + 32x32 ue8m0 */
-typedef struct { uint16_t *w; int O, I; } WB;              /* bf16                */
-typedef struct { float *w; int64_t n; } WF;                /* f32                 */
+typedef struct { uint8_t *q; uint8_t *s; int O, I; int gx, gt; } W8;   /* e4m3 + 32x32 ue8m0 */
+typedef struct { uint16_t *w; int O, I; int gx, gt; uint8_t *g; } WB;  /* bf16                */
+typedef struct { float *w; int64_t n; } WF;                            /* f32                 */
+/* A GGUF's (st_gguf.h): a matrix in ggml blocks has gx = 1 and its blocks in q (W8) or g (WB),
+ * held as type gt (the file's, or its rows interleaved by 16: coli_ggml_held_type), and runs on
+ * ggml_quants.h's kernels on the CPU. A WB the file holds as F16 or F32 comes back to BF16 when
+ * every value is a BF16 value, as a converter writes them from a BF16 checkpoint; else it stays
+ * the file's floats, as ggml blocks. */
 
 #define FP8_TILE 32
 
@@ -323,6 +330,15 @@ static int v41_stats(void) {
     static int on = -1;
     if (on < 0) on = getenv("V41_STATS") ? atoi(getenv("V41_STATS")) : 0;
     return on;
+}
+
+/* GGUF_CHECK=1 ./deepseek_v41 on a gguf_import folder of a header only (tools/gguf_header.py):
+ * every tensor the engine loads checked for its name, type and bytes, none read and nothing
+ * sized for the model's context; then the tensors of the file it would not read. */
+static int g_v41_dry;
+static unsigned char *g_v41_used;   /* [S.n]: a tensor the check found the engine reading */
+static void v41_used(const shards *S, const st_tensor *t) {
+    if (g_v41_used && t && t >= S->t && t < S->t + S->n) g_v41_used[t - S->t] = 1;
 }
 
 /* V41_TRACE=1 prints a checksum of the tensors the reference prints too, so a
@@ -469,17 +485,44 @@ static void *v41_weight_alloc(size_t bytes, const char *name) {
     return xmalloc(bytes, name);
 }
 
+/* A GGUF matrix of ggml type `type` (the float ones too): its blocks as held, interleaved by 16
+ * rows where the type has that form (V41_ILV16=0, like GQ_EXACT=1, keeps the file's rows). */
+static uint8_t *v41_gx_read(shards *S, const st_tensor *t, const char *name, int type, int O, int I, int *held) {
+    /* an embedding is read a row at a time: the file's rows */
+    const int rows16 = !strstr(name, "embed");
+    const int64_t rb = gq_row_bytes(type, I);
+    if (rb < 0 || t->nbytes != rb * O) {
+        fprintf(stderr, "%s: %lld bytes, expected %d rows of %d in ggml type %s\n",
+                name, (long long)t->nbytes, O, I, gq_type_name(type)); exit(1); }
+    *held = rows16 ? coli_ggml_held_type(type, O, I, "V41_ILV16") : type;
+    if (g_v41_dry) { v41_used(S, t); return NULL; }
+    uint8_t *q = xmalloc((size_t)(gq_row_bytes(*held, I) * O), name);
+    if (*held == type) { st_read_raw_cap(S, name, q, t->nbytes, 0); return q; }
+    uint8_t *raw = xmalloc((size_t)t->nbytes, name);
+    st_read_raw_cap(S, name, raw, t->nbytes, 0);
+    gq_r16_pack(*held, q, raw, O, I);
+    free(raw);
+    return q;
+}
+
 static void w8_load(shards *S, W8 *w, const char *name, int O, int I) {
     char scale_name[512];
     snprintf(scale_name, sizeof(scale_name), "%.*s.scale",
              (int)(strlen(name) - strlen(".weight")), name);
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "%s: missing\n", name); exit(1); }
+    const int type = st_ggml_type_any(t->dtype);
+    if (type >= 0) {   /* a GGUF's: ggml blocks, or F16 (fp8 dequantized), no scale tensor */
+        w->O = O; w->I = I; w->gx = 1; w->s = NULL;
+        w->q = v41_gx_read(S, t, name, type, O, I, &w->gt);
+        return;
+    }
     if (t->nbytes != (int64_t)O * I) {
         fprintf(stderr, "%s: %lld bytes, expected %lld for [%d, %d] fp8\n",
                 name, (long long)t->nbytes, (long long)O * I, O, I); exit(1); }
     int tiles = ((O + FP8_TILE - 1) / FP8_TILE) * ((I + FP8_TILE - 1) / FP8_TILE);
-    w->O = O; w->I = I;
+    w->O = O; w->I = I; w->gx = 0; w->gt = -1;   /* written: some holders are not zeroed (VisionBlock) */
+    if (g_v41_dry) { v41_used(S, t); v41_used(S, st_find(S, scale_name)); w->q = w->s = NULL; return; }
     w->q = v41_weight_alloc((size_t)O * I, name);
     w->s = xmalloc((size_t)tiles, scale_name);
     st_read_raw_cap(S, name, w->q, (int64_t)O * I, 0);
@@ -489,13 +532,54 @@ static void w8_load(shards *S, W8 *w, const char *name, int O, int I) {
 #endif
 }
 
+/* F16 or F32 values back to BF16, n of them from src into dst (which may be src, for F16):
+ * 1 when every one is a BF16 value, so the conversion is exact; 0, and dst undefined, else. */
+static int v41_floats_to_bf16(uint16_t *dst, const void *src, int f16, int64_t n) {
+    int exact = 1;
+    for (int64_t i = 0; i < n; i++) {
+        float v;
+        if (f16) { uint16_t h; memcpy(&h, (const uint8_t *)src + 2 * i, 2); v = gq_f16(h); }
+        else memcpy(&v, (const uint8_t *)src + 4 * i, 4);
+        uint32_t bits; memcpy(&bits, &v, 4);
+        if (bits & 0xffffu) exact = 0;
+        dst[i] = (uint16_t)(bits >> 16);
+    }
+    return exact;
+}
+
 static void wb_load(shards *S, WB *w, const char *name, int O, int I) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "%s: missing\n", name); exit(1); }
+    const int type = t->dtype == 0 ? -1 : st_ggml_type_any(t->dtype);   /* 0: BF16, the checkpoint's */
+    if (type >= 0) {   /* a GGUF's */
+        w->O = O; w->I = I; w->gx = 0; w->g = NULL;
+        if (g_v41_dry && (type == GQ_F16 || type == GQ_F32) && t->nbytes == (int64_t)O * I * (type == GQ_F16 ? 2 : 4)) {
+            v41_used(S, t); w->w = NULL; return; }
+        if ((type == GQ_F16 || type == GQ_F32) && t->nbytes == (int64_t)O * I * (type == GQ_F16 ? 2 : 4)) {
+            const int64_t n = (int64_t)O * I;
+            w->w = xmalloc((size_t)n * 2, name);
+            int exact;
+            if (type == GQ_F16) {   /* converted in place: the same two bytes a value */
+                st_read_raw_cap(S, name, w->w, t->nbytes, 0);
+                exact = v41_floats_to_bf16(w->w, w->w, 1, n);
+            } else {
+                float *f = xmalloc((size_t)t->nbytes, name);
+                st_read_raw_cap(S, name, f, t->nbytes, 0);
+                exact = v41_floats_to_bf16(w->w, f, 0, n);
+                free(f);
+            }
+            if (exact) return;
+            free(w->w); w->w = NULL;   /* not BF16 values: the file's floats as they are */
+        }
+        w->gx = 1;
+        w->g = v41_gx_read(S, t, name, type, O, I, &w->gt);
+        return;
+    }
     if (t->nbytes != (int64_t)O * I * 2) {
         fprintf(stderr, "%s: %lld bytes, expected %lld for [%d, %d] bf16\n",
                 name, (long long)t->nbytes, (long long)O * I * 2, O, I); exit(1); }
-    w->O = O; w->I = I;
+    w->O = O; w->I = I; w->gx = 0; w->gt = -1; w->g = NULL;   /* written: some holders are not zeroed (VisionBlock) */
+    if (g_v41_dry) { v41_used(S, t); w->w = NULL; return; }
     w->w = v41_weight_alloc((size_t)O * I * 2, name);
     st_read_raw_cap(S, name, w->w, (int64_t)O * I * 2, 0);
 #ifdef COLI_VULKAN
@@ -505,6 +589,14 @@ static void wb_load(shards *S, WB *w, const char *name, int O, int I) {
 
 static void wf_load(shards *S, WF *w, const char *name, int64_t n) {
     w->n = n;
+    if (g_v41_dry) {
+        const st_tensor *t = st_find(S, name);
+        if (!t || t->numel != n || t->dtype > 2) {
+            fprintf(stderr, "%s: expected %lld floats\n", name, (long long)n); exit(1); }
+        v41_used(S, t);
+        w->w = xcalloc((size_t)n, sizeof(float), name);
+        return;
+    }
     w->w = xmalloc((size_t)n * sizeof(float), name);
     /* st_read_f32 widens bf16/f16 as well, so a checkpoint that stores one of these
      * small tensors in bf16 rather than f32 still loads.
@@ -628,6 +720,25 @@ static int vk_mul(int fmt, const void *data, const uint8_t *tiles, int O, int I,
 }
 #endif
 
+/* y = W x for `rows` positions, W a GGUF matrix (ggml blocks of held type `type`): the
+ * ggml_quants.h kernels, the activations quantized once for every row; x and y strided as
+ * mv8_rows takes them. */
+static void v41_gx_rows(float *y, int ystride, const uint8_t *q, int type, int O, int I,
+                        const float *x, int xstride, int rows) {
+    ColiTensorView v = {.format = COLI_TENSOR_GGML, .data = q, .rows = O, .columns = I,
+                        .block_columns = (uint32_t)type};
+    const int pack_x = rows > 1 && xstride != I, pack_y = rows > 1 && ystride != O;
+    float *xp = pack_x ? xmalloc((size_t)rows * I * sizeof(float), "gguf inputs") : NULL;
+    float *yp = pack_y ? xmalloc((size_t)rows * O * sizeof(float), "gguf outputs") : NULL;
+    for (int r = 0; pack_x && r < rows; r++)
+        memcpy(xp + (size_t)r * I, x + (size_t)r * xstride, (size_t)I * sizeof(float));
+    if (coli_ggml_matmul(pack_y ? yp : y, &v, pack_x ? xp : x, rows)) {
+        fprintf(stderr, "[v41] no kernel for a GGUF matrix of type %s\n", gq_type_name(type)); exit(1); }
+    for (int r = 0; pack_y && r < rows; r++)
+        memcpy(y + (size_t)r * ystride, yp + (size_t)r * O, (size_t)O * sizeof(float));
+    free(xp); free(yp);
+}
+
 /* y[O] = W [O, I] x[I], W in e4m3 with one ue8m0 scale per 32x32 tile.
  *
  * The dense trunk's matvec, and the reason it is worth vectorising: V4.1's
@@ -636,6 +747,7 @@ static int vk_mul(int fmt, const void *data, const uint8_t *tiles, int O, int I,
  * checkpoint, the attention block was 41% of a turn's wall clock -- more than
  * the expert reads from disk. A scalar byte-at-a-time decode was most of it. */
 static void mv8(float *y, const W8 *w, const float *x) {
+    if (w->gx) { v41_gx_rows(y, w->O, w->q, w->gt, w->O, w->I, x, w->I, 1); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(12, w->q, w->s, w->O, w->I, y, w->O, x, w->I, 1)) return;
     v41_dho_host(w->q);
@@ -688,6 +800,7 @@ static int mv_block_rows(int I) {
 }
 
 static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
+    if (w->gx) { v41_gx_rows(y, ystride, w->q, w->gt, w->O, w->I, x, xstride, rows); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(12, w->q, w->s, w->O, w->I, y, ystride, x, xstride, rows)) return;
     v41_dho_host(w->q);
@@ -734,6 +847,17 @@ static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xst
     }
 }
 
+/* Row `id` of an embedding as f32: BF16, or a GGUF's ggml row (the file's rows: v41_gx_read). */
+static void wb_row_f32(const WB *e, int64_t id, float *out) {
+    if (e->gx) {
+        if (gq_dequant_row(e->gt, e->g + id * gq_row_bytes(e->gt, e->I), out, e->I)) {
+            fprintf(stderr, "[v41] no row reader for ggml type %s\n", gq_type_name(e->gt)); exit(1); }
+        return;
+    }
+    const uint16_t *row = e->w + (size_t)id * e->I;
+    for (int i = 0; i < e->I; i++) out[i] = bf16_to_f32(row[i]);
+}
+
 static void mvb_cpu(float *y, const WB *w, const float *x) {
     int I = w->I;
     #pragma omp parallel for schedule(static)
@@ -754,6 +878,7 @@ static void mvb_cpu(float *y, const WB *w, const float *x) {
     }
 }
 static void mvb(float *y, const WB *w, const float *x) {
+    if (w->gx) { v41_gx_rows(y, w->O, w->g, w->gt, w->O, w->I, x, w->I, 1); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(11, w->w, NULL, w->O, w->I, y, w->O, x, w->I, 1)) return;
     v41_dho_host(w->w);
@@ -764,6 +889,7 @@ static void mvb(float *y, const WB *w, const float *x) {
  * per position), the one-position kernel row by row on the CPU, so the CPU bits are
  * mvb's. A prefill site that projected token by token calls this once instead. */
 static void mvb_rows(float *y, int ystride, const WB *w, const float *x, int xstride, int rows) {
+    if (w->gx) { v41_gx_rows(y, ystride, w->g, w->gt, w->O, w->I, x, xstride, rows); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(11, w->w, NULL, w->O, w->I, y, ystride, x, xstride, rows)) return;
     v41_dho_host(w->w);
@@ -779,6 +905,7 @@ static void mvb_rows(float *y, int ystride, const WB *w, const float *x, int xst
 typedef struct {
     int fd_w, fd_s;
     int64_t off_w, off_s, rows;
+    int inline_scales;   /* a GGUF's table: each row its head_dim e4m3 then its scales, one read */
     /* row cache: open addressing on the row id, LRU by a clock */
     int cap, mask;
     int64_t *key;      /* row id, -1 for empty */
@@ -893,7 +1020,8 @@ static void engram_table_open(EngramTable *t, shards *S, int layer, int head_dim
     st_tensor *w = st_find(S, name);
     snprintf(name, sizeof(name), "layers.%d.engram.embed.scale", layer);
     st_tensor *s = st_find(S, name);
-    if (!w || !s) { fprintf(stderr, "[engram] layer %d has no table\n", layer); exit(1); }
+    t->inline_scales = w && !s;   /* a GGUF (st_gguf.h): the scales at the end of each row */
+    if (!w || (!s && !t->inline_scales)) { fprintf(stderr, "[engram] layer %d has no table\n", layer); exit(1); }
     /* SEC: engram_row() reads row `id` at id * head_dim bytes into the table and at
      * id * head_dim/32 into its scales. head_dim comes from the sidecar and the two
      * sizes from the shards, and nothing held them together: a head_dim of 0 divided
@@ -903,15 +1031,27 @@ static void engram_table_open(EngramTable *t, shards *S, int layer, int head_dim
         fprintf(stderr, "[engram] head_dim %d is not a positive multiple of 32\n", head_dim);
         exit(1);
     }
-    if (w->nbytes % head_dim || s->nbytes != w->nbytes / head_dim * (head_dim / 32)) {
+    if (t->inline_scales) {
+        const int64_t row = head_dim + head_dim / 32;
+        if (w->nbytes % row) {
+            fprintf(stderr, "[engram] layer %d: a table of %lld bytes is not whole rows of %d e4m3 "
+                            "and %d scales\n", layer, (long long)w->nbytes, head_dim, head_dim / 32);
+            exit(1);
+        }
+        t->fd_w = t->fd_s = w->fd; t->off_w = t->off_s = w->off;
+        t->rows = w->nbytes / row;
+    } else if (w->nbytes % head_dim || s->nbytes != w->nbytes / head_dim * (head_dim / 32)) {
         fprintf(stderr, "[engram] layer %d: a table of %lld bytes and %lld scale bytes are "
                         "not whole rows of %d bytes with one scale per 32\n", layer,
                 (long long)w->nbytes, (long long)s->nbytes, head_dim);
         exit(1);
     }
-    t->fd_w = w->fd; t->off_w = w->off;
-    t->fd_s = s->fd; t->off_s = s->off;
-    t->rows = w->nbytes / head_dim;
+    if (!t->inline_scales) {
+        t->fd_w = w->fd; t->off_w = w->off;
+        t->fd_s = s->fd; t->off_s = s->off;
+        t->rows = w->nbytes / head_dim;
+    }
+    if (g_v41_dry) { v41_used(S, w); v41_used(S, s); cache_rows = 1; }
     int cap = 1;
     while (cap < cache_rows) cap <<= 1;
     t->cap = cap; t->mask = cap - 1;
@@ -948,11 +1088,16 @@ static const float *engram_row(EngramTable *t, int64_t id, int head_dim) {
 fill:
     t->misses++;
     {
-        uint8_t bytes[512], scales[64];
-        if (head_dim > (int)sizeof(bytes) || groups > (int)sizeof(scales)) {
+        uint8_t row[512 + 64], *bytes = row, *scales = row + 512;
+        if (head_dim > 512 || groups > 64) {
             fprintf(stderr, "[engram] head_dim %d exceeds the row buffer\n", head_dim); exit(1); }
-        st_pread_full(t->fd_w, bytes, head_dim, t->off_w + id * head_dim, "engram row");
-        st_pread_full(t->fd_s, scales, groups, t->off_s + id * groups, "engram scale");
+        if (t->inline_scales) {
+            st_pread_full(t->fd_w, row, head_dim + groups, t->off_w + id * (head_dim + groups), "engram row");
+            scales = row + head_dim;
+        } else {
+            st_pread_full(t->fd_w, bytes, head_dim, t->off_w + id * head_dim, "engram row");
+            st_pread_full(t->fd_s, scales, groups, t->off_s + id * groups, "engram scale");
+        }
         float *out = t->value + (size_t)victim * head_dim;
         for (int g = 0; g < groups; g++) {
             float scale = ue8m0(scales[g]);
@@ -1032,6 +1177,11 @@ typedef struct {
      * lands. Only the read path needs the windows. */
     uint8_t *base[V41_EXPERT_TENSORS];
     uint64_t used;
+    /* A GGUF's expert (Model.gx): each matrix's ggml type as held (w1, w3, w2), -1 for the
+     * checkpoint's FP4 and scales (an MXFP4 GGUF's are laid out so); and while the Vulkan
+     * tier reads one held interleaved, its file rows (vk_slot_src, dropped after). */
+    int gt[3];
+    uint8_t *vk_rows;
 } Slot;
 
 /* The six buffers of a slot, in the order expert_read_list emits them. */
@@ -1119,6 +1269,14 @@ typedef struct {
     shards S;
     Engram engram;
     Layer *L;
+    /* A GGUF (st_gguf.h; 0 for the checkpoint). gguf: the trunk is ggml blocks. gx: so are the
+     * routed experts, typed by layer: [layer * 3 + k] for k = w1, w3, w2, the file's type, the
+     * slots' (gx_h: interleaved by 16 rows where the type has that form, -1 for MXFP4 laid out
+     * as the checkpoint's FP4 and scales) and the file's bytes of one matrix. The slots are
+     * sized for the largest layer's (gx_part, the six parts of Slot). */
+    int gguf, gx;
+    int *gx_t, *gx_h;
+    int64_t *gx_len, gx_part[V41_EXPERT_TENSORS];
     WB embed, head;
     WF norm;
     LCache *cache;
@@ -1483,6 +1641,7 @@ typedef struct {
     Slot *slot;           /* whose window, and which of the six, to republish after */
     int part;
     int rep;
+    int gx_layer;         /* a GGUF expert's matrix: its layer (its type and form), else -1 */
 } ExpertRead;
 
 /* Bytes one part of an expert occupies, from the config rather than the file:
@@ -1495,6 +1654,70 @@ static int64_t expert_part_bytes(const Cfg *c, int part) {
     case 4: return (int64_t)c->dim * c->moe_inter / 2;                /* w2 */
     default: return (int64_t)c->dim * (c->moe_inter / 32);            /* its scale */
     }
+}
+/* What a slot's part holds: the checkpoint's, or a GGUF's largest layer's (v41_gx_geometry). */
+static int64_t slot_part_bytes(const Model *m, int part) {
+    return m->gx ? m->gx_part[part] : expert_part_bytes(&m->c, part);
+}
+/* 1 when a GGUF layer's slots hold a matrix in another form than the file's (interleaved by
+ * 16 rows, or MXFP4 as FP4 and scales): it is read through a copy, and the Vulkan tier reads
+ * the file's rows back. */
+static int v41_gx_conv(const Model *m, int layer, int k) {
+    return m->gx && m->gx_h[3 * layer + k] != m->gx_t[3 * layer + k];
+}
+static void v41_gx_shape(const Cfg *c, int k, int64_t *out) {   /* rows, columns of w1, w3, w2 */
+    out[0] = k == 2 ? c->dim : c->moe_inter; out[1] = k == 2 ? c->moe_inter : c->dim;
+}
+/* A GGUF's routed experts: their types by layer, from each layer's expert 0 (a layer's experts
+ * are one tensor in the file, so they share it), and the slots' sizes. */
+static void v41_gx_geometry(Model *m) {
+    const Cfg *c = &m->c;
+    static const char *const k3[3] = {"w1", "w3", "w2"};
+    const st_tensor *t = st_find(&m->S, "layers.0.ffn.experts.0.w1.weight");
+    m->gx = t && st_ggml_type_any(t->dtype) >= 0;
+    if (!m->gx) return;
+    const int L = c->n_layers;
+    m->gx_t = xmalloc((size_t)L * 3 * sizeof(int), "gguf expert types");
+    m->gx_h = xmalloc((size_t)L * 3 * sizeof(int), "gguf expert forms");
+    m->gx_len = xmalloc((size_t)L * 3 * sizeof(int64_t), "gguf expert bytes");
+    memset(m->gx_part, 0, sizeof m->gx_part);
+    int ilv = 0, mx = 0;
+    for (int i = 0; i < L; i++)
+        for (int k = 0; k < 3; k++) {
+            char name[160];
+            int64_t shape[2];
+            v41_gx_shape(c, k, shape);
+            snprintf(name, sizeof name, "layers.%d.ffn.experts.0.%s.weight", i, k3[k]);
+            t = st_find(&m->S, name);
+            const int type = t ? st_ggml_type_any(t->dtype) : -1;
+            const int64_t rb = type >= 0 ? gq_row_bytes(type, shape[1]) : -1;
+            if (!t || rb < 0 || t->nbytes != rb * shape[0]) {
+                fprintf(stderr, "%s: not %lld rows of %lld in a ggml type\n", name,
+                        (long long)shape[0], (long long)shape[1]); exit(1); }
+            int held = type;
+            int64_t w = t->nbytes, sc = 0;
+            if (type == GQ_MXFP4) { held = -1; w = shape[0] * shape[1] / 2; sc = shape[0] * shape[1] / 32; mx++; }
+            else {
+                held = coli_ggml_held_type(type, shape[0], shape[1], "V41_ILV16");
+                w = gq_row_bytes(held, shape[1]) * shape[0];
+                ilv += held != type;
+            }
+            m->gx_t[3 * i + k] = type; m->gx_h[3 * i + k] = held; m->gx_len[3 * i + k] = t->nbytes;
+            for (int e = 0; g_v41_dry && e < c->n_routed; e++) {   /* every expert, as a read would refuse it */
+                snprintf(name, sizeof name, "layers.%d.ffn.experts.%d.%s.weight", i, e, k3[k]);
+                const st_tensor *x = st_find(&m->S, name);
+                if (!x || x->dtype != t->dtype || x->nbytes != t->nbytes) {
+                    fprintf(stderr, "%s: missing, or not the type and bytes of the layer's expert 0\n", name); exit(1); }
+                v41_used(&m->S, x);
+            }
+            if (w > m->gx_part[2 * k]) m->gx_part[2 * k] = w;
+            if (sc > m->gx_part[2 * k + 1]) m->gx_part[2 * k + 1] = sc;
+        }
+    fprintf(stderr, "[v41] GGUF experts: %s gate/up, %s down (layer 0)", gq_type_name(m->gx_t[0]),
+            gq_type_name(m->gx_t[2]));
+    if (mx) fprintf(stderr, "; MXFP4 as the checkpoint's FP4");
+    if (ilv) fprintf(stderr, "; %d of %d matrices interleaved by 16 rows (V41_ILV16=0: the file's rows)", ilv, 3 * L);
+    fprintf(stderr, "\n");
 }
 
 /* Fill in the six reads that make up one expert. Naming them into a list instead
@@ -1510,8 +1733,9 @@ static int expert_read_list(Model *m, const char *kind, int layer, int eid, Slot
     static const char *const leaf[2] = { "weight", "scale" };
     char name[160];
     int n = 0;
+    const int gx = m->gx && !strcmp(kind, "layers");   /* a GGUF's: the three matrices, no scales */
     for (int i = 0; i < 3; i++) {
-        for (int f = 0; f < 2; f++) {
+        for (int f = 0; f < 2 - gx; f++) {
             snprintf(name, sizeof(name), "%s.%d.ffn.experts.%d.%s.%s",
                      kind, layer, eid, part[i].suffix, leaf[f]);
             const st_tensor *t = st_find(&m->S, name);
@@ -1520,6 +1744,7 @@ static int expert_read_list(Model *m, const char *kind, int layer, int eid, Slot
             out[n].slot = s;
             out[n].part = f ? part[i].scale_part : part[i].weight_part;
             out[n].rep = rep;
+            out[n].gx_layer = gx ? layer : -1;
             n++;
         }
     }
@@ -1593,7 +1818,9 @@ static void expert_fetch(Model *m, const char *kind, int layer,
      * more than that must not be read into it -- same refusal st_read_raw_cap
      * applied when the read went by name. */
     for (int i = 0; i < total; i++) {
-        int64_t cap = expert_part_bytes(&m->c, list[i].part);
+        int64_t cap = list[i].gx_layer >= 0 ? m->gx_len[3 * list[i].gx_layer + list[i].part / 2]
+                                            : expert_part_bytes(&m->c, list[i].part);
+        if (list[i].gx_layer >= 0 && list[i].t->nbytes != cap) cap = -1;   /* a GGUF layer's experts share a size */
         if (list[i].t->nbytes < 0 || list[i].t->nbytes > cap) {
             fprintf(stderr, "%s: expert tensor declares %lld bytes, the slot holds %lld — "
                             "refusing (untrusted container)\n", list[i].t->name,
@@ -1611,6 +1838,26 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     for (int i = 0; i < total; i++) {
         const ExpertRead *r = &list[i];
         int64_t pad = r->t->off % ST_DIRECT_ALIGN;
+        if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {
+            /* A GGUF matrix the slot holds in another form: read into a buffer of this
+             * thread's, then interleaved by 16 rows or laid out as FP4 and scales. */
+            static __thread uint8_t *raw; static __thread int64_t raw_n;
+            const int64_t need = r->t->nbytes + 2 * ST_DIRECT_ALIGN;
+            if (raw_n < need) {
+                compat_aligned_free(raw); raw = NULL; raw_n = 0;
+                if (posix_memalign((void **)&raw, ST_DIRECT_ALIGN, (size_t)need)) {
+                    fprintf(stderr, "OOM reading a GGUF expert\n"); exit(1); }
+                raw_n = need;
+            }
+            st_read_range_rep(&m->S, r->t->fd, r->rep, r->t->off, r->t->nbytes, raw + pad,
+                              r->t->nbytes, 1, expert_direct(), "pread expert");
+            const int k = r->part / 2, held = m->gx_h[3 * r->gx_layer + k];
+            int64_t shape[2];
+            v41_gx_shape(&m->c, k, shape);
+            if (held < 0) coli_mxfp4_unblock(r->slot->base[r->part + 1], r->slot->base[r->part], raw + pad,
+                                             shape[0] * shape[1] / 32);
+            else gq_r16_pack(held, r->slot->base[r->part], raw + pad, (int)shape[0], (int)shape[1]);
+        } else
         /* The payload pointer carries the slack st_read_range_rep needs to read
          * from the enclosing block boundary, so an O_DIRECT transfer lands the
          * data exactly where the slot wants it and nothing is copied afterwards. */
@@ -1628,12 +1875,23 @@ static void expert_fetch(Model *m, const char *kind, int layer,
     /* Publish the payload pointers only now. A slot that advertises an expert has
      * to address that expert, and until the read landed the window base was the
      * only pointer that meant anything. */
-    for (int i = 0; i < total; i++)
-        *slot_part(list[i].slot, list[i].part) =
-            list[i].slot->base[list[i].part] + (list[i].t->off % ST_DIRECT_ALIGN);
+    for (int i = 0; i < total; i++) {
+        const ExpertRead *r = &list[i];
+        if (r->gx_layer >= 0 && v41_gx_conv(m, r->gx_layer, r->part / 2)) {   /* the copy's own */
+            *slot_part(r->slot, r->part) = r->slot->base[r->part];
+            *slot_part(r->slot, r->part + 1) = m->gx_h[3 * r->gx_layer + r->part / 2] < 0 ? r->slot->base[r->part + 1] : NULL;
+        } else {
+            *slot_part(r->slot, r->part) = r->slot->base[r->part] + (r->t->off % ST_DIRECT_ALIGN);
+            if (r->gx_layer >= 0) *slot_part(r->slot, r->part + 1) = NULL;
+        }
+    }
     m->expert_bytes += bytes;
     m->t_disk += now_s() - started;
-    for (int i = 0; i < n; i++) slot[i]->eid = eid[i];
+    const int gx = m->gx && !strcmp(kind, "layers");
+    for (int i = 0; i < n; i++) {
+        slot[i]->eid = eid[i];
+        for (int k = 0; k < 3; k++) slot[i]->gt[k] = gx ? m->gx_h[3 * layer + k] : -1;
+    }
     free(list);
 }
 
@@ -1775,7 +2033,6 @@ static void spec_load(Model *m, int ecap);
 /* One layer's expert cache. The DSpark stages route over their own, smaller expert set
  * but the experts themselves are the same shape, so the slots are too. */
 static void cache_init(Model *m, LCache *cache, int ecap) {
-    Cfg *c = &m->c;
     cache->cap = ecap; cache->n = 0;
     cache->slot = xmalloc((size_t)ecap * sizeof(Slot), "expert slots");
     for (int k = 0; k < ecap; k++) {
@@ -1786,8 +2043,9 @@ static void cache_init(Model *m, LCache *cache, int ecap) {
          * lets st_read_range_rep turn an unaligned safetensors range into one
          * aligned O_DIRECT pread, instead of bouncing every expert through a
          * scratch buffer and copying it again (see the expert reader). */
+        s->gt[0] = s->gt[1] = s->gt[2] = -1; s->vk_rows = NULL;
         for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
-            size_t bytes = (size_t)expert_part_bytes(c, part) + ST_DIRECT_ALIGN;
+            size_t bytes = (size_t)slot_part_bytes(m, part) + ST_DIRECT_ALIGN;
             void *window = NULL;
             if (posix_memalign(&window, ST_DIRECT_ALIGN, bytes) != 0) {
                 fprintf(stderr, "OOM allocating expert window (%zu bytes)\n", bytes);
@@ -1961,6 +2219,7 @@ static void v41_dho_place(Model *m, int mark) {   /* mark: the layer just read (
 static void model_load(Model *m, const char *snap, int ecap, int engram_cache_rows) {
     Cfg *c = &m->c;
     cfg_load(c, snap);
+    if (g_v41_dry && c->max_positions > 4 * c->window) c->max_positions = 4 * c->window;   /* nothing runs */
     attn_project_check(c);
     /* Sized with the state it describes. CTX caps max_positions (#1526), so this
      * is one int per position the engine can actually hold, not per position the
@@ -1975,13 +2234,19 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
      * They compose: a mirror dir may copy any subset of the split's shards. */
     const char *extra_dirs = getenv("COLI_MODEL_DIRS");
     st_init_multi(&m->S, snap, (extra_dirs && *extra_dirs) ? extra_dirs : NULL);
+    if (g_v41_dry) g_v41_used = xcalloc((size_t)m->S.n + 1, 1, "tensors read");
     /* DUAL-SSD: register COLI_MODEL_MIRROR copies and settle the read split
      * before the first expert read, so nothing has been pulled from the primary
      * by the time the replicas exist. */
     mirror_setup(&m->S, snap, c->n_routed);
     engram_load_sidecar(&m->engram, snap);
+    {   /* a GGUF (st_gguf.h): the trunk's matrices, and the experts, in ggml blocks */
+        const st_tensor *t = st_find(&m->S, "layers.0.attn.wq_a.weight");
+        m->gguf = t && st_ggml_type_any(t->dtype) >= 0;
+        v41_gx_geometry(m);
+    }
 #ifdef COLI_VULKAN
-    v41_dho_open(m);   /* COLI_VK_DENSE_HOST: the trunk to the device as it is read, its host pages back */
+    if (!m->gguf) v41_dho_open(m);   /* COLI_VK_DENSE_HOST: the trunk to the device as it is read, its host pages back */
 #endif
 
     int dim = c->dim, hd = c->head_dim, nh = c->n_heads, hc = c->hc_mult;
@@ -2099,7 +2364,10 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
     /* expert cache: `ecap` slots per layer, each holding one expert's three matrices */
     m->ecap = ecap;
     m->cache = xmalloc((size_t)c->n_layers * sizeof(LCache), "expert caches");
-    for (int i = 0; i < c->n_layers; i++) cache_init(m, &m->cache[i], ecap);
+    for (int i = 0; i < c->n_layers; i++) {
+        if (g_v41_dry) { memset(&m->cache[i], 0, sizeof(LCache)); continue; }   /* nothing is read */
+        cache_init(m, &m->cache[i], ecap);
+    }
     spec_load(m, ecap);
     if (c->vision_layers > 0) {
         m->vision = xmalloc(sizeof(Vision), "vision tower");
@@ -2424,9 +2692,15 @@ static void attn_project_out_rows(Model *m, Layer *l, const float *heads, int ro
          * on a tile boundary -- which o_lora being a multiple of 32 is what makes
          * true, and what the fallback below covers when it is not. */
         W8 block;
-        block.q = l->wo_a.q + (size_t)g * c->o_lora * per_group;
-        block.s = l->wo_a.s + (size_t)(g * c->o_lora / FP8_TILE)
-                            * ((per_group + FP8_TILE - 1) / FP8_TILE);
+        block.gx = l->wo_a.gx; block.gt = l->wo_a.gt;
+        if (block.gx) {   /* a GGUF's: whole rows of blocks (o_lora, a multiple of 32, keeps 16-row groups whole) */
+            block.q = l->wo_a.q + (size_t)g * c->o_lora * (size_t)gq_row_bytes(block.gt, per_group);
+            block.s = NULL;
+        } else {
+            block.q = l->wo_a.q + (size_t)g * c->o_lora * per_group;
+            block.s = l->wo_a.s + (size_t)(g * c->o_lora / FP8_TILE)
+                                * ((per_group + FP8_TILE - 1) / FP8_TILE);
+        }
         block.O = c->o_lora;
         block.I = per_group;
         mv8_rows(grouped + (size_t)g * c->o_lora, width, &block,
@@ -2666,19 +2940,31 @@ static void swiglu_into(const Cfg *c, float *gate, const float *up, int64_t coun
  * arithmetic and not a second pass over the weights. Each output row is what the
  * one-at-a-time call produced, bit for bit: the S loop sits inside the row loop,
  * so a row's groups fold in the same order whatever else is in the block. */
-static void expert_ffn_rows(Model *m, const uint8_t *w1, const uint8_t *s1,
-                            const uint8_t *w3, const uint8_t *s3,
-                            const uint8_t *w2, const uint8_t *s2,
-                            const float *x, int rows, float *down) {
+/* One of an expert's matrices: FP4 and scales (type -1), or a GGUF's ggml blocks. */
+static void expert_mat(float *y, const uint8_t *w, const uint8_t *scales, int type,
+                       const float *x, int rows, int I, int O) {
+    if (type < 0) matmul_mxfp4(y, x, w, scales, rows, I, O);
+    else v41_gx_rows(y, O, w, type, O, I, x, I, rows);
+}
+static void expert_ffn_rows(Model *m, const Slot *s, const float *x, int rows, float *down) {
     Cfg *c = &m->c;
     int inter = c->moe_inter, dim = c->dim;
     float *gate = xmalloc((size_t)rows * inter * sizeof(float), "expert gate");
     float *up = xmalloc((size_t)rows * inter * sizeof(float), "expert up");
     double started = now_s();
-    matmul_mxfp4(gate, x, w1, s1, rows, dim, inter);
-    matmul_mxfp4(up,   x, w3, s3, rows, dim, inter);
+    if (s->gt[0] >= 0 && s->gt[1] >= 0) {   /* a GGUF's gate and up: one quantization of x for both */
+        ColiTensorView g = {.format = COLI_TENSOR_GGML, .data = s->w1, .rows = inter, .columns = dim,
+                            .block_columns = (uint32_t)s->gt[0]};
+        ColiTensorView u = g;
+        u.data = s->w3; u.block_columns = (uint32_t)s->gt[1];
+        if (coli_ggml_matmul2(gate, &g, up, &u, x, rows)) {
+            fprintf(stderr, "[v41] no kernel for a GGUF expert of type %s\n", gq_type_name(s->gt[0])); exit(1); }
+    } else {
+        expert_mat(gate, s->w1, s->s1, s->gt[0], x, rows, dim, inter);
+        expert_mat(up,   s->w3, s->s3, s->gt[1], x, rows, dim, inter);
+    }
     swiglu_into(c, gate, up, (int64_t)rows * inter);
-    matmul_mxfp4(down, gate, w2, s2, rows, inter, dim);
+    expert_mat(down, s->w2, s->s2, s->gt[2], gate, rows, inter, dim);
     m->t_expert += now_s() - started;
     free(up); free(gate);
 }
@@ -2764,9 +3050,35 @@ static void moe_gate(Model *m, Layer *l, int E, int topk, float *scores,
 static char g_vk_usage[2100];   /* the tier's history (vk_tier_start); empty = none */
 static void vk_tier_save(void) { if (g_vk_usage[0]) rt_save(g_vk_usage, 1); }
 
-static VktExpertSrc vk_slot_src(const Slot *s) {
-    return (VktExpertSrc){s->w1, s->w3, s->w2, s->s1, s->s3, s->s2};
+/* An expert as the tier reads it: the checkpoint's FP4 and scales (an MXFP4 GGUF's are laid
+ * out so), or a GGUF's blocks as the file has them; a matrix the slot holds interleaved by 16
+ * rows goes back to the file's rows in s->vk_rows, kept until vk_drop_rows (the tier's
+ * release, or right after a note). */
+static int vk_slot_ilv(const Slot *s) {
+    for (int k = 0; k < 3; k++) if (s->gt[k] >= 0 && gq_r16_base(s->gt[k]) >= 0) return 1;
+    return 0;
 }
+static VktExpertSrc vk_slot_src(const Model *m, Slot *s) {
+    if (!vk_slot_ilv(s)) return (VktExpertSrc){s->w1, s->w3, s->w2, s->s1, s->s3, s->s2};
+    const uint8_t *w[3] = {s->w1, s->w3, s->w2}, *out[3];
+    int64_t b[3], shape[3][2], total = 0;
+    for (int k = 0; k < 3; k++) {
+        v41_gx_shape(&m->c, k, shape[k]);
+        const int base = s->gt[k] >= 0 ? gq_r16_base(s->gt[k]) : -1;
+        b[k] = base >= 0 ? gq_row_bytes(base, shape[k][1]) * shape[k][0] : 0;
+        total += b[k];
+    }
+    if (!s->vk_rows && !(s->vk_rows = malloc((size_t)total))) {
+        fprintf(stderr, "OOM: a GGUF expert's rows for the Vulkan tier\n"); exit(1); }
+    uint8_t *at = s->vk_rows;
+    for (int k = 0; k < 3; k++) {
+        if (!b[k]) { out[k] = w[k]; continue; }
+        gq_r16_unpack(s->gt[k], at, w[k], (int)shape[k][0], (int)shape[k][1]);
+        out[k] = at; at += b[k];
+    }
+    return (VktExpertSrc){out[0], out[1], out[2], s->s1, s->s3, s->s2};
+}
+static void vk_drop_rows(Slot *s) { free(s->vk_rows); s->vk_rows = NULL; }
 
 /* The draws want[d] of a block on the CPU into contrib[d] = w x expert(x): moe_run_at's
  * expert-major union over those draws only. */
@@ -2800,8 +3112,7 @@ static void moe_vk_cpu(Model *m, LCache *cache, const char *kind, int layer, int
             int cnt = count[u0 + u], at = 0;
             for (int d = head[u0 + u]; d >= 0; d = next[d], at++)
                 memcpy(gathered + (size_t)at * dim, xc + (size_t)(d / topk) * dim, (size_t)dim * sizeof(float));
-            expert_ffn_rows(m, slot[u]->w1, slot[u]->s1, slot[u]->w3, slot[u]->s3,
-                            slot[u]->w2, slot[u]->s2, gathered, cnt, down);
+            expert_ffn_rows(m, slot[u], gathered, cnt, down);
             at = 0;
             for (int d = head[u0 + u]; d >= 0; d = next[d], at++) {
                 float w = weights[d];
@@ -2810,8 +3121,12 @@ static void moe_vk_cpu(Model *m, LCache *cache, const char *kind, int layer, int
                 for (int i = 0; i < dim; i++) dst[i] = w * src[i];
             }
             m->hits += (uint64_t)(cnt - 1);
-            VktExpertSrc src = vk_slot_src(slot[u]);
-            vkt_note(v41_tier_layer(m, kind, layer), uniq[u0 + u], &src);
+            const int tl = v41_tier_layer(m, kind, layer);
+            if (!vk_slot_ilv(slot[u]) || vkt_wants(tl, uniq[u0 + u])) {   /* converted only for the tier to take */
+                VktExpertSrc src = vk_slot_src(m, slot[u]);
+                vkt_note(tl, uniq[u0 + u], &src);
+                vk_drop_rows(slot[u]);
+            }
         }
     }
     free(down); free(gathered); free(uniq);
@@ -2865,13 +3180,13 @@ static int vk_load_batch(void *ctx, int layer, const int *e, int n, VktExpertSrc
     if (n < 1) return 0;
     Slot *slot[64];
     expert_slots_at(m, cache, "layers", layer, e, n, slot);
-    for (int u = 0; u < n; u++) { srcs[u] = vk_slot_src(slot[u]); h[u] = slot[u]; }
+    for (int u = 0; u < n; u++) { srcs[u] = vk_slot_src(m, slot[u]); h[u] = slot[u]; }
     return n;
 }
 static int vk_load(void *ctx, int layer, int e, VktExpertSrc *src, void **h) {
     return vk_load_batch(ctx, layer, &e, 1, src, h) == 1;
 }
-static void vk_unhold(void *ctx, void *h) { (void)ctx; (void)h; }
+static void vk_unhold(void *ctx, void *h) { (void)ctx; if (h) vk_drop_rows((Slot *)h); }
 #endif
 
 #ifdef V41_CLUSTER
@@ -3105,7 +3420,7 @@ static int cluster_worker_run(const char *snap, int port) {
                 Slot *s = expert_slot_at(&m, &m.cache[layer], "layers", (int)layer, items[j].eid);
                 int rows = items[j].nr;
                 float *y = xmalloc((size_t)rows * D * sizeof(float), "worker outputs");
-                expert_ffn_rows(&m, s->w1, s->s1, s->w3, s->s3, s->w2, s->s2, items[j].inputs, rows, y);
+                expert_ffn_rows(&m, s, items[j].inputs, rows, y);
                 v = (uint32_t)items[j].eid;
                 if (cluster_u32(cfd, &v, 1)) bad = 1;
                 v = (uint32_t)rows;
@@ -3202,8 +3517,7 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
                 float *down = xmalloc((size_t)dim * sizeof(float), "expert down");
                 for (int k = 0; k < topk; k++) {
                     Slot *s = expert_slot_at(m, cache, kind, layer, chosen[r * topk + k]);
-                    expert_ffn_rows(m, s->w1, s->s1, s->w3, s->s3, s->w2, s->s2,
-                                    xc + (size_t)r * dim, 1, down);
+                    expert_ffn_rows(m, s, xc + (size_t)r * dim, 1, down);
                     float w = weights[r * topk + k];
                     for (int i = 0; i < dim; i++) o[i] += w * down[i];
                 }
@@ -3264,8 +3578,7 @@ static void moe_run_at(Model *m, Layer *l, LCache *cache, const char *kind, int 
                 for (int d = head[u0 + u]; d >= 0; d = next[d], at++)
                     memcpy(gathered + (size_t)at * dim, xc + (size_t)(d / topk) * dim,
                            (size_t)dim * sizeof(float));
-                expert_ffn_rows(m, slot[u]->w1, slot[u]->s1, slot[u]->w3, slot[u]->s3,
-                                slot[u]->w2, slot[u]->s2, gathered, cnt, down);
+                expert_ffn_rows(m, slot[u], gathered, cnt, down);
                 at = 0;
                 for (int d = head[u0 + u]; d >= 0; d = next[d], at++) {
                     float w = weights[d];
@@ -3650,6 +3963,10 @@ static void spec_load(Model *m, int ecap) {
         fprintf(stderr, "[v41] no DSpark head in this checkpoint: drafts off\n");
         return;
     }
+    if (m->gx) {   /* the stages' slots would be a GGUF layer's (cache_init) */
+        fprintf(stderr, "[v41] a GGUF's DSpark head is not read yet: drafts off\n");
+        return;
+    }
     int dim = c->dim, hd = c->head_dim, nh = c->n_heads, hc = c->hc_mult;
     sp->stage = xmalloc((size_t)c->n_mtp * sizeof(Layer), "DSpark stages");
     memset(sp->stage, 0, (size_t)c->n_mtp * sizeof(Layer));
@@ -3825,10 +4142,9 @@ static int spec_step(Model *m, int token, int start_pos, int main_rows,
     float *h = xmalloc((size_t)block * hc * dim * sizeof(float), "spec streams");
     for (int i = 0; i < block; i++) {
         int id = i == 0 ? token : c->spec_noise;
-        const uint16_t *row = m->embed.w + (size_t)id * dim;
-        for (int copy = 0; copy < hc; copy++)
-            for (int j = 0; j < dim; j++)
-                h[((size_t)i * hc + copy) * dim + j] = bf16_to_f32(row[j]);
+        wb_row_f32(&m->embed, id, h + (size_t)i * hc * dim);
+        for (int copy = 1; copy < hc; copy++)
+            memcpy(h + ((size_t)i * hc + copy) * dim, h + (size_t)i * hc * dim, (size_t)dim * sizeof(float));
     }
     float *pre_mix = xmalloc((size_t)block * hc * sizeof(float), "spec pre mix");
     for (int i = 0; i < block; i++)
@@ -4031,8 +4347,7 @@ static void forward_full(Model *m, const int *ids, int n, float *logits, int spe
     float *h = xmalloc((size_t)n * hc * dim * sizeof(float), "residual streams");
     float *embedded = xmalloc((size_t)dim * sizeof(float), "embedding row");
     for (int t = 0; t < n; t++) {
-        const uint16_t *row = m->embed.w + (size_t)ids[t] * dim;
-        for (int i = 0; i < dim; i++) embedded[i] = bf16_to_f32(row[i]);
+        wb_row_f32(&m->embed, ids[t], embedded);
         /* An image span carries the placeholder id at every position; what each one
          * MEANS follows from the grid, exactly as image_processor.py lays it out:
          *   [start] then h rows of (w image tokens + newline) then [end].
@@ -4300,8 +4615,7 @@ static void forward_rows(Model *m, const int *slots, const int *ids, int n, floa
     m->rollback_save = 0; m->pub_rows = 0;
     float *h = xmalloc((size_t)n * hc * dim * sizeof(float), "residual streams");
     for (int t = 0; t < n; t++) {
-        const uint16_t *row = m->embed.w + (size_t)ids[t] * dim;
-        for (int i = 0; i < dim; i++) h[(size_t)t * hc * dim + i] = bf16_to_f32(row[i]);
+        wb_row_f32(&m->embed, ids[t], h + (size_t)t * hc * dim);
         for (int copy = 1; copy < hc; copy++)
             memcpy(h + ((size_t)t * hc + copy) * dim, h + (size_t)t * hc * dim, (size_t)dim * sizeof(float));
     }
@@ -5254,10 +5568,10 @@ static int vk_placed(const void *data) {   /* on the device already (the dense w
     return h && h->gone;
 }
 static size_t vk_w8_bytes(const W8 *w) {   /* as the device holds it: fmt 12, an f32 per 32 inputs */
-    if (vk_placed(w->q)) return 0;
+    if (w->gx || vk_placed(w->q)) return 0;   /* a GGUF's ggml blocks stay on the CPU */
     return w->q ? (size_t)w->O * w->I + (size_t)w->O * ((w->I + FP8_TILE - 1) / FP8_TILE) * 4 : 0;
 }
-static size_t vk_wb_bytes(const WB *w) { return w->w && !vk_placed(w->w) ? (size_t)w->O * w->I * 2 : 0; }
+static size_t vk_wb_bytes(const WB *w) { return !w->gx && w->w && !vk_placed(w->w) ? (size_t)w->O * w->I * 2 : 0; }
 /* The trunk the dense hook would put on the device, for the tier's budget. */
 static size_t vk_dense_bytes(Model *m) {
     if (!coli_vk_dense() || g_v41_partial) return 0;   /* a partial chain: the per-matrix path uploads nothing new */
@@ -5280,12 +5594,89 @@ static int vk_in_ram(void *ctx, int layer, int e) {
     for (int i = 0; i < cache->n; i++) if (cache->slot[i].eid == e) return 1;
     return 0;
 }
+/* A GGUF's experts on the tier as the file has them (shaders/blockdec.glsl), the forms by
+ * layer as published files mix them; MXFP4 ones as the checkpoint's FP4 the slots hold. Gate
+ * and up share a type and every type has a device form, or the tier stays off (0). The most
+ * common pair is the main form; *lgu / *ldn are the layers' when they differ, else NULL. */
+static int v41_vk_gguf_forms(const Model *m, VktFmt *gu, VktFmt *dn, VktFmt **lgu_out, VktFmt **ldn_out) {
+    const Cfg *c = &m->c;
+    const int L = c->n_layers;
+    const VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    const char *no = NULL;
+    VktFmt *lgu = malloc((size_t)L * sizeof *lgu), *ldn = malloc((size_t)L * sizeof *ldn);
+    if (!lgu || !ldn) no = "out of memory";
+    for (int l = 0; !no && l < L; l++) {
+        const int *t = m->gx_t + 3 * l;
+        if (t[0] != t[1]) { no = "gate and up differ in type"; break; }
+        for (int k = 0; k < 3 && !no; k += 2) {
+            VktFmt *to = k ? &ldn[l] : &lgu[l];
+            if (t[k] == GQ_MXFP4) { *to = f; continue; }
+            const int be = coli_vk_block_elems(100 + t[k]);
+            if (!be || (k ? c->moe_inter : c->dim) % be) no = "a type without a device form";
+            *to = (VktFmt){(VktSrc)(VKT_SRC_GGML + t[k]), 0};
+        }
+    }
+    int best = 0, bestn = 0, forms = 0;
+    for (int l = 0; !no && l < L; l++) {
+        int n = 0, first = 1;
+        for (int j = 0; j < L; j++) {
+            const int same = lgu[j].kind == lgu[l].kind && ldn[j].kind == ldn[l].kind;
+            n += same;
+            if (same && j < l) first = 0;
+        }
+        forms += first;
+        if (n > bestn) { bestn = n; best = l; }
+    }
+    if (!no && forms > VKT_FORMS - 1) no = "more distinct types than the tier holds";
+    if (no) {
+        fprintf(stderr, "[VK] tier deepseek_v41: the GGUF's experts: %s; the tier stays off\n", no);
+        free(lgu); free(ldn);
+        return 0;
+    }
+    *gu = lgu[best]; *dn = ldn[best];
+    fprintf(stderr, "[VK] tier deepseek_v41: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down",
+            gq_type_name(m->gx_t[3 * best]), gq_type_name(m->gx_t[3 * best + 2]));
+    if (forms > 1) fprintf(stderr, " on %d of %d layers, the others their own types", bestn, L);
+    fprintf(stderr, ")\n");
+    if (forms > 1) { *lgu_out = lgu; *ldn_out = ldn; }
+    else { free(lgu); free(ldn); }
+    return 1;
+}
+/* A GGUF expert read for the tier's warm start: the file's rows into one buffer (*buf, the
+ * caller frees it), an MXFP4 matrix as FP4 and scales. 0, or -1 (no memory). */
+static int v41_gx_expert_rows(Model *m, int layer, int eid, uint8_t **buf, VktExpertSrc *src) {
+    static const char *const k3[3] = {"w1", "w3", "w2"};
+    int64_t total = 0, shape[3][2];
+    for (int k = 0; k < 3; k++) {
+        v41_gx_shape(&m->c, k, shape[k]);
+        total += m->gx_len[3 * layer + k];
+        if (m->gx_t[3 * layer + k] == GQ_MXFP4) total += shape[k][0] * shape[k][1] / 2 + shape[k][0] * shape[k][1] / 32;
+    }
+    uint8_t *at = *buf = malloc((size_t)total);
+    if (!at) return -1;
+    const void *w[3], *sc[3] = {NULL, NULL, NULL};
+    for (int k = 0; k < 3; k++) {
+        char name[160];
+        const int64_t len = m->gx_len[3 * layer + k], n = shape[k][0] * shape[k][1];
+        snprintf(name, sizeof name, "layers.%d.ffn.experts.%d.%s.weight", layer, eid, k3[k]);
+        st_read_raw_cap(&m->S, name, at, len, 0);
+        if (m->gx_t[3 * layer + k] == GQ_MXFP4) {
+            uint8_t *codes = at + len, *scales = codes + n / 2;
+            coli_mxfp4_unblock(scales, codes, at, n / 32);
+            w[k] = codes; sc[k] = scales; at = scales + n / 32;
+        } else { w[k] = at; at += len; }
+    }
+    *src = (VktExpertSrc){w[0], w[1], w[2], sc[0], sc[1], sc[2]};
+    return 0;
+}
 static void vk_tier_start(Model *m, const char *snap, int cap) {
     Cfg *c = &m->c;
     if (!g_vk_ready || c->n_routed < 1 || !vkt_wanted()) return;
-    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32}, gu = f, dn = f;
+    VktFmt *lgu = NULL, *ldn = NULL;   /* a GGUF's forms by layer, when they differ */
+    if (m->gx && !v41_vk_gguf_forms(m, &gu, &dn, &lgu, &ldn)) return;
     size_t expert = 0;
-    for (int part = 0; part < V41_EXPERT_TENSORS; part++) expert += (size_t)expert_part_bytes(c, part);
+    for (int part = 0; part < V41_EXPERT_TENSORS; part++) expert += (size_t)slot_part_bytes(m, part);
     /* The DSpark stages (index n_layers + stage): their experts are the backbone's form,
      * the tier's extra layers. By default on a discrete GPU only: on a GPU that shares
      * the RAM, qwen38's head measured no faster there (docs/vulkan.md, "The MTP head's
@@ -5295,7 +5686,8 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
     int stages = want_mtp && m->spec.active && c->spec_routed <= c->n_routed && c->spec_activated <= MOE_TOPK_MAX ? c->n_mtp : 0;
     VktConfig vc = {.engine = "deepseek_v41", .layers = c->n_layers, .experts = c->n_routed,
                     .hidden = c->dim, .inter = c->moe_inter, .topk = c->n_activated,
-                    .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU, .act_limit = c->swiglu_limit,
+                    .gate_up = gu, .down = dn, .layer_gate_up = lgu, .layer_down = ldn,
+                    .act = VKT_ACT_SWIGLU, .act_limit = c->swiglu_limit,
                     .extra_layers = stages, .extra_gate_up = f, .extra_down = f,
                     .max_rows = MOE_ROW_CHUNK * c->n_activated,
                     .ram_reserve = expert * (size_t)cap * (size_t)c->n_layers,
@@ -5313,7 +5705,9 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
      * expert batch's pipelines before it can refuse (no room), and a driver still
      * compiling them at exit crashed one run in sixteen on Mesa's Dozen. */
     atexit(coli_vk_shutdown);
-    if (!vkt_init(&vc, rt_counts_all())) { rt_destroy(); g_vk_usage[0] = 0; return; }
+    const int tier_on = vkt_init(&vc, rt_counts_all());
+    free(lgu); free(ldn);   /* read during vkt_init only */
+    if (!tier_on) { rt_destroy(); g_vk_usage[0] = 0; return; }
     atexit(vkt_shutdown);
     int all = c->n_layers * c->n_routed;
     int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
@@ -5324,6 +5718,14 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
         static const char *const part[V41_EXPERT_TENSORS] = {"w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale"};
         #pragma omp parallel for schedule(dynamic, 4)
         for (int i = 0; i < n; i++) {
+            if (m->gx) {   /* a GGUF's: the file's rows */
+                uint8_t *rows = NULL;
+                VktExpertSrc src;
+                if (!v41_gx_expert_rows(m, pl[i], pe[i], &rows, &src)) vkt_put(pl[i], pe[i], &src);
+                else vkt_put(pl[i], pe[i], NULL);   /* no memory: the planned slot is given back */
+                free(rows);
+                continue;
+            }
             uint8_t *buf = malloc(expert), *at = buf, *p[V41_EXPERT_TENSORS];
             if (!buf) continue;
             for (int k = 0; k < V41_EXPERT_TENSORS; k++) {
@@ -5342,6 +5744,30 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
     free(pl); free(pe);
 }
 #endif
+
+/* GGUF_CHECK's verdict, once model_load has looked up everything it reads: 0 = every tensor
+ * the engine loads is in the file with its type and bytes and the file has nothing else, 3 =
+ * the file holds tensors the engine does not read (listed), 1 = a mismatch (the loader said
+ * which, and stopped). The router's ffn.gate.bias_vl the engine reads from no checkpoint. */
+static int v41_gguf_report(Model *m, const char *snap) {
+    const Cfg *c = &m->c;
+    int unused = 0, vl = 0;
+    double bytes = 0;
+    for (int i = 0; i < m->S.n; i++) {
+        bytes += (double)m->S.t[i].nbytes;
+        if (g_v41_used[i]) continue;
+        const char *name = m->S.t[i].name;
+        size_t n = strlen(name);
+        if (n > 17 && !strcmp(name + n - 17, ".ffn.gate.bias_vl")) { vl++; continue; }
+        if (++unused <= 20) fprintf(stderr, "  not read by the engine: %s\n", name);
+    }
+    if (vl) fprintf(stderr, "  not read, as from the checkpoint: %d x ffn.gate.bias_vl\n", vl);
+    if (unused) { printf("GGUF CHECK FAIL: %s | %d tensors the engine would not read (listed above)\n", snap, unused); return 3; }
+    printf("GGUF CHECK OK: %s | DeepSeek V4.1: %d layers, %d experts top-%d, dim %d, vocab %d, engram %s, "
+           "%d tensors, %.2f GB\n", snap, c->n_layers, c->n_routed, c->n_activated, c->dim, c->vocab,
+           m->engram.active ? "on" : "off", m->S.n, bytes / 1e9);
+    return 0;
+}
 
 int main(int argc, char **argv) {
     /* Size the team to PHYSICAL cores before anything else touches the model.
@@ -5388,7 +5814,10 @@ int main(int argc, char **argv) {
     Model m;
     memset(&m, 0, sizeof(m));
     double started = now_s();
+    const char *check = getenv("GGUF_CHECK");
+    g_v41_dry = check && *check && *check != '0';
     model_load(&m, snap, cap, engram_rows);
+    if (g_v41_dry) return v41_gguf_report(&m, snap);
     Cfg *c = &m.c;
     fprintf(stderr, "[v41] %d layers, %d experts/layer (%d routed), dim %d, hc %d, "
                     "window %d, engram %s — loaded in %.2fs\n",
@@ -5408,7 +5837,7 @@ int main(int argc, char **argv) {
         g_vk_ready = coli_vk_init_env_tier("deepseek_v41", vkt_wanted() && c->n_routed > 0);
         if (g_vk_ready) v41c_fit_now(&m);   /* how many layers the chain places, before any upload */
         const char *keep = getenv("COLI_VK_DENSE_HOST");
-        if (g_vk_ready && keep && *keep && atoi(keep) != 0) {
+        if (g_vk_ready && keep && *keep && atoi(keep) != 0 && !m.gguf) {
             coli_vk_dense_host_decide("deepseek_v41", v41_dense_on(&m, v41c_decide(&m)), v41_dho_bytes(&m, v41_dense_layers(&m)));
             if (g_v41_fit.L > 0) coli_vk_dense_host_layers(v41_dense_layers(&m), c->n_layers);
         }
