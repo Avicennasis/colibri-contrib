@@ -32,6 +32,19 @@ make -C c deepseek_v41
 coli chat --model ~/Models/DeepSeek-V4.1-Flash
 ```
 
+**DeepSeek-V4.1-Flash-1017** (October 17) is the same model with new weights: the same
+`config.json`, the same 96,085 tensors in the same formats, the same tokenizer and prompt
+encoding, byte for byte. It runs the same way:
+
+```sh
+hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir ~/Models/DeepSeek-V4.1-Flash-1017
+python3 c/tools/prepare_dsv41.py --model ~/Models/DeepSeek-V4.1-Flash-1017
+coli chat --model ~/Models/DeepSeek-V4.1-Flash-1017
+```
+
+It ships no `chat_template.jinja`, and nothing here needs one: the gateway writes V4.1's
+prompts itself (`render_chat_dsv41` in `openai_server.py`).
+
 `prepare_dsv41.py` writes the three tables the engine cannot derive at load time and
 that never change for a checkpoint: the compressed-token map (the tokenizer's
 normalizer collapses ids that hash alike), the bucket primes (one prime-sized range
