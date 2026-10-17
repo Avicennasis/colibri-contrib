@@ -226,6 +226,77 @@ def qwen3_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
+def deepseek4_config(meta, tensors, overrides=None):
+    """DeepSeek V4 (llama.cpp's deepseek4: V4 Flash, Flash 0731, Pro) as the deepseek_v4 engine's
+    config.json, the keys of the original checkpoint's (conversion/deepseek.py writes each from
+    one of them). The engine reads the tensors through st_gguf.h under their checkpoint names;
+    the GGUF of the model carries no MTP head (llama.cpp writes it to its own mtp-*.gguf)."""
+    p = "deepseek4."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count")) - int(meta.get(p + "nextn_predict_layers", 0))
+    gating = int(meta.get(p + "expert_gating_func", 4))
+    if gating != 4:
+        sys.exit(f"{p}expert_gating_func {gating}: the engine routes with sqrt(softplus) (4) only")
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    clamp = meta.get(p + "swiglu_clamp_exp") or [10.0]
+    ratios = [int(r) for r in need("attention.compress_ratios")]
+    if len(ratios) < layers:
+        sys.exit(f"{p}attention.compress_ratios has {len(ratios)} entries for {layers} layers")
+    cfg = {
+        "architectures": ["DeepseekV4ForCausalLM"],
+        "model_type": "deepseek_v4",
+        "torch_dtype": "bfloat16",
+        "expert_dtype": "fp4",
+        "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc",
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "num_attention_heads": int(need("attention.head_count")),
+        "num_key_value_heads": int(meta.get(p + "attention.head_count_kv", 1)),
+        "head_dim": int(need("attention.key_length")),
+        "q_lora_rank": int(need("attention.q_lora_rank")),
+        "qk_rope_head_dim": int(need("rope.dimension_count")),
+        "o_groups": int(need("attention.output_group_count")),
+        "o_lora_rank": int(need("attention.output_lora_rank")),
+        "sliding_window": int(need("attention.sliding_window")),
+        "index_n_heads": int(need("attention.indexer.head_count")),
+        "index_head_dim": int(need("attention.indexer.key_length")),
+        "index_topk": int(need("attention.indexer.top_k")),
+        "n_routed_experts": int(need("expert_count")),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "n_shared_experts": int(meta.get(p + "expert_shared_count", 1)),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "num_hash_layers": int(meta.get(p + "hash_layer_count", 0)),
+        "num_nextn_predict_layers": 0,
+        "hc_mult": int(need("hyper_connection.count")),
+        "hc_sinkhorn_iters": int(need("hyper_connection.sinkhorn_iterations")),
+        "vocab_size": int(emb["dims"][1]),
+        "max_position_embeddings": int(meta.get(p + "context_length", 1048576)),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-6)),
+        "hc_eps": float(meta.get(p + "hyper_connection.epsilon", 1e-6)),
+        "routed_scaling_factor": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "norm_topk_prob": bool(meta.get(p + "expert_weights_norm", True)),
+        "swiglu_limit": float(clamp[0]),
+        "rope_theta": float(meta.get(p + "rope.freq_base", 10000.0)),
+        "compress_rope_theta": float(need("attention.compress_rope_freq_base")),
+        "compress_ratios": ratios,
+        "rope_scaling": {
+            "type": meta.get(p + "rope.scaling.type", "yarn"),
+            "factor": float(meta.get(p + "rope.scaling.factor", 1.0)),
+            "original_max_position_embeddings": int(meta.get(p + "rope.scaling.original_context_length",
+                                                             meta.get(p + "context_length", 65536))),
+            "beta_fast": int(meta.get(p + "rope.scaling.yarn_beta_fast", 32)),
+            "beta_slow": int(meta.get(p + "rope.scaling.yarn_beta_slow", 1)),
+        },
+        "quantization_config": {"activation_scheme": "dynamic", "fmt": "e4m3", "scale_fmt": "ue8m0",
+                                "quant_method": "fp8", "weight_block_size": [128, 128]},
+        "tie_word_embeddings": False,
+        "bos_token_id": int(meta.get("tokenizer.ggml.bos_token_id", 0)),
+        "eos_token_id": int(meta.get("tokenizer.ggml.eos_token_id", 1)),
+    }
+    return cfg, layers
+
+
 def qwen4exp_config(meta, tensors, overrides=None):
     """Qwen3.8-Flash-Next (llama.cpp's qwen4exp) as the qwen38 engine's config.json. The
     PLE table is one tensor here (per_layer_token_embd), so split_ngram_parts is 1; its
@@ -307,7 +378,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the

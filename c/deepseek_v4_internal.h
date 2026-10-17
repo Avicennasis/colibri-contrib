@@ -15,7 +15,10 @@
 #include "native_quant_batch.h"
 #include "native_quant_dual.h"
 #include "native_quant_fp4_rows16.h"
+#define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+
+#include "ggml_view.h"   /* the FP8 and FP4 entries hand a GGUF matrix to coli_ggml_matmul */
 
 /* Worker count for the persistent expert-loader pool in the block pipeline
  * (deepseek_v4_block_pipeline.c). Shared here so the CLI can size the OpenMP
@@ -207,7 +210,24 @@ typedef struct {
      * This is an in-memory execution layout only; checkpoint bytes and scales
      * remain unchanged. */
     int packed_rows8;
+    /* A GGUF index holds the tensor as another dtype the loader converts back, losslessly
+     * (coli_v4_layer_plan_index): 1 = F32 values of a BF16 tensor, 2 = I32 of an I64. */
+    unsigned char convert;
 } ColiDeepSeekV4TensorSpec;
+
+/* The view of a resident GGUF matrix (a ggml-typed spec, st_gguf.h): its blocks as the file
+ * has them, no scale tensor beside them. */
+static inline int coli_v4_ggml_view(ColiTensorView *view, const void *data,
+                                    const ColiDeepSeekV4TensorSpec *spec) {
+    const int type = st_ggml_type(spec->dtype);
+    const int64_t row = gq_row_bytes(type, spec->shape[1]);
+    if (!data || spec->rank != 2 || row < 0) return -1;
+    *view = (ColiTensorView){
+        COLI_TENSOR_GGML, COLI_SCALE_NONE, data, NULL, (size_t)(row * spec->shape[0]), 0,
+        spec->shape[0], spec->shape[1], 1, (uint32_t)type, NULL
+    };
+    return 0;
+}
 
 typedef struct {
     int layer;
@@ -273,6 +293,9 @@ static inline uint64_t coli_v4_dense_tensor_bytes(const ColiDeepSeekV4TensorSpec
 int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
                        const ColiDeepSeekV4Config *config, int layer,
                        char *error, size_t error_size);
+/* Fit a plan to what a GGUF index holds (st_gguf.h); a safetensors one comes back as it is. */
+int coli_v4_layer_plan_index(ColiDeepSeekV4LayerPlan *plan,
+                             const ColiSafetensorsIndex *index);
 int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
                            const ColiSafetensorsIndex *index,
                            ColiDeepSeekV4LayerStats *stats,

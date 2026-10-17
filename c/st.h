@@ -706,8 +706,14 @@ static void st_scan_dir(const char *dir, char files[][1024], int *nf, int *added
  * drive holds that shard, so concurrent expert loads parallelise across drives
  * and combined capacity is used. Scales to N drives. Metadata (config /
  * tokenizer / .coli_usage / .coli_kv) is read from snap_dir only. */
+#ifdef ST_GGUF
+static int st_init_gguf(shards *S, const char *snap_dir);   /* st_gguf.h: a gguf_import folder */
+#endif
 static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dirs) {
     memset(S, 0, sizeof(*S));
+#ifdef ST_GGUF
+    if (st_init_gguf(S, snap_dir)) return;
+#endif
     S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
     /* Duplicate-tensor-name detector, indexed-shard scope.
      * st_find()/S->hidx (below) aren't built until every shard has been read, so a
@@ -1531,5 +1537,9 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     free(raw);
     if (drop && nb) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
 }
+
+#ifdef ST_GGUF
+#include "st_gguf.h"
+#endif
 
 #endif

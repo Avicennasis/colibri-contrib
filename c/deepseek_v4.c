@@ -748,6 +748,53 @@ int coli_v4_layer_plan(ColiDeepSeekV4LayerPlan *plan,
     return 0;
 }
 
+/* llama.cpp's converter (conversion/deepseek.py) writes the checkpoint's FP8 matrices
+ * dequantized and requantized to a ggml type (Q8_0 by default, any type in a requantized
+ * file) with no .scale beside them, keeps BF16 matrices as BF16 (or quantizes them in a
+ * requantized file), writes BF16 vectors as F32 (their values are still BF16) and the hash
+ * router's table as I32. The specs take what the index holds; nothing else changes. */
+int coli_v4_layer_plan_index(ColiDeepSeekV4LayerPlan *plan,
+                             const ColiSafetensorsIndex *index) {
+    if (!plan || !index) return -1;
+    size_t kept = 0;
+    for (size_t i = 0; i < plan->tensor_count; i++) {
+        ColiDeepSeekV4TensorSpec spec = plan->tensors[i];
+        const ColiSafetensorsTensor *t = coli_st_find(index, spec.name);
+        if (spec.dtype == COLI_ST_F8_E8M0) {   /* a .scale, gone when its matrix came as ggml blocks */
+            char weight[COLI_V4_MAX_TENSOR_NAME];
+            size_t length = strlen(spec.name);
+            if (length > 6 && !strcmp(spec.name + length - 6, ".scale")) {
+                snprintf(weight, sizeof weight, "%.*s.weight", (int)(length - 6), spec.name);
+                const ColiSafetensorsTensor *w = coli_st_find(index, weight);
+                if (!t && w && st_is_ggml(w->dtype)) continue;
+            }
+        } else if (t && st_is_ggml(t->dtype) &&
+                   (spec.dtype == COLI_ST_F8_E4M3 || (spec.dtype == COLI_ST_BF16 && spec.rank == 2))) {
+            spec.dtype = t->dtype;
+        } else if (t && spec.dtype == COLI_ST_BF16 && t->dtype == COLI_ST_F32) {
+            spec.convert = 1;
+        } else if (t && spec.dtype == COLI_ST_I64 && t->dtype == 7) {
+            spec.convert = 2;
+        }
+        plan->tensors[kept++] = spec;
+    }
+    plan->tensor_count = kept;
+    return 0;
+}
+
+/* The dtype the index holds for spec: what the loader reads before any conversion. */
+static int v4_spec_stored_dtype(const ColiDeepSeekV4TensorSpec *spec) {
+    return spec->convert == 1 ? COLI_ST_F32 : spec->convert == 2 ? 7 : spec->dtype;
+}
+/* Its bytes in RAM once loaded: E8M0 scales as float, conversions at the planned width. */
+static uint64_t v4_spec_resident_bytes(const ColiDeepSeekV4TensorSpec *spec,
+                                       const ColiSafetensorsTensor *tensor) {
+    if (tensor->dtype == COLI_ST_F8_E8M0) return (uint64_t)tensor->numel * sizeof(float);
+    if (spec->convert == 1) return (uint64_t)tensor->numel * 2;
+    if (spec->convert == 2) return (uint64_t)tensor->numel * 8;
+    return (uint64_t)tensor->nbytes;
+}
+
 int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
                            const ColiSafetensorsIndex *index,
                            ColiDeepSeekV4LayerStats *stats,
@@ -760,14 +807,13 @@ int coli_v4_layer_validate(const ColiDeepSeekV4LayerPlan *plan,
         const ColiSafetensorsTensor *tensor = coli_st_find(index, spec->name);
         if (!tensor)
             return set_error(error, error_size, "missing tensor: %s", spec->name);
-        if (tensor->dtype != spec->dtype || tensor->rank != spec->rank)
+        if (tensor->dtype != v4_spec_stored_dtype(spec) || tensor->rank != spec->rank)
             return set_error(error, error_size, "dtype/rank mismatch: %s", spec->name);
         for (int dimension = 0; dimension < spec->rank; dimension++)
             if (tensor->shape[dimension] != spec->shape[dimension])
                 return set_error(error, error_size, "shape mismatch: %s", spec->name);
         local.tensor_count++;
-        uint64_t resident_bytes = tensor->dtype == COLI_ST_F8_E8M0
-            ? (uint64_t)tensor->numel * sizeof(float) : (uint64_t)tensor->nbytes;
+        uint64_t resident_bytes = v4_spec_resident_bytes(spec, tensor);
         local.total_bytes += resident_bytes;
         switch (tensor->dtype) {
             case COLI_ST_BF16: local.bf16_bytes += tensor->nbytes; break;
@@ -914,14 +960,14 @@ int coli_v4_layer_load(ColiV4Engine *engine,
     if (!weights) return set_error(error, error_size, "missing layer weights output");
     memset(weights, 0, sizeof(*weights));
     if (coli_v4_layer_plan(&weights->plan, config, layer, error, error_size) != 0 ||
+        coli_v4_layer_plan_index(&weights->plan, index) != 0 ||
         coli_v4_layer_validate(&weights->plan, index, &weights->stats,
                                error, error_size) != 0)
         return -1;
     for (size_t i = 0; i < weights->plan.tensor_count; i++) {
         const ColiDeepSeekV4TensorSpec *spec = &weights->plan.tensors[i];
         const ColiSafetensorsTensor *tensor = coli_st_find(index, spec->name);
-        size_t resident_bytes = tensor->dtype == COLI_ST_F8_E8M0
-            ? (size_t)tensor->numel * sizeof(float) : (size_t)tensor->nbytes;
+        size_t resident_bytes = (size_t)v4_spec_resident_bytes(spec, tensor);
         weights->mapped[i] = g_v4_layer_map && coli_v4_dense_device_only_tensor(spec) &&
                              resident_bytes == coli_v4_dense_tensor_bytes(spec);
         weights->data[i] = weights->mapped[i] ? v4_map_alloc(resident_bytes) : malloc(resident_bytes);
@@ -930,7 +976,19 @@ int coli_v4_layer_load(ColiV4Engine *engine,
             coli_v4_layer_free(NULL, weights);
             return set_error(error, error_size, "out of memory loading: %s", spec->name);
         }
-        int read_failed = tensor->dtype == COLI_ST_F8_E8M0
+        int read_failed;
+        if (spec->convert) {   /* GGUF: F32 back to the BF16 it was, I32 to I64 */
+            void *stored = malloc((size_t)tensor->nbytes);
+            read_failed = !stored || coli_st_read_tensor(index, tensor, stored) != 0;
+            for (int64_t k = 0; !read_failed && k < tensor->numel; k++) {
+                if (spec->convert == 1) {
+                    uint32_t bits; memcpy(&bits, (const float *)stored + k, 4);
+                    bits += 0x7fffu + ((bits >> 16) & 1u);   /* round to nearest even: exact on BF16 values */
+                    ((uint16_t *)weights->data[i])[k] = (uint16_t)(bits >> 16);
+                } else ((int64_t *)weights->data[i])[k] = ((const int32_t *)stored)[k];
+            }
+            free(stored);
+        } else read_failed = tensor->dtype == COLI_ST_F8_E8M0
             ? st_read_scale_f32((ColiSafetensorsIndex *)index, spec->name,
                                 weights->data[i], tensor->numel, 0) != tensor->numel
             : coli_st_read_tensor(index, tensor, weights->data[i]) != 0;
@@ -1450,6 +1508,10 @@ static uint64_t expert_record_bytes(const ColiSafetensorsIndex *index) {
     uint64_t total = 0;
     for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
         const ColiSafetensorsTensor *tensor = coli_st_find(index, parts[i]);
+        if (!tensor && (i & 1)) {   /* a GGUF expert: its blocks carry their scales */
+            const ColiSafetensorsTensor *w = coli_st_find(index, parts[i - 1]);
+            if (w && st_is_ggml(w->dtype)) continue;
+        }
         if (!tensor || tensor->nbytes < 0) return 0;
         uint64_t bytes = (uint64_t)tensor->nbytes;
         if (UINT64_MAX - total < bytes) return 0;
@@ -1503,6 +1565,7 @@ static int build_runtime_plan(ColiV4Engine *engine,
         ColiDeepSeekV4LayerStats stats = {0};
         if (coli_v4_layer_plan(&layer_plan, config, layer,
                                error, error_size) ||
+            coli_v4_layer_plan_index(&layer_plan, index) ||
             coli_v4_layer_validate(&layer_plan, index, &stats,
                                    error, error_size))
             return -1;
@@ -2080,6 +2143,8 @@ static int fp8_view(ColiTensorView *view,
     const ColiDeepSeekV4TensorSpec *weight_spec = NULL, *scale_spec = NULL;
     snprintf(suffix, sizeof(suffix), "%s.weight", prefix);
     const void *data = layer_data(weights, suffix, &weight_spec);
+    if (data && weight_spec && st_is_ggml(weight_spec->dtype))   /* a GGUF matrix: no .scale beside it */
+        return coli_v4_ggml_view(view, data, weight_spec);
     snprintf(suffix, sizeof(suffix), "%s.scale", prefix);
     const void *scales = layer_data(weights, suffix, &scale_spec);
     if (!data || !scales || !weight_spec || !scale_spec ||
@@ -2572,6 +2637,8 @@ static int fp8_view(ColiTensorView *view,
     const ColiDeepSeekV4TensorSpec *weight_spec = NULL, *scale_spec = NULL;
     snprintf(suffix, sizeof(suffix), "%s.weight", prefix);
     const void *data = layer_data(weights, suffix, &weight_spec);
+    if (data && weight_spec && st_is_ggml(weight_spec->dtype))   /* a GGUF matrix: no .scale beside it */
+        return coli_v4_ggml_view(view, data, weight_spec);
     snprintf(suffix, sizeof(suffix), "%s.scale", prefix);
     const void *scales = layer_data(weights, suffix, &scale_spec);
     if (!data || !scales || !weight_spec || !scale_spec ||
@@ -3782,6 +3849,8 @@ static int fp8_view(ColiTensorView *view,
     const ColiDeepSeekV4TensorSpec *ws = NULL, *ss = NULL;
     snprintf(suffix, sizeof(suffix), "%s.weight", prefix);
     const void *data = value(weights, suffix, &ws);
+    if (data && ws && st_is_ggml(ws->dtype))   /* a GGUF matrix: no .scale beside it */
+        return coli_v4_ggml_view(view, data, ws);
     snprintf(suffix, sizeof(suffix), "%s.scale", prefix);
     const void *scales = value(weights, suffix, &ss);
     if (!data || !scales || !ws || !ss || ws->rank != 2 ||
@@ -4615,6 +4684,8 @@ static int fp8_view(ColiTensorView *view,
     const ColiDeepSeekV4TensorSpec *ws = NULL, *ss = NULL;
     snprintf(name, sizeof(name), "%s.weight", prefix);
     const void *data = value(weights, name, &ws);
+    if (data && ws && st_is_ggml(ws->dtype))   /* a GGUF matrix: no .scale beside it */
+        return coli_v4_ggml_view(view, data, ws);
     snprintf(name, sizeof(name), "%s.scale", prefix);
     const void *scales = value(weights, name, &ss);
     if (!data || !scales || !ws || !ss || ws->rank != 2) return -1;
@@ -6109,9 +6180,9 @@ static int v4_shared_expert_forward_batch_ref(
     const float *inputs, int batch, float swiglu_limit) {
     if (!outputs || !gate_weight || !down_weight || !up_weight || !inputs ||
         batch < 1 || batch > V4_EXPERT_BATCH_MAX || swiglu_limit < 0.0f ||
-        gate_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
-        down_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
-        up_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+        (gate_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK && gate_weight->format != COLI_TENSOR_GGML) ||
+        (down_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK && down_weight->format != COLI_TENSOR_GGML) ||
+        (up_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK && up_weight->format != COLI_TENSOR_GGML) ||
         gate_weight->rows != up_weight->rows ||
         gate_weight->columns != up_weight->columns ||
         down_weight->columns != gate_weight->rows ||
@@ -7272,6 +7343,8 @@ static int fp8_view(ColiTensorView *view,
     const ColiDeepSeekV4TensorSpec *ws = NULL, *ss = NULL;
     snprintf(suffix, sizeof(suffix), "%s.weight", prefix);
     const void *data = value(weights, suffix, &ws);
+    if (data && ws && st_is_ggml(ws->dtype))   /* a GGUF matrix: no .scale beside it */
+        return coli_v4_ggml_view(view, data, ws);
     snprintf(suffix, sizeof(suffix), "%s.scale", prefix);
     const void *scales = value(weights, suffix, &ss);
     if (!data || !scales || !ws || !ss || ws->rank != 2 ||
@@ -7753,6 +7826,8 @@ static int fp8_view(ColiTensorView *view,
     const ColiDeepSeekV4TensorSpec *weight_spec = NULL, *scale_spec = NULL;
     snprintf(suffix, sizeof(suffix), "%s.weight", prefix);
     const void *data = layer_data(weights, suffix, &weight_spec);
+    if (data && weight_spec && st_is_ggml(weight_spec->dtype))   /* a GGUF matrix: no .scale beside it */
+        return coli_v4_ggml_view(view, data, weight_spec);
     snprintf(suffix, sizeof(suffix), "%s.scale", prefix);
     const void *scales = layer_data(weights, suffix, &scale_spec);
     if (!data || !scales || !weight_spec || !scale_spec ||
@@ -8210,6 +8285,13 @@ typedef struct {
     uint64_t m_scale_bytes[V4_MATRIX_COUNT];
     uint64_t m_weight_offset[V4_MATRIX_COUNT];
     uint64_t m_weight_bytes[V4_MATRIX_COUNT];
+    /* A GGUF expert (st_gguf.h): its three slices of the fused tensors, m_weight_* above,
+     * read one after another into the slab (gguf = 1, no scale tensors). An MXFP4 one is
+     * the checkpoint's FP4 with its scale byte in each block of 32: after the read it is
+     * laid out as the checkpoint's [w1 w2 w3 scales | w1 w2 w3 codes] (mx = 1), bit for
+     * bit, and runs on the FP4 kernels; any other type runs on ggml_quants.h. */
+    int gguf, mx;
+    int ggml_type[V4_MATRIX_COUNT];
 } V4ExpertRecord;
 
 typedef struct {
@@ -8315,10 +8397,40 @@ static int build_record(V4ExpertStoreState *state, int layer, int expert,
         snprintf(name, sizeof(name), "layers.%d.ffn.experts.%d.%s.scale",
                  layer, expert, matrix_names[matrix]);
         record->scale[matrix] = coli_st_find(state->index, name);
+        const ColiSafetensorsTensor *w = record->weight[matrix];
+        if (w && !record->scale[matrix] && st_is_ggml(w->dtype)) {   /* GGUF */
+            if (w->rank != 2 || gq_row_bytes(st_ggml_type(w->dtype), w->shape[1]) < 0 ||
+                (matrix && !record->gguf))
+                return set_error(error, error_size, "invalid GGUF expert matrix: layer=%d expert=%d %s",
+                                 layer, expert, matrix_names[matrix]);
+            record->gguf = 1;
+            record->ggml_type[matrix] = st_ggml_type(w->dtype);
+            continue;
+        }
+        if (record->gguf)
+            return set_error(error, error_size, "GGUF expert with a checkpoint matrix: layer=%d expert=%d %s",
+                             layer, expert, matrix_names[matrix]);
         if (validate_matrix(record->weight[matrix], record->scale[matrix]) != 0)
             return set_error(error, error_size,
                              "invalid native FP4 expert matrix: layer=%d expert=%d %s",
                              layer, expert, matrix_names[matrix]);
+    }
+    if (record->gguf) {
+        record->per_matrix = 1;
+        record->mx = 1;
+        for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
+            const ColiSafetensorsTensor *w = record->weight[matrix];
+            int shard = coli_st_tensor_shard(state->index, w);
+            if (shard < 0)
+                return set_error(error, error_size, "expert shard lookup failed: layer=%d expert=%d", layer, expert);
+            record->m_weight_shard[matrix] = record->m_scale_shard[matrix] = shard;
+            record->m_weight_offset[matrix] = (uint64_t)w->off;
+            record->m_weight_bytes[matrix] = (uint64_t)w->nbytes;
+            record->record_bytes += (uint64_t)w->nbytes;
+            if (record->ggml_type[matrix] != GQ_MXFP4 || w->shape[1] % 32) record->mx = 0;
+        }
+        record->scale_shard = record->weight_shard = record->m_weight_shard[0];
+        return 0;
     }
     int scale_shard = -1, weight_shard = -1;
     int scale_range_contiguous = contiguous_group(record->scale, state->index,
@@ -8528,6 +8640,37 @@ static void fill_tensor_view(ColiTensorView *view,
     const ColiSafetensorsTensor *weight = record->weight[matrix];
     const ColiSafetensorsTensor *scale = record->scale[matrix];
     uint64_t scale_base = 0, weight_base = 0;
+    if (record->gguf) {
+        const int64_t rows = weight->shape[0], cols = weight->shape[1];
+        memset(view, 0, sizeof(*view));
+        view->rows = rows;
+        view->columns = cols;
+        if (record->mx) {   /* laid out as the checkpoint's FP4 by v4_mxfp4_layout */
+            for (int all = 0; all < V4_MATRIX_COUNT; all++) {
+                const ColiSafetensorsTensor *w = record->weight[all];
+                if (all < matrix) scale_base += (uint64_t)(w->shape[0] * w->shape[1] / 32);
+                if (all < matrix) weight_base += (uint64_t)(w->shape[0] * w->shape[1] / 2);
+                weight_base += (uint64_t)(w->shape[0] * w->shape[1] / 32);
+            }
+            view->format = COLI_TENSOR_FP4_NATIVE_BLOCK;
+            view->scale_format = COLI_SCALE_UE8M0;
+            view->data = slot->slab + weight_base;
+            view->scales = slot->slab + scale_base;
+            view->data_bytes = (size_t)(rows * cols / 2);
+            view->scale_bytes = (size_t)(rows * cols / 32);
+            view->block_rows = 1;
+            view->block_columns = 32;
+            return;
+        }
+        for (int prior = 0; prior < matrix; prior++) weight_base += record->m_weight_bytes[prior];
+        view->format = COLI_TENSOR_GGML;
+        view->scale_format = COLI_SCALE_NONE;
+        view->data = slot->slab + weight_base;
+        view->data_bytes = (size_t)record->m_weight_bytes[matrix];
+        view->block_rows = 1;
+        view->block_columns = (uint32_t)record->ggml_type[matrix];   /* the ggml type (tensor.h) */
+        return;
+    }
     if (record->per_matrix) {
         /* REAP fallback: slab packs per-matrix scales first, then weights. */
         for (int prior = 0; prior < matrix; prior++)
@@ -8876,7 +9019,9 @@ int coli_deepseek_v4_expert_store_open(
             if (build_record(state, layer, expert, record, error, error_size) != 0)
                 goto fail;
             if (!state->record_bytes) state->record_bytes = record->record_bytes;
-            if (record->record_bytes != state->record_bytes) {
+            if (record->gguf) {   /* a GGUF types its experts per layer: slots of the largest */
+                if (record->record_bytes > state->record_bytes) state->record_bytes = record->record_bytes;
+            } else if (record->record_bytes != state->record_bytes) {
                 set_error(error, error_size, "non-uniform expert size at layer=%d expert=%d",
                           layer, expert);
                 goto fail;
@@ -9208,9 +9353,66 @@ static int v4_read_per_matrix_segment(V4ExpertStoreState *state, int shard,
                                slot->slab + dest);
 }
 
+/* MXFP4 blocks of one matrix (rows x cols, a scale byte then 16 code bytes per 32 values,
+ * value j in the low nibble of byte j and j+16 in its high one) to the checkpoint's FP4:
+ * one scale byte per 32 values, and values 2i, 2i+1 in the low and high nibble of byte i.
+ * The codes and the scale bytes are the same (conversion/base.py repack_mxfp4_blocks is
+ * the inverse). */
+static void v4_mxfp4_to_fp4(unsigned char *scales, unsigned char *codes,
+                            const unsigned char *blocks, int64_t rows, int64_t cols) {
+    const int64_t nb = rows * (cols / 32);
+    for (int64_t b = 0; b < nb; b++) {
+        const unsigned char *src = blocks + b * 17;
+        unsigned char *dst = codes + b * 16;
+        scales[b] = src[0];
+        for (int i = 0; i < 16; i++) {
+            const int e0 = 2 * i, e1 = 2 * i + 1;   /* source byte e % 16, nibble e / 16 */
+            const unsigned lo = e0 < 16 ? src[1 + e0] & 15u : src[1 + e0 - 16] >> 4;
+            const unsigned hi = e1 < 16 ? src[1 + e1] & 15u : src[1 + e1 - 16] >> 4;
+            dst[i] = (unsigned char)(lo | hi << 4);
+        }
+    }
+}
+/* The three MXFP4 slices read back to back into the slab, laid out as fill_tensor_view
+ * expects an mx record: every matrix's scales, then every matrix's codes. */
+static int v4_mxfp4_layout(const V4ExpertRecord *record, unsigned char *slab) {
+    static __thread unsigned char *copy;
+    static __thread uint64_t copy_bytes;
+    if (copy_bytes < record->record_bytes) {
+        free(copy);
+        copy = malloc((size_t)record->record_bytes);
+        copy_bytes = copy ? record->record_bytes : 0;
+        if (!copy) return -1;
+    }
+    memcpy(copy, slab, (size_t)record->record_bytes);
+    uint64_t src = 0, scale_at = 0, code_at = 0;
+    for (int m = 0; m < V4_MATRIX_COUNT; m++)
+        code_at += (uint64_t)(record->weight[m]->shape[0] * record->weight[m]->shape[1] / 32);
+    for (int m = 0; m < V4_MATRIX_COUNT; m++) {
+        const int64_t rows = record->weight[m]->shape[0], cols = record->weight[m]->shape[1];
+        v4_mxfp4_to_fp4(slab + scale_at, slab + code_at, copy + src, rows, cols);
+        src += record->m_weight_bytes[m];
+        scale_at += (uint64_t)(rows * cols / 32);
+        code_at += (uint64_t)(rows * cols / 2);
+    }
+    return 0;
+}
+
 static int v4_read_expert_record(V4ExpertStoreState *state,
                                  const V4ExpertRecord *record,
                                  V4ExpertSlot *slot, int rep) {
+    if (record->gguf) {
+        int used_direct = 0, used_fallback = 0;
+        uint64_t cursor = 0;
+        for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
+            if (v4_read_per_matrix_segment(state, record->m_weight_shard[matrix], rep, slot, cursor,
+                                           record->m_weight_offset[matrix], record->m_weight_bytes[matrix],
+                                           &used_direct, &used_fallback) != 0)
+                return -1;
+            cursor += record->m_weight_bytes[matrix];
+        }
+        return record->mx ? v4_mxfp4_layout(record, slot->slab) : 0;
+    }
     if (record->per_matrix) {
         int used_direct = 0;
         int used_fallback = 0;
@@ -9331,6 +9533,7 @@ static int hot_pack_slot_locked(V4HotPolicy *policy,
     size_t slot_index = hot_slot_index(state, slot);
     if (policy->packed[slot_index]) return 0;
     if (!hot_rows16_wanted()) return -1;
+    if (record->gguf && !record->mx) return -1;   /* ggml blocks: no rows16 form */
     ColiTensorView gate, down, up;
     fill_tensor_view(&gate, record, slot, V4_W1);
     fill_tensor_view(&down, record, slot, V4_W2);
@@ -10286,9 +10489,9 @@ int coli_v4_shared_expert_forward_ref(float *output,
                                       const float *input,
                                       float swiglu_limit) {
     if (!output || !gate_weight || !down_weight || !up_weight || !input ||
-        gate_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
-        down_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
-        up_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+        (gate_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK && gate_weight->format != COLI_TENSOR_GGML) ||
+        (down_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK && down_weight->format != COLI_TENSOR_GGML) ||
+        (up_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK && up_weight->format != COLI_TENSOR_GGML) ||
         gate_weight->rows != up_weight->rows ||
         gate_weight->columns != up_weight->columns ||
         down_weight->columns != gate_weight->rows ||
@@ -17379,9 +17582,9 @@ int coli_v4_shared_expert_forward_ref(float *output,
                                       const float *input,
                                       float swiglu_limit) {
     if (!output || !gate_weight || !down_weight || !up_weight || !input ||
-        gate_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
-        down_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
-        up_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+        (gate_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK && gate_weight->format != COLI_TENSOR_GGML) ||
+        (down_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK && down_weight->format != COLI_TENSOR_GGML) ||
+        (up_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK && up_weight->format != COLI_TENSOR_GGML) ||
         gate_weight->rows != up_weight->rows ||
         gate_weight->columns != up_weight->columns ||
         down_weight->columns != gate_weight->rows ||
@@ -18553,6 +18756,7 @@ int coli_v4_config_load(ColiDeepSeekV4Config *config, const char *model_dir,
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
+#include "ggml_view.h"   /* GGUF matrices (COLI_TENSOR_GGML) */
 
 #include <float.h>
 #include <math.h>
@@ -19280,6 +19484,8 @@ void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
 
 int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
+    if (weight && weight->format == COLI_TENSOR_GGML)   /* a GGUF expert in another ggml type */
+        return coli_ggml_matmul(output, weight, input, 1);
     if (!output || !weight || !input ||
         weight->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
         weight->scale_format != COLI_SCALE_UE8M0 ||
@@ -19419,6 +19625,8 @@ ColiV4VkHost coli_v4_vk_host;
 
 int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
+    if (weight && weight->format == COLI_TENSOR_GGML)
+        return coli_ggml_matmul(output, weight, input, 1);
     if (!output || !input || fp8_matvec_validate(weight))
         return -1;
     size_t columns = (size_t)weight->columns;
@@ -19456,6 +19664,8 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
  * path, which does its own thing exactly as in _ref. Bit-identical. */
 int coli_fp8_matvec_pre(float *output, const ColiTensorView *weight,
                         const float *input, const float *activation) {
+    if (weight && weight->format == COLI_TENSOR_GGML)   /* the raw input: the kernels quantize their own */
+        return coli_ggml_matmul(output, weight, input, 1);
     if (!output || !input || !activation || fp8_matvec_validate(weight))
         return -1;
 #ifdef COLI_V4_GPU_TIER
@@ -19489,6 +19699,7 @@ int coli_fp8_matvec_pre(float *output, const ColiTensorView *weight,
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
+#include "ggml_view.h"   /* GGUF matrices (COLI_TENSOR_GGML) */
 
 static int dual_same_shape(const ColiTensorView *a, const ColiTensorView *b) {
     return a && b && a->rows == b->rows && a->columns == b->columns &&
@@ -19500,6 +19711,8 @@ int coli_fp4_dual_matvec_ref(float *output_a, float *output_b,
                              const ColiTensorView *a,
                              const ColiTensorView *b,
                              const float *input) {
+    if (a && b && (a->format == COLI_TENSOR_GGML || b->format == COLI_TENSOR_GGML))
+        return coli_fp4_matvec_ref(output_a, a, input) || coli_fp4_matvec_ref(output_b, b, input) ? -1 : 0;
     if (!output_a || !output_b || !input || !dual_same_shape(a, b) ||
         a->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
         b->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
@@ -19547,6 +19760,8 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
                              const ColiTensorView *a,
                              const ColiTensorView *b,
                              const float *input) {
+    if (a && b && (a->format == COLI_TENSOR_GGML || b->format == COLI_TENSOR_GGML))
+        return coli_fp8_matvec_ref(output_a, a, input) || coli_fp8_matvec_ref(output_b, b, input) ? -1 : 0;
     if (!output_a || !output_b || !input || !dual_same_shape(a, b) ||
         a->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
         b->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
@@ -19677,6 +19892,7 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
+#include "ggml_view.h"   /* GGUF matrices (COLI_TENSOR_GGML) */
 
 #ifdef COLI_V4_TEST_HOOKS
 uint64_t coli_v4_test_fp4_batch_calls;
@@ -19705,6 +19921,8 @@ static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
 
 int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                               const float *inputs, int batch) {
+    if (weight && weight->format == COLI_TENSOR_GGML)
+        return coli_ggml_matmul(outputs, weight, inputs, batch);
     if (!outputs || !inputs || fp8_batch_validate(weight, batch)) return -1;
     size_t columns = (size_t)weight->columns;
     size_t scale_columns = columns / 128;
@@ -19745,6 +19963,8 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
 int coli_fp8_matmul_batch_pre(float *outputs, const ColiTensorView *weight,
                               const float *inputs, const float *activations,
                               int batch) {
+    if (weight && weight->format == COLI_TENSOR_GGML)
+        return coli_ggml_matmul(outputs, weight, inputs, batch);
     if (!outputs || !inputs || !activations || fp8_batch_validate(weight, batch))
         return -1;
 #ifdef COLI_V4_GPU_TIER
@@ -19906,6 +20126,8 @@ int coli_fp8_grouped_matvec_ref(float *outputs, const ColiTensorView *weight,
 
 int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                               const float *inputs, int batch) {
+    if (weight && weight->format == COLI_TENSOR_GGML)
+        return coli_ggml_matmul(outputs, weight, inputs, batch);
     if (!outputs || !weight || !inputs || batch < 1 || batch > 128 ||
         weight->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
         weight->scale_format != COLI_SCALE_UE8M0 ||
