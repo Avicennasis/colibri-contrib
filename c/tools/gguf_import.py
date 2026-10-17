@@ -542,11 +542,14 @@ DEEPSEEK_SPLITS = ["\\p{N}{1,3}", "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
 O200K_SPLITS = ["[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
                 "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
                 "\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"]
-PRE_SPLITS = {"deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
+# cl100k's, as GLM-5.3-Flash's tokenizer.json has it (llama.cpp's "glm4")
+CL100K_SPLITS = ["(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|"
+                 "\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"]
+PRE_SPLITS = {"glm4": CL100K_SPLITS, "deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
               "hunyuan-dense": DEEPSEEK_SPLITS, "hy_v4": DEEPSEEK_SPLITS,
               "inkling": O200K_SPLITS, "gpt-4o": O200K_SPLITS}
 # BPE options of the tokenizer.json a family ships (the GGUF does not carry them)
-PRE_MODEL = {"inkling": {"ignore_merges": True}, "gpt-4o": {"ignore_merges": True}}
+PRE_MODEL = {"inkling": {"ignore_merges": True}, "gpt-4o": {"ignore_merges": True}, "glm4": {"ignore_merges": True}}
 
 
 def pre_tokenizer(pre):
@@ -596,6 +599,10 @@ def tokenizer_files(meta):
             "bos_token": name(ids["bos"]), "eos_token": name(ids["eos"]), "pad_token": name(ids["padding"]),
             "add_bos_token": bool(meta.get("tokenizer.ggml.add_bos_token", False))}
     eos = [int(ids["eos"])] if ids["eos"] is not None else []
+    for k in ("eot", "eom"):   # end of turn, end of message (GLM's <|user|>, <|observation|>)
+        i = meta.get(f"tokenizer.ggml.{k}_token_id")
+        if i is not None and int(i) not in eos:
+            eos.append(int(i))
     for extra in ("<|endoftext|>", "<|im_end|>"):
         if extra in toks and toks.index(extra) not in eos:
             eos.append(toks.index(extra))
