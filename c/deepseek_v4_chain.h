@@ -1362,6 +1362,11 @@ static int v4c_decide(const ColiV4Engine *engine) {
     if (!g_v4_vk_ready || !engine) return 0;
     int tier_on = vkt_wanted() && !(engine->experts && engine->experts->gpu) && engine->config.n_routed_experts > 0;
     g_v4c_decision = coli_vk_chain_decide("deepseek_v4", tier_on, COLI_VK_CHAIN_UNMEASURED);
+    if (g_v4c_decision && coli_v4_index_gguf(engine->target_index)) {
+        g_v4c_decision = 0;
+        fprintf(stderr, "[VK] deepseek_v4: the dense chain is off for a GGUF (its dense matrices are ggml blocks, kept on the CPU); "
+                        "the expert tier runs\n");
+    }
     if (g_v4c_decision && g_v4_mux_slots > 1) {
         g_v4c_decision = 0;
         fprintf(stderr, "[VK] deepseek_v4: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "

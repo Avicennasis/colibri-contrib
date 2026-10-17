@@ -1554,7 +1554,7 @@ static double v4_open_now_s(void) {
 
 static uint64_t expert_record_bytes(const ColiSafetensorsIndex *index) {
     const ColiSafetensorsTensor *w0 = coli_st_find(index, "layers.0.ffn.experts.0.w1.weight");
-    if (w0 && st_is_ggml(w0->dtype)) {   /* a GGUF types its experts per layer: the largest */
+    if (w0 && st_is_ggml(w0->dtype)) {   /* a GGUF types its experts per layer: the largest, as held */
         uint64_t largest = 0;
         for (int layer = 0;; layer++) {
             uint64_t total = 0;
@@ -1563,7 +1563,10 @@ static uint64_t expert_record_bytes(const ColiSafetensorsIndex *index) {
                 snprintf(name, sizeof name, "layers.%d.ffn.experts.0.w%d.weight", layer, m);
                 const ColiSafetensorsTensor *t = coli_st_find(index, name);
                 if (!t) return m == 1 && layer > 0 ? largest : 0;
-                total += (uint64_t)t->nbytes;
+                const int type = st_ggml_type(t->dtype);
+                const int held = t->rank == 2 ? coli_v4_gguf_held_type(type, t->shape[0], t->shape[1]) : type;
+                total += held == type ? (uint64_t)t->nbytes
+                                      : (uint64_t)(gq_row_bytes(held, t->shape[1]) * t->shape[0]);
             }
             if (total > largest) largest = total;
         }
@@ -8432,9 +8435,15 @@ typedef struct {
      * read one after another into the slab (gguf = 1, no scale tensors). An MXFP4 one is
      * the checkpoint's FP4 with its scale byte in each block of 32: after the read it is
      * laid out as the checkpoint's [w1 w2 w3 scales | w1 w2 w3 codes] (mx = 1), bit for
-     * bit, and runs on the FP4 kernels; any other type runs on ggml_quants.h. */
+     * bit, and runs on the FP4 kernels; any other type runs on ggml_quants.h, held in the
+     * slab as held_type (its rows interleaved by 16 where coli_v4_gguf_held_type says so,
+     * v4_gguf_interleave), held_bytes each; record_bytes is then their sum, file_bytes the
+     * read's. */
     int gguf, mx;
     int ggml_type[V4_MATRIX_COUNT];
+    int held_type[V4_MATRIX_COUNT];
+    uint64_t held_bytes[V4_MATRIX_COUNT];
+    uint64_t file_bytes;
 } V4ExpertRecord;
 
 typedef struct {
@@ -8569,8 +8578,16 @@ static int build_record(V4ExpertStoreState *state, int layer, int expert,
             record->m_weight_shard[matrix] = record->m_scale_shard[matrix] = shard;
             record->m_weight_offset[matrix] = (uint64_t)w->off;
             record->m_weight_bytes[matrix] = (uint64_t)w->nbytes;
-            record->record_bytes += (uint64_t)w->nbytes;
+            record->file_bytes += (uint64_t)w->nbytes;
             if (record->ggml_type[matrix] != GQ_MXFP4 || w->shape[1] % 32) record->mx = 0;
+        }
+        for (int matrix = 0; matrix < V4_MATRIX_COUNT; matrix++) {
+            const ColiSafetensorsTensor *w = record->weight[matrix];
+            const int type = record->ggml_type[matrix];
+            record->held_type[matrix] = record->mx ? type : coli_v4_gguf_held_type(type, w->shape[0], w->shape[1]);
+            record->held_bytes[matrix] = record->held_type[matrix] == type ? (uint64_t)w->nbytes
+                : (uint64_t)(gq_row_bytes(record->held_type[matrix], w->shape[1]) * w->shape[0]);
+            record->record_bytes += record->held_bytes[matrix];
         }
         record->scale_shard = record->weight_shard = record->m_weight_shard[0];
         return 0;
@@ -8805,13 +8822,13 @@ static void fill_tensor_view(ColiTensorView *view,
             view->block_columns = 32;
             return;
         }
-        for (int prior = 0; prior < matrix; prior++) weight_base += record->m_weight_bytes[prior];
+        for (int prior = 0; prior < matrix; prior++) weight_base += record->held_bytes[prior];
         view->format = COLI_TENSOR_GGML;
         view->scale_format = COLI_SCALE_NONE;
         view->data = slot->slab + weight_base;
-        view->data_bytes = (size_t)record->m_weight_bytes[matrix];
+        view->data_bytes = (size_t)record->held_bytes[matrix];
         view->block_rows = 1;
-        view->block_columns = (uint32_t)record->ggml_type[matrix];   /* the ggml type (tensor.h) */
+        view->block_columns = (uint32_t)record->held_type[matrix];   /* the ggml type (tensor.h) */
         return;
     }
     if (record->per_matrix) {
@@ -9170,6 +9187,16 @@ int coli_deepseek_v4_expert_store_open(
                 goto fail;
             }
         }
+    }
+    if (state->records[0].gguf) {   /* a GGUF's experts: how many layers the CPU reads interleaved */
+        int ilv = 0;
+        for (int layer = 0; layer < state->layers; layer++) {
+            const V4ExpertRecord *r = &state->records[(size_t)layer * state->experts_per_layer];
+            for (int m = 0; m < V4_MATRIX_COUNT; m++)
+                if (r->held_type[m] != r->ggml_type[m]) { ilv++; break; }
+        }
+        if (ilv) fprintf(stderr, "v4_gguf experts interleaved by 16 rows on %d of %d layers "
+                                 "(COLI_V4_ROWS16=0: the file's rows)\n", ilv, state->layers);
     }
     state->slots_per_layer = (int)(options->cache_bytes /
         ((uint64_t)state->layers * state->record_bytes));
@@ -9541,6 +9568,41 @@ static int v4_mxfp4_layout(const V4ExpertRecord *record, unsigned char *slab) {
     return 0;
 }
 
+/* The file's rows of a GGUF record, read back to back into the slab, into the slab's
+ * layout (fill_tensor_view): each matrix as held_type at the sum of the held bytes before
+ * it, interleaved by 16 (gq_r16_pack) through a copy where the record holds it so. Last
+ * matrix first: a matrix's place starts at or after its file offset (held bytes are as many
+ * or a few percent more), so it overwrites only rows already moved. */
+static int v4_gguf_interleave(const V4ExpertRecord *record, unsigned char *slab) {
+    static __thread unsigned char *copy;
+    static __thread uint64_t copy_bytes;
+    uint64_t file_at[V4_MATRIX_COUNT], held_at[V4_MATRIX_COUNT], f = 0, h = 0;
+    int packed = 0;
+    for (int m = 0; m < V4_MATRIX_COUNT; m++) {
+        file_at[m] = f; held_at[m] = h;
+        f += record->m_weight_bytes[m]; h += record->held_bytes[m];
+        packed |= record->held_type[m] != record->ggml_type[m];
+    }
+    if (!packed) return 0;
+    for (int m = V4_MATRIX_COUNT - 1; m >= 0; m--) {
+        const uint64_t bytes = record->m_weight_bytes[m];
+        if (record->held_type[m] == record->ggml_type[m]) {
+            if (held_at[m] != file_at[m]) memmove(slab + held_at[m], slab + file_at[m], (size_t)bytes);
+            continue;
+        }
+        if (copy_bytes < bytes) {
+            free(copy);
+            copy = malloc((size_t)bytes);
+            copy_bytes = copy ? bytes : 0;
+            if (!copy) return -1;
+        }
+        memcpy(copy, slab + file_at[m], (size_t)bytes);
+        gq_r16_pack(record->held_type[m], slab + held_at[m], copy,
+                    (int)record->weight[m]->shape[0], (int)record->weight[m]->shape[1]);
+    }
+    return 0;
+}
+
 static int v4_read_expert_record(V4ExpertStoreState *state,
                                  const V4ExpertRecord *record,
                                  V4ExpertSlot *slot, int rep) {
@@ -9556,11 +9618,11 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
         }
         if (used_direct && !used_fallback) {
             __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
-            __atomic_fetch_add(&v4_direct_payload_bytes, record->record_bytes, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&v4_direct_payload_bytes, record->file_bytes, __ATOMIC_RELAXED);
         } else if (used_fallback) {
             __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1), __ATOMIC_RELAXED);
         }
-        return record->mx ? v4_mxfp4_layout(record, slot->slab) : 0;
+        return record->mx ? v4_mxfp4_layout(record, slot->slab) : v4_gguf_interleave(record, slot->slab);
     }
     if (record->per_matrix) {
         int used_direct = 0;
@@ -10167,6 +10229,18 @@ int coli_v4_expert_store_in_ram(ColiExpertStore *store, ColiExpertKey key) {
 uint64_t coli_v4_expert_store_record_bytes(ColiExpertStore *store) {
     return store && store->state && hot_find(store)
         ? ((V4ExpertStoreState *)store->state)->record_bytes : 0;
+}
+
+int coli_v4_expert_store_gguf_form(ColiExpertStore *store, int layer, int types[3], int *mx) {
+    if (!store || !store->state || !hot_find(store)) return -1;
+    V4ExpertStoreState *state = store->state;
+    if (layer < 0 || layer >= state->layers || state->experts_per_layer < 1) return -1;
+    const V4ExpertRecord *record = &state->records[(size_t)layer * state->experts_per_layer];
+    if (!record->gguf) return 0;
+    types[0] = record->ggml_type[V4_W1]; types[1] = record->ggml_type[V4_W3];
+    types[2] = record->ggml_type[V4_W2];
+    *mx = record->mx;
+    return 1;
 }
 
 int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
@@ -11861,6 +11935,9 @@ static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
     if (view->gate.block_rows != 1 || view->up.block_rows != 1 ||
         view->down.block_rows != 1)
         return -1;
+    if (view->gate.format != COLI_TENSOR_FP4_NATIVE_BLOCK || view->up.format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
+        view->down.format != COLI_TENSOR_FP4_NATIVE_BLOCK)
+        return -1;   /* a GGUF expert in another ggml type: the CPU's */
     /* A layer attaches its 6 routed experts before computing them; a cache
      * smaller than that would recycle a slot still referenced by an earlier
      * view of the same token (measured: DSV4_CUDA_EXPERT_MIRRORS=1 produces
@@ -13501,34 +13578,60 @@ static void v4_vkt_unpack16(unsigned char *rows, const unsigned char *packed,
             rows[row * stride + column] =
                 packed[((row / 16) * stride + column) * 16 + row % 16];
 }
-static void v4_vkt_note(const ColiExpertView *view) {
-    if (!v4_vkt_thread()) return;
-    int layer = view->key.layer, expert = view->key.expert;
+/* A GGUF matrix the store holds interleaved by 16 (coli_v4_gguf_held_type): the device
+ * reads the file's rows. */
+static int v4_vkt_ggml_r16(const ColiTensorView *m) {
+    return m->format == COLI_TENSOR_GGML && gq_r16_base((int)m->block_columns) >= 0;
+}
+/* An expert as the tier reads it: rows, as the checkpoint or the GGUF has them. A hot
+ * one the store keeps in rows16, or a GGUF one held interleaved by 16, goes back to rows
+ * in *buffer (the caller frees it); else *src points into the view and *buffer is NULL.
+ * 0, or -1 (no memory). */
+static int v4_vkt_rows(const ColiExpertView *view, VktExpertSrc *src, unsigned char **buffer) {
     const ColiTensorView *m[3] = {&view->gate, &view->up, &view->down};
-    if (m[0]->block_rows != 16 && m[1]->block_rows != 16 && m[2]->block_rows != 16) {
-        VktExpertSrc src = {m[0]->data, m[1]->data, m[2]->data,
-                            m[0]->scales, m[1]->scales, m[2]->scales};
-        vkt_note(layer, expert, &src);
-        return;
+    *buffer = NULL;
+    int copy = 0;
+    for (int k = 0; k < 3; k++) copy |= m[k]->block_rows == 16 || v4_vkt_ggml_r16(m[k]);
+    if (!copy) {
+        *src = (VktExpertSrc){m[0]->data, m[1]->data, m[2]->data, m[0]->scales, m[1]->scales, m[2]->scales};
+        return 0;
     }
-    if (!vkt_wants(layer, expert)) return;
-    size_t total = 0;
-    for (int k = 0; k < 3; k++) total += m[k]->data_bytes + m[k]->scale_bytes;
-    unsigned char *buffer = malloc(total), *at = buffer, *data[3], *scales[3];
-    if (!buffer) return;
+    size_t bytes[3], total = 0;
+    for (int k = 0; k < 3; k++) {
+        bytes[k] = v4_vkt_ggml_r16(m[k])
+            ? (size_t)(gq_row_bytes(gq_r16_base((int)m[k]->block_columns), m[k]->columns) * m[k]->rows)
+            : m[k]->data_bytes;
+        total += bytes[k] + m[k]->scale_bytes;
+    }
+    unsigned char *at = *buffer = malloc(total), *data[3], *scales[3];
+    if (!at) return -1;
     for (int k = 0; k < 3; k++) {
         size_t rows = (size_t)m[k]->rows;
-        data[k] = at; at += m[k]->data_bytes;
-        scales[k] = at; at += m[k]->scale_bytes;
-        if (m[k]->block_rows == 16) {
+        data[k] = at; at += bytes[k];
+        scales[k] = m[k]->scales ? at : NULL; at += m[k]->scale_bytes;
+        if (v4_vkt_ggml_r16(m[k])) {
+            gq_r16_unpack((int)m[k]->block_columns, data[k], m[k]->data, (int)m[k]->rows, (int)m[k]->columns);
+        } else if (m[k]->block_rows == 16) {
             v4_vkt_unpack16(data[k], m[k]->data, rows, m[k]->data_bytes / rows);
             v4_vkt_unpack16(scales[k], m[k]->scales, rows, m[k]->scale_bytes / rows);
         } else {
             memcpy(data[k], m[k]->data, m[k]->data_bytes);
-            memcpy(scales[k], m[k]->scales, m[k]->scale_bytes);
+            if (m[k]->scale_bytes) memcpy(scales[k], m[k]->scales, m[k]->scale_bytes);
         }
     }
-    VktExpertSrc src = {data[0], data[1], data[2], scales[0], scales[1], scales[2]};
+    *src = (VktExpertSrc){data[0], data[1], data[2], scales[0], scales[1], scales[2]};
+    return 0;
+}
+static void v4_vkt_note(const ColiExpertView *view) {
+    if (!v4_vkt_thread()) return;
+    int layer = view->key.layer, expert = view->key.expert;
+    const ColiTensorView *m[3] = {&view->gate, &view->up, &view->down};
+    int copy = 0;
+    for (int k = 0; k < 3; k++) copy |= m[k]->block_rows == 16 || v4_vkt_ggml_r16(m[k]);
+    if (copy && !vkt_wants(layer, expert)) return;   /* converted only for the tier to take */
+    VktExpertSrc src;
+    unsigned char *buffer;
+    if (v4_vkt_rows(view, &src, &buffer)) return;
     vkt_note(layer, expert, &src);
     free(buffer);
 }
@@ -13543,29 +13646,7 @@ static int v4_vkt_load(void *ctx, int layer, int expert, VktExpertSrc *src, void
     V4VkHold *hold = calloc(1, sizeof *hold);
     if (!hold) return 0;
     if (coli_expert_lookup(store, (ColiExpertKey){layer, expert}, &hold->view)) { free(hold); return 0; }
-    const ColiTensorView *m[3] = {&hold->view.gate, &hold->view.up, &hold->view.down};
-    if (m[0]->block_rows != 16 && m[1]->block_rows != 16 && m[2]->block_rows != 16) {
-        *src = (VktExpertSrc){m[0]->data, m[1]->data, m[2]->data, m[0]->scales, m[1]->scales, m[2]->scales};
-        *h = hold;
-        return 1;
-    }
-    size_t total = 0;
-    for (int k = 0; k < 3; k++) total += m[k]->data_bytes + m[k]->scale_bytes;
-    unsigned char *at = hold->buffer = malloc(total), *data[3], *scales[3];
-    if (!at) { coli_expert_release(store, &hold->view); free(hold); return 0; }
-    for (int k = 0; k < 3; k++) {
-        size_t rows = (size_t)m[k]->rows;
-        data[k] = at; at += m[k]->data_bytes;
-        scales[k] = at; at += m[k]->scale_bytes;
-        if (m[k]->block_rows == 16) {
-            v4_vkt_unpack16(data[k], m[k]->data, rows, m[k]->data_bytes / rows);
-            v4_vkt_unpack16(scales[k], m[k]->scales, rows, m[k]->scale_bytes / rows);
-        } else {
-            memcpy(data[k], m[k]->data, m[k]->data_bytes);
-            memcpy(scales[k], m[k]->scales, m[k]->scale_bytes);
-        }
-    }
-    *src = (VktExpertSrc){data[0], data[1], data[2], scales[0], scales[1], scales[2]};
+    if (v4_vkt_rows(&hold->view, src, &hold->buffer)) { coli_expert_release(store, &hold->view); free(hold); return 0; }
     *h = hold;
     return 1;
 }
@@ -13587,11 +13668,59 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
     if (!record || c->hidden_size % 128 || c->moe_intermediate_size % 128) return;
     ColiExpertStoreStats st = {0};
     if (store->ops && store->ops->stats) store->ops->stats(store, &st);
-    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32}, gu = f, dn = f;
+    VktFmt *lgu = NULL, *ldn = NULL;   /* a GGUF's forms by layer, when they differ */
+    int types[3], mx;
+    if (coli_v4_expert_store_gguf_form(store, 0, types, &mx) == 1) {
+        /* A GGUF's experts go to the device as the file has them (shaders/blockdec.glsl),
+         * the forms by layer as published files mix them; a layer of MXFP4 ones as the
+         * checkpoint's FP4 the store lays them out in. Gate and up share a type, and every
+         * type has a device form, or the tier stays off. */
+        const int L = c->num_hidden_layers;
+        const char *no = NULL;
+        lgu = malloc((size_t)L * sizeof *lgu); ldn = malloc((size_t)L * sizeof *ldn);
+        if (!lgu || !ldn) no = "out of memory";
+        int best = 0, bestn = 0, forms = 0, mixed = 0;
+        for (int l = 0; !no && l < L; l++) {
+            if (coli_v4_expert_store_gguf_form(store, l, types, &mx) != 1) { no = "a layer without GGUF experts"; break; }
+            if (mx) { lgu[l] = ldn[l] = f; continue; }
+            const int bg = coli_vk_block_elems(100 + types[0]), bd = coli_vk_block_elems(100 + types[2]);
+            if (types[0] != types[1]) no = "gate and up differ in type";
+            else if (!bg || !bd || c->hidden_size % bg || c->moe_intermediate_size % bd)
+                no = "a type without a device form";
+            lgu[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + types[0]), 0};
+            ldn[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + types[2]), 0};
+        }
+        for (int l = 0; !no && l < L; l++) {   /* the commonest pair is the tier's main form */
+            int n = 0, first = 1;
+            for (int j = 0; j < L; j++) {
+                const int same = lgu[j].kind == lgu[l].kind && ldn[j].kind == ldn[l].kind;
+                n += same;
+                if (same && j < l) first = 0;
+            }
+            forms += first;
+            if (n > bestn) { bestn = n; best = l; }
+        }
+        if (!no && forms > VKT_FORMS - 1) no = "more distinct types than the tier holds";
+        if (no) {
+            fprintf(stderr, "[VK] tier deepseek_v4: the GGUF's experts: %s; the tier stays off\n", no);
+            free(lgu); free(ldn);
+            return;
+        }
+        mixed = forms > 1;
+        gu = lgu[best]; dn = ldn[best];
+        fprintf(stderr, "[VK] tier deepseek_v4: the GGUF experts' blocks go to the device as the file has them (%s",
+                gu.kind == VKT_SRC_MXFP4_E8M0 ? "MXFP4" : gq_type_name((int)gu.kind - VKT_SRC_GGML));
+        fprintf(stderr, " gate/up, %s down", dn.kind == VKT_SRC_MXFP4_E8M0 ? "MXFP4" : gq_type_name((int)dn.kind - VKT_SRC_GGML));
+        if (mixed) fprintf(stderr, " on %d of %d layers, the others their own types", bestn, L);
+        fprintf(stderr, ")\n");
+        if (!mixed) { free(lgu); free(ldn); lgu = ldn = NULL; }
+    }
     VktConfig vc = {.engine = "deepseek_v4", .layers = c->num_hidden_layers,
                     .experts = c->n_routed_experts, .hidden = c->hidden_size,
                     .inter = c->moe_intermediate_size, .topk = c->num_experts_per_tok,
-                    .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU_V4,
+                    .gate_up = gu, .down = dn, .layer_gate_up = lgu, .layer_down = ldn,
+                    .act = VKT_ACT_SWIGLU_V4,
                     .act_limit = c->swiglu_limit, .max_rows = 128 * c->num_experts_per_tok,
                     .ram_reserve = st.capacity_bytes > st.resident_bytes
                         ? (size_t)(st.capacity_bytes - st.resident_bytes) : 0,
@@ -13605,7 +13734,9 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
      * last-registered first), and whether or not the tier starts: vkt_init makes the
      * expert batch's pipelines before it can refuse (no room). */
     atexit(coli_vk_shutdown);
-    if (!vkt_init(&vc, coli_v4_expert_store_history(store))) return;
+    const int tier_on = vkt_init(&vc, coli_v4_expert_store_history(store));
+    free(lgu); free(ldn);   /* read during vkt_init only */
+    if (!tier_on) return;
     atexit(vkt_shutdown);
     g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, v4_vkt_note, v4_vkt_routed};
     int all = c->num_hidden_layers * c->n_routed_experts;
@@ -13620,12 +13751,14 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
             unsigned char *buffer = NULL;
             ColiExpertView view;
             if (posix_memalign((void **)&buffer, 4096, (size_t)record + 8192u)) buffer = NULL;
+            VktExpertSrc src;
+            unsigned char *rows = NULL;
             if (buffer && !coli_v4_expert_store_read_private(
-                              store, (ColiExpertKey){pl[i], pe[i]}, buffer, &view)) {
-                VktExpertSrc src = {view.gate.data, view.up.data, view.down.data,
-                                    view.gate.scales, view.up.scales, view.down.scales};
+                              store, (ColiExpertKey){pl[i], pe[i]}, buffer, &view) &&
+                !v4_vkt_rows(&view, &src, &rows))
                 vkt_put(pl[i], pe[i], &src);
-            } else vkt_put(pl[i], pe[i], NULL);   /* no read: the planned slot is given back */
+            else vkt_put(pl[i], pe[i], NULL);   /* no read: the planned slot is given back */
+            free(rows);
             free(buffer);
         }
         vkt_put_done();
@@ -13702,6 +13835,7 @@ static int v4_dho_decide(ColiV4Engine *engine, uint64_t device_bytes, uint64_t h
     const char *on = getenv("COLI_VULKAN"), *keep = getenv("COLI_VK_DENSE_HOST");
     if (!on || !atoi(on)) return 0;
     if (keep && *keep && atoi(keep) != 0) return 0;   /* kept: said in v4_vk_open, the device opened there as before */
+    if (coli_v4_index_gguf(engine->target_index)) return 0;   /* a GGUF's dense matrices stay on the CPU */
 #ifdef COLI_V4_GPU_TIER
     const char *cuda = getenv("DSV4_CUDA");           /* the CUDA tier mirrors the host layers */
     if (!(cuda && atoi(cuda) == 0)) return 0;
