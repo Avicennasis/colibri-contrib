@@ -171,6 +171,8 @@ typedef struct {
     uint8_t *p13, *p2; float *s13, *s2;   /* container: packed rows + row scales */
     int8_t *q13, *q2;                     /* bits>0: runtime-quantized int8 */
     float *f13, *f2;                      /* bits==0: raw f32 (oracle) */
+    uint8_t *vk_rows;                     /* GGUF experts held interleaved: the file's rows for the
+                                           * Vulkan tier while it reads them (ink_vk_slot_src) */
 } Slot;
 typedef struct {
     Slot *slots;
@@ -198,6 +200,8 @@ typedef struct {
     int gx;                               /* ... or a GGUF's (xq too, for the slabs): gate and up rows
                                            * of an expert in p13, down in p2, of each layer's types */
     int *gx_t;                            /* [layer][gate, up, down]: their ggml types */
+    int *gx_h;                            /* ... as the slots hold them: interleaved by 16 rows where
+                                           * coli_ggml_held_type says so (INK_ILV16=0: the file's) */
     Wt embed, lm_head;
     float *embed_norm, *final_norm;
     Wt audio_enc;                         /* [mel_bins*mel_vocab, D] embedding table */
@@ -241,7 +245,7 @@ static float siluf(float x) { return x / (1.f + expf(-x)); }
  * g[0..I) and g[I..2I), the SwiGLU into g, then hh = down g; ggml_quants.h kernels. */
 static void ink_gx_expert(const Model *m, int layer, const Slot *e, const float *xs, float *g, float *hh) {
     const int64_t D = m->c.hidden, I = m->c.moe_inter;
-    const int *t3 = m->gx_t + 3 * layer;
+    const int *t3 = m->gx_h + 3 * layer;
     ColiTensorView vg = { COLI_TENSOR_GGML, COLI_SCALE_NONE, e->p13, NULL, 0, 0, I, D, 1, (uint32_t)t3[0], NULL };
     ColiTensorView vu = vg;
     vu.data = e->p13 + I * gq_row_bytes(t3[0], D); vu.block_columns = (uint32_t)t3[1];
@@ -992,6 +996,20 @@ static Wt load_w(Model *m, const char *name, int gpu_ok) {
         if (!b) { fprintf(stderr, "OOM %s\n", name); exit(1); }
         pread_all(t->fd, b, t->nbytes, t->off);
         w.gq = b; w.gqt = st_ggml_type(t->dtype); w.qn = t->nbytes;
+        /* its rows interleaved by 16 for the products (coli_ggml_held_type); an embedding,
+         * read a row at a time, keeps the file's */
+        const int64_t cols = t->rank > 0 ? t->shape[t->rank - 1] : 0, rows = cols > 0 ? t->numel / cols : 0;
+        const int h = strstr(name, "embed") || rows < 16 ? w.gqt : coli_ggml_held_type(w.gqt, rows, cols, "INK_ILV16");
+        if (h != w.gqt) {
+            const int64_t hb = gq_row_bytes(h, cols) * rows;
+            uint8_t *p = malloc((size_t)hb);
+            if (!p) { fprintf(stderr, "OOM %s\n", name); exit(1); }
+            #pragma omp parallel for schedule(static)
+            for (int64_t g = 0; g < rows / 16; g++)
+                gq_r16_pack(h, p + g * 16 * gq_row_bytes(h, cols), b + g * 16 * gq_row_bytes(w.gqt, cols), 16, (int)cols);
+            free(b);
+            w.gq = p; w.gqt = h; w.qn = hb;
+        }
         (void)gpu_ok;
         return w;
     }
@@ -1030,8 +1048,11 @@ static Wt wt_off_i(Wt w, int64_t off, int I) {
     r.f = w.f ? w.f + off : NULL;
     r.h = w.h ? w.h + off : NULL;
     r.dev = w.dev ? (char*)w.dev + off*2 : NULL;    /* dev is always bf16 */
-    if (w.gq) {   /* GGUF blocks: whole rows of the type's bytes */
+    if (w.gq) {   /* GGUF blocks: whole rows of the type's bytes (interleaved: whole groups of 16) */
         int64_t rb = gq_row_bytes(w.gqt, I), rows = off / I;
+        if (gq_r16_base(w.gqt) >= 0 && rows % 16) {
+            fprintf(stderr, "GGUF %s matrix sliced at row %lld, inside a group of 16\n", gq_type_name(w.gqt), (long long)rows); exit(1);
+        }
         r.gq = w.gq + rows * rb; r.qn = w.qn - rows * rb;
     }
     if (w.q4) {
@@ -1061,7 +1082,9 @@ static void wt_deq_row(Wt w, int64_t row, float *out, int I) {
 static void wt_row_f32(Wt w, int64_t off, float *out, int n) {
     if (w.gq) {   /* a GGUF table's row (the embedding), dequantized */
         int64_t rb = gq_row_bytes(w.gqt, n);
-        if (rb < 0 || (off / n + 1) * rb > w.qn || gq_dequant_row(w.gqt, w.gq + (off / n) * rb, out, n)) {
+        if (rb < 0 || (off / n + 1) * rb > w.qn ||
+            (gq_r16_base(w.gqt) >= 0 ? gq_r16_dequant_row(w.gqt, w.gq, off / n, out, n)
+                                     : gq_dequant_row(w.gqt, w.gq + (off / n) * rb, out, n))) {
             fprintf(stderr, "GGUF row %lld of %s rows of %d: outside the tensor\n", (long long)(off / n), gq_type_name(w.gqt), n); exit(1);
         }
         return;
@@ -1261,6 +1284,12 @@ static void ink_dho_place(Model *m, int layer_begin, int layer_end) {
                               );
 }
 
+/* 1 for a GGUF read in place (st_gguf.h): its matrices are ggml blocks, which the dense chain
+ * does not read (the expert tier does, ink_vk_gguf_forms). */
+static int ink_is_gguf(const Model *m) {
+    for (int i = 0; i < m->S.n; i++) if (st_is_ggml(m->S.t[i].dtype)) return 1;
+    return 0;
+}
 static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
     int sparse = 0, other_gpu = 0;
     for (int i = layer_begin; i < layer_end; i++) sparse += m->c.sparse[i];
@@ -1277,7 +1306,7 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
     /* COLI_VK_DENSE_HOST: with the dense part on the device (the per-matrix path, or the
      * chain: asked here silently, inkc_start says it after the tier), every matrix the
      * shaders read is marked and goes up now, its host copy given back */
-    int chain = !other_gpu && layer_begin == 0 && layer_end == m->c.n_layers &&
+    int chain = !other_gpu && layer_begin == 0 && layer_end == m->c.n_layers && !ink_is_gguf(m) &&
                 coli_vk_chain_decide(NULL, g_vk_tier_try, INKLING_CHAIN_IGPU) != COLI_VK_CHAIN_OFF;
     /* the chain's fit before any upload and before the expert cache is sized: the first n
      * layers on the device, the others (and lm_head, unless the tail went up) on the CPU
@@ -1463,10 +1492,14 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             tt[k] = st_find(&m->S, nm);
         }
         if (!tt[0]) break;   /* the checkpoint's gate_up_proj: not a GGUF */
-        if (!m->gx_t) { m->gx_t = calloc((size_t)c->n_layers * 3, sizeof(int)); if (!m->gx_t) { fprintf(stderr, "OOM\n"); exit(1); } }
+        if (!m->gx_t) {
+            m->gx_t = calloc((size_t)c->n_layers * 3, sizeof(int)); m->gx_h = calloc((size_t)c->n_layers * 3, sizeof(int));
+            if (!m->gx_t || !m->gx_h) { fprintf(stderr, "OOM\n"); exit(1); }
+        }
         for (int k = 0; k < 3; k++) {
             if (!tt[k] || st_ggml_type_any(tt[k]->dtype) < 0) { fprintf(stderr, "layer %d: GGUF experts without mlp.experts.%s\n", i, k3[k]); exit(1); }
             m->gx_t[3 * i + k] = st_ggml_type_any(tt[k]->dtype);
+            m->gx_h[3 * i + k] = coli_ggml_held_type(m->gx_t[3 * i + k], k < 2 ? I : D, k < 2 ? D : I, "INK_ILV16");
         }
         int64_t rbg = gq_row_bytes(m->gx_t[3 * i], D), rbu = gq_row_bytes(m->gx_t[3 * i + 1], D),
                 rbd = gq_row_bytes(m->gx_t[3 * i + 2], I);
@@ -1475,6 +1508,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             fprintf(stderr, "layer %d: GGUF experts are not [%lld][%lld][%lld] of their types\n", i, (long long)E, (long long)I, (long long)D); exit(1);
         }
         m->gx = m->xq = 1;
+        rbg = gq_row_bytes(m->gx_h[3 * i], D); rbu = gq_row_bytes(m->gx_h[3 * i + 1], D); rbd = gq_row_bytes(m->gx_h[3 * i + 2], I);
         if ((rbg + rbu + 1) / 2 > m->rb13) m->rb13 = (rbg + rbu + 1) / 2;
         if (rbd > m->rb2) m->rb2 = rbd;
     }
@@ -1665,16 +1699,25 @@ static void slot_fill(Model *m, int layer, Slot *s) {
     int64_t D = c->hidden, I = c->moe_inter, n13 = 2*I*D, n2 = D*I;
     int64_t eid = s->eid;
     char nm[320], qs[340];
-    if (m->gx) {   /* GGUF: the expert's gate rows, then its up rows, then down: three slices */
-        const int *t3 = m->gx_t + 3 * layer;
+    if (m->gx) {   /* GGUF: the expert's gate rows, then its up rows, then down: three slices,
+                    * interleaved by 16 rows through a copy where the slots hold them so */
+        static __thread uint8_t *raw; static __thread int64_t raw_n;
+        const int *t3 = m->gx_t + 3 * layer, *h3 = m->gx_h + 3 * layer;
         const int64_t rb[3] = { gq_row_bytes(t3[0], D), gq_row_bytes(t3[1], D), gq_row_bytes(t3[2], I) };
-        const int64_t rows[3] = { I, I, D };
-        uint8_t *dst[3] = { s->p13, s->p13 + I * rb[0], s->p2 };
+        const int64_t rows[3] = { I, I, D }, cols[3] = { D, D, I };
+        uint8_t *dst[3] = { s->p13, s->p13 + I * gq_row_bytes(h3[0], D), s->p2 };
         const char *k3[3] = {"gate_proj", "up_proj", "down_proj"};
         for (int k = 0; k < 3; k++) {
             snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%s", layer, k3[k]);
             st_tensor *t = st_find(&m->S, nm);
-            pread_all(t->fd, dst[k], rows[k] * rb[k], t->off + eid * rows[k] * rb[k]);
+            const int64_t n = rows[k] * rb[k];
+            if (h3[k] == t3[k]) { pread_all(t->fd, dst[k], n, t->off + eid * n); continue; }
+            if (raw_n < n) {
+                free(raw); raw = malloc((size_t)n); raw_n = raw ? n : 0;
+                if (!raw) { fprintf(stderr, "OOM GGUF expert\n"); exit(1); }
+            }
+            pread_all(t->fd, raw, n, t->off + eid * n);
+            gq_r16_pack(h3[k], dst[k], raw, (int)rows[k], (int)cols[k]);
         }
         s->filled = 1;
         return;
@@ -1999,7 +2042,7 @@ static void shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
  * moe() reads down with gate/up's kernel, so the two share one kind. 0: none. */
 static int ink_vk_fmt_of(const Model *m, VktFmt *f) {
     int D = m->c.hidden, I = m->c.moe_inter;
-    if (m->gx) return 0;   /* GGUF experts: the CPU's ggml_quants.h kernels only, for now */
+    if (m->gx) return 0;   /* GGUF experts: their blocks by layer (ink_vk_gguf_forms) */
     if (m->xq) {
         int q4 = m->rb13 * 2 == D;
         if (q4 ? m->rb2 * 2 != I : m->rb2 != I) return 0;
@@ -2008,13 +2051,64 @@ static int ink_vk_fmt_of(const Model *m, VktFmt *f) {
     else *f = (VktFmt){VKT_SRC_F32, 0};
     return 1;
 }
-static VktExpertSrc ink_vk_slot_src(const Model *m, const Slot *e) {
+/* A GGUF's experts go to the device as the file has them (shaders/blockdec.glsl), each layer
+ * its types (published files mix them): gu[l], dn[l] for every layer, a layer without experts
+ * given the first sparse layer's; *best = the commonest pair's layer. 0 when gate and up
+ * differ in type, a type has no device form, or there are more pairs than the tier holds. */
+static int ink_vk_gguf_forms(const Model *m, VktFmt *gu, VktFmt *dn, int *best, int *forms) {
+    const Cfg *c = &m->c;
+    int first = -1, bestn = 0;
+    *forms = 0; *best = -1;
+    for (int l = 0; l < c->n_layers; l++) if (c->sparse[l]) {
+        const int *t3 = m->gx_t + 3 * l;
+        const int bg = coli_vk_block_elems(100 + t3[0]), bd = coli_vk_block_elems(100 + t3[2]);
+        if (t3[0] != t3[1] || !bg || !bd || c->hidden % bg || c->moe_inter % bd) return 0;
+        gu[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + t3[0]), 0};
+        dn[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + t3[2]), 0};
+        if (first < 0) first = l;
+    }
+    if (first < 0) return 0;
+    for (int l = 0; l < c->n_layers; l++) if (!c->sparse[l]) { gu[l] = gu[first]; dn[l] = dn[first]; }
+    for (int l = 0; l < c->n_layers; l++) if (c->sparse[l]) {
+        int n = 0, seen = 0;
+        for (int j = 0; j < c->n_layers; j++) if (c->sparse[j] && gu[j].kind == gu[l].kind && dn[j].kind == dn[l].kind) {
+            n++;
+            if (j < l) seen = 1;
+        }
+        *forms += !seen;
+        if (n > bestn) { bestn = n; *best = l; }
+    }
+    return *forms <= VKT_FORMS - 1;
+}
+/* 1 when the slots hold a GGUF layer's experts interleaved (the tier reads the file's rows). */
+static int ink_gx_ilv(const Model *m, int layer) {
+    for (int k = 0; m->gx && k < 3; k++) if (m->gx_h[3 * layer + k] != m->gx_t[3 * layer + k]) return 1;
+    return 0;
+}
+/* The expert's bytes as the tier reads them. A GGUF expert held interleaved goes back to the
+ * file's rows in e->vk_rows, kept until ink_vk_drop_rows (the tier's release, or right after a
+ * note). */
+static VktExpertSrc ink_vk_slot_src(const Model *m, int layer, Slot *e) {
     int64_t D = m->c.hidden, I = m->c.moe_inter;
-    if (m->gx) return (VktExpertSrc){0};
+    if (m->gx) {
+        const int *t3 = m->gx_t + 3 * layer, *h3 = m->gx_h + 3 * layer;
+        const int64_t gb = I * gq_row_bytes(t3[0], D), ub = I * gq_row_bytes(t3[1], D), db = D * gq_row_bytes(t3[2], I);
+        const uint8_t *src[3] = { e->p13, e->p13 + I * gq_row_bytes(h3[0], D), e->p2 };
+        if (!ink_gx_ilv(m, layer)) return (VktExpertSrc){src[0], src[1], src[2], NULL, NULL, NULL};
+        if (!e->vk_rows && !(e->vk_rows = malloc((size_t)(gb + ub + db)))) { fprintf(stderr, "OOM GGUF expert for the Vulkan tier\n"); exit(1); }
+        uint8_t *dst[3] = { e->vk_rows, e->vk_rows + gb, e->vk_rows + gb + ub };
+        const int64_t bytes[3] = { gb, ub, db }, rows[3] = { I, I, D }, cols[3] = { D, D, I };
+        for (int k = 0; k < 3; k++) {
+            if (h3[k] != t3[k]) gq_r16_unpack(h3[k], dst[k], src[k], (int)rows[k], (int)cols[k]);
+            else memcpy(dst[k], src[k], (size_t)bytes[k]);
+        }
+        return (VktExpertSrc){dst[0], dst[1], dst[2], NULL, NULL, NULL};
+    }
     if (m->xq) return (VktExpertSrc){e->p13, e->p13 + I * m->rb13, e->p2, e->s13, e->s13 + I, e->s2};
     if (m->quant_bits) return (VktExpertSrc){e->q13, e->q13 + I * D, e->q2, e->s13, e->s13 + I, e->s2};
     return (VktExpertSrc){e->f13, e->f13 + I * D, e->f2, NULL, NULL, NULL};
 }
+static void ink_vk_drop_rows(Slot *e) { free(e->vk_rows); e->vk_rows = NULL; }
 /* Is the expert in this layer's RAM cache now (the tier's balance asks)? */
 static int ink_vk_in_ram(void *ctx, int layer, int e) {
     Slot *s = slot_indexed((Model *)ctx, layer, e);
@@ -2057,7 +2151,7 @@ static int ink_vk_tmp_slot(const Model *m, Slot *s, int eid) {
     return s->s13 && (m->xq ? s->p13 && s->p2 : m->quant_bits ? s->q13 && s->q2 : s->f13 && s->f2);
 }
 static void ink_vk_tmp_free(Slot *s) {
-    free(s->p13); free(s->p2); free(s->q13); free(s->q2); free(s->f13); free(s->f2); free(s->s13);
+    free(s->p13); free(s->p2); free(s->q13); free(s->q2); free(s->f13); free(s->f2); free(s->s13); free(s->vk_rows);
 }
 /* COLI_VULKAN=1: describe the experts to the tier, after the weights and the history
  * (pins_load reads it in the generate and serve modes; the oracle reads none), and
@@ -2080,26 +2174,52 @@ static void ink_vk_tier_start(Model *m) {
         return;
     }
 #endif
-    VktFmt f;
-    if (g_vk_tier_try && !ink_vk_fmt_of(m, &f))
+    VktFmt f, fd, *lgu = NULL, *ldn = NULL;   /* fd: down's, as f unless a GGUF's */
+    int gguf_ok = 0;
+    if (g_vk_tier_try && m->gx) {
+        int best, forms;
+        lgu = malloc((size_t)c->n_layers * sizeof *lgu); ldn = malloc((size_t)c->n_layers * sizeof *ldn);
+        gguf_ok = lgu && ldn && ink_vk_gguf_forms(m, lgu, ldn, &best, &forms);
+        if (gguf_ok) {
+            f = lgu[best]; fd = ldn[best];
+            int bestn = 0;
+            for (int l = 0; l < c->n_layers; l++) bestn += c->sparse[l] && lgu[l].kind == lgu[best].kind && ldn[l].kind == ldn[best].kind;
+            int nsp = 0;
+            for (int l = 0; l < c->n_layers; l++) nsp += c->sparse[l];
+            fprintf(stderr, "[VK] tier inkling: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down",
+                    gq_type_name(m->gx_t[3 * best]), gq_type_name(m->gx_t[3 * best + 2]));
+            if (forms > 1) fprintf(stderr, " on %d of %d layers, the others their own types", bestn, nsp);
+            fprintf(stderr, ")\n");
+            if (forms == 1) { free(lgu); free(ldn); lgu = ldn = NULL; }
+        } else {
+            free(lgu); free(ldn); lgu = ldn = NULL;
+            fprintf(stderr, "[VK] tier inkling: the GGUF's experts have a type without a device form, gate and up of two types, "
+                            "or more types than the tier holds; the experts stay on the CPU\n");
+        }
+    }
+    if (g_vk_tier_try && !m->gx && !ink_vk_fmt_of(m, &f))
         fprintf(stderr, "[VK] tier inkling: container rows of %lld/%lld bytes are no expert format the tier reads; the experts stay on the CPU\n",
                 (long long)m->rb13, (long long)m->rb2);
-    else if (g_vk_tier_try) {
+    else if (g_vk_tier_try && (!m->gx || gguf_ok)) {
         int nsp = 0;
         for (int i = 0; i < c->n_layers; i++) nsp += c->sparse[i];
         int64_t D = c->hidden, I = c->moe_inter;
         int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
                       : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
+        if (!m->gx) fd = f;
         VktConfig vc = {.engine = "inkling", .layers = c->n_layers, .experts = c->n_experts,
                         .hidden = c->hidden, .inter = c->moe_inter, .topk = c->topk,
-                        .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU,
+                        .gate_up = f, .down = fd, .layer_gate_up = lgu, .layer_down = ldn,
+                        .act = VKT_ACT_SWIGLU,
                         .max_rows = INK_VK_ROWS * c->topk,
                         .ram_reserve = (size_t)slotb * (size_t)m->cache[0].cap * (size_t)nsp,
                         .dense_bytes = ink_vk_dense_bytes(m),
                         .in_ram = ink_vk_in_ram, .ram_ctx = m,
                         .load = ink_vk_load, .release = ink_vk_unhold, .load_ctx = m, .load_batch = ink_vk_load_batch};
         atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
-        if (vkt_init(&vc, m->eusage)) {
+        const int tier_on = vkt_init(&vc, m->eusage);
+        free(lgu); free(ldn);   /* read during vkt_init only */
+        if (tier_on) {
             atexit(vkt_shutdown);
             int all = c->n_layers * c->n_experts;
             int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
@@ -2112,7 +2232,7 @@ static void ink_vk_tier_start(Model *m) {
                     Slot tmp;
                     if (ink_vk_tmp_slot(m, &tmp, pe[i])) {
                         slot_fill(m, pl[i], &tmp);
-                        VktExpertSrc src = ink_vk_slot_src(m, &tmp);
+                        VktExpertSrc src = ink_vk_slot_src(m, pl[i], &tmp);
                         vkt_put(pl[i], pe[i], &src);
                     } else vkt_put(pl[i], pe[i], NULL);   /* no memory: the planned slot is released */
                     ink_vk_tmp_free(&tmp);
@@ -2155,7 +2275,7 @@ static int ink_vk_load_batch(void *ctx, int layer, const int *e, int n, VktExper
     }
     for (int i = 0; i < n; i++) {
         if (use[i]->eid != e[i]) return i;   /* the cache served another: the rest one by one */
-        srcs[i] = ink_vk_slot_src(m, use[i]); h[i] = use[i];
+        srcs[i] = ink_vk_slot_src(m, layer, use[i]); h[i] = use[i];
     }
     return n;
 }
@@ -2165,10 +2285,10 @@ static int ink_vk_load(void *ctx, int layer, int e, VktExpertSrc *src, void **h)
     Slot *s = ink_vk_get(m, layer, e, fill, &nfill);
     if (nfill) { double tf = now_s(); slot_fill(m, layer, s); m->t_fill += now_s() - tf; }
     if (s->eid != e) return 0;
-    *src = ink_vk_slot_src(m, s); *h = s;
+    *src = ink_vk_slot_src(m, layer, s); *h = s;
     return 1;
 }
-static void ink_vk_unhold(void *ctx, void *h) { (void)ctx; (void)h; }
+static void ink_vk_unhold(void *ctx, void *h) { (void)ctx; ink_vk_drop_rows((Slot *)h); }
 static void ink_vk_tier_report(const Model *m, const char *scope) {
     vkt_report(scope, m->hits, m->miss);   /* nothing when the tier never started */
 }
@@ -2231,8 +2351,10 @@ static void ink_vk_cpu_pairs(Model *m, int layer, const float *x, int n, const i
                 for (int k = 0; k < I; k++) g[k] = siluf(g[k]) * u[k];
                 matmul(hh, g, e->f2, 1, I, D);
             }
-            VktExpertSrc vs = ink_vk_slot_src(m, e);
+            if (ink_gx_ilv(m, layer) && !vkt_wants(layer, e->eid)) continue;   /* converted only for the tier to take */
+            VktExpertSrc vs = ink_vk_slot_src(m, layer, e);
             vkt_note(layer, e->eid, &vs);
+            ink_vk_drop_rows(e);
         }
     }
     free(use); free(fill); free(pi);
