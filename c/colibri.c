@@ -2765,6 +2765,8 @@ static void model_init_range(Model *m, const char *snap, int cap,
         char mn[256]; m->has_mtp=1;
         for(unsigned q=0;q<sizeof(req)/sizeof(req[0]);q++){
             snprintf(mn,sizeof(mn),"model.layers.%d.%s",c->n_layers,req[q]);
+            if(!st_has(&m->S,mn) && !strcmp(req[q],"self_attn.kv_b_proj.weight"))   /* a GGUF's k_b / v_b instead */
+                snprintf(mn,sizeof(mn),"model.layers.%d.self_attn.k_b_proj.weight",c->n_layers);
             if(!st_has(&m->S,mn)){ m->has_mtp=0; break; }
         }
         /* probe the LAST expert by index, not a fixed 255: REAP-pruned
