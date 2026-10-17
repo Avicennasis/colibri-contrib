@@ -99,7 +99,46 @@ static const st_gg_name st_gg_ink_layer[] = {
     {"ffn_down_exps.weight", "mlp.experts.down_proj"},
     {NULL, NULL}};
 
+/* GLM-5.3-Flash (glm5-next): conversion/glm.py Glm5NextModel. MLA's kv_b comes split the way
+ * glm53.c absorbs it (k_b = W_k^T per head, v_b = W_v); KDA's A_log comes as ssm_a = -exp(A_log);
+ * glm53.c reads both forms. */
+static const st_gg_name st_gg_g5n_glob[] = {
+    {"token_embd.weight", "model.language_model.embed_tokens.weight"},
+    {"output_norm.weight", "model.language_model.norm.weight"}, {"output.weight", "lm_head.weight"},
+    {NULL, NULL}};
+static const st_gg_name st_gg_g5n_layer[] = {
+    {"attn_norm.weight", "input_layernorm.weight"}, {"ffn_norm.weight", "post_attention_layernorm.weight"},
+    {"hc_attn_fn.weight", "hc_attn_fn"}, {"hc_attn_base.weight", "hc_attn_base"}, {"hc_attn_scale.weight", "hc_attn_scale"},
+    {"hc_ffn_fn.weight", "hc_ffn_fn"}, {"hc_ffn_base.weight", "hc_ffn_base"}, {"hc_ffn_scale.weight", "hc_ffn_scale"},
+    {"attn_q.weight", "self_attn.q_proj.weight"}, {"attn_k.weight", "self_attn.k_proj.weight"},
+    {"attn_v.weight", "self_attn.v_proj.weight"}, {"attn_output.weight", "self_attn.o_proj.weight"},
+    {"ssm_g_a.weight", "self_attn.g_a_proj.weight"}, {"ssm_g_b.weight", "self_attn.g_b_proj.weight"},
+    {"ssm_f_a.weight", "self_attn.f_a_proj.weight"}, {"ssm_f_b.weight", "self_attn.f_b_proj.weight"},
+    {"ssm_beta.weight", "self_attn.b_proj.weight"},
+    {"ssm_conv1d_q.weight", "self_attn.q_conv1d.weight"}, {"ssm_conv1d_k.weight", "self_attn.k_conv1d.weight"},
+    {"ssm_conv1d_v.weight", "self_attn.v_conv1d.weight"},
+    {"ssm_dt.bias", "self_attn.dt_bias"}, {"ssm_a", "self_attn.ssm_a"}, {"ssm_norm.weight", "self_attn.o_norm.weight"},
+    {"attn_q_a.weight", "self_attn.q_a_proj.weight"}, {"attn_q_a_norm.weight", "self_attn.q_a_layernorm.weight"},
+    {"attn_q_b.weight", "self_attn.q_b_proj.weight"}, {"attn_kv_a_mqa.weight", "self_attn.kv_a_proj_with_mqa.weight"},
+    {"attn_kv_a_norm.weight", "self_attn.kv_a_layernorm.weight"},
+    {"attn_k_b.weight", "self_attn.k_b_proj.weight"}, {"attn_v_b.weight", "self_attn.v_b_proj.weight"},
+    {"indexer.attn_q_b.weight", "self_attn.indexer.wq_b.weight"}, {"indexer.attn_k.weight", "self_attn.indexer.wk.weight"},
+    {"indexer.proj.weight", "self_attn.indexer.weights_proj.weight"},
+    {"indexer.k_norm.weight", "self_attn.indexer.k_norm.weight"}, {"indexer.k_norm.bias", "self_attn.indexer.k_norm.bias"},
+    {"indexer_compressor_ape.weight", "self_attn.indexer.index_kpool_compress_ape"},
+    {"indexer_compressor_gate.weight", "self_attn.indexer.index_kpool_compress_gate"},
+    {"ffn_gate.weight", "mlp.gate_proj.weight"}, {"ffn_up.weight", "mlp.up_proj.weight"}, {"ffn_down.weight", "mlp.down_proj.weight"},
+    {"ffn_gate_inp.weight", "mlp.gate.weight"}, {"exp_probs_b.bias", "mlp.gate.e_score_correction_bias"},
+    {"ffn_gate_shexp.weight", "mlp.shared_experts.gate_proj.weight"}, {"ffn_up_shexp.weight", "mlp.shared_experts.up_proj.weight"},
+    {"ffn_down_shexp.weight", "mlp.shared_experts.down_proj.weight"},
+    {"ffn_gate_exps.weight", "mlp.experts.%d.gate_proj.weight"}, {"ffn_up_exps.weight", "mlp.experts.%d.up_proj.weight"},
+    {"ffn_down_exps.weight", "mlp.experts.%d.down_proj.weight"},
+    {"nextn.eh_proj.weight", "eh_proj.weight"}, {"nextn.enorm.weight", "enorm.weight"}, {"nextn.hnorm.weight", "hnorm.weight"},
+    {"nextn.shared_head_norm.weight", "shared_head.norm.weight"},
+    {NULL, NULL}};
+
 static const st_gg_map st_gguf_maps[] = {
+    {"glm5-next", "model.language_model.layers.%d.", st_gg_g5n_glob, st_gg_g5n_layer},
     {"deepseek4", "layers.%d.", st_gg_dsv4_glob, st_gg_dsv4_layer},
     {"inkling", "model.layers.%d.", st_gg_ink_glob, st_gg_ink_layer},
 };

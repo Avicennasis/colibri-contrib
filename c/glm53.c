@@ -70,7 +70,9 @@
 #include "cli_args.h"
 #include "json.h"
 #include "stop_ids.h"
+#define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+#include "ggml_view.h"
 #include "quant.h"
 #include "tok.h"
 #include "omp_tune.h"
@@ -661,7 +663,9 @@ int main(int argc, char **argv) {
  * `nome` U8 con due valori per byte, `nome.qs` F32 con una scala ogni 64
  * colonne. */
 typedef struct {
-    int fmt;                              /* 0 = f32, 1 = int8 per riga, 4 = int4 gs64 */
+    int fmt;                              /* 0 = f32, 1 = int8 per riga, 4 = int4 gs64,
+                                           * 32 = a GGUF matrix (G53_GGML: its blocks in q4, its
+                                           * ggml type in gs) */
     const float *f;
     const int8_t *q8;
     const uint8_t *q4;
@@ -677,6 +681,17 @@ typedef struct {
     int vk_kind, vk_gone;
 } Mat;
 
+enum { G53_GGML = 32 };
+/* out[S][rows] = W[row0 .. row0+rows) x[S] for a GGUF matrix, on ggml_quants.h */
+static void g53_gq(float *out, const Mat *w, const float *x, int S, int row0, int rows) {
+    const int64_t rb = gq_row_bytes(w->gs, w->columns);
+    ColiTensorView v = { COLI_TENSOR_GGML, COLI_SCALE_NONE, w->q4 + (size_t)row0 * (size_t)rb, NULL,
+                         (size_t)rb * (size_t)rows, 0, rows, w->columns, 1, (uint32_t)w->gs, NULL };
+    if (coli_ggml_matmul(out, &v, x, S)) {
+        fprintf(stderr, "GGUF matmul failed: %s rows of %d\n", gq_type_name(w->gs), w->columns); exit(1);
+    }
+}
+
 typedef struct {
     /* comune */
     const float *in_ln, *post_ln;
@@ -685,6 +700,7 @@ typedef struct {
     /* KDA */
     Mat kq, kk, kv, ko, kga, kgb, kfa, kfb, kb;
     const float *conv, *dt, *alog, *onorm;
+    const float *aexp;                    /* exp(A_log)[heads], once at load: a GGUF holds -exp(A_log) */
     /* MLA + indexer */
     Mat qa, qb, kva, kvb_kt, kvb_v, o, iwq, iwk, iwp, ikpg;
     const float *qa_ln, *kva_ln, *ik_nw, *ik_nb, *ikpa;
@@ -737,6 +753,9 @@ typedef struct {
     struct ERef *eref;
     struct LCache *ecache;
     int64_t e_len[6], e_at[6], e_slot;
+    int gx;                               /* GGUF experts (st_gguf.h): pieces 0/2/4 gate/up/down of */
+    int *gx_t;                            /* each layer's ggml types, gx_t[3 * layer + k] ... */
+    int64_t *gx_len;                      /* ... and bytes; no scale pieces (1/3/5 stay empty) */
     uint64_t clock, ebytes;
     long hits, miss;
     /* Telemetria per la dashboard (#1376 follow-up: Brain e Profile erano
@@ -775,6 +794,16 @@ static const float *load_f32(GModel *m, int64_t want, const char *fmt, ...) {
     }
     float *buffer = malloc((size_t)t->numel * sizeof(float));
     if (!buffer) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
+    if (st_is_ggml(t->dtype)) {   /* a GGUF tensor in a block type: its rows dequantized */
+        const int type = st_ggml_type(t->dtype);
+        const int64_t cols = t->shape[t->rank - 1], rows = t->numel / cols, rb = gq_row_bytes(type, cols);
+        uint8_t *raw = malloc((size_t)t->nbytes);
+        if (!raw || rb < 0) { fprintf(stderr, "%s: cannot read %s rows\n", name, gq_type_name(type)); exit(1); }
+        st_pread_full(t->fd, raw, t->nbytes, t->off, name);
+        for (int64_t r = 0; r < rows; r++) gq_dequant_row(type, raw + r * rb, buffer + r * cols, cols);
+        free(raw);
+        return buffer;
+    }
     st_read_f32_cap(&m->S, name, buffer, t->numel, 0);
     return buffer;
 }
@@ -877,9 +906,23 @@ static Mat quantize_loaded(float *buffer, int rows, int columns) {
  *
  * Le due matrici si costruiscono qui, da kv_b_proj in f32, e poi passano dallo
  * stesso quantizzatore di tutto il resto. */
+static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, ...);
 static void absorb_kvb(GModel *m, GLayer *l, const char *name) {
     const Cfg *c = &m->c;
     const int H = c->n_heads, QK = c->qk_nope, V = c->v_head, L = c->kv_lora;
+    {   /* a GGUF (llama.cpp's converter split kv_b this same way: k_b = W_k^T per head, v_b = W_v) */
+        char kb[512], vb[512];
+        const char *at = strstr(name, "kv_b_proj.weight");
+        if (at) {
+            snprintf(kb, sizeof kb, "%.*sk_b_proj.weight", (int)(at - name), name);
+            snprintf(vb, sizeof vb, "%.*sv_b_proj.weight", (int)(at - name), name);
+            if (st_find(&m->S, kb) && st_find(&m->S, vb)) {
+                l->kvb_kt = load_mat(m, (int64_t)H * L, QK, "%s", kb);
+                l->kvb_v = load_mat(m, (int64_t)H * V, L, "%s", vb);
+                return;
+            }
+        }
+    }
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "missing %s\n", name); exit(1); }
     if (t->numel != (int64_t)H * (QK + V) * L) {
@@ -924,6 +967,24 @@ static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, .
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "missing matrix %s\n", name); exit(1); }
     Mat mat; memset(&mat, 0, sizeof(mat));
+
+    /* A GGUF matrix (st_gguf.h): its blocks as the file has them, computed by ggml_quants.h.
+     * A 3-D one (MLA's per-head k_b / v_b) is its heads' rows one after another. */
+    if (st_is_ggml(t->dtype)) {
+        const int type = st_ggml_type(t->dtype);
+        const int64_t rb = gq_row_bytes(type, columns);
+        if (t->shape[t->rank - 1] != columns || rb < 0 || t->nbytes != rb * rows) {
+            fprintf(stderr, "%s: %lld bytes of %s, the config needs %lld rows of %lld\n", name,
+                    (long long)t->nbytes, gq_type_name(type), (long long)rows, (long long)columns);
+            exit(1);
+        }
+        uint8_t *blocks = malloc((size_t)t->nbytes);
+        if (!blocks) { fprintf(stderr, "OOM on %s\n", name); exit(1); }
+        st_pread_full(t->fd, blocks, t->nbytes, t->off, name);
+        mat.fmt = G53_GGML; mat.q4 = blocks; mat.gs = type;
+        mat.rows = (int)rows; mat.columns = (int)columns;
+        return mat;
+    }
 
     /* Gia' quantizzato nel checkpoint: si prende com'e', senza passare per
      * f32. Un giro in f32 costerebbe il picco di RAM che stiamo evitando, e
@@ -982,8 +1043,10 @@ static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, .
         return mat;
     }
 
-    if (t->rank != 2) { fprintf(stderr, "%s: rank %d, expected 2\n", name, t->rank); exit(1); }
-    if (t->shape[0] != rows || t->shape[1] != columns) {
+    /* a GGUF's per-head MLA halves: [heads][rows][columns], the heads' rows one after another */
+    const int heads3 = t->rank == 3 && t->shape[0] * t->shape[1] == rows && t->shape[2] == columns;
+    if (t->rank != 2 && !heads3) { fprintf(stderr, "%s: rank %d, expected 2\n", name, t->rank); exit(1); }
+    if (!heads3 && (t->shape[0] != rows || t->shape[1] != columns)) {
         fprintf(stderr, "%s: %lld x %lld, the config needs %lld x %lld\n", name,
                 (long long)t->shape[0], (long long)t->shape[1],
                 (long long)rows, (long long)columns);
@@ -1070,6 +1133,7 @@ static void mv_rows(float *out, const Mat *w, const float *x, int row0, int rows
     if (g53_dho_gone(w)) g53_dho_reload((Mat *)w);
 #endif
     switch (w->fmt) {
+    case G53_GGML: g53_gq(out, w, x, 1, row0, rows); break;
     case 4: {
         const int packed = (w->columns + 1) / 2, groups = w->columns / w->gs;
         matmul_i4_grouped(out, x, w->q4 + (size_t)row0 * packed,
@@ -1116,6 +1180,7 @@ static void mv(float *out, const Mat *w, const float *x) {
     }
 #endif
     switch (w->fmt) {
+    case G53_GGML: g53_gq(out, w, x, 1, 0, w->rows); break;
     case 4: matmul_i4_grouped(out, x, w->q4, w->s, 1, w->columns, w->rows, w->gs); break;
     case 1: matmul_q(out, x, w->q8, w->s, 1, w->columns, w->rows); break;
     default: matmul(out, x, w->f, 1, w->columns, w->rows); break;
@@ -1130,6 +1195,7 @@ static void mv(float *out, const Mat *w, const float *x) {
  * A matrix on the Vulkan device takes the S rows in one call (the backend's GEMM);
  * Metal keeps the per-row path it already has. */
 static void mm(float *out, const Mat *w, const float *x, int S) {
+    if (w->fmt == G53_GGML) { g53_gq(out, w, x, S, 0, w->rows); return; }   /* GGUF: all S rows at once */
     int gpu = 0;
 #ifdef COLI_METAL
     gpu |= g_metal_ready && w->resident && (w->fmt == 1 || w->fmt == 4);
@@ -1164,6 +1230,7 @@ static void mm_rows(float *out, const Mat *w, const float *x, int S, int row0, i
     if (g53_dho_gone(w)) g53_dho_reload((Mat *)w);
 #endif
     switch (w->fmt) {
+    case G53_GGML: g53_gq(out, w, x, S, row0, rows); break;
     case 4: {
         const int packed = (w->columns + 1) / 2, groups = w->columns / w->gs;
         matmul_i4_grouped(out, x, w->q4 + (size_t)row0 * packed,
@@ -1267,7 +1334,7 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         for (int h = 0; h < H; h++)
             for (int d = 0; d < D; d++) {
                 int i = h * D + d;
-                dk[i] = c->gate_lb * sigmoidf_(expf(l->alog[h]) * (dk[i] + l->dt[i]));
+                dk[i] = c->gate_lb * sigmoidf_(l->aexp[h] * (dk[i] + l->dt[i]));
             }
         for (int h = 0; h < H; h++) bt[h] = sigmoidf_(bt[h]);
         memcpy(qkv, q + t * P, (size_t)P * sizeof(float));
@@ -1472,8 +1539,42 @@ typedef struct LCache { Slot *s; int n, cap; } LCache;
 /* Lunghezze e posizioni dei sei pezzi dentro allo slot. Gate e up sono
  * [moe_inter, hidden], down e' [hidden, moe_inter]: stessi byte, forme
  * scambiate. */
+/* The bytes of piece p of an expert of `layer`: the container's are the same everywhere, a
+ * GGUF types its experts per layer. */
+static inline int64_t e_len_at(const GModel *m, int layer, int p) {
+    return m->gx ? ((p & 1) ? 0 : m->gx_len[3 * layer + p / 2]) : m->e_len[p];
+}
+
 static void expert_geometry(GModel *m) {
     const int64_t hidden = m->c.hidden, inter = m->c.moe_inter;
+    if (m->gx) {   /* a GGUF: slots of the largest layer's experts */
+        const Cfg *c = &m->c;
+        static const char *k3[3] = {"gate_proj.weight", "up_proj.weight", "down_proj.weight"};
+        m->gx_t = calloc((size_t)c->n_layers * 3, sizeof(int));
+        m->gx_len = calloc((size_t)c->n_layers * 3, sizeof(int64_t));
+        if (!m->gx_t || !m->gx_len) { fprintf(stderr, "OOM\n"); exit(1); }
+        int64_t most[3] = {0, 0, 0};
+        const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
+        for (int i = from; i < m->layer_end; i++)
+            for (int k = 0; k < 3; k++) {
+                char name[512];
+                snprintf(name, sizeof(name), "%slayers.%d.mlp.experts.0.%s", m->prefix, i, k3[k]);
+                st_tensor *t = st_find(&m->S, name);
+                const int type = t ? st_ggml_type_any(t->dtype) : -1;
+                const int64_t rows = k == 2 ? hidden : inter, cols = k == 2 ? inter : hidden;
+                const int64_t rb = type >= 0 ? gq_row_bytes(type, cols) : -1;
+                if (!t || rb < 0 || t->nbytes != rb * rows) {
+                    fprintf(stderr, "%s: not %lld rows of %lld in a ggml type\n", name, (long long)rows, (long long)cols); exit(1);
+                }
+                m->gx_t[3 * i + k] = type; m->gx_len[3 * i + k] = t->nbytes;
+                if (t->nbytes > most[k]) most[k] = t->nbytes;
+            }
+        const int64_t length[GLM53_EXPERT_PIECES] = { most[0], 0, most[1], 0, most[2], 0 };
+        int64_t at = 0;
+        for (int p = 0; p < GLM53_EXPERT_PIECES; p++) { m->e_len[p] = length[p]; m->e_at[p] = at; at += length[p]; }
+        m->e_slot = at;
+        return;
+    }
     const int64_t packed = inter * hidden / 2;
     const int64_t scales = inter * hidden / 64 * (int64_t)sizeof(float);
     const int64_t length[GLM53_EXPERT_PIECES] = { packed, scales, packed, scales, packed, scales };
@@ -1498,6 +1599,24 @@ static void expert_table_init(GModel *m) {
     };
     m->eref = calloc((size_t)c->n_layers * c->n_experts, sizeof(*m->eref));
     if (!m->eref) { fprintf(stderr, "OOM allocating expert table\n"); exit(1); }
+    if (m->gx) {   /* a GGUF: three pieces, each its slice of the fused tensor */
+        static const char *k3[3] = {"gate_proj.weight", "up_proj.weight", "down_proj.weight"};
+        const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
+        for (int i = from; i < m->layer_end; i++)
+            for (int e = 0; e < c->n_experts; e++) {
+                ERef *ref = &m->eref[(size_t)i * c->n_experts + e];
+                for (int k = 0; k < 3; k++) {
+                    char name[512];
+                    snprintf(name, sizeof(name), "%slayers.%d.mlp.experts.%d.%s", m->prefix, i, e, k3[k]);
+                    st_tensor *t = st_find(&m->S, name);
+                    if (!t || t->nbytes != m->gx_len[3 * i + k]) { fprintf(stderr, "missing or resized %s\n", name); exit(1); }
+                    ref->fd[2 * k] = ref->fd[2 * k + 1] = t->fd;
+                    ref->off[2 * k] = ref->off[2 * k + 1] = t->off;
+                }
+                ref->contig = 0;
+            }
+        return;
+    }
 
     const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
     for (int i = from; i < m->layer_end; i++) {
@@ -1889,8 +2008,9 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
     if (!metal_slot) {
         int mapped_ok = 1;
         for (int p = 0; p < GLM53_EXPERT_PIECES && mapped_ok; p++) {
+            if (!e_len_at(m, layer, p)) { slot->piece[p] = NULL; continue; }   /* a GGUF's empty scale piece */
             int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[p], rep) : ref->fd[p];
-            const void *pr = st_map_shard_range(fd, ref->off[p], m->e_len[p]);
+            const void *pr = st_map_shard_range(fd, ref->off[p], e_len_at(m, layer, p));
             if (!pr) {
                 mapped_ok = 0;
                 break;
@@ -1939,11 +2059,12 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
         st_pread_full(fd, slot->own, m->e_slot, ref->off[0], "expert");
     } else {
         for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
+            if (!e_len_at(m, layer, p)) continue;
             int fd = rep > 0 ? st_fd_rep(&m->S, ref->fd[p], rep) : ref->fd[p];
 
             st_pread_full(fd,
                           slot->own + m->e_at[p],
-                          m->e_len[p],
+                          e_len_at(m, layer, p),
                           ref->off[p],
                           "expert piece");
         }
@@ -1990,8 +2111,17 @@ static Slot *expert_slot(GModel *m, int layer, int eid) {
 }
 
 /* Le tre matrici di un esperto, che puntano dentro al suo slot. */
-static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, Mat *down) {
+static void expert_mats(const GModel *m, int layer, const Slot *slot, Mat *gate, Mat *up, Mat *down) {
     const int hidden = m->c.hidden, inter = m->c.moe_inter;
+    if (m->gx) {   /* a GGUF expert: three ggml matrices of the layer's types */
+        const int *t = m->gx_t + 3 * layer;
+        memset(gate, 0, sizeof *gate); memset(up, 0, sizeof *up); memset(down, 0, sizeof *down);
+        gate->fmt = up->fmt = down->fmt = G53_GGML;
+        gate->q4 = slot->piece[0]; gate->gs = t[0]; gate->rows = inter; gate->columns = hidden;
+        up->q4 = slot->piece[2]; up->gs = t[1]; up->rows = inter; up->columns = hidden;
+        down->q4 = slot->piece[4]; down->gs = t[2]; down->rows = hidden; down->columns = inter;
+        return;
+    }
     const Mat shape[3] = {
         { 4, NULL, NULL, slot->piece[0], (const float *)slot->piece[1],
           inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0 },
@@ -2122,7 +2252,7 @@ static void ffn_vk_cpu(GModel *m, int index, const float *x, int rows, int K, co
             Slot *slot = &cache->s[slot_of[u]];
             slot->used = ++m->clock;
             Mat gate, up, down;
-            expert_mats(m, slot, &gate, &up, &down);
+            expert_mats(m, index, slot, &gate, &up, &down);
             int R = 0;
             for (int i = 0; i < n; i++) if (want[i] && ib[i] == eid) {
                 memcpy(xg + (size_t)R * D, x + (size_t)(i / K) * D, (size_t)D * sizeof(float));
@@ -2821,7 +2951,7 @@ static int glm53_worker_serve_one(GModel *m, int fd, int weight, int *establishe
              * stamping it again now would rank this block above the one
              * being read, making that block the next victims. */
             Mat gate, up, down;
-            expert_mats(m, slot, &gate, &up, &down);
+            expert_mats(m, (int)layer, slot, &gate, &up, &down);
             const size_t need = (size_t)nr[j] * D;
             if (need > y_cap) {
                 free(y);
@@ -3106,7 +3236,7 @@ static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
          * On any backend refusal/fault, run the original CPU loop unchanged. */
         int metal_done = 0;
 #ifdef COLI_METAL
-        if (g_metal_ready) {
+        if (g_metal_ready && !m->gx) {   /* GGUF experts: the CPU's ggml_quants.h only, for now */
             g_metal_moe_attempt++;
             const int max_rows = tokens * topk;
             const void **mg = malloc((size_t)here * sizeof(*mg));
@@ -3127,7 +3257,7 @@ static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
                     Slot *slot = &cache->s[slot_of[i]];
                     slot->used = ++m->clock;
                     Mat gate, up, down;
-                    expert_mats(m, slot, &gate, &up, &down);
+                    expert_mats(m, index, slot, &gate, &up, &down);
                     mg[i] = gate.q4; mu[i] = up.q4; md[i] = down.q4;
                     mgs[i] = gate.s; mus[i] = up.s; mds[i] = down.s;
                     xoff[i] = R;
@@ -3167,7 +3297,7 @@ static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
                 Slot *slot = &cache->s[slot_of[i]];
                 slot->used = ++m->clock;
                 Mat gate, up, down;
-                expert_mats(m, slot, &gate, &up, &down);
+                expert_mats(m, index, slot, &gate, &up, &down);
                 int R = 0;
                 for (int t = 0; t < tokens; t++) {
                     float scale = 0.0f;
@@ -3345,7 +3475,8 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
                  P, probe_layer);
         st_tensor *probe_expert = st_find(&m->S, first);
         if (!probe_expert) { fprintf(stderr, "missing %s\n", first); exit(1); }
-        m->streaming = probe_expert->dtype == 3;
+        m->gx = st_is_ggml(probe_expert->dtype);   /* a GGUF's quantized experts stream too */
+        m->streaming = probe_expert->dtype == 3 || m->gx;
     }
     if (m->streaming) {
         expert_geometry(m);
@@ -3396,7 +3527,22 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
             l->kfb = load_mat(m, c->kda_proj, c->kda_hd, "%slayers.%d.self_attn.f_b_proj.weight", P, i);
             l->kb = load_mat(m, c->kda_heads, D, "%slayers.%d.self_attn.b_proj.weight", P, i);
             l->dt = load_f32(m, c->kda_proj, "%slayers.%d.self_attn.dt_bias", P, i);
-            l->alog = load_f32(m, c->kda_heads, "%slayers.%d.self_attn.A_log", P, i);
+            {   /* exp(A_log), the decay rate: llama.cpp writes it negated (ssm_a = -exp(A_log)) */
+                float *aexp = malloc((size_t)c->kda_heads * sizeof(float));
+                if (!aexp) { fprintf(stderr, "OOM\n"); exit(1); }
+                if (st_find(&m->S, (snprintf(probe, sizeof(probe), "%slayers.%d.self_attn.ssm_a", P, i), probe))) {
+                    const float *neg = load_f32(m, c->kda_heads, "%s", probe);
+                    float *alog = malloc((size_t)c->kda_heads * sizeof(float));
+                    if (!alog) { fprintf(stderr, "OOM\n"); exit(1); }
+                    for (int h = 0; h < c->kda_heads; h++) { aexp[h] = -neg[h]; alog[h] = logf(-neg[h]); }
+                    free((void *)neg);
+                    l->alog = alog;   /* the Vulkan chain's input, which takes exp of it */
+                } else {
+                    l->alog = load_f32(m, c->kda_heads, "%slayers.%d.self_attn.A_log", P, i);
+                    for (int h = 0; h < c->kda_heads; h++) aexp[h] = expf(l->alog[h]);
+                }
+                l->aexp = aexp;
+            }
             l->onorm = load_f32(m, c->kda_hd, "%slayers.%d.self_attn.o_norm.weight", P, i);
             /* Il checkpoint tiene q/k/v conv separate; la ricorrenza le vuole
              * concatenate nello stesso ordine di qkv. */
@@ -3463,7 +3609,7 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
          * expert tier (glm53_vk_tier_start, once the history is read); while it will
          * be tried, a device that shares the CPU's RAM keeps the resident matrices on
          * the CPU (coli_vk_dense_decide, COLI_VK_DENSE overrides). */
-        const int tier = vkt_wanted() && m->streaming && m->c.n_experts > 0 && m->c.swiglu_limit > 0.f;
+        const int tier = vkt_wanted() && m->streaming && !m->gx && m->c.n_experts > 0 && m->c.swiglu_limit > 0.f;
         g_vk_ready = coli_vk_init_env_tier("glm53", tier);
         g_vk_dense = g_vk_ready && coli_vk_dense();
         if (g_vk_ready) coli_vk_set_swiglu_limit(m->c.swiglu_limit);

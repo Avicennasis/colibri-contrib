@@ -350,6 +350,63 @@ def inkling_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
+def glm5next_config(meta, tensors, overrides=None):
+    """GLM-5.3-Flash (llama.cpp's glm5-next) as the glm53 engine's config.json, the shape of
+    zai-org's (Glm5NextForConditionalGeneration, its text_config). head_count_kv marks the MLA
+    layers (1) among the KDA ones (0); the MTP block counts in block_count only where the file
+    holds it."""
+    p = "glm5-next."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    blocks = int(need("block_count"))
+    nextn = int(meta.get(p + "nextn_predict_layers", 0))
+    has_mtp = nextn > 0 and f"blk.{blocks - 1}.nextn.eh_proj.weight" in tensors
+    layers = blocks - nextn if has_mtp else blocks
+    kv = need("attention.head_count_kv")
+    kinds = ["deepseek_sparse_attention" if int(x) else "linear_attention" for x in kv][:layers]
+    dense = int(meta.get(p + "leading_dense_block_count", 0))
+    heads = int(need("attention.head_count"))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    itypes = meta.get(p + "attention.indexer.types")
+    clamp = meta.get(p + "swiglu_clamp_exp") or [10.0]
+    text = {
+        "model_type": "glm5_next_text",
+        "vocab_size": int(meta.get(p + "vocab_size", emb["dims"][1])),
+        "hidden_size": int(need("embedding_length")),
+        "intermediate_size": int(need("feed_forward_length")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "num_hidden_layers": layers, "num_attention_heads": heads, "num_key_value_heads": heads,
+        "n_shared_experts": int(meta.get(p + "expert_shared_count", 1)), "n_routed_experts": int(need("expert_count")),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "kv_lora_rank": int(need("attention.kv_lora_rank")), "q_lora_rank": int(need("attention.q_lora_rank")),
+        "qk_rope_head_dim": int(meta.get(p + "rope.dimension_count", 0)),
+        "qk_nope_head_dim": int(need("attention.key_length_mla")), "v_head_dim": int(need("attention.value_length_mla")),
+        "max_position_embeddings": int(meta.get(p + "context_length", 1048576)),
+        "layer_types": kinds,
+        "mlp_layer_types": ["dense"] * dense + ["sparse"] * (layers - dense), "first_k_dense_replace": dense,
+        "index_topk": int(need("attention.indexer.top_k")), "index_kpool": int(meta.get(p + "attention.indexer.kpool", 1)),
+        "index_head_dim": int(need("attention.indexer.key_length")), "index_n_heads": int(need("attention.indexer.head_count")),
+        "index_kpool_always_select_tail": bool(meta.get(p + "attention.indexer.kpool_select_tail", True)),
+        "linear_head_dim": int(need("kda.head_dim")), "linear_num_heads": heads,
+        "linear_conv_kernel_dim": int(need("ssm.conv_kernel")),
+        "linear_attn_config": {"num_heads": heads, "head_dim": int(need("kda.head_dim")),
+                               "short_conv_kernel_size": int(need("ssm.conv_kernel")),
+                               "gate_lower_bound": float(meta.get(p + "kda.gate_lower_bound", -5.0)),
+                               "kda_layers": [i for i in range(layers) if kinds[i] == "linear_attention"]},
+        "hc_mult": int(need("hyper_connection.count")), "hc_sinkhorn_iters": int(need("hyper_connection.sinkhorn_iterations")),
+        "hc_eps": float(meta.get(p + "hyper_connection.epsilon", 1e-6)),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-5)),
+        "routed_scaling_factor": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "norm_topk_prob": bool(meta.get(p + "expert_weights_norm", True)),
+        "swiglu_limit": float(clamp[0]),
+        "num_nextn_predict_layers": nextn if has_mtp else 0,
+        "mla_use_nope": True, "scoring_func": "sigmoid", "tie_word_embeddings": False,
+        "bos_token_id": meta.get("tokenizer.ggml.bos_token_id"), "eos_token_id": meta.get("tokenizer.ggml.eos_token_id"),
+    }
+    if itypes is not None:
+        text["indexer_types"] = ["full" if t else "shared" for t in itypes][:layers]
+    return {"architectures": ["Glm5NextForConditionalGeneration"], "model_type": "glm5_next", "text_config": text}, layers
+
+
 def qwen4exp_config(meta, tensors, overrides=None):
     """Qwen3.8-Flash-Next (llama.cpp's qwen4exp) as the qwen38 engine's config.json. The
     PLE table is one tensor here (per_layer_token_embd), so split_ngram_parts is 1; its
@@ -431,7 +488,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the
