@@ -260,6 +260,31 @@ class ContainerLayers(unittest.TestCase):
             self.assertFalse((Path(d) / "out").exists())
 
 
+@unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+class PlannerExperts(unittest.TestCase):
+    """The planner's inventory of a GGUF: one entry per routed expert under a name every family
+    counts (resource_plan._GGUF_EXPERT), and the model's own layers from its config, so that
+    a file whose nextn_predict_layers does not count its blocks (antirez's V4) loses none."""
+    def test_layers_from_the_config(self):
+        import resource_plan as rp
+        rng = np.random.default_rng(5)
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "m.gguf"
+            w = gguf.GGUFWriter(str(src), "deepseek4")
+            w.add_uint32("deepseek4.block_count", 3); w.add_uint32("deepseek4.nextn_predict_layers", 1)
+            for L in range(3):
+                for k, shape in (("gate", (4, 32, 64)), ("up", (4, 32, 64)), ("down", (4, 64, 32))):
+                    w.add_tensor(f"blk.{L}.ffn_{k}_exps.weight", blocks("Q8_0", shape, rng), raw_dtype=QT["Q8_0"])
+            w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+            def layers_seen(n):
+                return sorted({int(m.group(1)) for name, *_ in rp._gguf_tensor_sizes([src], n)
+                               for m in [rp._GGUF_EXPERT.match(name)] if m})
+            self.assertEqual(layers_seen(3), [0, 1, 2])
+            self.assertEqual(layers_seen(None), [0, 1])   # the file's own count: the last block taken for MTP
+            per = [size for name, size, *_ in rp._gguf_tensor_sizes([src], 3) if name.startswith("model.layers.0.mlp.experts.1.")]
+            self.assertEqual(sum(per), 3 * 32 * 2 * 34)   # gate, up, down: 32 rows of two Q8_0 blocks each
+
+
 class Qwen3MoeConfig(unittest.TestCase):
     """llama.cpp's qwen3moe (Qwen3-30B-A3B, Qwen3-Coder) as the qwen36 engine's config, from the
     metadata of unsloth's Qwen3-Coder-30B-A3B-Instruct GGUF: every layer attention, no shared

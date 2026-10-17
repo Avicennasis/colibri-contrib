@@ -77,7 +77,7 @@ class _CgroupMount:
 # sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
 # straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
 _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
-_ANALYSIS_CACHE_VERSION = 12
+_ANALYSIS_CACHE_VERSION = 13   # 13: a GGUF's experts counted for every family (V4, Inkling)
 
 
 def _dense_in_ram(descriptor, on_disk_bytes):
@@ -1576,11 +1576,19 @@ def _gguf_sources(model_dir):
     return link, parts
 
 
-def _gguf_tensor_sizes(parts):
+# The routed experts _gguf_tensor_sizes names, one entry per expert whatever the family
+# (analyze_model counts them as experts without the family's checkpoint names).
+_GGUF_EXPERT = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(?:(?:gate|up|down)_proj\.weight|gguf)$")
+
+
+def _gguf_tensor_sizes(parts, layers=None):
     """(name, bytes, dtype, shape) for a GGUF model, the shape in safetensors
     order (rows first; ggml stores the dimensions the other way round), named so the family's expert
     inventory sees one entry per routed expert (the file stores each layer's
-    experts fused, or packed by tools/gguf_import.py --mode copy)."""
+    experts fused, or packed by tools/gguf_import.py --mode copy). layers: the
+    model's own layers (its config); past them a multi-token-prediction head's,
+    which the engine does not load. Unset, the file's block_count less its
+    nextn_predict_layers."""
     import importlib.util
     spec = importlib.util.spec_from_file_location("gguf_reader", Path(__file__).resolve().parent / "tools" / "gguf_reader.py")
     gr = importlib.util.module_from_spec(spec); spec.loader.exec_module(gr)
@@ -1596,7 +1604,9 @@ def _gguf_tensor_sizes(parts):
             # model's own (nextn_predict_layers); the engine does not load it.
             # Only the first part of a split model carries the metadata.
             blocks = meta.get(f"{arch}.block_count")
-            if blocks:
+            if layers:
+                last = int(layers)
+            elif blocks:
                 last = int(blocks) - int(meta.get(f"{arch}.nextn_predict_layers", 0) or 0)
             stride_bytes = None
             if meta.get("colibri.layout") == "expert-packed-v1":
@@ -1684,9 +1694,10 @@ def analyze_model(model):
     dense_tensors = []
     expert_groups = {}
     tensor_names = set()
+    own_layers = (resolved.family_config.get("text_config") or resolved.family_config).get("num_hidden_layers")
     for shard in ([None] if gguf else shards):
         try:
-            sizes = (list(_gguf_tensor_sizes(shards)) if gguf
+            sizes = (list(_gguf_tensor_sizes(shards, own_layers if isinstance(own_layers, int) else None)) if gguf
                      else list(_tensor_sizes(shard, with_shape=True)))
         except OSError as error:
             # Name the file. An OSError raised by read() on an already-open
@@ -1700,7 +1711,9 @@ def analyze_model(model):
                           f"{error.strerror or error}: {shard}") from error
         for name, size, dtype, shape in sizes:
             tensor_names.add(name)
-            contributions = expert_contributions(resolved, name, size, dtype)
+            m = _GGUF_EXPERT.match(name) if gguf else None
+            contributions = (((int(m.group(1)), int(m.group(2)), size),) if m
+                             else expert_contributions(resolved, name, size, dtype))
             if contributions:
                 for layer, expert, byte_count in contributions:
                     key = (layer, expert)
