@@ -821,11 +821,11 @@ typedef struct {
     unsigned long long attn_blocked;   /* attention calls through chain_attnb (blocks of rows) */
     unsigned long long attn_flash;     /* attention calls through chain_attn_flash (matrix units) */
     unsigned long long attn_slices;    /* extra submissions that cut a long attention (COLI_VK_ATTN_SLICE) */
-    unsigned long long tile_gemms;     /* prompt matmuls through chain_gemm.comp (matrix units) */
+    unsigned long long tile_gemms;     /* prompt matmuls on the matrix units (chain_gemm.comp, qmatmul_gemm_bdc.comp) */
     unsigned long long moe_i8;         /* routed-expert layer steps in the CPU's integer form (chain_moe_i8) */
     unsigned long long gemv_i8;        /* a GGUF's dense GEMVs in it (chain_gemv_bd_i8) */
     unsigned long long copy_grids;     /* region lists copied by one dispatch (chain_copy2d, vkc_copy_regions) */
-    unsigned long long grp_coop;       /* our formats' grouped expert GEMMs on the matrix units (qmatmul_grp_qc) */
+    unsigned long long grp_coop;       /* grouped expert GEMMs on the matrix units (qmatmul_grp_qc, qmatmul_grp*_bdc) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

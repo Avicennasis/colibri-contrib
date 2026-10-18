@@ -120,6 +120,8 @@ typedef struct {
      * formats' grouped GEMMs (qmatmul_grp_bd.comp: [0] down, [1] gate+up) a pipeline per
      * (pass, ggml type), made on first use */
     VkShaderModule mod_rows, mod_grp[2]; VkPipeline rows; VkPipeline grp[2][64]; uint8_t grp_tried[2][64];
+    VkShaderModule mod_grpc[2]; VkPipeline grpc[2][64]; uint8_t grpc_tried[2][64];   /* qmatmul_grp*_bdc.comp: the same on the matrix units */
+    VkShaderModule mod_bdgc; VkPipeline bdgc[64]; uint8_t bdgc_tried[64];             /* qmatmul_gemm_bdc.comp: a GGUF's prompt GEMM on them */
     VkShaderModule mod_grpq[2]; VkPipeline grpq[2]; uint8_t grpq_tried[2], grpq_coop[2];   /* our formats' (1, 2, 4): qmatmul_grp_qc.comp, or _q in floats */
     int rows_tried;
     int discrete;                     /* a discrete card: vkc_prewarm's default */
@@ -374,6 +376,29 @@ static VkPipeline make_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
     VkPipeline p = VK_NULL_HANDLE;
     if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
     return p;
+}
+
+/* A pipeline of the matrix units' shaders: at the device's cooperative-matrix subgroup
+ * size (64 or 32), required, in full subgroups; NULL elsewhere or when it fails. */
+static VkPipeline coop_pipe(VkShaderModule m, const VkSpecializationInfo *si) {
+    int sg = KC.core.coop_sg;
+    if (!m || (sg != 64 && sg != 32)) return VK_NULL_HANDLE;
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .requiredSubgroupSize = (uint32_t)sg};
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
+                  .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main", .pSpecializationInfo = si},
+        .layout = KC.pl};
+    VkPipeline p = VK_NULL_HANDLE;
+    if (vkCreateComputePipelines(KC.dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    return p;
+}
+/* COLI_VK_<name>=0 keeps a family of matrix-unit shaders off */
+static int coop_on(const char *env) {
+    const char *e = getenv(env);
+    return (KC.core.coop_sg == 64 || KC.core.coop_sg == 32) && !(e && *e == '0');
 }
 
 static void dsv4_init(void);       /* chain_dsv4.comp (DeepSeek V4.1 / V4), below */
@@ -1115,8 +1140,21 @@ static VkPipeline bdv8_pipe(int t, int nr, int rowWords, int I) {
 int vkc_gemm_bd_ready(void) { return vkc_ready() && KC.mod_bdg != VK_NULL_HANDLE; }
 /* qmatmul_gemm_bd.comp's pipeline for ggml type t, made on first use */
 static VkPipeline bdg_pipe(int t, int rowWords) {
-    if (!KC.mod_bdg || t < 0 || t >= 64 || !(t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 20 || t == 21 ||
+    if (t < 0 || t >= 64 || !(t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 20 || t == 21 ||
         t == 22 || t == 23 || t == 42) || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
+    /* on the matrix units where the device has them (qmatmul_gemm_bdc.comp; COLI_VK_CHAIN_GEMM=0 off) */
+    if (!KC.bdgc_tried[t]) {
+        KC.bdgc_tried[t] = 1;
+        if (KC.bd && coop_on("COLI_VK_CHAIN_GEMM")) {
+            if (!KC.mod_bdgc) KC.mod_bdgc = load_module(KC.core.spv_path, "qmatmul_gemm_bdc.spv");
+            int32_t v = t;
+            VkSpecializationMapEntry me = {0, 0, 4};
+            VkSpecializationInfo si = {1, &me, 4, &v};
+            KC.bdgc[t] = coop_pipe(KC.mod_bdgc, &si);
+        }
+    }
+    if (KC.bdgc[t]) return KC.bdgc[t];
+    if (!KC.mod_bdg) return VK_NULL_HANDLE;
     if (!KC.bdg_tried[t]) {
         KC.bdg_tried[t] = 1;
         int32_t v = t;
@@ -1139,6 +1177,7 @@ static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y
         KC.kind = PK_GEMM;
         int ok = record(gp, bd, 4, &pc, sizeof pc, (uint32_t)((ti->O + 63) / 64), (uint32_t)((S + 63) / 64), 1);
         KC.st.matmuls += ok; KC.st.gemms += ok;
+        if (gp == KC.bdgc[ti->fmt - 100]) KC.st.tile_gemms += ok;   /* on the matrix units */
         return ok;
     }
     /* a speculative verify's rows (S <= 4) share each weight's decode */
@@ -1933,7 +1972,20 @@ static int bd_type(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t 
 /* the grouped GEMM's pipeline for pass v (1 gate+up, 0 down) and ggml type t */
 static VkPipeline grp_pipe(int v, int t) {
     static const char *file[2] = {"qmatmul_grp_bd.spv", "qmatmul_grp_gate_up_bd.spv"};
+    static const char *cfile[2] = {"qmatmul_grp_bdc.spv", "qmatmul_grp_gate_up_bdc.spv"};
     if (t < 0 || t >= 64 || !bd_type(t)) return VK_NULL_HANDLE;
+    /* on the matrix units where the device has them (qmatmul_grp*_bdc.comp; COLI_VK_GRP_COOP=0 off) */
+    if (!KC.grpc_tried[v][t]) {
+        KC.grpc_tried[v][t] = 1;
+        if (coop_on("COLI_VK_GRP_COOP")) {
+            if (!KC.mod_grpc[v]) KC.mod_grpc[v] = load_module(KC.core.spv_path, cfile[v]);
+            int32_t c = t;
+            VkSpecializationMapEntry me = {0, 0, 4};
+            VkSpecializationInfo si = {1, &me, 4, &c};
+            KC.grpc[v][t] = coop_pipe(KC.mod_grpc[v], &si);
+        }
+    }
+    if (KC.grpc[v][t]) return KC.grpc[v][t];
     if (!KC.grp_tried[v][t]) {
         KC.grp_tried[v][t] = 1;
         if (!KC.mod_grp[v]) KC.mod_grp[v] = load_module(KC.core.spv_path, file[v]);
@@ -2069,7 +2121,8 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
     struct { int I, O; float limit; int ibase, kgat, rpw; } pd = {p->I, p->D, 0.f, (int)imax, p->K, 0};
     VkcBind db[5] = {B(r->hid, 0), B(r->items, 0), {r->etab->buf, eb0, eb0, 0}, B(r->yk, 1), B(r->amap, 0)};
     ok = ok && record_indirect(rows_pipe(0, p->dfmt), db, 5, &pd, sizeof pd, r->aux, 16);
-    if (ok) KC.st.grp_coop += (our_fmt(p->gfmt) && KC.grpq_coop[1]) + (our_fmt(p->dfmt) && KC.grpq_coop[0]);
+    if (ok) KC.st.grp_coop += (our_fmt(p->gfmt) ? KC.grpq_coop[1] : p->gfmt >= 100 && p->gfmt < 164 && KC.grpc[1][p->gfmt - 100]) +
+                              (our_fmt(p->dfmt) ? KC.grpq_coop[0] : p->dfmt >= 100 && p->dfmt < 164 && KC.grpc[0][p->dfmt - 100]);
     /* the rows' sums over their experts, in rank order */
     pc.mode = 3;
     VkcBind yb[7] = {B(ids, 0), B(table, 0), B(NULL, 0), B(NULL, 0), B(w, 0), B(r->yk, 0), B(y, 1)};
@@ -2694,6 +2747,12 @@ void vkc_shutdown(void) {
         if (KC.bdv[r][t][b]) vkDestroyPipeline(KC.dev, KC.bdv[r][t][b], NULL);
     for (int t = 0; t < 64; t++) if (KC.bdg[t]) vkDestroyPipeline(KC.dev, KC.bdg[t], NULL);
     if (KC.mod_bdg) vkDestroyShaderModule(KC.dev, KC.mod_bdg, NULL);
+    for (int t = 0; t < 64; t++) if (KC.bdgc[t]) vkDestroyPipeline(KC.dev, KC.bdgc[t], NULL);
+    if (KC.mod_bdgc) vkDestroyShaderModule(KC.dev, KC.mod_bdgc, NULL);
+    for (int v = 0; v < 2; v++) {
+        for (int t = 0; t < 64; t++) if (KC.grpc[v][t]) vkDestroyPipeline(KC.dev, KC.grpc[v][t], NULL);
+        if (KC.mod_grpc[v]) vkDestroyShaderModule(KC.dev, KC.mod_grpc[v], NULL);
+    }
     if (KC.mod_bdv) vkDestroyShaderModule(KC.dev, KC.mod_bdv, NULL);
     if (KC.mod_bd) vkDestroyShaderModule(KC.dev, KC.mod_bd, NULL);
     for (int d = 0; d < 2; d++) for (int b = 0; b <= KC_STAGES; b++) if (KC.moe[d][b]) vkDestroyPipeline(KC.dev, KC.moe[d][b], NULL);

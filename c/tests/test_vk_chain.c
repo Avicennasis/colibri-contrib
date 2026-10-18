@@ -2766,17 +2766,22 @@ static void test_moe_rows(int tg, int td, int S, int K, int E, int D, int I) {
         VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 0, 1, fg, fd, E, 0};
         VkcMoeRows rr = {0};
         vkc_moe_set_idot(0);   /* against chain_moe's float form: the grouped GEMMs' sums */
+        VkcStats s0, s1; vkc_stats(&s0);
         ok = vkc_begin() && vkc_write(tb, 0, tab, (size_t)E * COLI_VK_XB_ENTRY * 4) && vkc_route(lb, NULL, ib, wb, &rp) &&
              vkc_moe(xb, ib, wb, tb, hb, y0, &mp) && vkc_moe_rows(xb, ib, wb, tb, &rr, y1, &mp) && vkc_submit(1);
+        vkc_stats(&s1);
         vkc_moe_set_idot(-1);
         CHECK(ok, "moe rows %s/%s S %d: the frame failed", gq_type_name(tg), gq_type_name(td), S);
         if (ok) {
+            /* in floats to 1e-4; on the matrix units (qmatmul_grp*_bdc: f16 operands, two GEMMs) to 2e-3 of the largest */
+            int coop = s1.grp_coop > s0.grp_coop;
             const float *a = vkc_ptr(y0), *b = vkc_ptr(y1);
             double mx = 0, ref = 0;
             for (size_t i = 0; i < (size_t)S * D; i++) { double d = fabs((double)a[i] - b[i]); if (d > mx) mx = d; if (fabs(a[i]) > ref) ref = fabs(a[i]); }
-            CHECK(mx <= 1e-4 * (ref > 1 ? ref : 1), "moe rows %s/%s S %d: max |diff| %.3g of %.3g against chain_moe",
-                  gq_type_name(tg), gq_type_name(td), S, mx, ref);
-            printf("moe rows %s/%s S %d K %d E %d: max |diff| %.3g of %.3g against chain_moe\n", gq_type_name(tg), gq_type_name(td), S, K, E, mx, ref);
+            CHECK(mx <= (coop ? 2e-3 * ref : 1e-4 * (ref > 1 ? ref : 1)), "moe rows %s/%s S %d%s: max |diff| %.3g of %.3g against chain_moe",
+                  gq_type_name(tg), gq_type_name(td), S, coop ? " (matrix units)" : "", mx, ref);
+            printf("moe rows %s/%s S %d K %d E %d%s: max |diff| %.3g of %.3g against chain_moe\n", gq_type_name(tg), gq_type_name(td), S, K, E,
+                   coop ? " on the matrix units" : "", mx, ref);
         }
         vkc_moe_rows_free(&rr);
         VkcBuf *fr[] = {lb, xb, tb, ib, wb, hb, y0, y1};
@@ -2958,15 +2963,19 @@ static void test_matmul_bd(int t, int S, int I, int O) {
     if (!coli_vk_tensor_ensure(&tt, w, NULL, fmt, I, O, 0)) { CHECK(0, "matmul_bd %s: upload", gq_type_name(t)); free(w); free(W); free(x); return; }
     VkcBuf *xb = up(x, (size_t)S * I), *yb = vkc_buf((size_t)S * O * 4, VKC_DEV);
     vkc_moe_set_idot(0);   /* the float form, against the float dequantization */
+    VkcStats st0, st1; vkc_stats(&st0);
     vkc_begin(); int ok = vkc_matmul(tt, xb, 0, yb, 0, S); vkc_submit(1);
+    vkc_stats(&st1);
     vkc_moe_set_idot(-1);
+    int coop = st1.tile_gemms > st0.tile_gemms;   /* qmatmul_gemm_bdc.comp: f16 weights and x */
     float *y = down(yb, 0, (size_t)S * O), *ref = malloc((size_t)S * O * sizeof *ref);
     for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
         double a = 0; for (int i = 0; i < I; i++) a += (double)x[(size_t)s * I + i] * W[(size_t)o * I + i];
         ref[(size_t)s * O + o] = (float)a;
     }
     double e = relerr(y, ref, (size_t)S * O, 1e-6);
-    CHECK(ok && !bad(y, (size_t)S * O) && e < 1e-5, "matmul_bd %s S %d [%d x %d]: err %.2e", gq_type_name(t), S, O, I, e);
+    CHECK(ok && !bad(y, (size_t)S * O) && e < (coop ? 2e-3 : 1e-5), "matmul_bd %s S %d [%d x %d]%s: err %.2e", gq_type_name(t), S, O, I,
+          coop ? " (matrix units)" : "", e);
     coli_vk_tensor_free(tt); vkc_free(xb); vkc_free(yb);
     free(w); free(W); free(x); free(y); free(ref);
 }
