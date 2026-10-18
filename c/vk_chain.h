@@ -819,6 +819,7 @@ typedef struct {
     unsigned long long attn_slices;    /* extra submissions that cut a long attention (COLI_VK_ATTN_SLICE) */
     unsigned long long tile_gemms;     /* prompt matmuls through chain_gemm.comp (matrix units) */
     unsigned long long moe_i8;         /* routed-expert layer steps in the CPU's integer form (chain_moe_i8) */
+    unsigned long long gemv_i8;        /* a GGUF's dense GEMVs in it (chain_gemv_bd_i8) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

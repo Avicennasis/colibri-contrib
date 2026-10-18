@@ -104,6 +104,7 @@ typedef struct {
     VkShaderModule mod_gv2; VkPipeline gv2; int gv2_floats;   /* chain_gemv2.comp: int8 decode GEMVs (COLI_VK_CHAIN_GEMV2), x staged up to gv2_floats */
     VkShaderModule mod_bd; VkPipeline bd;   /* qmatmul_bd.comp: the block formats (a GGUF's matrices, blockdec.glsl); none without the file */
     VkShaderModule mod_bdv; VkPipeline bdv[4][64][10]; uint8_t bdv_tried[4][64][10]; int bdv_xs;   /* chain_gemv_bd.comp: a pipeline per (rows, ggml type, staging size), made on first use */
+    VkShaderModule mod_bdv8; VkPipeline bdv8[4][64][10]; uint8_t bdv8_tried[4][64][10];   /* chain_gemv_bd_i8.spv: the same in the CPU's integer form, by its codes' size */
     VkShaderModule mod_bdg; VkPipeline bdg[64]; uint8_t bdg_tried[64];   /* qmatmul_gemm_bd.comp: a prompt's rows, a pipeline per ggml type */
     VkShaderModule mod_moe; VkPipeline moe[2][10];            /* chain_moe.comp: the routed experts, by address (bufferDeviceAddress),
                                                                  [1] with the block formats' paths (BD = 1), by staging size */
@@ -973,6 +974,14 @@ static int stage_of(int need, int cap) {   /* a bucket: the smallest that holds 
     return KC_STAGES;
 }
 static int stage_vec4(int b, int cap) { return b < KC_STAGES ? kc_stage[b] : cap; }
+/* the integer form's sizes for a row's codes (16 inputs a uvec4): the smallest of these
+ * that holds the row; KC_STAGES past them (the form declines) */
+static const int kc_codes[9] = {16, 32, 64, 128, 160, 192, 256, 384, 512};
+static int codes_of(int I) {
+    int need = (I + 15) / 16;
+    for (int b = 0; b < KC_STAGES; b++) if (kc_codes[b] >= need) return b;
+    return KC_STAGES;
+}
 /* A block-format matrix (fmt >= 100, a GGUF's): qmatmul_bd.comp, its table at binding 2,
  * one row of outputs per workgroup row as the expert batch dispatches it; every row's
  * products as a decode step's. */
@@ -997,6 +1006,33 @@ static VkPipeline bdv_pipe(int t, int nr, int rowWords, int I) {
         KC.bdv[nr - 1][t][b] = make_pipe(KC.mod_bdv, &si);
     }
     return KC.bdv[nr - 1][t][b];
+}
+/* chain_gemv_bd_i8.spv's pipeline (the integer form, where it is on: moe_i8_pipe's rule) for
+ * ggml type t, nr rows of x and inputs of I: their codes in the smallest kc_codes bucket of
+ * uvec4s that holds a row, within the device's shared memory. NULL: the float form. */
+static int moe_i8_type(int fmt);
+static VkPipeline bdv8_pipe(int t, int nr, int rowWords, int I) {
+    if (!(KC.idot_set >= 0 ? KC.idot_set && KC.idot : KC.idot == 2) || !KC.mod_bd || nr < 1 || nr > 4 || I % 32 ||
+        !moe_i8_type(100 + t) || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
+    /* IQ4_XS and IQ4_NL look their values up: one row ran slower so (10240 x 2560 on an RTX
+     * PRO 4000, 44.2 -> 46.8 us), two or more faster (three 80.8 -> 58.0) */
+    if ((t == 20 || t == 23) && nr < 2 && KC.idot_set < 0) return VK_NULL_HANDLE;
+    int b = codes_of(I);
+    if (b >= KC_STAGES) return VK_NULL_HANDLE;
+    int xq = kc_codes[b];
+    size_t sh = (size_t)nr * (xq + xq / 8 + 1) * 16 + (size_t)nr * (xq / 2 + 1) * 4 + (size_t)nr * (xq + 1) * 4 + 8768 + 64 + 64;
+    if (sh > kc_shared_limit()) return VK_NULL_HANDLE;
+    if (!KC.bdv8_tried[nr - 1][t][b]) {
+        KC.bdv8_tried[nr - 1][t][b] = 1;
+        if (!KC.mod_bdv8) KC.mod_bdv8 = load_module(KC.core.spv_path, "chain_gemv_bd_i8.spv");
+        if (KC.mod_bdv8) {
+            int32_t v[4] = {4, t, nr, xq};
+            VkSpecializationMapEntry me[4] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}};
+            VkSpecializationInfo si = {4, me, sizeof v, v};
+            KC.bdv8[nr - 1][t][b] = make_pipe(KC.mod_bdv8, &si);
+        }
+    }
+    return KC.bdv8[nr - 1][t][b];
 }
 int vkc_gemm_bd_ready(void) { return vkc_ready() && KC.mod_bdg != VK_NULL_HANDLE; }
 /* qmatmul_gemm_bd.comp's pipeline for ggml type t, made on first use */
@@ -1029,7 +1065,9 @@ static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y
     }
     /* a speculative verify's rows (S <= 4) share each weight's decode */
     int nr = S <= 4 ? S : 1;
-    VkPipeline v = ti->fmt < 164 && ti->I % 32 == 0 ? bdv_pipe(ti->fmt - 100, nr, ti->rowWords, ti->I) : VK_NULL_HANDLE;
+    VkPipeline v = ti->fmt < 164 && ti->I % 32 == 0 ? bdv8_pipe(ti->fmt - 100, nr, ti->rowWords, ti->I) : VK_NULL_HANDLE;
+    if (v) KC.st.gemv_i8++;
+    else if (ti->fmt < 164 && ti->I % 32 == 0) v = bdv_pipe(ti->fmt - 100, nr, ti->rowWords, ti->I);
     int ok;
     if (v) {
         /* lanes per row: about six 32-weight steps each, at most a subgroup (the shader
@@ -1580,9 +1618,9 @@ static int moe_i8_type(int fmt) {
 }
 static VkPipeline moe_i8_pipe(int n) {
     if (!(KC.idot_set >= 0 ? KC.idot_set && KC.idot : KC.idot == 2) || !KC.moe_xs_bd) return VK_NULL_HANDLE;
-    int np = (n + 255) & ~255, b = stage_of(np / 16, 1 << 30);
+    int b = codes_of(n > 0 ? n : 8192);
     if (b >= KC_STAGES) return VK_NULL_HANDLE;
-    int xq = kc_stage[b];
+    int xq = kc_codes[b];
     /* its shared memory: the codes, scales and sums, bdstep.glsl's tables */
     if ((size_t)(xq + xq / 8 + 1) * 16 + (size_t)(xq / 2 + 1) * 4 + (size_t)(xq + 1) * 4 + 8768 + 16 > kc_shared_limit()) return VK_NULL_HANDLE;
     VkPipeline *pp = &KC.moe_i8[b];
@@ -1635,7 +1673,9 @@ int vkc_prewarm(const VkcPrewarm *pw) {
             for (int nr = 1; nr <= 4 && ok; nr++) {
                 VkPipeline made[KC_STAGES + 1]; int nm = 0;
                 for (int k = 0; k < (pw->n_gemv_i > 0 ? pw->n_gemv_i : 1) && ok; k++) {
-                    VkPipeline v = bdv_pipe(t, nr, 64, pw->n_gemv_i > 0 ? pw->gemv_i[k] : 256);
+                    int I = pw->n_gemv_i > 0 ? pw->gemv_i[k] : 256;
+                    VkPipeline v = bdv8_pipe(t, nr, 64, I);
+                    if (!v) v = bdv_pipe(t, nr, 64, I);
                     int seen = 0;
                     for (int j = 0; j < nm; j++) seen |= made[j] == v;
                     if (seen) continue;
@@ -2488,6 +2528,9 @@ void vkc_shutdown(void) {
     if (KC.mod_bd) vkDestroyShaderModule(KC.dev, KC.mod_bd, NULL);
     for (int d = 0; d < 2; d++) for (int b = 0; b <= KC_STAGES; b++) if (KC.moe[d][b]) vkDestroyPipeline(KC.dev, KC.moe[d][b], NULL);
     for (int b = 0; b <= KC_STAGES; b++) if (KC.moe_i8[b]) vkDestroyPipeline(KC.dev, KC.moe_i8[b], NULL);
+    for (int r = 0; r < 4; r++) for (int t = 0; t < 64; t++) for (int b = 0; b <= KC_STAGES; b++)
+        if (KC.bdv8[r][t][b]) vkDestroyPipeline(KC.dev, KC.bdv8[r][t][b], NULL);
+    if (KC.mod_bdv8) vkDestroyShaderModule(KC.dev, KC.mod_bdv8, NULL);
     if (KC.mod_moe_i8) vkDestroyShaderModule(KC.dev, KC.mod_moe_i8, NULL);
     if (KC.rows) vkDestroyPipeline(KC.dev, KC.rows, NULL);
     if (KC.mod_rows) vkDestroyShaderModule(KC.dev, KC.mod_rows, NULL);

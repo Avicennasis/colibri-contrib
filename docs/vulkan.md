@@ -2055,6 +2055,30 @@ Measured on the RTX PRO 4000 (`COLI_VK_CHAIN_BENCH=moe`, the float form with
 | Q4_K / Q6_K | 2048 | 75.6 -> 69.3 | 128 -> 120 | 193 -> 165 |
 | IQ4_XS / IQ4_XS | 2560 | 106 -> 99.6 | 187 -> 180 | 268 -> 283 |
 
+A GGUF's dense GEMV (`chain_gemv_bd_i8.spv`, `chain_gemv_bd.comp` with `-DIDOT`) takes the
+same form there: up to four rows of x (a verify's) quantized into shared memory, and each
+32-weight step decoded once for all of them (`bsi_step` loops over `BSI_NR` rows; the
+experts' kernel is its one-row case). The rows' codes take a quarter of the floats' room,
+so a verify's rows no longer fill the shared memory, and the integer products cost less
+than the conversions. IQ4_XS and IQ4_NL look their values up and keep the float form for
+one row (44.2 us against 46.8). The codes are the CPU's to the bit: a Vulkan division
+may be 2.5 ulp off and an fma need not be fused (Lavapipe's are not), and either moved a
+code at a tie now and then, so `bsi_div` makes `127 / amax` and `amax / 127` exact with
+the integer remainder of the mantissas' quotient. `tests/test_vk_chain`'s `matmul_bd i8`
+cases, every type at 1, 3 and 4 rows, agree with `gq_matmul`'s integer path to under
+2e-5, on the RTX and on Lavapipe. A GEMV of 10240 x 2560 in microseconds (float form ->
+integer form):
+
+| type | 1 row | 2 rows | 3 rows | 4 rows |
+|---|---|---|---|---|
+| IQ2_S | 52.0 -> 29.9 | 67.2 -> 39.7 | 87.3 -> 46.2 | 232.7 -> 58.3 |
+| IQ2_XXS | 48.1 -> 25.4 | 60.8 -> 36.8 | 81.7 -> 46.4 | 232.2 -> 54.0 |
+| Q2_0 | 40.0 -> 29.0 | 51.6 -> 32.8 | 72.7 -> 39.8 | 217.8 -> 47.2 |
+| Q4_K | 46.9 -> 42.2 | 62.5 -> 45.0 | 82.1 -> 50.2 | 149.1 -> 59.0 |
+| Q6_K | 68.1 -> 63.1 | 90.0 -> 67.3 | 113.2 -> 72.1 | 262.4 -> 81.6 |
+| Q8_0 | 74.6 -> 73.2 | 87.0 -> 75.6 | 104.8 -> 78.9 | 272.5 -> 98.9 |
+| IQ4_XS | 44.5 (kept) | 59.7 -> 51.2 | 80.8 -> 58.0 | 231.1 -> 66.2 |
+
 **Staging sizes.** `chain_moe.comp` stages a row of x in shared memory, and so does
 `chain_gemv_bd.comp` (a GGUF's dense GEMV). Both pipelines used to be built at the
 device's largest staging (48 KiB on NVIDIA, with bdstep.glsl's 8.5 KiB of tables), which

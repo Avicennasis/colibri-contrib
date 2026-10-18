@@ -6,11 +6,12 @@
 // with the inner sums in integers (packed 4 x 8 dot products). The same integers and
 // scales as the CPU's, so the two differ only in the order of the float sums.
 // The including shader includes bdstep.glsl first (its loads, tables and helpers) and
-// defines:
-//   BSI_X(i)   int word i of the row's codes (elements 4i..4i+3)
-//   BSI_DX(b)  the scale of block b (elements 32b..32b+31)
-//   BSI_XS(g)  the sum of the codes of group g (elements 16g..16g+15)
-//   BSI_ACC(v) adds the step's float v to the row's sum
+// defines, for BSI_NR rows of x (a step's weights decoded once for all of them: a
+// speculative verify's rows), for row r:
+//   BSI_X(r, i)   int word i of the row's codes (elements 4i..4i+3)
+//   BSI_DX(r, b)  the scale of block b (elements 32b..32b+31)
+//   BSI_XS(r, g)  the sum of the codes of group g (elements 16g..16g+15)
+//   BSI_ACC(r, v) adds the step's float v to the row's sum
 #ifndef BDSTEP_I8_GLSL
 #define BDSTEP_I8_GLSL
 #extension GL_EXT_integer_dot_product : require
@@ -18,10 +19,11 @@
 // a / b rounded to nearest even, as the CPU's float division rounds it: Vulkan allows a
 // division 2.5 ulp off and an fma that is not fused (Lavapipe's), and an ulp of 127 / amax
 // moves a code at a tie. The quotient's 25 bits floor(ma 2^24 / mb) of the mantissas from
-// the device's division (a few units off), made exact by the remainder (small, so its low
-// 32 bits are all of it), bit by bit if the division were further off; the remainder's
-// sign for the sticky bit. For a, b or a quotient not positive and normal, the device's
-// division
+// the device's division (2.5 ulp: a few units, well inside the 16 steps), made exact by
+// the remainder (small, so its low 32 bits are all of it), the remainder for the sticky
+// bit. A bit-by-bit division for a device further off cost the GEMV's prologue a fifth
+// of IQ2_S's one-row GEMV (29.8 -> 35.1 us on an RTX PRO 4000) without ever running.
+// For a, b or a quotient not positive and normal, the device's division
 float bsi_div(float a, float b) {
     uint ua = floatBitsToUint(a), ub = floatBitsToUint(b);
     int e = int(ua >> 23) - int(ub >> 23);
@@ -32,11 +34,6 @@ float bsi_div(float a, float b) {
     int r = int((ma << 24) - qv * mb);
     for (int i = 0; i < 16 && r < 0; i++) { qv--; r += int(mb); }
     for (int i = 0; i < 16 && r >= int(mb); i++) { qv++; r -= int(mb); }
-    if (r < 0 || r >= int(mb)) {
-        qv = 0u;
-        for (int i = 0; i < 25; i++) { qv <<= 1; if (ma >= mb) { ma -= mb; qv |= 1u; } ma <<= 1; }
-        r = int(ma);
-    }
     uint m = qv >> 1;
     if ((qv & 1u) != 0u && (r != 0 || (m & 1u) != 0u)) m++;
     if (m > 0xFFFFFFu) { m >>= 1; e++; }
@@ -45,7 +42,7 @@ float bsi_div(float a, float b) {
 }
 float bsi_id(float amax) { return amax > 0.0 ? bsi_div(127.0, amax) : 0.0; }
 bool bsi_has(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42; }
-int bsi_dot(uint w, uint xi) { return dotPacked4x8EXT(int(w), BSI_X(xi)); }
+int bsi_dot(uint w, uint r, uint xi) { return dotPacked4x8EXT(int(w), BSI_X(r, xi)); }
 // 0xFF in each byte whose bit (of the low four) is set: those bytes are negated
 uint bsi_smask(uint b4) { return ((b4 * 0x00204081u) & 0x01010101u) * 0xFFu; }
 uint bsi_neg(uint g, uint b4) { uint m = bsi_smask(b4 & 15u); return (g ^ m) + (m & 0x01010101u); }
@@ -55,7 +52,8 @@ uint bsi_kv4(uint w, int sh) {
            ((uint(int(bs_kvt[bitfieldExtract(w, sh + 16, 4)])) & 255u) << 16) | ((uint(int(bs_kvt[bitfieldExtract(w, sh + 24, 4)])) & 255u) << 24);
 }
 
-// step q (weights 32q..32q+31 of the row at byte rb, ggml type t)
+// step q (weights 32q..32q+31 of the row at byte rb, ggml type t), for each row of x
+#define BSI_ROWS [[unroll]] for (uint r = 0u; r < uint(BSI_NR); r++)
 void bsi_step(int t, uint rb, uint q) {
     if (t == 12 || t == 13) {   // Q4_K / Q5_K: chunk c (64 weights), half h: weights 64c + 16h + 0..15 (low nibbles)
         uint b = q >> 3, c = (q >> 1) & 3u, h = q & 1u;   // and 64c + 32 + 16h + 0..15 (high), groups of their own
@@ -66,15 +64,18 @@ void bsi_step(int t, uint rb, uint q) {
         uvec4 qs = BS_W4((base + (t == 12 ? 16u : 48u) + 32u * c + 16u * h) >> 4);
         uvec4 qh = t == 13 ? BS_W4((base + 16u + 16u * h) >> 4) : uvec4(0u);
         uint e = b * 64u + c * 16u + h * 4u;   // the low run's first word of codes
-        int sl = 0, sh = 0;
+        uint wl[4], wh[4];
         [[unroll]] for (int k = 0; k < 4; k++) {
-            uint wl = qs[k] & 0x0F0F0F0Fu, wh = (qs[k] >> 4) & 0x0F0F0F0Fu;
-            if (t == 13) { uint hb = qh[k] >> (2u * c); wl |= (hb & 0x01010101u) << 4; wh |= ((hb >> 1) & 0x01010101u) << 4; }
-            sl += bsi_dot(wl, e + uint(k)); sh += bsi_dot(wh, e + 8u + uint(k));
+            wl[k] = qs[k] & 0x0F0F0F0Fu; wh[k] = (qs[k] >> 4) & 0x0F0F0F0Fu;
+            if (t == 13) { uint hb = qh[k] >> (2u * c); wl[k] |= (hb & 0x01010101u) << 4; wh[k] |= ((hb >> 1) & 0x01010101u) << 4; }
         }
         uint gl = e >> 2, gh = gl + 2u;   // their groups of 16 (and blocks of 32: g / 2)
-        BSI_ACC(BSI_DX(gl >> 1) * (dm.x * float(lo.x) * float(sl) - dm.y * float(lo.y) * float(BSI_XS(gl))) +
-                BSI_DX(gh >> 1) * (dm.x * float(hi.x) * float(sh) - dm.y * float(hi.y) * float(BSI_XS(gh))));
+        BSI_ROWS {
+            int sl = 0, sh = 0;
+            [[unroll]] for (int k = 0; k < 4; k++) { sl += bsi_dot(wl[k], r, e + uint(k)); sh += bsi_dot(wh[k], r, e + 8u + uint(k)); }
+            BSI_ACC(r, BSI_DX(r, gl >> 1) * (dm.x * float(lo.x) * float(sl) - dm.y * float(lo.y) * float(BSI_XS(r, gl))) +
+                       BSI_DX(r, gh >> 1) * (dm.x * float(hi.x) * float(sh) - dm.y * float(hi.y) * float(BSI_XS(r, gh))));
+        }
         return;
     }
     if (t == 14) {   // Q6_K: (6-bit code) - 32, the codes' dot less 32 times the sum of x
@@ -83,21 +84,29 @@ void bsi_step(int t, uint rb, uint q) {
         uint s2 = bs_ldu(base + 192u + 8u * n + 2u * m);
         float d = bs_f16at(base + 208u);
         uint sh = (m >> 1) * 4u, hs = 2u * m;
-        int s0 = 0, s1 = 0;
+        uint w[8];
         [[unroll]] for (int k = 0; k < 8; k++) {
             uint lw = bs_ldu(qlo + 4u * uint(k)), hw = bs_ldu(qhi + 4u * uint(k));
-            int v = bsi_dot(((lw >> sh) & 0x0F0F0F0Fu) | (((hw >> hs) & 0x03030303u) << 4), q * 8u + uint(k));
-            if (k < 4) s0 += v; else s1 += v;
+            w[k] = ((lw >> sh) & 0x0F0F0F0Fu) | (((hw >> hs) & 0x03030303u) << 4);
         }
-        s0 -= 32 * BSI_XS(2u * q); s1 -= 32 * BSI_XS(2u * q + 1u);
-        BSI_ACC(BSI_DX(q) * (d * bs_sbyte(s2, 0) * float(s0) + d * bs_sbyte(s2, 1) * float(s1)));
+        BSI_ROWS {
+            int s0 = 0, s1 = 0;
+            [[unroll]] for (int k = 0; k < 8; k++) { int v = bsi_dot(w[k], r, q * 8u + uint(k)); if (k < 4) s0 += v; else s1 += v; }
+            s0 -= 32 * BSI_XS(r, 2u * q); s1 -= 32 * BSI_XS(r, 2u * q + 1u);
+            BSI_ACC(r, BSI_DX(r, q) * (d * bs_sbyte(s2, 0) * float(s0) + d * bs_sbyte(s2, 1) * float(s1)));
+        }
         return;
     }
     if (t == 8) {   // Q8_0: the step is the block
         uint base = rb + q * 34u;
-        int s = 0;
-        [[unroll]] for (int k = 0; k < 8; k++) s += bsi_dot(bs_ldu(base + 2u + 4u * uint(k)), q * 8u + uint(k));
-        BSI_ACC(BSI_DX(q) * bs_f16at(base) * float(s));
+        uint w[8];
+        [[unroll]] for (int k = 0; k < 8; k++) w[k] = bs_ldu(base + 2u + 4u * uint(k));
+        float d = bs_f16at(base);
+        BSI_ROWS {
+            int s = 0;
+            [[unroll]] for (int k = 0; k < 8; k++) s += bsi_dot(w[k], r, q * 8u + uint(k));
+            BSI_ACC(r, BSI_DX(r, q) * d * float(s));
+        }
         return;
     }
     if (t == 20 || t == 23) {   // IQ4_NL (the step is the block) / IQ4_XS (8 steps a block): kvalues of the nibbles
@@ -109,12 +118,16 @@ void bsi_step(int t, uint rb, uint q) {
             uint ls = ((w2 >> (8u * (ib >> 1) + 4u * (ib & 1u))) & 15u) | (((w0 >> (16u + 2u * ib)) & 3u) << 4);
             d = unpackHalf2x16(w0).x * float(int(ls) - 32); qa = base + 8u + 16u * ib;
         }
-        int s = 0;
+        uint wl[4], wh[4];
         [[unroll]] for (int k = 0; k < 4; k++) {
             uint wd = t == 20 ? bs_ldu(qa + 4u * uint(k)) : BS_W1((qa >> 2) + uint(k));
-            s += bsi_dot(bsi_kv4(wd, 0), q * 8u + uint(k)) + bsi_dot(bsi_kv4(wd, 4), q * 8u + 4u + uint(k));
+            wl[k] = bsi_kv4(wd, 0); wh[k] = bsi_kv4(wd, 4);
         }
-        BSI_ACC(BSI_DX(q) * d * float(s));
+        BSI_ROWS {
+            int s = 0;
+            [[unroll]] for (int k = 0; k < 4; k++) s += bsi_dot(wl[k], r, q * 8u + uint(k)) + bsi_dot(wh[k], r, q * 8u + 4u + uint(k));
+            BSI_ACC(r, BSI_DX(r, q) * d * float(s));
+        }
         return;
     }
     if (t == 21) {   // IQ3_S: 8 chunks of 4 weights, a grid row each, its signs
@@ -122,12 +135,17 @@ void bsi_step(int t, uint rb, uint q) {
         uint i0 = bs_ldu(base + 2u + 8u * ib), i1 = bs_ldu(base + 6u + 8u * ib);
         uint hb = bs_u8at(base + 66u + ib), sg = bs_ldu(base + 74u + 4u * ib);
         uint sc = (bs_u8at(base + 106u + (ib >> 1)) >> (4u * (ib & 1u))) & 15u;
-        int s = 0;
+        uint w[8];
         [[unroll]] for (int l = 0; l < 8; l++) {
             uint idx = (((l < 4 ? i0 : i1) >> (8u * uint(l & 3))) & 255u) | (((hb >> uint(l)) & 1u) << 8);
-            s += bsi_dot(bsi_neg(bs_grid[idx], sg >> (4u * uint(l))), q * 8u + uint(l));
+            w[l] = bsi_neg(bs_grid[idx], sg >> (4u * uint(l)));
         }
-        BSI_ACC(BSI_DX(q) * bs_f16at(base) * float(1u + 2u * sc) * float(s));
+        float d = bs_f16at(base);
+        BSI_ROWS {
+            int s = 0;
+            [[unroll]] for (int l = 0; l < 8; l++) s += bsi_dot(w[l], r, q * 8u + uint(l));
+            BSI_ACC(r, BSI_DX(r, q) * d * float(1u + 2u * sc) * float(s));
+        }
         return;
     }
     if (t == 22) {   // IQ2_S: 4 chunks of 8 weights, a 10-bit grid index each; a scale per 16
@@ -135,44 +153,58 @@ void bsi_step(int t, uint rb, uint q) {
         uint ix = bs_ldu(base + 2u + 4u * ib), sg = bs_ldu(base + 34u + 4u * ib);
         uint hb = bs_u8at(base + 66u + ib), scb = bs_u8at(base + 74u + ib);
         float d = bs_f16at(base);
-        int s0 = 0, s1 = 0;
+        uint w[8];
         [[unroll]] for (int l = 0; l < 4; l++) {
             uint idx = ((ix >> (8u * uint(l))) & 255u) | (((hb >> (2u * uint(l))) & 3u) << 8);
             uint s8 = sg >> (8u * uint(l));
-            int v = bsi_dot(bsi_neg(bs_grid[2u * idx], s8), q * 8u + 2u * uint(l)) +
-                    bsi_dot(bsi_neg(bs_grid[2u * idx + 1u], s8 >> 4), q * 8u + 2u * uint(l) + 1u);
-            if (l < 2) s0 += v; else s1 += v;
+            w[2 * l] = bsi_neg(bs_grid[2u * idx], s8); w[2 * l + 1] = bsi_neg(bs_grid[2u * idx + 1u], s8 >> 4);
         }
-        BSI_ACC(BSI_DX(q) * (d * (0.5 + float(scb & 15u)) * 0.25 * float(s0) + d * (0.5 + float(scb >> 4)) * 0.25 * float(s1)));
+        BSI_ROWS {
+            int s0 = 0, s1 = 0;
+            [[unroll]] for (int l = 0; l < 4; l++) {
+                int v = bsi_dot(w[2 * l], r, q * 8u + 2u * uint(l)) + bsi_dot(w[2 * l + 1], r, q * 8u + 2u * uint(l) + 1u);
+                if (l < 2) s0 += v; else s1 += v;
+            }
+            BSI_ACC(r, BSI_DX(r, q) * (d * (0.5 + float(scb & 15u)) * 0.25 * float(s0) + d * (0.5 + float(scb >> 4)) * 0.25 * float(s1)));
+        }
         return;
     }
     if (t == 16) {   // IQ2_XXS: 4 grid indices, their signs (ksigns) and a 4-bit scale
         uint b = q >> 3, ib = q & 7u, base = rb + b * 66u;
         uint i0 = bs_ldu(base + 2u + 8u * ib), i1 = bs_ldu(base + 6u + 8u * ib);
-        int s = 0;
+        uint w[8];
         [[unroll]] for (int l = 0; l < 4; l++) {
             uint idx = (i0 >> (8u * uint(l))) & 255u, s8 = bs_ks[(i1 >> (7u * uint(l))) & 127u];
-            s += bsi_dot(bsi_neg(bs_grid[2u * idx], s8), q * 8u + 2u * uint(l)) +
-                 bsi_dot(bsi_neg(bs_grid[2u * idx + 1u], s8 >> 4), q * 8u + 2u * uint(l) + 1u);
+            w[2 * l] = bsi_neg(bs_grid[2u * idx], s8); w[2 * l + 1] = bsi_neg(bs_grid[2u * idx + 1u], s8 >> 4);
         }
-        BSI_ACC(BSI_DX(q) * bs_f16at(base) * (0.5 + float(i1 >> 28)) * 0.25 * float(s));
+        float d = bs_f16at(base);
+        BSI_ROWS {
+            int s = 0;
+            [[unroll]] for (int l = 0; l < 8; l++) s += bsi_dot(w[l], r, q * 8u + uint(l));
+            BSI_ACC(r, BSI_DX(r, q) * d * (0.5 + float(i1 >> 28)) * 0.25 * float(s));
+        }
         return;
     }
     if (t == 42) {   // Q2_0: codes 0..3, w = code - 1: the codes' dot less the sum of x
         uint b = q >> 1, h = q & 1u, base = rb + b * 18u;
         uint c0 = bs_ldu(base + 2u + 8u * h), c1 = bs_ldu(base + 6u + 8u * h);
-        int s = -BSI_XS(2u * q) - BSI_XS(2u * q + 1u);
+        uint w[8];
         [[unroll]] for (int k = 0; k < 2; k++) {
             uint wd = k == 0 ? c0 : c1;
             [[unroll]] for (int j = 0; j < 4; j++) {
                 uint by = wd >> (8u * uint(j));
-                s += bsi_dot((by & 3u) | ((by << 6) & 0x300u) | ((by << 12) & 0x30000u) | ((by << 18) & 0x3000000u),
-                             q * 8u + 4u * uint(k) + uint(j));
+                w[4 * k + j] = (by & 3u) | ((by << 6) & 0x300u) | ((by << 12) & 0x30000u) | ((by << 18) & 0x3000000u);
             }
         }
-        BSI_ACC(BSI_DX(q) * bs_f16at(base) * float(s));
+        float d = bs_f16at(base);
+        BSI_ROWS {
+            int s = -BSI_XS(r, 2u * q) - BSI_XS(r, 2u * q + 1u);
+            [[unroll]] for (int k = 0; k < 8; k++) s += bsi_dot(w[k], r, q * 8u + uint(k));
+            BSI_ACC(r, BSI_DX(r, q) * d * float(s));
+        }
         return;
     }
 }
+#undef BSI_ROWS
 
 #endif

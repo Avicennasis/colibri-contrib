@@ -2862,7 +2862,9 @@ static void test_matmul_bd(int t, int S, int I, int O) {
     ColiVkTensor *tt = NULL;
     if (!coli_vk_tensor_ensure(&tt, w, NULL, fmt, I, O, 0)) { CHECK(0, "matmul_bd %s: upload", gq_type_name(t)); free(w); free(W); free(x); return; }
     VkcBuf *xb = up(x, (size_t)S * I), *yb = vkc_buf((size_t)S * O * 4, VKC_DEV);
+    vkc_moe_set_idot(0);   /* the float form, against the float dequantization */
     vkc_begin(); int ok = vkc_matmul(tt, xb, 0, yb, 0, S); vkc_submit(1);
+    vkc_moe_set_idot(-1);
     float *y = down(yb, 0, (size_t)S * O), *ref = malloc((size_t)S * O * sizeof *ref);
     for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
         double a = 0; for (int i = 0; i < I; i++) a += (double)x[(size_t)s * I + i] * W[(size_t)o * I + i];
@@ -2872,6 +2874,33 @@ static void test_matmul_bd(int t, int S, int I, int O) {
     CHECK(ok && !bad(y, (size_t)S * O) && e < 1e-5, "matmul_bd %s S %d [%d x %d]: err %.2e", gq_type_name(t), S, O, I, e);
     coli_vk_tensor_free(tt); vkc_free(xb); vkc_free(yb);
     free(w); free(W); free(x); free(y); free(ref);
+}
+/* The dense GEMV in the CPU's integer form (chain_gemv_bd_i8: vkc_moe_set_idot(1)) against
+ * gq_matmul's integer path (gq_quant_act's int8 rows, gq_dot's integer sums) */
+static void test_matmul_bd_i8(int t, int S, int I, int O) {
+    int fmt = 100 + t, bl = GQ_TYPES[t].blck, by = GQ_TYPES[t].bytes;
+    size_t rb = (size_t)gq_row_bytes(t, I);
+    if (!vkc_moe_idot() || gq_exact_mode() || !gq_int_ok(t, I)) { printf("matmul_bd i8 %s: not here\n", gq_type_name(t)); return; }
+    uint8_t *w = malloc(rb * O);
+    for (size_t i = 0; i < rb * O; i++) w[i] = (uint8_t)rnd();
+    for (int o = 0; o < O; o++) for (int b = 0; b < I / bl; b++) bd_fix(t, w + (size_t)o * rb + (size_t)b * by);
+    float *x = fvec((size_t)S * I, 1.f), *ref = malloc((size_t)S * O * sizeof *ref);
+    gq_matmul(ref, x, w, t, S, I, O);
+    ColiVkTensor *tt = NULL;
+    if (!coli_vk_tensor_ensure(&tt, w, NULL, fmt, I, O, 0)) { CHECK(0, "matmul_bd i8 %s: upload", gq_type_name(t)); free(w); free(x); free(ref); return; }
+    VkcBuf *xb = up(x, (size_t)S * I), *yb = vkc_buf((size_t)S * O * 4, VKC_DEV);
+    VkcStats s0, s1; vkc_stats(&s0);
+    vkc_moe_set_idot(1);
+    vkc_begin(); int ok = vkc_matmul(tt, xb, 0, yb, 0, S); vkc_submit(1);
+    vkc_moe_set_idot(-1);
+    vkc_stats(&s1);
+    float *y = down(yb, 0, (size_t)S * O);
+    double e = relerr(y, ref, (size_t)S * O, 1e-6);
+    if (ok && s1.gemv_i8 == s0.gemv_i8) printf("matmul_bd i8 %s S %d [%d x %d]: not on this device (its shared memory)\n", gq_type_name(t), S, O, I);
+    else CHECK(ok && !bad(y, (size_t)S * O) && e < 2e-5, "matmul_bd i8 %s S %d [%d x %d]: err %.2e against the CPU's integer form",
+               gq_type_name(t), S, O, I, e);
+    coli_vk_tensor_free(tt); vkc_free(xb); vkc_free(yb);
+    free(w); free(x); free(y); free(ref);
 }
 static void test_bd(void) {
     const int types[] = {GQ_Q8_0, GQ_Q4_K, GQ_Q5_K, GQ_Q6_K, GQ_IQ2_XXS, GQ_IQ4_NL, GQ_IQ3_S, GQ_IQ2_S, GQ_IQ4_XS,
@@ -2884,6 +2913,7 @@ static void test_bd(void) {
         test_matmul_bd(t, 1, 16640, 9);     /* x past the staging (16 KiB floats at most): read from the buffer */
         test_matmul_bd(t, 70, 1280, 33);    /* a prompt's rows: the tiled GEMM, partial tiles both ways */
         test_matmul_bd(t, 130, 2560, 160);
+        if (k < 10) { test_matmul_bd_i8(t, 1, 2560, 130); test_matmul_bd_i8(t, 3, 1280, 33); test_matmul_bd_i8(t, 4, 256, 70); }
     }
     printf("matmul_bd: %zu block types\n", sizeof types / sizeof *types);
 }

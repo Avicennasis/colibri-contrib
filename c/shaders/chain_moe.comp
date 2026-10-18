@@ -211,10 +211,11 @@ shared uvec4 xq4[XQ + XQ / 8 + 1];
 shared float xdx[XQ / 2 + 1];
 shared int xsum[XQ + 1];
 bool g_idq;
-#define BSI_X(i) int(xq4[min(xsw((i) >> 2), uint(XQ + XQ / 8))][(i) & 3u])
-#define BSI_DX(b) xdx[min((b), uint(XQ / 2))]
-#define BSI_XS(g) xsum[min((g), uint(XQ))]
-#define BSI_ACC(v) g_acc += (v)
+#define BSI_NR 1
+#define BSI_X(r, i) int(xq4[min(xsw((i) >> 2), uint(XQ + XQ / 8))][(i) & 3u])
+#define BSI_DX(r, b) xdx[min((b), uint(XQ / 2))]
+#define BSI_XS(r, g) xsum[min((g), uint(XQ))]
+#define BSI_ACC(r, v) g_acc += (v)
 #include "bdstep_i8.glsl"
 // the input row (src 0 x, 1 hid; n inputs from base) quantized as gq_quant_act_ref does: a
 // block of 32 a thread
