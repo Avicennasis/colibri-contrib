@@ -2321,10 +2321,10 @@ int main(int argc, char **argv) {
             char *arena = NULL; jval *r = json_parse(buf, &arena);
             const char *g = r ? jstr(r, "gguf") : NULL;
             if (!g || !*g) { fprintf(stderr, "%s: no \"gguf\" path\n", gj); return 1; }
-            if (g[0] == '/') snprintf(gp, sizeof gp, "%s", g); else snprintf(gp, sizeof gp, "%s/%s", snap, g);
+            gguf_path_join(gp, sizeof gp, snap, g);
             const char *mt = jstr(r, "mtp");   /* the MTP head's own GGUF (unsloth's mtp-*.gguf), optional */
             char mp[4096] = "";
-            if (mt && *mt) { if (mt[0] == '/') snprintf(mp, sizeof mp, "%s", mt); else snprintf(mp, sizeof mp, "%s/%s", snap, mt); }
+            if (mt && *mt) gguf_path_join(mp, sizeof mp, snap, mt);
             free(arena);
             if (gguf_open(&g_q38gg, gp)) { fprintf(stderr, "GGUF: %s\n", g_q38gg.err); return 1; }
             if (mp[0]) {

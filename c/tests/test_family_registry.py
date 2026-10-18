@@ -1056,6 +1056,19 @@ class FamilyRegistryTest(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "gateway adapter is not wired"):
                 cli.cmd_chat(args)
 
+        # a family the gateway drives without a one-shot adapter (Qwen3.8, #2189): coli run
+        # goes through the private server coli chat starts
+        resolved = type("R", (), {"descriptor": replace(
+            FAMILIES[0], has_cli_adapter=False, has_gateway_adapter=True)})()
+        with mock.patch.object(cli, "need_model"), \
+             mock.patch.object(cli, "resolve_model", return_value=resolved), \
+             mock.patch.object(cli, "engine_for", return_value="engine"), \
+             mock.patch.object(cli, "banner"), \
+             mock.patch.object(cli, "run_via_gateway") as gateway:
+            cli.cmd_run(args)
+        gateway.assert_called_once()
+        self.assertEqual(gateway.call_args.args[2:], ("engine", "hello"))
+
     def test_tuning_replay_prompts_are_registry_owned(self):
         prompt = "hello {world}"
         expected = {
