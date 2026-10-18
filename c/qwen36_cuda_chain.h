@@ -76,7 +76,7 @@ typedef struct {
      * their sum, and a hybrid layer's host rows and words */
     int dm_on, dm_fmt, dm_gs, dm_read, dm_held;
     unsigned dm_epoch, dm_seq;
-    CcExpert *dm_host; uint8_t *dm_res; int *dm_part;
+    CcExpert *dm_host; uint8_t *dm_res; int *dm_part; uint8_t *dm_ran;   /* dm_ran: the step's layers that ran so */
     CcBuf *dm_tab, *dm_ids, *dm_w, *dm_idsd, *dm_wd, *dm_hid, *dm_y, *dm_hy, *dm_dfl, *dm_hfl;
     float *dm_g, *dm_u, *dm_hh;
     unsigned long long dm_steps, dm_hyb, dm_pairs;   /* layer steps in the frame, the hybrid ones, slots the host computed */
@@ -580,12 +580,13 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m) {
     size_t r = (size_t)ch->rows, ne = (size_t)L * E, F = sizeof(float);
     if (!ch->dm_host) {
         ch->dm_host = malloc(ne * sizeof(CcExpert)); ch->dm_res = calloc(ne, 1); ch->dm_part = calloc(L, sizeof(int));
+        ch->dm_ran = calloc(L, 1);
         ch->dm_g = falloc(I); ch->dm_u = falloc(I); ch->dm_hh = falloc(D);
-        if (!ch->dm_host || !ch->dm_res || !ch->dm_part) return 0;
+        if (!ch->dm_host || !ch->dm_res || !ch->dm_part || !ch->dm_ran) return 0;
     }
     if (!cc_reserve(&ch->dm_ids, (size_t)L * r * K * 4, CC_DEV) || !cc_reserve(&ch->dm_w, (size_t)L * r * K * F, CC_DEV) ||
         !cc_reserve(&ch->dm_idsd, (size_t)L * r * K * 4, CC_DOWN) || !cc_reserve(&ch->dm_wd, (size_t)L * r * K * F, CC_DOWN) ||
-        !cc_reserve(&ch->dm_hid, r * K * (size_t)(I + D) * F, CC_DEV) || !cc_reserve(&ch->dm_y, r * D * F, CC_DEV) ||
+        !cc_reserve(&ch->dm_hid, cc_moe_hid_floats((int)r, K, D, I, E) * F, CC_DEV) || !cc_reserve(&ch->dm_y, r * D * F, CC_DEV) ||
         !cc_reserve(&ch->dm_hy, r * D * F, CC_UP) || !cc_reserve(&ch->dm_dfl, 64, CC_DOWN) || !cc_reserve(&ch->dm_hfl, 64, CC_UP) ||
         !cc_reserve(&ch->dm_tab, ne * sizeof(CcExpert), CC_DEV)) return 0;
     if (!ch->dm_held) { qt_chain_hold(1); ch->dm_held = 1; }
@@ -615,7 +616,7 @@ static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsig
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1, io = i * ch->rows * K;
     CcRoute rp = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, ng, ng > 1 ? c->topk_group : 1, 1, 1.f, 1.f, 0.f};
-    CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1};
+    CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1, E};
     int ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp) &&
              cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K);
     *v = 0;
@@ -660,6 +661,7 @@ static int q36cc_dm_serve(Q36CChain *ch, Model *m, int i, int n, unsigned v) {
 static void q36cc_dm_books(Q36CChain *ch, Model *m, int n, int pb) {
     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, K = c->topk;
     for (int i = 0; i < L; i++) {
+        if (!ch->dm_ran[i]) continue;   /* a layer that took the host's step kept its own books */
         q36cc_kv_down(ch, m, i, n, pb);
         const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
         for (int s = 0; s < n; s++) {
@@ -716,13 +718,16 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 }
             }
         }
-        /* a decode-sized step: the routed experts in the frame (the table before the frame) */
-        int dm = E > 0 && ch->dm_on && n <= Q36CC_DM_ROWS;
+        /* the routed experts in the frame (the table before the frame): a decode-sized step's
+         * every layer; a prompt chunk's layers whose experts are all in the table (a layer
+         * with some elsewhere, or the prompt's re-plan of the residents, keeps the host's step) */
+        int dm = E > 0 && ch->dm_on && (n <= Q36CC_DM_ROWS || !prefill_replan_on());
         if (dm && !q36cc_dm_begin(ch, m)) {
             if (cc_lost()) goto lost;
             fprintf(stderr, "[chain] qwen36: the routed experts' buffers or table refused; the host's step from here on\n");
             q36cc_dm_end(ch); ch->dm_on = dm = 0;
         }
+        if (dm) memset(ch->dm_ran, 0, (size_t)L);
         if (!q36cc_frame_begin(ch) || !cc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
             !q36cc_push_state(ch, m, pb)) goto lost;
         int ok = 1, pending = 0, pend_i = -1;   /* pend_i: the hybrid layer the host serves after recording the next */
@@ -741,8 +746,10 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             ok = ok && cc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
             if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)i * 3 + 1) * D, ch->x, (size_t)(n - 1) * D, D);
             ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps);
-            if (ok && dm) {   /* routed in the frame, the residents here; a hybrid layer's host share once the next is recorded */
+            if (ok && dm && (n <= Q36CC_DM_ROWS || !ch->dm_part[i])) {   /* routed in the frame, the residents here; a hybrid
+                                                                         * layer's host share once the next is recorded */
                 unsigned v = 0;
+                ch->dm_ran[i] = 1;
                 ok = q36cc_dm_layer(ch, m, l, i, n, &v);
                 if (ok && pend_v) ok = q36cc_dm_serve(ch, m, pend_i, n, pend_v);
                 pend_i = i; pend_v = v; routed = ch->dm_y; pending = 1;
@@ -751,6 +758,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             if (ok && E > 0) {
                 ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) &&
                      cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
+                if (ok && pend_v) { ok = q36cc_dm_serve(ch, m, pend_i, n, pend_v); pend_v = 0; }   /* before a wait for the frame */
                 double t0 = tm_now();
                 ok = ok && cc_submit(1);   /* A1 */
                 ch->wait_ms += tm_now() - t0;

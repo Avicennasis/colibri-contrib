@@ -447,9 +447,29 @@ the Vulkan chain does (docs/vulkan.md, "The routed experts in the frame"):
   the resident collection; the hot-pin counts) follow from the ids after the frame, with
   the K/V rows into the host's cache.
 
+A prompt chunk (more than 8 rows) runs its routed experts in the frame too, layer by
+layer, where the table holds all of that layer's experts: `cc_moe` sorts the chunk's
+slots by expert (a count, the offsets and 64-row tiles, each slot's place) and runs each
+expert's rows through the tensor cores (`tcg_moe_k`: gate and up into silu(g) * u, then
+down), then each row's sum in rank order. A layer with experts elsewhere, or a prompt
+that re-plans the residents (`QT_PREFILL_REPLAN=1`), keeps the host's step in that chunk.
+
+The dense matrices of a prompt chunk go through the same tensor-core GEMM
+(`tcg_dense_k`, from `coli_cuda_tensor_gemm_async` for more than 8 rows), where the block
+kernel spent 256 threads on each output: TF32 fragments on sm_80 and later, the inputs
+rounded to TF32 (a 10-bit mantissa, the fp32 range), int8 and int4 codes staged exact
+with the row's scale after the sum, int4 per 64 times its group's scale as staged, sums
+in fp32. Against an fp64 reference the outputs are within 2e-4 to 4e-4 (relative to the
+largest); the CPU's own experts quantize their inputs to int8. `COLI_CUDA_TC_GEMM=0`
+keeps the block kernel.
+
 It is off with cache routing or the agreement meter (their state crosses tokens on the
 host), a gate bias, more groups than the kernel keeps, or a tier on more than one card.
-`COLI_CUDA_CHAIN_MOE=0` keeps the host's step. The greedy text is the same either way.
+`COLI_CUDA_CHAIN_MOE=0` keeps the host's step. A decode step's text is the same either
+way; a prompt's rows sum in another order and with TF32 inputs, and the greedy text may
+part where two tokens are that close. The teacher-forced loss after a 600-token prompt
+(125 tokens scored, `PPL=1`) is 3.2223 nats a token with the experts in the frame,
+3.2326 with the host's step, 3.2181 with no tensor cores at all and 3.2340 on the CPU.
 
 **Measured** (RTX PRO 4000 Blackwell 24 GB, i5-13500, Qwen3.6-35B-A3B int4-g64, two runs
 of `bench_stream.py` each, two rounds):
@@ -457,12 +477,16 @@ of `bench_stream.py` each, two rounds):
 | | decode tok/s | prefill tok/s |
 |---|---|---|
 | per matrix (`COLI_CUDA_CHAIN=0`) | 33.6-34.2 | 60 |
-| the chain, the host's step (`COLI_CUDA_CHAIN_MOE=0`) | 58.9-59.5 | 71 |
-| the chain, the experts in the frame (the default) | 85.3-86.0 | 71 |
-| the same, `CUDA_EXPERT_GB=8` (a third of the experts in VRAM) | 48.9-50.0 | 63 |
-| the host's step at `CUDA_EXPERT_GB=8` | 45.1-45.7 | 63 |
+| the chain, the host's step, the block kernel (`COLI_CUDA_CHAIN_MOE=0 COLI_CUDA_TC_GEMM=0`) | 58.9-59.5 | 71 |
+| a decode step's experts in the frame, a prompt's on the host, the block kernel | 85.3-86.0 | 71 |
+| the same with the tensor cores' dense GEMM | 86.0 | 120 |
+| every step's experts in the frame, the tensor cores (the default) | 85.9-86.1 | 809-834 |
+| the default at `CUDA_EXPERT_GB=8` (a third of the experts in VRAM) | 49.1-50.2 | 114-116 |
+| the host's step at `CUDA_EXPERT_GB=8`, the block kernel | 45.1-45.7 | 63 |
 
-With every expert in VRAM a decode token is the device's 10 ms. With a third of them,
+With every expert in VRAM a decode token is the device's 10 ms, and a 467-token prompt
+0.57 s instead of 6.6. With a third of them (every layer then has some on the host, so a
+prompt keeps the host's step for its experts),
 the CPU computes two thirds of the slots (about 10 ms a token) and the layer after waits
 for them: the hybrid step overlaps the device's experts with the host's, not the layers.
 

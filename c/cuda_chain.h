@@ -110,7 +110,7 @@ typedef struct {
 typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; } CcExpert;
 /* A layer's routed experts on the device for S rows (cc_moe): x (x_off + s*x_row, D
  * floats) routed to ids and w as cc_route writes them (i_off + s*i_row, w_off + s*w_row,
- * K each); expert e is entry t_off + e of the table, its matrices of format fmt (1 int8
+ * K each); expert e is entry t_off + e of the table (E of them), its matrices of format fmt (1 int8
  * rows, 2 int4 rows, 4 int4 with a scale per gs inputs, 8 fp8-e4m3 with a scale per
  * 128 x 128 block: the tier's formats), D and I multiples of 32 up to CC_MOE_DIM_MAX. hid holds S*K rows of
  * I floats (silu(gate) * up, act 0, the only one) and then S*K rows of D (down's
@@ -123,7 +123,17 @@ typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; } CcExpert;
 typedef struct {
     int S, K, D, I, fmt, gs, act, parts;
     int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row, h_off;
+    int E;   /* the layer's experts: a step of more than CC_MOE_FRAME_ROWS rows sorts its slots by expert */
 } CcMoe;
+/* More rows than this (a prompt chunk): the slots sorted by expert and each expert's rows
+ * through the tensor cores' GEMM where the device has it (gate and up, then down); hid
+ * then also holds the sort's integers, cc_moe_hid_floats in all. */
+#define CC_MOE_FRAME_ROWS 8
+static inline size_t cc_moe_hid_floats(int S, int K, int D, int I, int E) {
+    size_t A = (size_t)S * K, n = A * (size_t)(I + D);
+    if (S > CC_MOE_FRAME_ROWS) n += 3 * (size_t)E + 2 + 2 * ((A + 63) / 64 + (size_t)(E < (int)A ? E : (int)A)) + 2 * A;
+    return n;
+}
 /* one copy over n regions (a KV row per head, say); offsets and counts in floats */
 typedef struct { size_t dst, src, n; } CcRegion;
 /* counters, for the engines' [chain] lines */

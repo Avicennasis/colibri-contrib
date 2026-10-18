@@ -336,6 +336,21 @@ int main(void) {
                maxdiff(down(yb, O).data(), ref2.data(), O) < 1e-3, "int8 rows of a width the warp GEMV leaves to the block kernel");
             coli_cuda_tensor_free(t2); T->free(x2b);
         }
+        {   /* a prompt chunk's rows (more than the warp GEMV's 8): the tensor cores on sm_80+, TF32's 10-bit inputs */
+            const int S2 = 70, I2 = 256, O2 = 100;
+            std::vector<float> x2 = rnd((size_t)S2 * I2, 17), dq;
+            for (int fmt : {1, 2, 4}) {
+                ColiCudaTensor *tt = moe_mat(fmt, fmt == 4 ? 64 : 0, I2, O2, 700 + fmt, dq);
+                std::vector<float> r2((size_t)S2 * O2); double mx = 0;
+                for (int r = 0; r < S2; r++) for (int o = 0; o < O2; o++) { double a = 0; for (int i = 0; i < I2; i++) a += (double)x2[(size_t)r * I2 + i] * dq[(size_t)o * I2 + i]; r2[(size_t)r * O2 + o] = (float)a; mx = fmax(mx, fabs(a)); }
+                CcBuf *xb2 = up(x2), *yb2 = T->buf((size_t)S2 * O2 * 4, CC_DEV);
+                int ok2 = tt && T->begin() && T->matmul(tt, xb2, 0, yb2, 0, S2) && T->submit(1);
+                double e2 = ok2 ? maxdiff(down(yb2, (size_t)S2 * O2).data(), r2.data(), (size_t)S2 * O2) / mx : 1;
+                if (e2 >= 2e-3) printf("  (prompt matmul fmt %d: relative error %.3g)\n", fmt, e2);
+                ck(ok2 && e2 < 2e-3, fmt == 1 ? "seventy rows of int8 rows (a prompt chunk)" : fmt == 2 ? "seventy rows of int4 rows" : "seventy rows of int4 with a scale per 64");
+                if (tt) coli_cuda_tensor_free(tt); T->free(xb2); T->free(yb2);
+            }
+        }
         std::vector<float> w = rnd((size_t)I * O, 11), ones(O, 1.f), ref0(O);
         for (int o = 0; o < O; o++) { float a = 0; for (int i = 0; i < I; i++) a += x[7 + i] * w[(size_t)o * I + i]; ref0[o] = a; }
         ColiCudaTensor *t0 = NULL;
@@ -554,7 +569,7 @@ int main(void) {
             CcBuf *yb = T->buf(((size_t)S * D + 8) * 4, CC_DEV), *hyb = up(hy, CC_UP);
             int ok = tb && pb && T->begin() && T->write(tb, 0, tab.data(), tab.size() * sizeof(CcExpert)) && T->write(pb, 0, part.data(), part.size() * sizeof(CcExpert)) &&
                      T->write(ib, 0, ids.data(), ids.size() * 4) && T->submit(1);
-            CcMoe m = {S, K, D, I, fmt, gs, 0, 3, 2, 4, D, 0, K, 0, K, 8, D, -1};
+            CcMoe m = {S, K, D, I, fmt, gs, 0, 3, 2, 4, D, 0, K, 0, K, 8, D, -1, E};
             ok = ok && T->begin() && T->moe(tb, xb, ib, wb, hb, yb, NULL, &m) && T->submit(1);
             std::vector<float> y = down(yb, (size_t)S * D + 8);
             double scale = 0; for (float v : ref_full) scale = fmax(scale, fabs(v));
@@ -563,6 +578,34 @@ int main(void) {
             ok = T->begin() && T->moe(pb, xb, ib, wb, hb, yb, hyb, &m1) && T->submit(0) && T->begin() && T->moe(pb, xb, ib, wb, hb, yb, hyb, &m2) && T->submit(1);
             y = down(yb, (size_t)S * D + 8);
             ck(ok && maxdiff(y.data() + 8, ref_part.data(), (size_t)S * D) < 2e-5 * scale + 1e-6, "two of the table's experts the host's: its rows plus the device's slots");
+            {   /* a prompt chunk's rows (more than CC_MOE_FRAME_ROWS): sorted by expert, the tensor cores' GEMMs */
+                const int S2 = 40;
+                unsigned rs = 900 + fmt;
+                std::vector<int> ids2((size_t)S2 * K); std::vector<float> w2((size_t)S2 * K), x2 = rnd((size_t)S2 * D, 950 + fmt), hy2 = rnd((size_t)S2 * D, 960 + fmt);
+                for (int a = 0; a < S2 * K; a++) { int v = (int)((frand(&rs) * 0.5f + 0.5f) * (E - 0.01f)); ids2[a] = a % 17 == 5 ? -1 : v; w2[a] = 0.1f + 0.3f * (frand(&rs) * 0.5f + 0.5f); }
+                std::vector<float> rf((size_t)S2 * D, 0.f), rp((size_t)S2 * D, 0.f);
+                for (int s2 = 0; s2 < S2; s2++) {
+                    for (int d = 0; d < D; d++) rp[(size_t)s2 * D + d] = hy2[(size_t)s2 * D + d];
+                    for (int k = 0; k < K; k++) {
+                        int e = ids2[s2 * K + k]; if (e < 0) continue;
+                        expert(e, x2.data() + (size_t)s2 * D, ye);
+                        for (int d = 0; d < D; d++) { rf[(size_t)s2 * D + d] += w2[s2 * K + k] * ye[d]; if (e != 1 && e != 5) rp[(size_t)s2 * D + d] += w2[s2 * K + k] * ye[d]; }
+                    }
+                }
+                double sc2 = 0; for (float v : rf) sc2 = fmax(sc2, fabs(v));
+                CcBuf *x2b = up(x2), *i2b = T->buf(ids2.size() * 4, CC_DEV), *w2b = up(w2), *h2b = T->buf(cc_moe_hid_floats(S2, K, D, I, E) * 4, CC_DEV);
+                CcBuf *y2b = T->buf((size_t)S2 * D * 4, CC_DEV), *hy2b = up(hy2, CC_UP);
+                CcMoe m2 = {S2, K, D, I, fmt, gs, 0, 3, 2, 0, D, 0, K, 0, K, 0, D, -1, E};
+                int ok2 = T->begin() && T->write(i2b, 0, ids2.data(), ids2.size() * 4) && T->moe(tb, x2b, i2b, w2b, h2b, y2b, NULL, &m2) && T->submit(1);
+                double ef = ok2 ? maxdiff(down(y2b, (size_t)S2 * D).data(), rf.data(), (size_t)S2 * D) / sc2 : 1;
+                CcMoe a2 = m2, b2 = m2; a2.parts = 1; b2.parts = 2; b2.h_off = 0;
+                int okp = T->begin() && T->moe(pb, x2b, i2b, w2b, h2b, y2b, hy2b, &a2) && T->moe(pb, x2b, i2b, w2b, h2b, y2b, hy2b, &b2) && T->submit(1);
+                double ep = okp ? maxdiff(down(y2b, (size_t)S2 * D).data(), rp.data(), (size_t)S2 * D) / sc2 : 1;
+                if (ef >= 2e-3 || ep >= 2e-3) printf("  (prompt rows fmt %d: relative errors %.3g, %.3g)\n", fmt, ef, ep);
+                ck(ok2 && ef < 2e-3, "forty rows: the slots sorted by expert, their GEMMs, the sum in rank order");
+                ck(okp && ep < 2e-3, "forty rows, two experts the host's: its rows plus the device's slots");
+                T->free(x2b); T->free(i2b); T->free(w2b); T->free(h2b); T->free(y2b); T->free(hy2b);
+            }
             for (int e = 0; e < E; e++) { coli_cuda_tensor_free(tg[e]); coli_cuda_tensor_free(tu[e]); coli_cuda_tensor_free(td[e]); }
             T->free(tb); T->free(pb); T->free(xb); T->free(ib); T->free(wb); T->free(hb); T->free(yb); T->free(hyb);
         }
@@ -600,7 +643,7 @@ int main(void) {
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 7, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 10, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;
