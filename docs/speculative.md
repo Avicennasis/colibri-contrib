@@ -80,6 +80,12 @@ not a recommendation to freeze the tier for normal use.
 The engine loads the head by default when the checkpoint has one and the whole model is
 loaded, and says so when it cannot; `Q38_MTP=0` leaves it unread, and `Q38_MTP=1` refuses a
 checkpoint without one (see [qwen38.md](qwen38.md#speculative-decoding-with-the-mtp-head)).
+With the Vulkan dense chain running every layer and the lm_head on the device, the head
+stays off unless `Q38_MTP=1` asks for it: its layer runs on the CPU, once per draft and
+once per accepted row, against a device forward whose verify of three rows costs little
+more than a plain step. On an RTX PRO 4000 with Qwen3.8-Flash-Next IQ2_XS, plain decoding
+ran at 34.9 tok/s and the head's two drafts at 24.3 to 26.2; the prompt at 81 against
+64 tok/s, the head reading each prompt row on the CPU.
 Its first draft reads the model's four streams at the last fed position with the picked
 token. Each next draft reads the head's own streams from the row before, in place of the
 model's (only the verify computes those), with the draft just proposed. Those deeper
@@ -147,7 +153,7 @@ state is the one plain decoding leaves.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `Q38_MTP` | on when the checkpoint has the head | `0`: plain decoding, the head unread; `1`: the head, and a checkpoint without one is refused. The RAM plan (`coli plan`) prices the head when it is on: its dense tensors and its own expert cache (`Q38_MTP_CAP`, the layers' cap by default, at the head's FP8 record). |
+| `Q38_MTP` | on when the checkpoint has the head, off beside a dense chain that holds every layer | `0`: plain decoding, the head unread; `1`: the head, and a checkpoint without one is refused. The RAM plan (`coli plan`) prices the head when it is on: its dense tensors and its own expert cache (`Q38_MTP_CAP`, the layers' cap by default, at the head's FP8 record). |
 | `Q38_MTP_DRAFTS` | `2` | qwen38 with the MTP head on: the MTP head's drafts per verify, `1` to `3`, or `0` / `auto` for the gate's pick. |
 | `COLI_LOOKUP` | `1` | Prompt-lookup drafts (qwen38, qwen36), and colibri's n-gram drafts from the same lookup and gate when it has no MTP head; always gated. `0` turns them off. |
 | `COLI_LOOKUP_DRAFTS` | `5` | Lookup drafts per verify at most, `1` to `5`. |
