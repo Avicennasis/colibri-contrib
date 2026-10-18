@@ -73,6 +73,9 @@ static struct {
     int *ev; int ev_h, ev_n;
     /* qt_stats_mark: counters at the prefill/decode boundary */
     uint64_t mk_hits, mk_miss; int mk_on;
+    /* the dense chain's routed experts (qt_chain_*): residency changes counted, and its
+     * forwards in flight, which no swap may touch the tensors of */
+    unsigned epoch; int chain_hold;
 } G;
 #define QT_EV_CAP 8192
 
@@ -84,6 +87,8 @@ static void wait_take_locked(void){
 }
 
 static QSlot *qs(int layer, int eid){ return &G.slot[(size_t)layer*G.ne + eid]; }
+/* G.mx held: every change of residency goes through here (qt_chain_epoch) */
+static void res_set(QSlot *s, int r){ if(s->resident!=r){ s->resident=(uint8_t)r; G.epoch++; } }
 /* Expert homes. Default: expert eid lives on device index eid % ndev in every
  * layer (each layer's group joins across the cards). QT_HOME=layer: every
  * expert of layer l lives on one device, chosen per layer range, so a token
@@ -221,10 +226,10 @@ static void *uploader(void *arg){
         ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
         int ok=0, inplace=0;
         if(ve>=0){
-            /* LFRU swap: touch the victim only when no group is in flight */
-            while(G.issue_open && !G.th_stop) wait_take_locked();
+            /* LFRU swap: touch the victim only when no group and no chain forward is in flight */
+            while((G.issue_open||G.chain_hold) && !G.th_stop) wait_take_locked();
             QSlot *v=qs(vl,ve);
-            if(G.th_stop && G.issue_open){
+            if(G.th_stop && (G.issue_open||G.chain_hold)){
                 /* Shutting down with a group still open: qt_take() -- the only
                  * thing that clears issue_open -- will never come. Abandon
                  * this swap instead of freeing a victim tensor the in-flight
@@ -232,7 +237,7 @@ static void *uploader(void *arg){
                  * cleared the victim's resident flag before enqueueing, so
                  * restore it to keep the flag consistent with the tensor it
                  * still holds. */
-                v->resident=1; qs(layer,eid)->queued=0; G.inflight--;
+                res_set(v,1); qs(layer,eid)->queued=0; G.inflight--;
                 pthread_cond_broadcast(&G.cv_take);
                 pthread_mutex_unlock(&G.mx); free(w); free(sc); continue;
             }
@@ -285,7 +290,7 @@ static void *uploader(void *arg){
         }
         pthread_mutex_lock(&G.mx);
         QSlot *s=qs(layer,eid);
-        if(ok){ s->tg=tg; s->tu=tu; s->td=td; s->resident=1; G.uploads++; if(inplace) G.inplace++; }
+        if(ok){ s->tg=tg; s->tu=tu; s->td=td; res_set(s,1); G.uploads++; if(inplace) G.inplace++; }
         else  { int hd=home2(layer,eid); G.used[hd]-=G.exp_bytes;
                 G.budget[hd]=G.used[hd];   /* device genuinely full: stop trying */ }
         s->queued=0;
@@ -1098,6 +1103,57 @@ int qt_lmhead_matmul(float *y, const float *x, int I, int O){
 }
 
 /* Is (layer,eid) currently VRAM-resident? (used to free RAM-side int8 copies) */
+/* ---- the dense chain's routed experts (qwen36_cuda_chain.h, qwen38_cuda_chain.h) ----
+ * The chain reads the residents' tensors by address from a table it builds when the epoch
+ * moved, and holds the tier for each forward that reads that table: no swap writes into a
+ * resident's buffers while one is in flight (an eviction only clears the flag at once,
+ * which moves the epoch; its buffers wait for the hold to drop). The books qt_issue keeps
+ * for the experts it serves, qt_chain_count keeps for the chain's. */
+static void qt_lfru_tick_locked(void);
+unsigned qt_chain_epoch(void){
+    if(!G.on) return 0;
+    pthread_mutex_lock(&G.mx);
+    unsigned e=G.epoch;
+    pthread_mutex_unlock(&G.mx);
+    return e;
+}
+int qt_chain_devices(void){ return G.on ? G.ndev : 0; }
+int qt_chain_resident(int layer,int eid,int device,ColiCudaTensor **g,ColiCudaTensor **u,ColiCudaTensor **d){
+    if(!G.on || G_trunk_only || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
+    pthread_mutex_lock(&G.mx);
+    QSlot *s=qs(layer,eid);
+    int r=s->resident && s->tg && s->tu && s->td && G.dev[home2(layer,eid)]==device;
+    if(r){ *g=s->tg; *u=s->tu; *d=s->td; }
+    pthread_mutex_unlock(&G.mx);
+    return r;
+}
+void qt_chain_hold(int on){
+    if(!G.on) return;
+    pthread_mutex_lock(&G.mx);
+    if(on) G.chain_hold++;
+    else if(G.chain_hold>0 && --G.chain_hold==0) pthread_cond_broadcast(&G.cv_take);
+    pthread_mutex_unlock(&G.mx);
+}
+void qt_chain_count(int layer,const int *eids,int K){
+    if(!G.on || layer<0 || layer>=G.nl) return;
+    pthread_mutex_lock(&G.mx);
+    if(G.th_stop){ pthread_mutex_unlock(&G.mx); return; }
+    if(layer==0) qt_lfru_tick_locked();
+    for(int k=0;k<K;k++){
+        if(eids[k]<0 || eids[k]>=G.ne) continue;
+        QSlot *s=qs(layer,eids[k]);
+        if(s->resident){ if(s->heat<0xFFFFFFFFu) s->heat++; G.hits[home2(layer,eids[k])]++; }
+        else G.miss++;
+    }
+    pthread_mutex_unlock(&G.mx);
+}
+int qt_chain_format(int *fmt,int *gs){
+    if(!G.on) return 0;
+    if(fmt) *fmt=G.wfmt==8?8:G.wfmt==1?1:G.egs?4:2;
+    if(gs) *gs=G.egs;
+    return 1;
+}
+
 int qt_is_resident(int layer,int eid){
     if(!G.on) return 0;
     pthread_mutex_lock(&G.mx);
@@ -1157,9 +1213,9 @@ static void stream_promote_locked(int layer,int eid){
     }
     if(cold<0 || !tier_should_promote(s->heat,ch)) return;
     QSlot *v=&G.slot[cold];
-    v->resident=0;
+    res_set(v,0);
     if(enqueue_locked(layer,eid,cold/G.ne,cold%G.ne,0)) G.swaps++;
-    else v->resident=1;
+    else res_set(v,1);
 }
 
 void qt_note(int layer,int eid,
@@ -1337,9 +1393,9 @@ static void replan_drain_locked(int max){
         QSlot *cs=&G.slot[ci], *vs=&G.slot[vi];
         if(cs->resident||cs->queued||!cs->g4) continue;
         if(!vs->resident||vs->queued) continue;
-        vs->resident=0;                                   /* CPU fallback from now on */
+        res_set(vs,0);                                    /* CPU fallback from now on */
         if(enqueue_locked(ci/G.ne,ci%G.ne,vi/G.ne,vi%G.ne,0)){ G.swaps++; G.rp_done++; evict_note_locked(vi); }
-        else { vs->resident=1; G.rp_i--; break; }         /* no staging memory: retry later */
+        else { res_set(vs,1); G.rp_i--; break; }          /* no staging memory: retry later */
     }
     if(G.rp_i==G.rp_n){ free(G.rp_c); free(G.rp_v); G.rp_c=G.rp_v=NULL; G.rp_n=G.rp_i=0; }
 }
@@ -1428,9 +1484,9 @@ static void qt_lfru_tick_locked(void){
         if(cold<0||hot<0) continue;
         if(!tier_should_promote(hh,ch)) continue;
         QSlot *v=&G.slot[cold];
-        v->resident=0;                                    /* CPU fallback from now on */
+        res_set(v,0);                                     /* CPU fallback from now on */
         if(enqueue_locked(hot/G.ne,hot%G.ne,cold/G.ne,cold%G.ne,0)){ G.swaps++; evict_note_locked(cold); }
-        else v->resident=1;                               /* queue full: revert */
+        else res_set(v,1);                                /* queue full: revert */
     }
 }
 

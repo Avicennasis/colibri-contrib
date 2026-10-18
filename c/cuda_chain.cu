@@ -29,6 +29,10 @@
  * device's default) with device pointers, no transfer, no synchronization. */
 extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I, int *O);
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
+/* and the routed experts' kernels (cc_moe), on the same terms, and a resident tensor's device copy */
+extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs);
+extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
+                                   float *hid, float *y, const float *hy, const CcMoe *p, void *stream);
 
 struct CcBuf { int kind, dev; size_t bytes; float *d; void *h; };
 
@@ -478,6 +482,121 @@ __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ 
     }
 }
 
+/* chain_route.comp: one block per row, its 8 warps the shader's subgroups (the row's max
+ * and sum: each warp's, then theirs in warp order) */
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#define cc_shfl_xor(v, o) __shfl_xor((v), (o), 32)   /* 32-lane groups on a wave64 device too */
+#else
+#define cc_shfl_xor(v, o) __shfl_xor_sync(0xffffffffu, (v), (o), 32)
+#endif
+__device__ __forceinline__ float cc_wmax(float v) { for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, cc_shfl_xor(v, o)); return v; }
+__device__ __forceinline__ float cc_wsum(float v) { for (int o = 16; o > 0; o >>= 1) v += cc_shfl_xor(v, o); return v; }
+__device__ __forceinline__ int cc_wmin(int v) { for (int o = 16; o > 0; o >>= 1) v = min(v, cc_shfl_xor(v, o)); return v; }
+__global__ static void __launch_bounds__(256) cc_route_k(const float *__restrict__ l, const float *__restrict__ bias,
+                                                         int *__restrict__ ids, float *__restrict__ w, CcRoute p) {
+    const float NEG = -3.402823466e38f;
+    __shared__ float sc[1024], pk[1024], rv[256], gv[64], wv[32];
+    __shared__ int keepg[64], chosen[32], keepi[256];
+    int s = blockIdx.x;
+    if (s >= p.S) return;
+    int tid = threadIdx.x, lane = tid & 31, sg = tid >> 5, nsg = 8;
+    int lb = p.l_off + s * p.l_row;
+    auto logit = [&](int e) { float v = l[lb + e]; if (p.has_bias == 2) v += bias[p.b_off + e]; return v / p.temp; };
+    if (p.kind == 0) {
+        float m = NEG;
+        for (int e = tid; e < p.E; e += 256) m = fmaxf(m, logit(e));
+        m = cc_wmax(m);
+        if (lane == 0) rv[sg] = m;
+        __syncthreads();
+        float mx = NEG;
+        for (int g = 0; g < nsg; g++) mx = fmaxf(mx, rv[g]);
+        __syncthreads();
+        float acc = 0.f;
+        for (int e = tid; e < p.E; e += 256) { float v = expf(logit(e) - mx); sc[e] = v; acc += v; }
+        acc = cc_wsum(acc);
+        if (lane == 0) rv[sg] = acc;
+        __syncthreads();
+        float sum = 0.f;
+        for (int g = 0; g < nsg; g++) sum += rv[g];
+        __syncthreads();
+        for (int e = tid; e < p.E; e += 256) sc[e] = sc[e] / sum;
+    } else {
+        for (int e = tid; e < p.E; e += 256) {
+            float v = logit(e);
+            sc[e] = p.kind == 1 ? 1.f / (1.f + expf(-v)) : sqrtf(v > 20.f ? v : logf(1.f + expf(v)));
+        }
+    }
+    __syncthreads();
+    for (int e = tid; e < p.E; e += 256) {
+        float v = sc[e];
+        if (p.has_bias == 1) v += bias[p.b_off + e];
+        pk[e] = isnan(v) ? NEG : v;
+    }
+    __syncthreads();
+    if (p.n_group > 1) {
+        int per = p.E / p.n_group;
+        if (tid < p.n_group) {
+            float b1 = NEG, b2 = NEG;
+            for (int e = tid * per; e < tid * per + per; e++) { float v = pk[e]; if (v > b1) { b2 = b1; b1 = v; } else if (v > b2) b2 = v; }
+            gv[tid] = b1 + b2; keepg[tid] = 0;
+        }
+        __syncthreads();
+        if (tid == 0)
+            for (int k = 0; k < p.topk_group; k++) {
+                int bg = -1; float bv = NEG;
+                for (int g = 0; g < p.n_group; g++) if (keepg[g] == 0 && gv[g] > bv) { bv = gv[g]; bg = g; }
+                if (bg < 0) break;
+                keepg[bg] = 1;
+            }
+        __syncthreads();
+        for (int e = tid; e < p.E; e += 256) if (keepg[min(max(e / per, 0), p.n_group - 1)] == 0) pk[e] = NEG;
+        __syncthreads();
+    }
+    float mine[4];
+    #pragma unroll
+    for (int j = 0; j < 4; j++) { int e = tid + 256 * j; mine[j] = e < p.E ? pk[e] : NEG; }
+    for (int k = 0; k < p.K; k++) {
+        float bv = NEG; int be = 0x7fffffff;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int e = tid + 256 * j;
+            if (mine[j] > bv || (mine[j] == bv && mine[j] > NEG && e < be)) { bv = mine[j]; be = e; }
+        }
+        float m = cc_wmax(bv);
+        int me = cc_wmin(bv == m && m > NEG ? be : 0x7fffffff);
+        int h = (k & 1) * 128;
+        if (lane == 0) { rv[h + sg] = m; keepi[h + sg] = me; }
+        __syncthreads();
+        float b = NEG; int c = -1;
+        for (int g = 0; g < nsg; g++) {
+            float u = rv[h + g]; int ie = keepi[h + g];
+            if (u > NEG && ie != 0x7fffffff && (u > b || (u == b && ie < c))) { b = u; c = ie; }
+        }
+        if (tid == 0) chosen[k] = c;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) if (c == tid + 256 * j) mine[j] = NEG;
+    }
+    __syncthreads();
+    int b = tid < 32 ? chosen[tid] : -1;
+    if (tid < 32) wv[tid] = tid < p.K && b >= 0 ? sc[b] : 0.f;
+    __syncthreads();
+    float sum = 0.f;
+    for (int k = 0; k < p.K; k++) sum += wv[k];
+    float div = sum + p.norm_eps;
+    bool norm = (p.norm == 1 || (p.norm == 2 && p.K > 1)) && div > 0.f;
+    if (tid < p.K) {
+        float x = wv[tid];
+        if (norm) x = x / div;
+        ids[p.i_off + s * p.i_row + tid] = b;
+        w[p.w_off + s * p.w_row + tid] = x * p.scale;
+    }
+}
+/* the hybrid steps' flags: the device's word in host memory once the stream gets here
+ * (a system-wide fence first: the step's rows the host reads are there before it), and
+ * the stream held until the host's word reaches v */
+__global__ static void cc_signal_k(volatile unsigned *f, unsigned v) { __threadfence_system(); *f = v; __threadfence_system(); }
+__global__ static void cc_wait_k(volatile unsigned *f, unsigned v) { while (*f < v) { } __threadfence_system(); }
+
 /* ---- contexts ------------------------------------------------------------------- */
 static int cc_init(int device) {
     CcCtx *c = ctx_of(device);
@@ -758,6 +877,39 @@ static int cc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated,
     } else return 0;
     return launched(c, "ple");
 }
+static int cc_route(CcBuf *l, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *p) {
+    CcCtx *c = live();
+    if (!c || !l || !ids || !w || !p || p->S < 1 || p->E < 1 || p->E > CC_ROUTE_EMAX || p->K < 1 || p->K > CC_ROUTE_KMAX ||
+        p->K > p->E || p->kind < 0 || p->kind > 2 || p->has_bias < 0 || p->has_bias > 2 || (p->has_bias && !bias) || !(p->temp > 0.f) ||
+        (p->n_group > 1 && (p->n_group > 64 || p->E % p->n_group || p->topk_group < 1 || p->topk_group > p->n_group))) return 0;
+    if ((size_t)(p->l_off + (p->S - 1) * p->l_row + p->E) * 4 > l->bytes || (size_t)(p->i_off + (p->S - 1) * p->i_row + p->K) * 4 > ids->bytes ||
+        (size_t)(p->w_off + (p->S - 1) * p->w_row + p->K) * 4 > w->bytes) return 0;
+    cc_route_k<<<(unsigned)p->S, 256, 0, c->stream>>>(fp(l), fp(bias), (int *)ids->d, fpw(w), *p);
+    return launched(c, "route");
+}
+static int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p) {
+    CcCtx *c = live();
+    if (!c || !tab || !ids || !hid || !p || p->parts < 1 || p->parts > 3 || p->S < 1 || p->K < 1) return 0;
+    if ((p->parts & 1) && !x) return 0;
+    if ((p->parts & 2) && (!w || !y || (p->h_off >= 0 && !hy))) return 0;
+    if (cc_moe_hid_floats(p->S, p->K, p->D, p->I, p->E) * 4 > hid->bytes || (p->S > CC_MOE_FRAME_ROWS && p->E < 1)) return 0;
+    g_st.ops++;
+    if (!coli_cuda_moe_async(c->device, (const CcExpert *)tab->d, fp(x), (const int *)ids->d, fp(w), fpw(hid), fpw(y), fp(hy), p,
+                             (void *)c->stream)) { c->lost = 1; return 0; }
+    return 1;
+}
+static int cc_signal(CcBuf *flag, size_t word, unsigned v) {
+    CcCtx *c = live();
+    if (!c || !flag || flag->kind != CC_DOWN || (word + 1) * 4 > flag->bytes) return 0;
+    cc_signal_k<<<1, 1, 0, c->stream>>>((volatile unsigned *)flag->d + word, v);
+    return launched(c, "signal");
+}
+static int cc_wait_host(CcBuf *flag, size_t word, unsigned v) {
+    CcCtx *c = live();
+    if (!c || !flag || flag->kind != CC_UP || (word + 1) * 4 > flag->bytes) return 0;
+    cc_wait_k<<<1, 1, 0, c->stream>>>((volatile unsigned *)flag->d + word, v);
+    return launched(c, "wait host");
+}
 static void cc_stats(CcStats *st) { if (st) *st = g_st; }
 
 static const ColiCudaChainOps g_cc_ops = {
@@ -769,5 +921,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_matmul, cc_norm, cc_rope, cc_attn, cc_dnconv, cc_dnrec, cc_ew,
     cc_stats,
     cc_qsa, cc_ple,
+    cc_route, cc_moe, cc_signal, cc_wait_host, coli_cuda_tensor_dev,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
