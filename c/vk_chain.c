@@ -47,6 +47,7 @@ static const char *const pipe_file[P_NPIPE] = {
 #define VKC_GEMM_MAX 4
 #define VKC_DNREC_MAX 8
 #define VKC_FRAMES 16
+#define VKC_STAGE0 (((size_t)16 << 20) / VKC_FRAMES)   /* a frame's first staging buffer: 16 MiB over the frames, as when they were 4 of 4 MiB */
 #define VKC_BIND 8
 #define VKC_TRACK 64
 #define VKC_PROF_Q 512
@@ -942,7 +943,7 @@ int vkc_write(VkcBuf *dst, size_t off, const void *src, size_t bytes) {
     size_t at = (f->stage_used + 15) & ~(size_t)15;
     if (!f->stage || at + bytes > f->stage->bytes) {
         /* a new staging buffer; the old one stays alive until the frame comes back */
-        size_t want = f->stage ? 2 * f->stage->bytes : (size_t)4 << 20;
+        size_t want = f->stage ? 2 * f->stage->bytes : VKC_STAGE0;
         while (want < bytes) want *= 2;
         VkcBuf *n = vkc_buf(want, VKC_UP);
         if (!n) return 0;
@@ -2351,7 +2352,7 @@ size_t vkc_fit_reserve(void) {
  * first staging buffers: what the pools may hold beyond the bytes asked for. */
 size_t vkc_fit_pools(void) {
     return coli_vk_block_bytes_dev(g_kd, (size_t)256 << 20) + 3 * (size_t)coli_vk_block_bytes_dev(g_kd, VKC_BLOCK) +
-           (size_t)VKC_FRAMES * ((size_t)4 << 20);
+           (size_t)VKC_FRAMES * VKC_STAGE0;
 }
 int vkc_fit_rows(int def) {
     const char *e = getenv("COLI_VK_CHAIN_ROWS");
