@@ -746,7 +746,9 @@ VK_SPV   += shaders/chain_route.spv
 # the routed experts on the device, their weights by address (vk_chain.h: vkc_moe)
 VK_SPV   += shaders/chain_moe.spv
 # a GGUF's dense matrices on the chain, one pipeline per block type (vk_chain.c: matmul_bd)
-VK_SPV   += shaders/chain_gemv_bd.spv
+VK_SPV   += shaders/chain_gemv_bd.spv shaders/qmatmul_gemm_bd.spv
+# the expert batch's grouped GEMM for a GGUF's experts, down and gate+up (backend_vulkan.c)
+VK_SPV   += shaders/qmatmul_grp_bd.spv shaders/qmatmul_grp_gate_up_bd.spv
 # inkling's chain ops (made on first use): the short convolution and the attention
 # with its relative-position bias
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
@@ -922,7 +924,10 @@ vk_chain.o: vk_chain.c .build-config
 # routed experts; the chain's block GEMV reads the same table
 shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv shaders/chain_moe.spv: shaders/blockdec.glsl shaders/blockdec_table.h
 # the per-type decoders of the chain's block GEMV and of its routed experts
-shaders/chain_gemv_bd.spv shaders/chain_moe.spv: shaders/bdstep.glsl shaders/blockdec_table.h
+shaders/chain_gemv_bd.spv shaders/chain_moe.spv shaders/qmatmul_gemm_bd.spv shaders/qmatmul_grp_bd.spv: shaders/bdstep.glsl shaders/blockdec_table.h
+shaders/qmatmul_grp_gate_up_bd.spv: shaders/qmatmul_grp_bd.comp shaders/bdstep.glsl shaders/blockdec_table.h
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 shaders/%.spv: shaders/%.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
@@ -2670,8 +2675,12 @@ $(V4_OWN_DIR)/expert_store_registry.o: expert_store_registry.c | $(V4_OWN_DIR)
 tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
 	$(CC) $(V4_OWN_CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
 
+# After test_deepseek_v4: both sub-makes build the same COLI_V4_UNIT_*.o, and under -j the
+# one linking read an object the other was writing (lto1: "resolution sub id ... not in
+# object file")
 tests/test_v4_serve_framing$(EXE): tests/test_v4_serve_framing.c sse41_kernels.h deepseek_v4.c \
-		deepseek_v4.h deepseek_v4_internal.h serve_codec.h Makefile.deepseek-v4 Makefile.deepseek-v4.units
+		deepseek_v4.h deepseek_v4_internal.h serve_codec.h Makefile.deepseek-v4 Makefile.deepseek-v4.units \
+		| tests/test_deepseek_v4$(EXE)
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) $@
 
 endif

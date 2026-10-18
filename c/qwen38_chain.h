@@ -1190,7 +1190,7 @@ static int q38c_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
     /* a GGUF's dense matrices run on the block formats' GEMV, a row at a time: decode and
      * verifies here, a prompt's longer chunks through the CPU and the expert tier, as
      * qwen36_chain.h's (Q36C_GGUF_ROWS) */
-    if (g_q38_gguf && S > Q38C_GGUF_ROWS) return 0;
+    if (g_q38_gguf && S > Q38C_GGUF_ROWS && !vkc_gemm_bd_ready()) return 0;
     Q38Chain *ch = q38c_setup(m), *ch2 = q38c_of(m, 1);
     if (!ch || ch->failed) return 0;
     if (ch2 && (!ch2->ok || ch2->failed || ch2->lo != ch->lo + ch->nl || ch->head)) ch2 = NULL;

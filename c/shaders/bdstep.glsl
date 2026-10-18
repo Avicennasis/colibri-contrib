@@ -96,23 +96,18 @@ void bs_step(int t, uint rb, uint q) {
         }
         return;
     }
-    if (t == 14) {   // Q6_K: 8 steps a block: half n (128 weights), bytes l0..l0+7 of its 32-runs
-        uint b = q >> 3, n = (q >> 2) & 1u, l0 = (q & 3u) * 8u;
-        uint base = rb + b * 210u;
-        uint qa0 = bs_ldu(base + 64u * n + l0), qa1 = bs_ldu(base + 64u * n + l0 + 4u);
-        uint qb0 = bs_ldu(base + 64u * n + 32u + l0), qb1 = bs_ldu(base + 64u * n + 32u + l0 + 4u);
-        uint qh0 = bs_ldu(base + 128u + 32u * n + l0), qh1 = bs_ldu(base + 128u + 32u * n + l0 + 4u);
-        uint s0 = bs_ldu(base + 192u + 8u * n), s1 = bs_ldu(base + 196u + 8u * n);
-        uint g = l0 >> 4;   // the scales of runs m = 0..3: bytes 2m + g of s0|s1
-        float d = bs_f16at(base + 208u);
-        float sc0 = d * bs_sbyte(s0, int(g)), sc1 = d * bs_sbyte(s0, int(2u + g)), sc2 = d * bs_sbyte(s1, int(g)), sc3 = d * bs_sbyte(s1, int(2u + g));
-        uint e = b * 64u + n * 32u + l0 / 4u;   // weight 256b + 128n + l0
-        [[unroll]] for (int k = 0; k < 2; k++) {
-            uint la = k == 0 ? qa0 : qa1, lb = k == 0 ? qb0 : qb1, hh = k == 0 ? qh0 : qh1;
-            BS_ACC((bs_u8x4((la & 0x0F0F0F0Fu) | ((hh << 4) & 0x30303030u)) - 32.0) * sc0, e + uint(k));
-            BS_ACC((bs_u8x4((lb & 0x0F0F0F0Fu) | ((hh << 2) & 0x30303030u)) - 32.0) * sc1, e + 8u + uint(k));
-            BS_ACC((bs_u8x4(((la >> 4) & 0x0F0F0F0Fu) | (hh & 0x30303030u)) - 32.0) * sc2, e + 16u + uint(k));
-            BS_ACC((bs_u8x4(((lb >> 4) & 0x0F0F0F0Fu) | ((hh >> 2) & 0x30303030u)) - 32.0) * sc3, e + 24u + uint(k));
+    if (t == 14) {   // Q6_K: 8 steps a block, step j = weights 32j..32j+31: half n = j / 4, run m = j % 4
+        // (weight 128n + 32m + l: the low nibble of ql[64n + l] (m 0) or ql[64n + 32 + l] (m 1),
+        // their high nibbles (m 2, 3); bits 2m, 2m + 1 of qh[32n + l]; scale 8n + 2m + l / 16)
+        uint b = q >> 3, j = q & 7u, n = j >> 2, m = j & 3u;
+        uint base = rb + b * 210u, qlo = base + 64u * n + 32u * (m & 1u), qhi = base + 128u + 32u * n;
+        uint s2 = bs_ldu(base + 192u + 8u * n + 2u * m);   /* the two scales, bytes 0 and 1 */
+        float d = bs_f16at(base + 208u), sc0 = d * bs_sbyte(s2, 0), sc1 = d * bs_sbyte(s2, 1);
+        uint sh = (m >> 1) * 4u, hs = 2u * m;
+        [[unroll]] for (int k = 0; k < 8; k++) {
+            uint lw = bs_ldu(qlo + 4u * uint(k)), hw = bs_ldu(qhi + 4u * uint(k));
+            vec4 v = bs_u8x4(((lw >> sh) & 0x0F0F0F0Fu) | (((hw >> hs) & 0x03030303u) << 4)) - 32.0;
+            BS_ACC(v * (k < 4 ? sc0 : sc1), q * 8u + uint(k));
         }
         return;
     }
