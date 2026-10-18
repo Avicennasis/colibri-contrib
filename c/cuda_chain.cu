@@ -529,7 +529,9 @@ static CcBuf *cc_buf(size_t bytes, int kind) {
     if (!b) return nullptr;
     b->kind = kind; b->dev = c->device; b->bytes = bytes;
     if (kind == CC_DEV) {
-        if (cudaMalloc((void **)&b->d, bytes) != cudaSuccess || cudaMemset(b->d, 0, bytes) != cudaSuccess) {
+        /* zeroed on the chain's stream: a cudaMemset runs on the legacy default stream, which
+         * a non-blocking stream does not wait for, and landed after a first write now and then */
+        if (cudaMalloc((void **)&b->d, bytes) != cudaSuccess || cudaMemsetAsync(b->d, 0, bytes, c->stream) != cudaSuccess) {
             (void)cudaGetLastError();
             if (b->d) cudaFree(b->d);
             std::free(b);
