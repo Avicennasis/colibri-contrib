@@ -1989,6 +1989,36 @@ fit a device whole, where their layers keep the tier's step.
 The device opens with `bufferDeviceAddress` wherever it has it now (before, only with
 the matrix units, for the grouped GEMM); `COLI_VK_BDA=0` still opens it without.
 
+**The integer form.** A GGUF's experts run, where the device accelerates packed 4 x 8
+integer dot products (`VK_KHR_shader_integer_dot_product`,
+`integerDotProduct4x8BitPackedSignedAccelerated`), in the CPU's integer form
+(`chain_moe_i8.spv`, `bdstep_i8.glsl`), as `ggml_quants.h` computes them by default:
+- each input row (x for gate and up, the activation for down) is quantized to int8 in
+  blocks of 32 as `gq_quant_act_ref` does it (d = amax / 127, codes rounded to nearest
+  even and clamped to +-127, their sum per 16), in shared memory instead of the float row;
+- each type's weights are the integers and scales of `gq_unpack_row` (a scale and a min
+  per 16), and a group's sum `dx * (sw * sum(w8 * xq) - mw * xs)` is formed with exact
+  integer inner sums (`dotPacked4x8EXT`).
+
+Against the CPU's integer form, `tests/test_vk_chain`'s `moe i8` cases agree to about
+2e-7 for every type it decodes (Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, IQ3_S, IQ4_NL,
+IQ4_XS, Q2_0), where the float form differs by about 1e-2: on the device the experts now
+give what the CPU gives. Both of a layer's formats must have the form (else the float
+pipeline runs that layer); a prompt chunk's grouped GEMMs keep their float sums.
+`COLI_VK_IDOT=0` leaves the extension off; a device that supports it without
+acceleration (Lavapipe) keeps the float form unless a test asks (`vkc_moe_set_idot`).
+The chain's line counts the layer steps that took it (`N in the integer form`).
+
+Measured on the RTX PRO 4000 (`COLI_VK_CHAIN_BENCH=moe`, the float form with
+`COLI_VK_IDOT=0`), a layer's experts in microseconds:
+
+| experts (gate+up / down) | D | 1 row | 2 rows | 3 rows |
+|---|---|---|---|---|
+| IQ2_S / Q2_0 | 2560 | 98.6 -> 67.2 | 170 -> 118 | 244 -> 178 |
+| IQ2_XXS / Q6_K | 2048 | 65.8 -> 60.4 | 117 -> 105 | 177 -> 143 |
+| Q4_K / Q6_K | 2048 | 75.6 -> 69.3 | 128 -> 120 | 193 -> 165 |
+| IQ4_XS / IQ4_XS | 2560 | 106 -> 99.6 | 187 -> 180 | 268 -> 283 |
+
 **Staging sizes.** `chain_moe.comp` stages a row of x in shared memory, and so does
 `chain_gemv_bd.comp` (a GGUF's dense GEMV). Both pipelines used to be built at the
 device's largest staging (48 KiB on NVIDIA, with bdstep.glsl's 8.5 KiB of tables), which

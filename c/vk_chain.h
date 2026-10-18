@@ -458,6 +458,14 @@ int vkc_prewarm(const VkcPrewarm *w);
  * (qmatmul_gemm_bd.comp), else only the GEMV's few rows a step suit them */
 int vkc_gemm_bd_ready(void);
 int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p);
+/* A GGUF's experts (blocks, gfmt and dfmt both types bdstep_i8.glsl has) in the CPU's
+ * integer form: the input rows quantized to int8 per 32, packed 4 x 8 integer dot products
+ * (ggml_quants.h's gq_quant_act_ref and gq_dot_i8, the same integers and scales). On by
+ * default where the device accelerates them (vkc_moe_idot: 0 none, 1 supported, 2
+ * accelerated; COLI_VK_IDOT=0 leaves the extension off); vkc_moe_set_idot(1) asks for it
+ * where supported, 0 never, -1 the default (tests). */
+void vkc_moe_set_idot(int on);
+int vkc_moe_idot(void);
 
 /* ---- attention residuals and SiTU-GLU (chain_ares.comp) ----------------------------
  * Kimi K3's residual stream (AttnRes) and its activation, for S rows:
@@ -800,6 +808,7 @@ typedef struct {
     unsigned long long attn_flash;     /* attention calls through chain_attn_flash (matrix units) */
     unsigned long long attn_slices;    /* extra submissions that cut a long attention (COLI_VK_ATTN_SLICE) */
     unsigned long long tile_gemms;     /* prompt matmuls through chain_gemm.comp (matrix units) */
+    unsigned long long moe_i8;         /* routed-expert layer steps in the CPU's integer form (chain_moe_i8) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

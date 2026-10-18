@@ -1706,7 +1706,7 @@ dmoe_gate() {
   local n h c
   n=$(sed -n "s/^\[VK\] $eng chain: .* \([0-9]*\) layer steps with the routed experts in the frame.*/\1/p" vk.log | tail -1)
   h=$(sed -n "s/^\[VK\] $eng chain: .* \([0-9.]*\) ms of routed experts on the host.*/\1/p" vk.log | tail -1)
-  c=$(sed -n "s/^\[VK\] $eng chain: .* in the frame (\([0-9]*\) of them a prompt chunk's).*/\1/p" vk.log | tail -1)
+  c=$(sed -n "s/^\[VK\] $eng chain: .* in the frame (\([0-9]*\) of them a prompt chunk's[,)].*/\1/p" vk.log | tail -1)
   case $want in
     all) [ "${n:-0}" -gt 0 ] && [ "$h" = 0.0 ] ;;
     some) [ "${n:-0}" -gt 0 ] && [ "${h:-0.0}" != 0.0 ] ;;

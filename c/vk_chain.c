@@ -107,6 +107,8 @@ typedef struct {
     VkShaderModule mod_moe; VkPipeline moe[2][10];            /* chain_moe.comp: the routed experts, by address (bufferDeviceAddress),
                                                                  [1] with the block formats' paths (BD = 1), by staging size */
     int moe_xs, moe_xs_bd; uint8_t moe_tried[2][10];          /* their largest staging floats (0: the device cannot); made once asked for */
+    VkShaderModule mod_moe_i8; VkPipeline moe_i8[10]; uint8_t moe_i8_tried[10];   /* chain_moe_i8.spv, by its codes' size */
+    int idot, idot_set;                                       /* the integer form on (vkc_moe_set_idot: -1 = the device's default) */
     /* a prompt chunk's routed experts (vkc_moe_rows): chain_moe_rows.comp, and the block
      * formats' grouped GEMMs (qmatmul_grp_bd.comp: [0] down, [1] gate+up) a pipeline per
      * (pass, ggml type), made on first use */
@@ -472,6 +474,7 @@ int vkc_init(void) {
         xs = (int32_t)((kc_shared_limit() > 8768 ? kc_shared_limit() - 8768 : 0) / 4) & ~3;
         KC.moe_xs_bd = xs > 8192 ? 8192 : xs >= 1024 ? xs : 0;
     }
+    KC.idot = g_kd == 0 ? coli_vk_idot() : 0; KC.idot_set = -1;
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
     for (int i = 0; i < PM_N; i++) {
         char path[1200];
@@ -1499,6 +1502,33 @@ static VkPipeline moe_pipe(int bd, int n) {
     if (dt > 5000.0) fprintf(stderr, "[VK] chain: chain_moe.spv%s took %.1f s to build\n", bd ? " (block formats)" : "", dt / 1e3);
     return *pp;
 }
+/* The routed experts in the CPU's integer form (chain_moe_i8.spv, bdstep_i8.glsl): the
+ * types it decodes, and its pipeline for rows of up to n inputs (their codes in the
+ * smallest kc_stage bucket of uvec4s that holds them, the float staging the least). On by
+ * default where the device's packed 4 x 8 dot is accelerated. */
+static int moe_i8_type(int fmt) {
+    int t = fmt - 100;
+    return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42;
+}
+static VkPipeline moe_i8_pipe(int n) {
+    if (!(KC.idot_set >= 0 ? KC.idot_set && KC.idot : KC.idot == 2) || !KC.moe_xs_bd) return VK_NULL_HANDLE;
+    int np = (n + 255) & ~255, b = stage_of(np / 16, 1 << 30);
+    if (b >= KC_STAGES) return VK_NULL_HANDLE;
+    int xq = kc_stage[b];
+    /* its shared memory: the codes, scales and sums, bdstep.glsl's tables */
+    if ((size_t)(xq + xq / 8 + 1) * 16 + (size_t)(xq / 2 + 1) * 4 + (size_t)(xq + 1) * 4 + 8768 + 16 > kc_shared_limit()) return VK_NULL_HANDLE;
+    VkPipeline *pp = &KC.moe_i8[b];
+    if (*pp || KC.moe_i8_tried[b]) return *pp;
+    KC.moe_i8_tried[b] = 1;
+    if (!KC.mod_moe_i8 && !(KC.mod_moe_i8 = load_module(KC.core.spv_path, "chain_moe_i8.spv"))) return VK_NULL_HANDLE;
+    int32_t v[3] = {4, 1, xq};
+    VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+    VkSpecializationInfo si = {3, me, sizeof v, v};
+    *pp = make_pipe(KC.mod_moe_i8, &si);
+    return *pp;
+}
+void vkc_moe_set_idot(int on) { KC.idot_set = on; }
+int vkc_moe_idot(void) { return KC.idot; }
 /* chain_moe can run here: its module and a staging size (no pipeline made yet) */
 static int moe_build(void) {
     if (!KC.moe_xs) return 0;
@@ -1558,6 +1588,13 @@ int vkc_prewarm(const VkcPrewarm *pw) {
         VkcMoe p = {.S = 1, .K = 1, .D = 64, .I = 64, .x_row = 64, .i_row = 1, .w_row = 1, .y_row = 64, .blocks = pw->moe == 2,
                     .stage_n = mn};
         ok = vkc_moe(x, ids, rw, tab, hid, y, &p); n += ok;
+        /* and the integer form's, for the file's expert types that have it */
+        int gi = -1, di = -1;
+        for (int t = 0; t < 64; t++) { if ((pw->ex_gu >> t & 1) && moe_i8_type(100 + t) && gi < 0) gi = t; if ((pw->ex_dn >> t & 1) && moe_i8_type(100 + t) && di < 0) di = t; }
+        if (ok && pw->moe == 2 && gi >= 0 && di >= 0 && mn > 0 && moe_i8_pipe(mn)) {
+            p.gfmt = 100 + gi; p.dfmt = 100 + di;
+            ok = vkc_moe(x, ids, rw, tab, hid, y, &p); n += ok;
+        }
     }
     /* DeltaNet's recurrence, made (its launch wants a layer's state) */
     if (ok && pw->dn_kd > 0 && pw->dn_kd <= 256) n += dnrec_pipe(pw->dn_kd) != VK_NULL_HANDLE;
@@ -1598,7 +1635,12 @@ int vkc_prewarm(const VkcPrewarm *pw) {
 int vkc_moe_ready(void) { return vkc_ready() && moe_build(); }
 int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p) {
     KC.kind = PK_MOE;
-    VkPipeline mp = moe_pipe(p->blocks != 0, p->stage_n ? p->stage_n : p->D > p->I ? p->D : p->I);
+    int sn = p->stage_n ? p->stage_n : p->D > p->I ? p->D : p->I;
+    /* the integer form where both of the layer's formats have it */
+    VkPipeline mp = p->blocks && moe_i8_type(p->gfmt) && moe_i8_type(p->dfmt) && p->D % 32 == 0 && p->I % 32 == 0
+                    ? moe_i8_pipe(sn) : VK_NULL_HANDLE;
+    if (mp) KC.st.moe_i8++;
+    else mp = moe_pipe(p->blocks != 0, sn);
     if (!mp || p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || p->D < 1 || p->I < 1 || p->act < 0 || p->act > 1 ||
         (p->act == 1 && !(p->a > 0.0f && p->b > 0.0f)) || p->t_off < 0 || !x || !ids || !w || !table || !hid || !y ||
         hid == x || hid == y || y == x) return 0;
@@ -2373,6 +2415,8 @@ void vkc_shutdown(void) {
     if (KC.mod_bdv) vkDestroyShaderModule(KC.dev, KC.mod_bdv, NULL);
     if (KC.mod_bd) vkDestroyShaderModule(KC.dev, KC.mod_bd, NULL);
     for (int d = 0; d < 2; d++) for (int b = 0; b <= KC_STAGES; b++) if (KC.moe[d][b]) vkDestroyPipeline(KC.dev, KC.moe[d][b], NULL);
+    for (int b = 0; b <= KC_STAGES; b++) if (KC.moe_i8[b]) vkDestroyPipeline(KC.dev, KC.moe_i8[b], NULL);
+    if (KC.mod_moe_i8) vkDestroyShaderModule(KC.dev, KC.mod_moe_i8, NULL);
     if (KC.rows) vkDestroyPipeline(KC.dev, KC.rows, NULL);
     if (KC.mod_rows) vkDestroyShaderModule(KC.dev, KC.mod_rows, NULL);
     for (int v = 0; v < 2; v++) {

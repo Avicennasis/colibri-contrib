@@ -151,8 +151,9 @@ static int vkc_dmoe_layer(VkcDmoe *d, int layer, int n, VkcBuf *lg, VkcBuf *bias
     m.S = n; m.K = d->K; m.t_off = i * d->E; m.x_off = 0; m.x_row = mp->D; m.i_off = io; m.i_row = d->K;
     m.w_off = 0; m.w_row = d->K; m.y_off = 0; m.y_row = mp->D;
     if (!m.gfmt && d->tabh) m.gfmt = vkc_dmoe_fmt(d, i, 12);   /* the layer's gate/up format */
+    if (!m.dfmt && d->tabh) m.dfmt = vkc_dmoe_fmt(d, i, 15);   /* and down's (the integer form wants both) */
     if (n > VKC_DMOE_ROWS) {   /* a prompt chunk: the grouped GEMMs (vkc_dmoe_prepare checked the layer's formats) */
-        m.dfmt = vkc_dmoe_fmt(d, i, 15); m.E = d->E;
+        m.E = d->E;
         if (!vkc_route(lg, bias, d->rid, d->rwt, &r) || !vkc_moe_rows(x, d->rid, d->rwt, d->tab, &d->rows, d->y, &m)) return 0;
         d->steps++; d->big_steps++;
         return 1;

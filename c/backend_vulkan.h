@@ -389,6 +389,9 @@ void coli_vk_xb_stats_dev(int dev, ColiVkXbStats *st);
 int coli_vk_device_integrated(void);
 /* 1 for an integrated GPU or a CPU device (Lavapipe): device memory is host RAM. */
 int coli_vk_device_shares_ram(void);
+/* VK_KHR_shader_integer_dot_product on the primary device: 0 none, 1 supported, 2 with
+ * the packed 4 x 8 signed dot accelerated (COLI_VK_IDOT=0 leaves the extension off). */
+int coli_vk_idot(void);
 /* The largest DEVICE_LOCAL heap in bytes (for a budget without VK_EXT_memory_budget). */
 size_t coli_vk_device_local_bytes(void);
 const char *coli_vk_device_name(void);

@@ -1062,9 +1062,9 @@ static void q36c_report(Model *m) {
         VkcStats st; vkc_stats(&st);
         fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                         "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %llu layer steps with "
-                        "the routed experts in the frame (%llu of them a prompt chunk's), %.1f MiB on the device\n",
+                        "the routed experts in the frame (%llu of them a prompt chunk's, %llu in the integer form), %.1f MiB on the device\n",
                 q36c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
-                ch->dm.steps, ch->dm.big_steps, st.dev_bytes / 1048576.0);
+                ch->dm.steps, ch->dm.big_steps, st.moe_i8, st.dev_bytes / 1048576.0);
         vkc_kv_report(&ch->ks);
         vkc_prof_print();
         vkc_device(was);

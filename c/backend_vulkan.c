@@ -423,6 +423,9 @@ static struct {
      * (measured: decode attention 7.8s at 7.6 GB resident -> 17.8s at 15.2 GB).
      * VK_EXT_memory_budget lets the tier fill stop at a reserve instead of guessing. */
     int has_prio, has_budget, has_hostmem;
+    /* VK_KHR_shader_integer_dot_product on (COLI_VK_IDOT=0 leaves it off): 1, 2 with the
+     * packed 4 x 8 signed dot accelerated (coli_vk_idot) */
+    int has_idot;
     float prio;                  /* priority applied to the NEXT allocations (class knob) */
     /* the routed-expert tier's queue (coli_vk_xb_*): family, index, whether it is the
      * main queue after all, and its timestamp bits; device limits its batches respect */
@@ -1124,6 +1127,9 @@ int coli_vk_init(const char *spv_path) {
 #ifdef VK_EXT_memory_budget
                 if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G.has_budget = 1;
 #endif
+#ifdef VK_KHR_shader_integer_dot_product
+                if (!strcmp(ep[i].extensionName, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) G.has_idot = 1;
+#endif
 #ifdef VK_EXT_external_memory_host
                 if (!strcmp(ep[i].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) G.has_hostmem = 1;
 #endif
@@ -1209,6 +1215,33 @@ int coli_vk_init(const char *spv_path) {
 #endif
 #ifdef VK_EXT_memory_budget
     if (G.has_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+#endif
+#ifdef VK_KHR_shader_integer_dot_product
+    /* the chain's routed experts in the CPU's integer form (chain_moe_i8.spv): the feature,
+     * and whether its packed 4 x 8 signed dot is accelerated (the default then) */
+    VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR idf = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR};
+    {
+        const char *ie = getenv("COLI_VK_IDOT");
+        if (G.has_idot && !(ie && *ie == '0')) {
+            VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &idf};
+            vkGetPhysicalDeviceFeatures2(G.phys, &f2);
+            VkPhysicalDeviceShaderIntegerDotProductPropertiesKHR ip = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES_KHR};
+            VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &ip};
+            vkGetPhysicalDeviceProperties2(G.phys, &p2);
+            G.has_idot = idf.shaderIntegerDotProduct ? (ip.integerDotProduct4x8BitPackedSignedAccelerated ? 2 : 1) : 0;
+        } else G.has_idot = 0;
+        if (G.has_idot) {
+            dext[ndext++] = VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
+            idf = (VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR){
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR,
+                .pNext = (void *)di.pNext, .shaderIntegerDotProduct = VK_TRUE};
+            di.pNext = &idf;
+        }
+    }
+#else
+    G.has_idot = 0;
 #endif
 #ifdef VK_EXT_external_memory_host
     /* host memory the device reads in place (no copy): measured by the harness
@@ -3805,6 +3838,8 @@ int coli_vk_device_integrated(void) {
     vkGetPhysicalDeviceProperties(G.phys, &p);
     return p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
 }
+/* The integer dot product on the primary device: 0 none, 1 supported, 2 accelerated. */
+int coli_vk_idot(void) { return G.dev ? G.has_idot : 0; }
 /* An integrated GPU or a CPU device (Lavapipe): its "device memory" is host RAM. */
 int coli_vk_device_shares_ram(void) {
     if (!G.phys) return 0;
