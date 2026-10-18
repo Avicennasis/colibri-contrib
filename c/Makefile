@@ -2675,8 +2675,12 @@ $(V4_OWN_DIR)/expert_store_registry.o: expert_store_registry.c | $(V4_OWN_DIR)
 tests/test_v4_ownership$(EXE): tests/test_v4_ownership.c $(V4_OWNERSHIP_OBJS)
 	$(CC) $(V4_OWN_CFLAGS) $< $(V4_OWNERSHIP_OBJS) -o $@ -pthread $(LDFLAGS)
 
+# After test_deepseek_v4: both sub-makes build the same COLI_V4_UNIT_*.o, and under -j the
+# one linking read an object the other was writing (lto1: "resolution sub id ... not in
+# object file")
 tests/test_v4_serve_framing$(EXE): tests/test_v4_serve_framing.c sse41_kernels.h deepseek_v4.c \
-		deepseek_v4.h deepseek_v4_internal.h serve_codec.h Makefile.deepseek-v4 Makefile.deepseek-v4.units
+		deepseek_v4.h deepseek_v4_internal.h serve_codec.h Makefile.deepseek-v4 Makefile.deepseek-v4.units \
+		| tests/test_deepseek_v4$(EXE)
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) $@
 
 endif

@@ -357,6 +357,20 @@ static uint32_t kc_shared_limit(void) {
     return pp.limits.maxComputeSharedMemorySize;
 }
 
+/* qmatmul_gemm_bd.comp's fixed shared memory, held to the compiled shader's by
+ * tests/test_vk_shared_memory.py: a device with less keeps the GEMV for a prompt's rows */
+#define GEMM_BD_SHARED 44544u
+/* an ASan or UBSan build (gcc defines __SANITIZE_ADDRESS__; clang has __has_feature) */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_UNDEFINED__)
+#define VKC_SANITIZED 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(undefined_behavior_sanitizer)
+#define VKC_SANITIZED 1
+#endif
+#endif
+#ifndef VKC_SANITIZED
+#define VKC_SANITIZED 0
+#endif
 int vkc_init(void) {
     if (KC.ready) return !KC.lost;
     if (!coli_vk_core_dev(g_kd, &KC.core)) return 0;
@@ -364,10 +378,13 @@ int vkc_init(void) {
     /* 20 s tells a GPU that hangs. A software device (llvmpipe) generates a shader's code
      * at its first launch, inside the frame's wait, and caches it on disk: on a CI runner's
      * empty cache chain_moe's first frame took more than 20 s (4 s on a laptop), and the
-     * device was given up for a compile. There a frame waits up to 5 minutes. */
+     * device was given up for a compile. There a frame waits up to 5 minutes, and 15 in a
+     * sanitized build: under ASan the first frame of a GGUF's chain (chain_moe's block
+     * formats and the GEMVs of five types) went past the 5 minutes on a CI runner. */
     {
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
-        KC.fence_ns = pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? 300000000000ULL : 20000000000ULL;
+        KC.fence_ns = pp.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU ? 20000000000ULL
+                    : VKC_SANITIZED ? 900000000000ULL : 300000000000ULL;
     }
     KC.align = KC.core.ssbo_align > 16 ? KC.core.ssbo_align : 16;
     VkDescriptorSetLayoutBinding b[VKC_BIND];
@@ -444,7 +461,7 @@ int vkc_init(void) {
             KC.bdv_xs = xs;
         /* the tiled GEMM for a prompt's rows: its tiles and bdstep's tables, 43.5 KiB */
         const char *g = getenv("COLI_VK_CHAIN_GEMM_BD");
-        if (KC.bd && !(g && *g == '0') && pp.limits.maxComputeSharedMemorySize >= 44544)
+        if (KC.bd && !(g && *g == '0') && pp.limits.maxComputeSharedMemorySize >= GEMM_BD_SHARED)
             KC.mod_bdg = load_module(KC.core.spv_path, "qmatmul_gemm_bd.spv");
     }
     /* the routed experts by address (chain_moe.comp): a device with bufferDeviceAddress
