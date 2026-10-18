@@ -2656,11 +2656,15 @@ static void test_kvs_cold(void) {
 #include <time.h>
 static double bnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void bench_gemv(void) {
-    int shapes[3][2] = {{2560, 10240}, {6144, 2560}, {2560, 640}};
-    int fmts[3] = {1, 4, 11};
-    for (int f = 0; f < 3; f++) for (int k = 0; k < 3; k++) {
+    int shapes[3][2] = {{2560, 10240}, {6144, 2560}, {2560, 640}}, nsh = 3;
+    int fmts[3] = {1, 4, 11}, nf = 3;
+    const char *she = getenv("COLI_VK_BENCH_SHAPE");   /* "O I": one shape of your own */
+    if (she && *she) { int o = 0, i = 0; if (sscanf(she, "%d %d", &o, &i) == 2 && o > 0 && i > 0) { shapes[0][0] = i; shapes[0][1] = o; nsh = 1; } }
+    const char *fe = getenv("COLI_VK_BENCH_FMTS");      /* one of 1, 4, 10, 11 */
+    if (fe && *fe) { fmts[0] = atoi(fe); nf = 1; }
+    for (int f = 0; f < nf; f++) for (int k = 0; k < nsh; k++) {
         int I = shapes[k][0], O = shapes[k][1], fmt = fmts[f], gs = fmt == 4 ? 64 : 0, nm = 24;
-        size_t rb = fmt == 1 ? (size_t)I : fmt == 4 ? (size_t)I / 2 : (size_t)I * 2;
+        size_t rb = fmt == 1 ? (size_t)I : fmt == 4 ? (size_t)I / 2 : fmt == 10 ? (size_t)I * 4 : (size_t)I * 2;
         ColiVkTensor **t = calloc(nm, sizeof *t);
         uint8_t *w = malloc(rb * O); float *sc = malloc((size_t)O * (I / 64 + 1) * sizeof(float));
         for (size_t i = 0; i < rb * O; i++) w[i] = (uint8_t)rnd();
