@@ -274,6 +274,21 @@ def cuda_release_advice(sm, version=None):
     return None, f"install a CUDA toolkit whose `nvcc --list-gpu-arch` lists compute_{sm}"
 
 
+def _cc_finds_vulkan_h(cc):
+    """Whether the compiler the build would use finds <vulkan/vulkan.h> on its own include
+    path: a Nix shell's headers sit in the store, named by NIX_CFLAGS_COMPILE (the gcc
+    wrapper reads it), others by CPATH or C_INCLUDE_PATH; the build sees them the same way
+    (#2122). Only the preprocessor runs, on one line."""
+    if not cc:
+        return False
+    try:
+        r = subprocess.run([cc, "-E", "-x", "c", "-", "-o", os.devnull], input="#include <vulkan/vulkan.h>\n",
+                           capture_output=True, text=True, timeout=30)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def toolchain(here=None):
     """What can be built here, and with what."""
     here = here or HERE
@@ -315,7 +330,7 @@ def toolchain(here=None):
         tc["vulkan_headers"] = False   # macOS: the GPU path is Metal, not offered here
     else:
         tc["vulkan_headers"] = any(os.path.isfile(os.path.join(p, "vulkan", "vulkan.h"))
-                                   for p in ("/usr/include", "/usr/local/include"))
+                                   for p in ("/usr/include", "/usr/local/include")) or _cc_finds_vulkan_h(tc["cc"])
     tc["can_build"] = bool(tc["source_checkout"] and tc["make"] and tc["cc"])
     tc["can_build_vulkan"] = bool(tc["can_build"] and tc["glslc"] and tc["vulkan_headers"])
     tc["can_build_cuda"] = bool(tc["can_build"] and tc["nvcc"] and sys.platform.startswith("linux"))

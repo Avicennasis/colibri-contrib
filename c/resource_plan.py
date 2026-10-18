@@ -2907,13 +2907,25 @@ def physical_cpu_count():
         except (OSError, ValueError, AttributeError) as error:
             _physical_cores_warn(f"Windows core probe failed: {error}")
     if sys.platform == "darwin":
-        # Apple Silicon's performance cores pace barriered expert matmuls. The
-        # physical count includes efficiency cores, which is not the useful
-        # OpenMP team size for this workload.
+        # Apple Silicon: every core but the efficiency tier's paces barriered expert
+        # matmuls (omp_tune.h coli_physical_cores, the same rule). The tiers are
+        # hw.perflevel0 .. hw.perflevel(N-1), fastest first, the last the efficiency
+        # cores: two on an M1-M4 (perflevel0 alone), three on an M6 (2 Super + 4
+        # Performance, #2194); one tier is every core.
+        def sysctl_int(name):
+            result = subprocess.run(["sysctl", "-n", name], text=True, capture_output=True,
+                                    check=True, timeout=5)
+            return int(result.stdout.strip())
         try:
-            result = subprocess.run(["sysctl", "-n", "hw.perflevel0.logicalcpu"],
-                                    text=True, capture_output=True, check=True, timeout=5)
-            cores = int(result.stdout.strip())
+            levels = sysctl_int("hw.nperflevels")
+            cores = sum(sysctl_int(f"hw.perflevel{i}.logicalcpu")
+                        for i in range(min(max(levels - 1, 1), 16))) if levels >= 1 else 0
+            if cores > 0:
+                return cores
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        try:
+            cores = sysctl_int("hw.perflevel0.logicalcpu")
             if cores > 0:
                 return cores
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -2967,6 +2979,92 @@ def physical_cpu_count():
         f"physical-core probes unavailable; using {logical} logical CPUs "
         f"(SMT may over-subscribe). Set OMP_NUM_THREADS to physical cores if slow.")
     return logical
+
+
+def _cpulist(text):
+    """The CPUs of a sysfs list ("0-11,16") as a set; empty on a malformed one."""
+    cpus = set()
+    for part in text.strip().split(","):
+        if not part:
+            continue
+        try:
+            lo, _, hi = part.partition("-")
+            cpus.update(range(int(lo), int(hi or lo) + 1))
+        except ValueError:
+            return set()
+    return cpus
+
+
+def performance_core_count():
+    """The performance cores of a hybrid x86 CPU (Intel's P and E cores), else None.
+
+    An OpenMP team meets at a barrier after every matmul, so its slowest thread sets the
+    pace, as on Apple Silicon (physical_cpu_count leaves the efficiency cores out there,
+    #707). Measured on an i5-13500 (6 P + 8 E cores), Qwen3.8 IQ2_XS on the CPU alone,
+    four runs each: the 6 P-cores decoded at 9.40 tok/s against 9.00 for all 14 and
+    prefilled 1.7% faster. None on a CPU with one kind of core, or where the probe
+    cannot tell (the caller keeps the physical count)."""
+    if sys.platform == "win32":
+        # PROCESSOR_RELATIONSHIP's EfficiencyClass (byte 9 of a RelationProcessorCore
+        # record): larger is faster; one value for every core means one kind of core
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            k32.GetLogicalProcessorInformationEx.argtypes = [
+                ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+            k32.GetLogicalProcessorInformationEx.restype = ctypes.c_int
+            need = ctypes.c_ulong(0)
+            k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(need))
+            buf = (ctypes.c_char * need.value)()
+            if not k32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(need)):
+                return None
+            return _windows_performance_cores(bytes(buf)[:need.value])
+        except (OSError, ValueError, AttributeError):
+            return None
+    if sys.platform.startswith("linux"):
+        return _linux_performance_cores(Path("/sys"))
+    return None
+
+
+def _linux_performance_cores(sysfs):
+    """performance_core_count's Linux half: a hybrid Intel CPU registers two core PMUs,
+    cpu_core (P) and cpu_atom (E); the P-cores counted once per SMT sibling list."""
+    try:
+        p = _cpulist((sysfs / "devices/cpu_core/cpus").read_text(encoding="ascii"))
+        e = _cpulist((sysfs / "devices/cpu_atom/cpus").read_text(encoding="ascii"))
+    except OSError:
+        return None
+    if not p or not e:
+        return None
+    cores = set()
+    for cpu in p:
+        try:
+            cores.add((sysfs / f"devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read_text(encoding="ascii").strip())
+        except OSError:
+            return None
+    return len(cores) or None
+
+
+def _windows_performance_cores(raw):
+    """performance_core_count's Windows half, on GetLogicalProcessorInformationEx's buffer."""
+    classes, off = [], 0
+    while off + 10 <= len(raw):
+        relationship = int.from_bytes(raw[off:off + 4], "little")
+        size = int.from_bytes(raw[off + 4:off + 8], "little")
+        if size <= 0 or off + size > len(raw):
+            return None
+        if relationship == 0:  # RelationProcessorCore
+            classes.append(raw[off + 9])
+        off += size
+    if not classes or len(set(classes)) < 2:
+        return None
+    return classes.count(max(classes))
+
+
+def team_cpu_count():
+    """The OpenMP team a launch defaults to: the performance cores of a hybrid CPU
+    (performance_core_count), else the physical cores (physical_cpu_count)."""
+    return performance_core_count() or physical_cpu_count()
 
 
 def _resolve_physical_cores(physical_cpus):
@@ -3253,6 +3351,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     shared_dense_bytes = (device_copy
                           if (vulkan or {}).get("type") in ("integrated", "cpu")
                           and _vk_dense_active(family_id, env_now, vulkan) else 0)
+    # the team a launch defaults to (environment_for_plan): a hybrid CPU's performance
+    # cores, probed only when the caller did not name a count
+    team_cpus = (performance_core_count() if physical_cpus is None else None)
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     resolved = info["resolved_family"]
@@ -3491,7 +3592,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                   "configured_experts": configured_experts},
         "cpu": {"physical_cores": _resolve_physical_cores(physical_cpus),
                  "sockets": max(1, int(cpu_sockets)),
-                 "thread_policy": "physical-cores"},
+                 "team_threads": _resolve_physical_cores(team_cpus or physical_cpus),
+                 "thread_policy": "performance-cores" if team_cpus else "physical-cores"},
         "memory": {"unified": unified, "available_bytes": available_memory},
         # the Vulkan device a COLI_VULKAN=1 run opens (its expert tier and dense chain
         # size themselves from its free memory at start)
@@ -3550,7 +3652,7 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     """Apply a plan without overriding explicit user environment settings."""
     result = dict(env or {})
     result.setdefault("COLI_POLICY", plan["policy"]["name"])
-    result.setdefault("OMP_NUM_THREADS", str(plan["cpu"]["physical_cores"]))
+    result.setdefault("OMP_NUM_THREADS", str(plan["cpu"].get("team_threads", plan["cpu"]["physical_cores"])))
     # NOTE: we intentionally do NOT set OMP_PROC_BIND / OMP_PLACES here.
     # The engine's own hot-thread tuning (glm.c main(), the COLI_OMP_TUNED
     # self-exec) sets OMP_PROC_BIND=close with overwrite=0 -- it prefers
