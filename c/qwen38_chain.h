@@ -50,7 +50,10 @@
  * every chunk's streams through them; after layer N-1 the four streams of every row come
  * back to the host once per chunk, and the CPU runs layers N.. (their state on the host,
  * as without the chain), the final mixer and lm_head. The MTP head reads the final streams
- * from whichever side ran the last layer; it always runs on the CPU. */
+ * from whichever side ran the last layer. With the full chain its layer (index c.layers)
+ * runs here too (q38c_mtp_rows): its input, its attention over its own K/V mirror (the
+ * split's last attention ordinal), its mixer and the lm_head on the device, its routed
+ * experts the host's step; anywhere else it runs on the CPU. */
 #include "vk_chain.h"
 #include "vk_kvsplit.h"
 #include "vk_dmoe.h"
@@ -89,7 +92,18 @@ typedef struct {
     unsigned long long forwards, drafts;   /* drafts: the MTP head's logits computed here (q38c_draft_logits) */
     double host_ms;
     VkcDmoe dm;                                /* the routed experts in the frame (vk_dmoe.h) */
+    int mtp_on;                       /* the MTP head's layer (index c.layers) runs here too (q38c_mtp_rows) */
+    size_t o_mtp_emb, o_mtp_hid, o_mtp_mix;   /* the head's norms in prm */
+    VkcBuf *ones;                     /* rows x C ones: the head's fc_embedding row added to each stream */
+    VkcDmoe dm_mtp;                   /* the head's routed experts in the frame (its layer whole in the tier) */
+    unsigned long long mtp_rows;      /* the head's rows run here */
 } Q38Chain;
+/* the MTP head's layer on the device beside the full chain (q38c_mtp_rows); Q38_MTP_CHAIN=0:
+ * on the CPU, as before */
+static int q38c_mtp_wanted(void) { const char *e = getenv("Q38_MTP_CHAIN"); return !(e && *e == '0'); }
+/* layer i attends (index c.layers is the MTP head's layer, full attention: is_attn holds
+ * the model's layers only) */
+static int q38c_attn_at(const Cfg *c, int i) { return i >= c->layers || c->is_attn[i]; }
 /* the primary device's chain (d 0) or the second device's (d 1, after it) */
 static Q38Chain *q38c_of(Model *m, int d) { return (Q38Chain *)(d ? m->vkchain2 : m->vkchain); }
 static const char *q38c_name(const Q38Chain *ch) { return ch && ch->d ? "qwen38 dev2" : "qwen38"; }
@@ -179,8 +193,8 @@ static int q38c_mirror(Q38Chain *ch, Model *m) {
                                             (size_t)ch->n_attn * ch->dev_rows * row) : 1;
         if (!plan) { ch->cap = 0; return 0; }
         ch->dev_rows = ch->ks.on ? ch->ks.rows : m->kv_cap;
-        for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
-            if (!c->is_attn[i]) continue;
+        for (int i = ch->lo; i < ch->lo + ch->nl + (ch->mtp_on ? 1 : 0); i++) {
+            if (!q38c_attn_at(c, i)) continue;
             vkc_free(ch->kc[i]); vkc_free(ch->vc[i]); vkc_free(ch->ik[i]); vkc_free(ch->pk[i]);
             ch->kv_valid[i] = ch->pk_valid[i] = 0;
             ch->kc[i] = vkc_buf((size_t)kvo * ch->dev_rows * 4, VKC_DEV);
@@ -242,6 +256,11 @@ static int g_q38c_fitted;
 static VkcFit g_q38c_fit2;
 static int g_q38c_fit2_on;
 static int g_q38c_ran;                /* the layers the last forward ran on the devices (q38c_layers) */
+/* the full chain with the MTP head's layer here, as q38c_start's fit has it: the tier asks
+ * before the chain's setup, to keep the head's experts whole (VktConfig.extra_whole) */
+static int q38c_mtp_planned(Model *m) {
+    return m->mtp && g_vk_chain == COLI_VK_CHAIN_ON && q38c_mtp_wanted() && !(g_q38c_fitted && vkc_fit_partial(&g_q38c_fit));
+}
 #define Q38C_MATS 18
 #define Q38C_TAIL 32
 /* Layer i's matrices as the chain reads them (the PLE projections with their layer); the
@@ -251,7 +270,7 @@ static int q38c_mats(Model *m, int i, Q38Weight **w) {
     Q38Weight *all[] = {&l->attn_gr.down, &l->attn_gr.up, &l->attn_gr.inject, &l->mlp_gr.down, &l->mlp_gr.up,
                         &l->mlp_gr.inject, &l->router, &l->sh_g, &l->sh_u, &l->sh_d};
     for (size_t k = 0; k < sizeof all / sizeof *all; k++) w[n++] = all[k];
-    if (c->is_attn[i]) { w[n++] = &l->q; w[n++] = &l->k; w[n++] = &l->v; w[n++] = &l->o; w[n++] = &l->idx_qk; }
+    if (q38c_attn_at(c, i)) { w[n++] = &l->q; w[n++] = &l->k; w[n++] = &l->v; w[n++] = &l->o; w[n++] = &l->idx_qk; }
     else { w[n++] = &l->dn_qkv; w[n++] = &l->dn_z; w[n++] = &l->dn_b; w[n++] = &l->dn_a; w[n++] = &l->dn_out; }
     if (i == c->ple_layer) { w[n++] = &l->ple_key; w[n++] = &l->ple_value; }
     return n;
@@ -413,6 +432,14 @@ static int q38c_arena(Q38Chain *ch, Model *m) {
     }
     ch->o_fn = n; n += W;
     if (ple) { ch->o_ple = n; n += 3 * (size_t)W; ch->o_pconv = n; n += (size_t)W * c->ple_convk; }
+    if (ch->mtp_on) {   /* the head's layer, the split's last attention ordinal, and the head's norms */
+        int i = c->layers;
+        ch->o_an[i] = n; n += W; ch->o_mn[i] = n; n += W;
+        ch->attn_ord[i] = ch->n_attn++;
+        ch->o_qn[i] = n; n += c->head_dim; ch->o_kn[i] = n; n += c->head_dim;
+        ch->o_iqn[i] = n; n += c->idx_dim; ch->o_ikn[i] = n; n += c->idx_dim;
+        ch->o_mtp_emb = n; n += c->hidden; ch->o_mtp_hid = n; n += W; ch->o_mtp_mix = n; n += W;
+    }
     float *a = calloc(n, sizeof(float));
     if (!a) return 0;
     for (int i = lo; i < hi; i++) {
@@ -430,6 +457,18 @@ static int q38c_arena(Q38Chain *ch, Model *m) {
         }
     }
     memcpy(a + ch->o_fn, m->final_gr.norm, W * sizeof(float));
+    if (ch->mtp_on) {
+        Layer *l = &m->L[c->layers];
+        memcpy(a + ch->o_an[c->layers], l->attn_gr.norm, W * sizeof(float));
+        memcpy(a + ch->o_mn[c->layers], l->mlp_gr.norm, W * sizeof(float));
+        memcpy(a + ch->o_qn[c->layers], l->qn, c->head_dim * sizeof(float));
+        memcpy(a + ch->o_kn[c->layers], l->kn, c->head_dim * sizeof(float));
+        memcpy(a + ch->o_iqn[c->layers], l->idx_qn, c->idx_dim * sizeof(float));
+        memcpy(a + ch->o_ikn[c->layers], l->idx_kn, c->idx_dim * sizeof(float));
+        memcpy(a + ch->o_mtp_emb, m->mtp_norm_emb, (size_t)c->hidden * sizeof(float));
+        memcpy(a + ch->o_mtp_hid, m->mtp_norm_hid, W * sizeof(float));
+        memcpy(a + ch->o_mtp_mix, m->mtp_mixer.norm, W * sizeof(float));
+    }
     if (ple) {
         Layer *pl = &m->L[c->ple_layer];
         memcpy(a + ch->o_ple, pl->ple_norm_key, W * sizeof(float));
@@ -457,7 +496,7 @@ static Q38Chain *q38c_new_dev(Model *m, int d) {
         ch->built = 1;
         return NULL;
     }
-#define Q38C_ARR(f, t) if (!(ch->f = (t *)calloc((size_t)L, sizeof(t)))) { ch->built = 1; return NULL; }
+#define Q38C_ARR(f, t) if (!(ch->f = (t *)calloc((size_t)L + 1, sizeof(t)))) { ch->built = 1; return NULL; }   /* + the head's layer */
     Q38C_ARR(o_an, size_t); Q38C_ARR(o_mn, size_t); Q38C_ARR(o_qn, size_t); Q38C_ARR(o_kn, size_t);
     Q38C_ARR(o_iqn, size_t); Q38C_ARR(o_ikn, size_t); Q38C_ARR(o_conv, size_t); Q38C_ARR(o_dn, size_t);
     Q38C_ARR(t_sg, ColiVkTensor *); Q38C_ARR(rec, VkcBuf *); Q38C_ARR(ring, VkcBuf *); Q38C_ARR(rec_snap[0], VkcBuf *);
@@ -495,6 +534,15 @@ static Q38Chain *q38c_setup_dev(Model *m, int d) {
         if (q38c_place_mats(ch, m, i) && q38c_place_bufs(ch, m, i)) { if (fit) vkc_fit_mark(fit, i - ch->lo); continue; }
         q38c_shrink(ch, m, i, vkc_lost() ? "the device was lost" : "the device refused an upload or an allocation");
         break;
+    }
+    /* the MTP head's layer beside the full chain: its matrices and shared gate (placed here),
+     * the head's own (up already with the dense matrices) */
+    if (!d && ch->nl && ch->head && ch->lo == 0 && ch->nl == m->c.layers && m->mtp && q38c_mtp_wanted()) {
+        Q38Weight *hw[] = {&m->mtp_fc_emb, &m->mtp_fc_hid, &m->mtp_mixer.down, &m->mtp_mixer.up, &m->lm_head};
+        int ok = q38c_place_mats(ch, m, m->c.layers);
+        for (size_t k = 0; k < sizeof hw / sizeof *hw && ok; k++) ok = q38c_t(hw[k]) != NULL;
+        ch->mtp_on = ok;
+        if (!ok) fprintf(stderr, "[VK] qwen38 chain: the MTP head's matrices did not reach the device; the head runs on the CPU\n");
     }
     if (ch->nl && !q38c_arena(ch, m))
         q38c_shrink(ch, m, ch->lo, vkc_lost() ? "the device was lost" : "the device refused the chain's parameter buffer");
@@ -575,19 +623,20 @@ static void q38c_start(Model *m) {
     g_q38c_fitted = 1;
     int partial = vkc_fit_partial(&g_q38c_fit), n0 = g_q38c_fit.n;
     if (!n0) { g_vk_chain = 0; g_q38_vk_noup = 1; free(lb); free(mb); return; }   /* the chain off: its pipelines never come up */
-    /* Every layer and the head on the device: the MTP head's drafts cost more than they
-     * save there. Its layer runs on the CPU (attention, the routed experts it keeps there,
-     * its mixers) for each draft and each accepted row, against a device forward whose
-     * verify of three rows costs little more than a plain step. An RTX PRO 4000,
-     * Qwen3.8-Flash-Next IQ2_XS: plain decode 34.9 tok/s, with the head's two drafts 24.3
-     * to 26.2, the prompt 81 against 64 tok/s (the head reads each prompt row on the CPU).
-     * Unset, Q38_MTP leaves the head off there, before its matrices and its experts' pool
-     * take the device's memory; Q38_MTP=1 drafts anyway. */
+    /* Every layer and the head on the device: the MTP head's drafts do not pay for
+     * themselves there yet. On the CPU its layer (attention, the routed experts it keeps
+     * there, its mixers) ran for each draft and each accepted row, which cost more than the
+     * drafts saved (an RTX PRO 4000, Qwen3.8-Flash-Next IQ2_XS: plain decode 34.9 tok/s,
+     * with the head's two drafts 24.3 to 26.2). On the device (q38c_mtp_rows, Q38_MTP=1) it
+     * is close: a verify of three rows costs about 2.5 plain steps there, and the head reads
+     * every prompt row. Unset, Q38_MTP leaves the head off, before its matrices and its
+     * experts' pool take the device's memory; Q38_MTP=1 drafts, the head's layer on the
+     * device unless Q38_MTP_CHAIN=0. */
     const char *mtp_env = getenv("Q38_MTP");
     if (m->mtp && !(mtp_env && *mtp_env) && g_vk_chain == COLI_VK_CHAIN_ON && !partial && n0 == L) {
         m->mtp = 0;
         fprintf(stderr, "[qwen38] speculative decoding with the MTP head: off (the dense chain runs every layer on the "
-                        "device and the head would run on the CPU; Q38_MTP=1 drafts anyway)\n");
+                        "device; Q38_MTP=1 drafts, the head's layer on the device too)\n");
     }
     if (!vkc_init()) { g_vk_chain = 0; g_q38c_fitted = 0; free(lb); free(mb); return; }   /* the per-matrix path, as before */
     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
@@ -833,6 +882,30 @@ static int q38c_spec_slots(Q38Chain *ch, Model *m, int rows) {
     }
     return 1;
 }
+/* Attention layer i's device mirror current up to pos_base before a step of n_rows: the
+ * split's window placed and its blocks' rows below pos_base uploaded, or the host's rows
+ * past the watermark; the pooled keys of the blocks the step rewrites invalid. */
+static int q38c_push_kv(Q38Chain *ch, Model *m, int i, int pos_base, int n_rows) {
+    Cfg *c = &m->c; int ok = 1;
+    int D = c->head_dim, KVH = c->kv_heads, ID = c->idx_dim, R = c->idx_ratio;
+    if (ch->pk_valid[i] > pos_base / R) ch->pk_valid[i] = pos_base / R;   /* blocks this step rewrites */
+    if (ch->ks.on) {   /* the split: the window placed, the K/V rows below pos_base of its blocks uploaded */
+        VkcKvPart pt[2] = {{KVH, D, m->K[i], (size_t)m->kv_cap * D, ch->kc[i], 0},
+                           {KVH, D, m->V[i], (size_t)m->kv_cap * D, ch->vc[i], 0}};
+        vkc_kv_place(&ch->ks, ch->attn_ord[i], pos_base, n_rows);
+        ok = vkc_kv_push(&ch->ks, ch->attn_ord[i], pt, 2, pos_base);
+    }
+    if (ch->kv_valid[i] >= pos_base) return ok;
+    int t0 = ch->kv_valid[i], n = pos_base - t0;
+    for (int h = 0; h < KVH && ok && !ch->ks.on; h++) {
+        size_t src = ((size_t)h * m->kv_cap + t0) * D, dst = ((size_t)h * ch->dev_rows + t0) * D;
+        ok = vkc_write(ch->kc[i], dst, m->K[i] + src, (size_t)n * D * 4) && vkc_write(ch->vc[i], dst, m->V[i] + src, (size_t)n * D * 4);
+    }
+    ok = ok && vkc_write(ch->ik[i], (size_t)t0 * ID, m->IK[i] + (size_t)t0 * ID, (size_t)n * ID * 4);
+    ch->kv_valid[i] = pos_base;
+    if (ch->pk_valid[i] > t0 / R) ch->pk_valid[i] = t0 / R;
+    return ok;
+}
 static int q38c_push_state(Q38Chain *ch, Model *m, int pos_base, int n_rows) {
     Cfg *c = &m->c; int ok = 1;
     if (ch->dn_where == Q38C_HOST) {
@@ -848,26 +921,8 @@ static int q38c_push_state(Q38Chain *ch, Model *m, int pos_base, int n_rows) {
         }
         ch->dn_where = Q38C_BOTH;
     }
-    int D = c->head_dim, KVH = c->kv_heads, ID = c->idx_dim, R = c->idx_ratio;
-    for (int i = ch->lo; i < ch->lo + ch->nl && ok; i++) {
-        if (!c->is_attn[i]) continue;
-        if (ch->pk_valid[i] > pos_base / R) ch->pk_valid[i] = pos_base / R;   /* blocks this step rewrites */
-        if (ch->ks.on) {   /* the split: the window placed, the K/V rows below pos_base of its blocks uploaded */
-            VkcKvPart pt[2] = {{KVH, D, m->K[i], (size_t)m->kv_cap * D, ch->kc[i], 0},
-                               {KVH, D, m->V[i], (size_t)m->kv_cap * D, ch->vc[i], 0}};
-            vkc_kv_place(&ch->ks, ch->attn_ord[i], pos_base, n_rows);
-            ok = vkc_kv_push(&ch->ks, ch->attn_ord[i], pt, 2, pos_base);
-        }
-        if (ch->kv_valid[i] >= pos_base) continue;
-        int t0 = ch->kv_valid[i], n = pos_base - t0;
-        for (int h = 0; h < KVH && ok && !ch->ks.on; h++) {
-            size_t src = ((size_t)h * m->kv_cap + t0) * D, dst = ((size_t)h * ch->dev_rows + t0) * D;
-            ok = vkc_write(ch->kc[i], dst, m->K[i] + src, (size_t)n * D * 4) && vkc_write(ch->vc[i], dst, m->V[i] + src, (size_t)n * D * 4);
-        }
-        ok = ok && vkc_write(ch->ik[i], (size_t)t0 * ID, m->IK[i] + (size_t)t0 * ID, (size_t)n * ID * 4);
-        ch->kv_valid[i] = pos_base;
-        if (ch->pk_valid[i] > t0 / R) ch->pk_valid[i] = t0 / R;
-    }
+    for (int i = ch->lo; i < ch->lo + ch->nl && ok; i++)
+        if (c->is_attn[i]) ok = q38c_push_kv(ch, m, i, pos_base, n_rows);
     return ok;
 }
 
@@ -932,8 +987,9 @@ static int q38c_attention(Q38Chain *ch, Model *m, Layer *l, int i, int n, int pb
     int nb = (pb + n) / R, b0 = ch->pk_valid[i];
     if (ok && nb > b0) {
         float *pc = (float *)vkc_ptr(ch->pcs);
+        float theta = i < c->layers ? c->theta : c->mtp_theta;   /* the MTP head has its own RoPE base */
         if (half) for (int b = b0; b < nb; b++) for (int j = 0; j < half; j++) {
-            float ang = (float)(b * R) / powf(c->theta, (float)(2 * j) / c->rotary_dim);
+            float ang = (float)(b * R) / powf(theta, (float)(2 * j) / c->rotary_dim);
             pc[((b - b0) * half + j) * 2] = cosf(ang); pc[((b - b0) * half + j) * 2 + 1] = sinf(ang);
         }
         VkcQsa pp = {0, ID, R, b0, half, 0, 0, 0, 0, 0, 0, 0, 0, c->eps, 0, (int)ch->o_ikn[i], 0, nb - b0};
@@ -1055,7 +1111,7 @@ static int q38c_moe_apply(Q38Chain *ch, Model *m, int n, VkcBuf *routed) {
  * their frame is done. */
 static void q38c_kv_down(Q38Chain *ch, Model *m, int i, int n, int pb) {
     Cfg *c = &m->c; int kvo = c->kv_heads * c->head_dim, ID = c->idx_dim;
-    if (!c->is_attn[i]) return;
+    if (!q38c_attn_at(c, i)) return;
     const float *kv = (const float *)vkc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * q38c_kv_stride(ch, c);
     for (int s = 0; s < n; s++) {
         for (int h = 0; h < c->kv_heads; h++) {
@@ -1254,6 +1310,128 @@ static int q38c_forward(Model *m, const int *ids, int S, int pos_base, int nlogi
     return r2;
 }
 
+/* The MTP head's rows from head row pos on are the host's (the CPU ran them): the device's
+ * mirror of its layer behind them, the split's blocks past them released. */
+static void q38c_mtp_host(Model *m, int pos) {
+    Q38Chain *ch = q38c_of(m, 0);
+    if (!ch || !ch->ok || !ch->mtp_on) return;
+    int L = m->c.layers, R = m->c.idx_ratio > 0 ? m->c.idx_ratio : 1;
+    if (ch->kv_valid[L] > pos) ch->kv_valid[L] = pos;
+    if (ch->pk_valid[L] > pos / R) ch->pk_valid[L] = pos / R;
+    vkc_kv_lower(&ch->ks, ch->attn_ord[L], pos);
+}
+/* The MTP head over S pairs on the device, as q38_mtp_rows runs them on the CPU: row s pairs
+ * the model's four streams (streams, row s) with the token next[s], at head row pos_base+s.
+ * Its input: the embedding row's norm and fc_embedding added to each stream's norm and
+ * fc_hidden (wiring a: one norm over the four streams); its layer: attention over its own
+ * K/V mirror (the split's last attention ordinal, its own RoPE base), the routed experts the
+ * host's step (the tier holds them as its extra layer); with `logit`, the last row's mixer
+ * and lm_head; with `hidden`, the last row's streams as the layer leaves them (what a deeper
+ * draft reads). settle: settled pairs (the head's rows end there, mtp_len), else a deeper
+ * draft's tail row, which the settled pair at that row overwrites before anything reads past
+ * it. 0: not here (the CPU runs it); a frame that fails gives the device up, the state on
+ * the CPU (q38c_recover), and the CPU runs it too. */
+static int q38c_mtp_rows(Model *m, const float *streams, const int *next, int S, int pos_base, float *logit,
+                         float *hidden, int settle) {
+    Q38Chain *ch = q38c_of(m, 0);
+    if (!g_vk_chain || qt_ready() || !ch || !ch->ok || ch->failed || !ch->mtp_on || S < 1 || vkc_lost()) return 0;
+    Cfg *c = &m->c; int H = c->hidden, W = c->hc_width, C = c->hc_count, E = c->experts, V = c->vocab, L = c->layers;
+    int half = c->rotary_dim / 2, R = c->idx_ratio > 0 ? c->idx_ratio : 1;
+    Layer *l = &m->L[L];
+    int was = vkc_device(0);
+    if (!q38c_mirror(ch, m)) { vkc_device(was); return 0; }
+    /* in chunks of VKC_DMOE_ROWS rows at most: the head's routed experts in the frame as a
+     * decode step's (vk_dmoe.h), or the host's step, whose tier batch scales its scratch with
+     * the rows (a prompt's pairs beside a full card) */
+    int CH = q38c_chunk_rows(ch, m), rows = S < CH ? S : CH;
+    if (rows > VKC_DMOE_ROWS) rows = VKC_DMOE_ROWS;
+    if (ch->ks.on && rows > ch->ks.chunk) rows = ch->ks.chunk;
+    float *emb = (float *)malloc((size_t)rows * (H + C) * sizeof(float)), *ones = emb ? emb + (size_t)rows * H : NULL;
+    if (!emb || !q38c_scratch(ch, m, rows) || (hidden && !q38c_res(&ch->hypd, (size_t)rows * W, VKC_DOWN)) ||
+        !q38c_res(&ch->ones, (size_t)rows * C, VKC_DEV)) { free(emb); vkc_device(was); return 0; }
+    for (int k = 0; k < rows * C; k++) ones[k] = 1.f;
+    /* the rows from pos_base on are rewritten: the mirror's watermarks behind them */
+    if (ch->kv_valid[L] > pos_base) { ch->kv_valid[L] = pos_base; vkc_kv_lower(&ch->ks, ch->attn_ord[L], pos_base); }
+    if (ch->pk_valid[L] > pos_base / R) ch->pk_valid[L] = pos_base / R;
+    /* the backend's rule for the tiled GEMM: the head's rows only propose drafts, which the
+     * verify checks, so they need no decode step's bits (rows of 8 through the GEMV took 2.3 ms
+     * a [320 x 10240] Q8_0 matrix on an RTX PRO 4000) */
+    vkc_gemm_rows(-1);
+    int dmh = !ch->d && E > 0 && !rt_fp && vkc_dmoe_prepare(&ch->dm_mtp, L, 1, E, c->topk, H, c->inter, rows);
+    for (int base = 0; base < S; base += rows) {
+        int n = S - base < rows ? S - base : rows, pb = pos_base + base, last = base + n == S;
+        for (int s = 0; s < n; s++) q38_embed_row(m, next[base + s], pb + s + 1, emb + (size_t)s * H);
+        if (!vkc_begin() || !vkc_write(ch->fin, 0, emb, (size_t)n * H * 4) ||
+            !vkc_write(ch->hyper, 0, streams + (size_t)base * W, (size_t)n * W * 4) ||
+            !vkc_write(ch->ones, 0, ones, (size_t)n * C * 4) || !q38c_push_kv(ch, m, L, pb, n) ||
+            (dmh && !vkc_dmoe_upload(&ch->dm_mtp))) goto lost;
+        if (half) {
+            float *cs = (float *)vkc_ptr(ch->cs);
+            for (int s = 0; s < n; s++) for (int j = 0; j < half; j++) {
+                float ang = (float)(pb + s) / powf(c->mtp_theta, (float)(2 * j) / c->rotary_dim);
+                cs[(s * half + j) * 2] = cosf(ang); cs[(s * half + j) * 2 + 1] = sinf(ang);
+            }
+        }
+        VkcNorm en = {n, H, 1, 0, H, H, 0, H, H, (int)ch->o_mtp_emb, 0, VKC_NORM_ADD1, c->eps, 1.f};
+        VkcNorm hn = m->mtp_wiring == Q38_MTP_WHOLE_NORM
+                         ? (VkcNorm){n, W, 1, 0, W, W, 0, W, W, (int)ch->o_mtp_hid, 0, VKC_NORM_ADD1, c->eps, 1.f}
+                         : (VkcNorm){n * C, H, C, 0, W, H, 0, W, H, (int)ch->o_mtp_hid, C, VKC_NORM_ADD1, c->eps, 1.f};
+        VkcEw add = {VKC_EW_HC_APPLY, n * W, H, C, 0, 1, 0, 0, 0, 0, 0, 1.f};   /* each stream += the embedding's row */
+        int ok = vkc_norm(ch->fin, ch->prm, ch->mixed, &en) && vkc_matmul(q38c_t(&m->mtp_fc_emb), ch->mixed, 0, ch->blk, 0, n) &&
+                 vkc_norm(ch->hyper, ch->prm, ch->hn, &hn) && vkc_matmul(q38c_t(&m->mtp_fc_hid), ch->hn, 0, ch->hyper, 0, n * C) &&
+                 vkc_ew(ch->hyper, ch->ones, ch->blk, NULL, NULL, &add);
+        ok = ok && q38c_gr_read(ch, m, &l->attn_gr, ch->o_an[L], n, ch->inj_a) && q38c_attention(ch, m, l, L, n, pb) &&
+             q38c_gr_apply(ch, m, ch->inj_a, n) && q38c_gr_read(ch, m, &l->mlp_gr, ch->o_mn[L], n, ch->inj_m);
+        int in_frame = ok && dmh && vkc_dmoe_on(&ch->dm_mtp, L);
+        if (in_frame) {   /* the tier holds every expert of the head's layer here: one frame for the rows */
+            VkcRoute rp = {.kind = 0, .n_group = 1, .topk_group = 1, .norm = c->norm_topk ? 1 : 0, .temp = 1.f, .scale = 1.f};
+            VkcMoe mp = {.D = H, .I = c->inter, .act = 0, .blocks = g_q38_gguf};
+            ok = vkc_matmul(q38c_t(&l->router), ch->mixed, 0, ch->lg, 0, n) && q38c_shared(ch, m, l, L, n) &&
+                 vkc_dmoe_layer(&ch->dm_mtp, L, n, ch->lg, NULL, ch->mixed, &rp, &mp) && q38c_moe_apply(ch, m, n, ch->dm_mtp.y);
+        } else {          /* the host's step: the frame ends at the router, the tier's batch or the CPU runs them */
+            ok = ok && vkc_matmul(q38c_t(&l->router), ch->mixed, 0, ch->lg, 0, n) &&
+                 vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->mixd, 0, ch->mixed, 0, (size_t)n * H);
+            ok = ok && vkc_submit(0) && vkc_finish();
+            if (!ok) goto lost;
+            q38c_kv_down(ch, m, L, n, pb);
+            ok = vkc_begin() && q38c_shared(ch, m, l, L, n) && vkc_submit(0);   /* while the host routes the experts */
+            double t1 = now_s();
+            q38_moe_ex(m, l, L, (const float *)vkc_ptr(ch->mixd), n, ch->host_routed, (const float *)vkc_ptr(ch->lgd), 1);
+            memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)n * H * sizeof(float));
+            ch->host_ms += (now_s() - t1) * 1e3;
+            ok = ok && vkc_begin() && q38c_moe_apply(ch, m, n, ch->routed);
+        }
+        if (ok && last && hidden) ok = vkc_copy(ch->hypd, 0, ch->hyper, (size_t)(n - 1) * W, (size_t)W);
+        if (ok && last && logit)
+            ok = q38c_gr_read(ch, m, &m->mtp_mixer, ch->o_mtp_mix, n, NULL) &&
+                 vkc_matmul(q38c_t(&m->lm_head), ch->mixed, (size_t)(n - 1) * H, ch->outd, 0, 1);
+        ok = ok && vkc_submit(1);
+        if (!ok) goto lost;
+        if (in_frame) {   /* the frame's books: the head's K/V rows down, the tier's heat from its ids */
+            q38c_kv_down(ch, m, L, n, pb);
+            vkt_dev_count(L, n, c->topk, vkc_dmoe_ids(&ch->dm_mtp, L));
+        }
+        if (settle) {
+            ch->kv_valid[L] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[L], pb + n);
+            m->mtp_len = pb + n;
+        }
+        if (last && hidden) memcpy(hidden, vkc_ptr(ch->hypd), (size_t)W * sizeof(float));
+        if (last && logit) { memcpy(logit, vkc_ptr(ch->outd), (size_t)V * sizeof(float)); ch->drafts++; }
+        ch->mtp_rows += (unsigned long long)n;
+    }
+    vkc_gemm_rows(-1);
+    free(emb);
+    vkc_device(was);
+    return 1;
+lost:   /* a frame failed: the device is gone; the CPU takes over, the head too */
+    vkc_gemm_rows(-1);
+    free(emb);
+    if (!vkc_lost()) { vkc_finish(); coli_vk_mark_lost_dev(0); }
+    vkc_device(0);
+    q38c_recover(m, m->kv_len);
+    return 0;
+}
+
 /* The MTP head's draft logits on the device that holds the lm_head (the chain's tail): one
  * row's GEMV and the vocabulary's floats read back, where the CPU's pass reads the whole
  * matrix (Qwen3.8-Flash-Next's IQ4_XS lm_head: 337 MiB a draft, 12 ms on the 20 cores of
@@ -1282,8 +1460,9 @@ static void q38c_report(Model *m) {
         if (!ch || !ch->ok || !ch->forwards) continue;
         int was = vkc_device(d);
         VkcStats st; vkc_stats(&st);
-        char dl[64] = "";
-        if (ch->drafts) snprintf(dl, sizeof dl, ", %llu MTP drafts' logits here", ch->drafts);
+        char dl[96] = "";
+        if (ch->mtp_rows) snprintf(dl, sizeof dl, ", %llu MTP head rows and %llu drafts' logits here", ch->mtp_rows, ch->drafts);
+        else if (ch->drafts) snprintf(dl, sizeof dl, ", %llu MTP drafts' logits here", ch->drafts);
         fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                         "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %llu layer steps with "
                         "the routed experts in the frame (%llu of them a prompt chunk's), %.1f MiB on the device%s\n",

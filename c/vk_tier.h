@@ -214,6 +214,11 @@ typedef struct {
      * main layers only). 0: none. */
     int extra_layers;
     VktFmt extra_gate_up, extra_down;
+    /* Optional: 1 = the extra layers' pool holds all their experts when they take at most a
+     * fifth of the budget, and the warm start puts them up first (an MTP head whose layer the
+     * dense chain runs on the device, its routed experts in the frame: its steps are serial
+     * with every forward, a few rows each); 0 = their layers' share of the budget. */
+    int extra_whole;
     /* Optional: the main layers' forms when they differ by layer (a GGUF whose layers mix
      * block types, as published ones do): layer_gate_up[l], layer_down[l] for l < layers,
      * at most VKT_FORMS - 1 distinct pairs, gate_up/down among them or not; NULL = every

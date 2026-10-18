@@ -3636,6 +3636,9 @@ static void q38_draft_head_build(Model *m) {
 /* logit[V] for one row x[H]: the draft head when there is one, else lm_head */
 #ifdef COLI_VULKAN
 static int q38c_draft_logits(Model *m,float *logit,const float *x);   /* qwen38_chain.h */
+static int q38c_mtp_rows(Model *m,const float *streams,const int *next,int S,int pos_base,float *logit,
+                         float *hidden,int settle);   /* qwen38_chain.h: the head's layer on the device */
+static void q38c_mtp_host(Model *m,int pos);
 #endif
 static void q38_draft_logits(Model *m,float *logit,const float *x) {
     const int V=m->lm_head.rows,H=m->lm_head.cols;
@@ -4801,6 +4804,8 @@ static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out)
     q38_moe_ex(m,l,layer,x,S,out,NULL,0);
 }
 #ifdef COLI_VULKAN
+enum { Q38_MTP_WHOLE_NORM='a', Q38_MTP_STREAM_NORM='b' };   /* the MTP head's wiring (q38_mtp_input) */
+static void q38_embed_row(Model *m,int id,int abs_pos,float *out);   /* below; the chain's MTP head embeds its tokens too */
 #include "qwen38_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
 #ifdef COLI_CUDA
@@ -5155,7 +5160,6 @@ static float *q38_forward_rows(Model *m,const Q38Row *rows,const int *ids,int S)
  * forward waits in mtp_pend, a draft runs the pending rows with the token
  * the caller just picked, and the rows of a verify wait until the caller's
  * next pick settles which of them stand. */
-enum { Q38_MTP_WHOLE_NORM='a', Q38_MTP_STREAM_NORM='b' };
 
 /* Q38_MTP_FORCE (tests): 'r' rejects every draft, a right one too, so the
  * rollback runs on every token; 'a' drafts the reference's next token
@@ -5197,6 +5201,8 @@ static void q38_mtp_input(Model *m,const float *streams,const int *next,int S,in
  * chunking changes no result. */
 static void q38_mtp_rows(Model *m,const float *streams,const int *next,int S,int pos_base,float *logit,
                          float *hidden) {
+    if(q38c_mtp_rows(m,streams,next,S,pos_base,logit,hidden,1))return;   /* the dense chain runs the head's layer */
+    q38c_mtp_host(m,pos_base);   /* the head's rows from here are the host's: the device's mirror behind them */
     Cfg *c=&m->c; int H=c->hidden,W=c->hc_width,C=c->hc_count;
     int cap=q38_bounded_prefill_rows(S,0,(uint64_t)(3*W+2*H+C)*sizeof(float));
     float *hyper=falloc((int64_t)cap*W),*mixed=falloc((int64_t)cap*H);
@@ -5281,6 +5287,12 @@ static int q38_mtp_draft(Model *m,int tok,int pos,float *hidden) {
  * streams, for the draft after. */
 static int q38_mtp_draft_more(Model *m,float *hidden,int tok,int row) {
     Cfg *c=&m->c; int H=c->hidden,W=c->hc_width,C=c->hc_count;
+    {   /* the dense chain runs the head's layer: its tail row at `row`, hidden in and out */
+        float *lo=falloc(c->vocab);
+        if(q38c_mtp_rows(m,hidden,&tok,1,row,lo,hidden,0)){int d=q38_argmax(lo,c->vocab);free(lo);return d;}
+        free(lo);
+        q38c_mtp_host(m,row);
+    }
     float *hyper=falloc(W),*mixed=falloc(H),*inject=falloc(C),*block=falloc(H),*logit=falloc(c->vocab);
     q38_mtp_input(m,hidden,&tok,1,row,hyper);
     q38_layer_forward(m,c->layers,hyper,&tok,1,row,mixed,inject,block);

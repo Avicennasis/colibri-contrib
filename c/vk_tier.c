@@ -661,6 +661,17 @@ int vkt_plan(int *layers, int *eids, int max) {
     T.plan_hist = 0;
     if (!T.on) return 0;
     int L = T.main_layers, E = T.c.experts, n = 0, k = 0;   /* the main layers' */
+    /* the extra layers' experts first where they stay whole (extra_whole): their own pool,
+     * and no history names them */
+    if (T.c.extra_whole && T.xmax >= T.c.extra_layers * E)
+        for (int l = L; l < T.c.layers; l++)
+            for (int e = 0; e < E && k < max && room_dev(l) >= 0; e++) {
+                VSlot *v = slot(l, e);
+                if (v->state != VS_NONE) continue;
+                v->state = VS_QUEUED; set_place(v, 0); T.queued++; T.xque++;
+                layers[k] = l; eids[k] = e; k++;
+            }
+    int kx = k;
     if (g_heat_hist) {
         int *order = malloc((size_t)L * E * sizeof(int));
         if (!order) return 0;
@@ -677,7 +688,7 @@ int vkt_plan(int *layers, int *eids, int max) {
         }
         free(order);
     }
-    T.plan_hist = k;
+    T.plan_hist = k - kx;
     /* only the layers the heat table has a row for: a NULL row is a layer without
      * experts (route_trace.h's rt_drop_row), and with no table at all nothing is known */
     const char *fill = getenv("COLI_VK_TIER_FILL");
@@ -1755,6 +1766,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         long long xall = (long long)T.c.extra_layers * T.c.experts, xn;
         double bud = (double)fit_raw * T.exp_bytes;
         if (bud >= (double)all * T.exp_bytes + (double)xall * T.x_bytes) xn = xall;
+        else if (T.c.extra_whole && (double)xall * T.x_bytes <= bud / 5) xn = xall;   /* the head's layer whole */
         else xn = (long long)(bud * T.c.extra_layers / (T.main_layers + T.c.extra_layers) / T.x_bytes);
         if (xn < 1 && bud >= (double)T.x_bytes + 2.0 * T.exp_bytes) xn = 1;
         if (xn > xall) xn = xall;
@@ -1764,7 +1776,15 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
                     eng, human((double)T.x_bytes, hx, sizeof hx));
             T.c.layers = T.main_layers; T.c.extra_layers = 0;
         } else {
-            long long take = (long long)(((size_t)xn * T.x_bytes + T.exp_bytes - 1) / T.exp_bytes);
+            /* every expert of the extra layers: their pool's blocks hold whole experts, so it
+             * takes whole blocks (512 of 5 MiB need 11 blocks of 256 MiB, not 10) */
+            size_t xbytes = (size_t)xn * T.x_bytes, xb = coli_vk_block_bytes((size_t)256 << 20);
+            if (xn == xall && xb >= T.x_bytes) {
+                size_t per = xb / T.x_bytes;
+                xbytes = (size_t)((xall + (long long)per - 1) / (long long)per) * xb;
+            }
+            long long take = (long long)((xbytes + T.exp_bytes - 1) / T.exp_bytes);
+            if (take > fit_raw - 2) { take = (long long)(((size_t)xn * T.x_bytes + T.exp_bytes - 1) / T.exp_bytes); }
             T.xmax = (int)xn; T.x_budget = (size_t)take * T.exp_bytes; fit_raw -= take;
         }
     }

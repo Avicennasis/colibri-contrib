@@ -4023,21 +4023,37 @@ static int xb_reserve(XbCtx *X, size_t xr, size_t ir, size_t yr) {
     if (xr <= X->x.region && ir <= X->g.region && yr <= X->y.region) return 1;
     size_t nx, ni, ny;
     if (!xb_sizes(X, xr, ir, yr, &nx, &ni, &ny)) return 0;   /* one window cannot address it */
+    size_t ox = X->x.region, oi = X->g.region, oy = X->y.region;
     int ok = 1;
     if (nx != X->x.region) ok &= xb_buf(X, &X->x, nx, X->mt_host, 1);
     if (ni != X->g.region) ok &= xb_buf(X, &X->g, ni, X->mt_dev, 0) && xb_buf(X, &X->u, ni, X->mt_dev, 0) &&
                                  xb_buf(X, &X->h, ni, X->mt_dev, 0);
     if (ny != X->y.region) ok &= xb_buf(X, &X->y, ny, X->mt_cached, 1);
-    if (!ok) {   /* out of device memory: no batch from here on */
+    if (!ok) {
+        /* Out of device memory for the growth: the sizes before it back (the room its
+         * frees left), this step's experts on the CPU and the batch kept for the next. A
+         * step that needed more (an MTP head's prompt rows beside a full card) used to stop
+         * the tier for good. Only where the old sizes do not come back does the batch stop. */
+        XbBuf *bs[5] = {&X->x, &X->g, &X->u, &X->h, &X->y};
+        size_t old[5] = {ox, oi, oi, oi, oy};
+        uint32_t mt[5] = {X->mt_host, X->mt_dev, X->mt_dev, X->mt_dev, X->mt_cached};
+        int mp[5] = {1, 0, 0, 0, 1}, back = ox && oi && oy;
+        for (int k = 0; k < 5; k++)   /* every grown buffer freed first, so the old sizes have their room */
+            if (bs[k]->region != old[k] && bs[k]->buf) {
+                vkDestroyBuffer(X->dev, bs[k]->buf, NULL); vkFreeMemory(X->dev, bs[k]->mem, NULL); memset(bs[k], 0, sizeof *bs[k]);
+            }
+        for (int k = 0; k < 5 && back; k++) if (bs[k]->region != old[k]) back = xb_buf(X, bs[k], old[k], mt[k], mp[k]);
         fprintf(stderr, "[VK] %sexpert batch: scratch of %.1f MiB failed, %s\n", X->d ? "dev2 " : "",
-                (double)(nx + 3 * ni + ny) * 2 / 1048576.0, X->d ? "the second device stops" : "the tier stops");
-        X->ready = 0;
-        return 0;
+                (double)(nx + 3 * ni + ny) * 2 / 1048576.0,
+                back ? "this step's experts on the CPU (the batch keeps its scratch)"
+                     : X->d ? "the second device stops" : "the tier stops");
+        if (!back) { X->ready = 0; return 0; }
+        ok = 0;
     }
     for (ColiVkExpert *e = X->live; e; e = e->next) xb_write_sets(e);
     xb_write_act_set(X);
     if (X->v4_set) xb_write_v4_set(X);
-    return 1;
+    return ok;
 }
 
 static int xb_layout(XbCtx *X, int nbind, unsigned dynmask, size_t pc, VkDescriptorSetLayout *dsl, VkPipelineLayout *pl) {

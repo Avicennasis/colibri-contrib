@@ -3090,6 +3090,7 @@ static void q38_vk_tier_start(Model *m,int cap){
     VktConfig vc={.engine="qwen38",.layers=c->layers,.experts=c->experts,.hidden=H,.inter=F,.topk=c->topk,
                   .gate_up=f,.down=fd,.act=VKT_ACT_SWIGLU,
                   .extra_layers=fm.kind!=VKT_SRC_NONE,.extra_gate_up=fm,.extra_down=fmd,
+                  .extra_whole=q38c_mtp_planned(m),   /* the head's layer on the device: its experts whole, in the frame */
                   .max_rows=q38_moe_prefill_rows(c,q38_prefill_batch_rows())*c->topk,
                   .ram_reserve=ram_expert*(size_t)cap*(size_t)c->layers,
                   .dense_bytes=q38_vk_dense_bytes(m),
@@ -3104,7 +3105,7 @@ static void q38_vk_tier_start(Model *m,int cap){
     if(!tier_on)return;
     atexit(vkt_shutdown);
     /* the warm start: the history's hottest experts, read in parallel */
-    int all=c->layers*c->experts,*pl=(int*)malloc((size_t)all*sizeof(int)),*pe=(int*)malloc((size_t)all*sizeof(int));
+    int all=(c->layers+(m->mtp?1:0))*c->experts,*pl=(int*)malloc((size_t)all*sizeof(int)),*pe=(int*)malloc((size_t)all*sizeof(int));
     if(!pl||!pe){free(pl);free(pe);return;}
     const char *warm=getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
     int n=warm&&*warm=='0'?0:vkt_plan(pl,pe,all);
