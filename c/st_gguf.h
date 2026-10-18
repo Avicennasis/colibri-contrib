@@ -316,7 +316,7 @@ static int st_init_gguf(shards *S, const char *snap_dir) {
     const char *g = gv && gv->t == J_STR ? gv->str : NULL;
     if (!g || !*g) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: no \"gguf\" path", gj);
     char path[4096];
-    if (g[0] == '/') snprintf(path, sizeof path, "%s", g); else snprintf(path, sizeof path, "%s/%s", snap_dir, g);
+    gguf_path_join(path, sizeof path, snap_dir, g);
     free(arena);
     if (getenv("GGUF_CHECK")) gguf_header_only = 1;
     gguf_ctx *G = &st_gguf_meta;

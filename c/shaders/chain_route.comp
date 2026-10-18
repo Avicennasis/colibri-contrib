@@ -67,23 +67,24 @@ void main() {
     int lb = p.l_off + s * p.l_row;
 
     int nsg = int(gl_NumSubgroups), sg = int(gl_SubgroupID);
-    // scores (the row's max and sum: each subgroup's, then theirs in subgroup order)
+    // scores (the row's max and sum by the workgroup's tree: its order of the sum is the
+    // one every step of a prompt or a decode gives a row, so a weight is the same bits
+    // however the rows came; a subgroup's reduction summed in another order and moved a
+    // weight's last bit against the host's routing of the same row)
     if (p.kind == 0) {
         float m = NEG;
         for (int e = tid; e < p.E; e += 256) m = max(m, logit(lb, e));
-        m = subgroupMax(m);
-        if (subgroupElect()) rv[min(sg, 255)] = m;
+        rv[tid] = m;
         barrier();
-        float mx = NEG;
-        for (int g = 0; g < nsg && g < 256; g++) mx = max(mx, rv[g]);
+        for (int off = 128; off > 0; off >>= 1) { if (tid < off) rv[tid] = max(rv[tid], rv[tid + off]); barrier(); }
+        float mx = rv[0];
         barrier();
         float acc = 0.0;
         for (int e = tid; e < p.E; e += 256) { float v = exp(logit(lb, e) - mx); sc[e] = v; acc += v; }
-        acc = subgroupAdd(acc);
-        if (subgroupElect()) rv[min(sg, 255)] = acc;
+        rv[tid] = acc;
         barrier();
-        float sum = 0.0;
-        for (int g = 0; g < nsg && g < 256; g++) sum += rv[g];
+        for (int off = 128; off > 0; off >>= 1) { if (tid < off) rv[tid] += rv[tid + off]; barrier(); }
+        float sum = rv[0];
         barrier();
         for (int e = tid; e < p.E; e += 256) sc[e] = sc[A(e)] / sum;
     } else {

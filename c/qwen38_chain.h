@@ -183,6 +183,29 @@ static int q38c_chunk_rows(Q38Chain *ch, Model *m) {
          + ((size_t)c->experts + 3 * (size_t)c->shared_inter + c->hidden + 1) * sizeof(float);
     return vkc_chunk_rows(q38c_name(ch), row);
 }
+/* What the chain allocates at its first forward, after the tier has filled the device:
+ * the KV mirror whole at the context's capacity (at most a quarter of the device's free
+ * memory, past which vkc_kv_plan splits it anyway) and a prompt chunk of 512 rows. The
+ * tier leaves it free (VktConfig.chain_bytes). Without it the tier took all but 1 GiB,
+ * the mirror was split (its attention twice the time) and the chunks were 151 rows: on
+ * an RTX PRO 4000, Qwen3.8 IQ2_XS at 64K of context decoded at 32 to 36 tok/s beside a
+ * 19.8 GiB tier and at 40 beside 16 GiB, its prefill 87 against 115 tok/s. */
+static size_t q38c_late_bytes(Model *m, int ctx) {
+    Q38Chain *ch = q38c_of(m, 0);
+    if (!ch || ctx < 1) return 0;
+    Cfg *c = &m->c;
+    size_t kvo = (size_t)c->kv_heads * c->head_dim, idx = (size_t)c->idx_dim;
+    size_t nb = (size_t)ctx / (c->idx_ratio > 0 ? c->idx_ratio : 1) + 1;
+    size_t kv = (size_t)ch->n_attn * (((2 * kvo + idx) * (size_t)ctx + idx * nb) * sizeof(float)), q = vkc_dev_avail() / 4;
+    if (kv > q) kv = q;
+    /* a row's scratch counted as q38c_chunk_rows counts it, at this context's capacity */
+    int keep = ch->rows, cap = m->kv_cap;
+    m->kv_cap = ctx;
+    ch->rows = 1; g_q38c_count = 0; q38c_bufs(ch, m, 1); long long b1 = g_q38c_count;
+    ch->rows = 2; g_q38c_count = 0; q38c_bufs(ch, m, 2); long long b2 = g_q38c_count;
+    g_q38c_count = -1; ch->rows = keep; m->kv_cap = cap;
+    return kv + 512 * (size_t)(b2 - b1);
+}
 /* Plan and allocate the KV mirror before sizing a prompt chunk. */
 static int q38c_mirror(Q38Chain *ch, Model *m) {
     Cfg *c = &m->c; int kvo = c->kv_heads * c->head_dim;

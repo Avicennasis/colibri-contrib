@@ -185,6 +185,8 @@ typedef struct {
     int max_rows;                  /* most (row, expert) assignments one vkt_issue carries */
     size_t ram_reserve;            /* bytes the engine's RAM caches may still grow by */
     size_t dense_bytes;            /* dense weights the engine puts on the device after vkt_init */
+    size_t chain_bytes;            /* what the dense chain allocates at its first forward, after the
+                                      tier has filled the device (its KV mirror, a prompt chunk): left free */
     /* Optional: is this expert in the engine's RAM cache right now? With it the tier
      * balances a step: when the device keeps the CPU waiting, resident experts the
      * CPU also holds in RAM go back to the CPU (never ones it would read from disk),
