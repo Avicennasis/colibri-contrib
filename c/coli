@@ -1331,7 +1331,7 @@ def cmd_info(a):
         info_decision_model(a, resolved, row)
         return
     if os.path.exists(cfgp):
-        c=json.load(open(cfgp))
+        c=json.load(open(cfgp, encoding="utf-8"))
         # Multimodal wrappers such as Qwen3.8 keep the language architecture
         # below text_config.  The registry has already resolved that section;
         # using the root here produced a recognized family followed by four
@@ -1677,6 +1677,71 @@ def cmd_tune(a):
               f"{100*a.min_gain:.1f}% gain and safety gates")
     print(f"  profile: {path}\n")
 
+def run_via_gateway(a, family, engine, prompt):
+    """coli run for a family the gateway drives (Qwen3.8 and the others without a one-shot
+    adapter, #2189): the private server coli chat starts, on a free port, one streamed
+    turn printed as it comes, then the server stopped."""
+    import socket, urllib.request, urllib.error
+    from family_registry import default_model_id
+    resolved=resolve_model(a.model); arch=family.id
+    model_id=default_model_id(resolved)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1",0)); port=probe.getsockname()[1]
+    base=f"http://127.0.0.1:{port}"
+    import openai_server
+    cmd=[sys.executable,openai_server.__file__,"--model",a.model,"--engine",engine,"--arch",arch,
+         "--model-id",model_id,"--host","127.0.0.1","--port",str(port),"--max-tokens",str(serve_max_tokens(a))]
+    if a.cap is not None: cmd+=["--cap",str(a.cap)]
+    p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
+    try:
+        sp=Spinner(f"loading {model_id}…"); sp.start()
+        for _ in range(1800):
+            if p.poll() is not None:
+                sp.stop(); sys.exit(f"{model_id} server exited while loading")
+            if server_probe(base,timeout=1.0): break
+            time.sleep(1)
+        else:
+            sp.stop(); sys.exit(f"timed out loading {model_id}")
+        sp.stop()
+        request={"model":model_id,"messages":[{"role":"user","content":prompt}],"stream":True,
+                 "max_tokens":ngen_for(a,interactive=True,family=family)}
+        if getattr(a,"effort",None): request["reasoning_effort"]=a.effort
+        if getattr(a,"think",None) is not None: request["enable_thinking"]=a.think
+        elif arch in CHAT_THINK_OFF: request["enable_thinking"]=False
+        req=urllib.request.Request(base+"/v1/chat/completions",data=json.dumps(request).encode(),
+                                   headers={"Content-Type":"application/json"})
+        think_open=False
+        try:
+            with urllib.request.urlopen(req) as r:
+                for raw in r:
+                    line=raw.decode("utf-8","replace").strip()
+                    if not line.startswith("data: "): continue
+                    if line[6:]=="[DONE]": break
+                    try: ev=json.loads(line[6:])
+                    except ValueError: continue
+                    for ch in ev.get("choices",[]):
+                        d=ch.get("delta",{})
+                        rtxt=d.get("reasoning_content")
+                        if rtxt and os.environ.get("COLI_SHOW_THINK","1")!="0":
+                            if not think_open: think_open=True; sys.stdout.write(C.dim)
+                            sys.stdout.write(rtxt); sys.stdout.flush()
+                        txt=d.get("content")
+                        if txt:
+                            if think_open: think_open=False; sys.stdout.write(C.r+"\n")
+                            sys.stdout.write(txt); sys.stdout.flush()
+        except KeyboardInterrupt:
+            pass
+        except urllib.error.HTTPError as e:
+            try: detail=json.loads(e.read().decode("utf-8","replace")).get("error",{}).get("message","")
+            except Exception: detail=""
+            sys.exit(f"\n{C.yel}the server rejected the request: HTTP {e.code}{C.r} {detail}")
+        sys.stdout.write((C.r if think_open else "")+"\n"); sys.stdout.flush()
+    finally:
+        if p.poll() is None:
+            p.terminate()
+            try: p.wait(timeout=10)
+            except subprocess.TimeoutExpired: p.kill()
+
 def cmd_run(a):
     need_model(a.model)
     family=resolve_model(a.model).descriptor
@@ -1690,6 +1755,8 @@ def cmd_run(a):
     if family.modality=="decision":
         sys.exit(decision_refusal(family))
     if not family.has_cli_adapter:
+        if family.has_gateway_adapter:
+            return run_via_gateway(a, family, engine, prompt)
         sys.exit(f"{C.yel}coli run is not wired for {family.display_name};{C.r} "
                  f"use coli chat or coli serve")
     if arch=="deepseek_v4":

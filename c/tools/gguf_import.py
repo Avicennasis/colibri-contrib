@@ -960,9 +960,10 @@ def main():
     cfg["colibri_gguf"] = {"arch": arch, "mode": args.mode, "source": str(src), **model_name(meta)}
     for name, obj in (("config.json", cfg), ("tokenizer.json", tok), ("tokenizer_config.json", tcfg),
                       ("generation_config.json", gen)):
-        (args.out / name).write_text(json.dumps(obj, ensure_ascii=False, indent=1 if name != "tokenizer.json" else None))
+        (args.out / name).write_text(json.dumps(obj, ensure_ascii=False, indent=1 if name != "tokenizer.json" else None),
+                                     encoding="utf-8")
     if arch == "deepseek41" and (engram := deepseek41_engram(meta, cfg)):
-        (args.out / "dsv41_engram.json").write_text(json.dumps(engram))
+        (args.out / "dsv41_engram.json").write_text(json.dumps(engram), encoding="utf-8")
     target = src
     if args.mode == "copy":
         target = args.out / "model.colibri.gguf"
@@ -973,7 +974,7 @@ def main():
             "size": sum(p.stat().st_size for p in parts) if args.mode == "link" else target.stat().st_size}
     if mtp_file:
         link["mtp"] = str(mtp_file)
-    (args.out / "gguf.json").write_text(json.dumps(link, indent=1))
+    (args.out / "gguf.json").write_text(json.dumps(link, indent=1), encoding="utf-8")
     for r in readers:
         r.close()
     print(f"colibri model directory ready: {args.out}  ({arch}, {layers} layers, mode {args.mode})")
