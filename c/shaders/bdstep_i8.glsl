@@ -15,6 +15,14 @@
 #define BDSTEP_I8_GLSL
 #extension GL_EXT_integer_dot_product : require
 
+// 127 / amax as the CPU's float division rounds it (Vulkan allows a division 2.5 ulp off,
+// which moved a code at a tie now and then): one Newton step on the quotient's residual
+float bsi_id(float amax) {
+    if (amax <= 0.0) return 0.0;
+    precise float q = 127.0 / amax;
+    precise float r = fma(-q, amax, 127.0);
+    return fma(r, 1.0 / amax, q);
+}
 bool bsi_has(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42; }
 int bsi_dot(uint w, uint xi) { return dotPacked4x8EXT(int(w), BSI_X(xi)); }
 // 0xFF in each byte whose bit (of the low four) is set: those bytes are negated
