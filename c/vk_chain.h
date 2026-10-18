@@ -466,6 +466,16 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
  * where supported, 0 never, -1 the default (tests). */
 void vkc_moe_set_idot(int on);
 int vkc_moe_idot(void);
+/* Hybrid steps (vk_dmoe.h): a frame that signals the device's timeline at its end, and the
+ * next frame waiting for the host's, so the CPU computes a part of a layer between them
+ * while the device runs the rest; the values rise with every step. The host's side, from
+ * any thread (the primary device's timelines): vkc_hybrid_host_wait until the device has
+ * signalled g, vkc_hybrid_host_signal h. */
+int  vkc_hybrid_ready(void);
+int  vkc_hybrid_submit(uint64_t g);
+void vkc_hybrid_wait_next(uint64_t h);
+int  vkc_hybrid_host_wait(uint64_t g);
+int  vkc_hybrid_host_signal(uint64_t h);
 
 /* ---- attention residuals and SiTU-GLU (chain_ares.comp) ----------------------------
  * Kimi K3's residual stream (AttnRes) and its activation, for S rows:

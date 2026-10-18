@@ -1989,6 +1989,38 @@ fit a device whole, where their layers keep the tier's step.
 The device opens with `bufferDeviceAddress` wherever it has it now (before, only with
 the matrix units, for the grouped GEMM); `COLI_VK_BDA=0` still opens it without.
 
+**Hybrid steps: the host pool's experts on the CPU.** The tier's host pool holds the
+experts the card has no room for in system RAM, which the device reads over PCIe: 10 to
+11 GB/s on an RTX PRO 4000 at PCIe 4.0 x8, at any size (`COLI_VK_BENCH_HOST`). With
+Qwen3.8 Next IQ2_XS on that card about 7% of a decode step's pairs and 11% of a 3-row
+verify's come from there, and each layer that has one waits for it: skipping them
+(wrong tokens, the right times) took decode from 38.5 to 50.1 tok/s and an MTP verify's
+forward from 70 to about 45 ms. In a step of up to 8 rows (`vk_dmoe.h`), where the device
+has timeline semaphores, the CPU now computes those pairs in place while the device
+computes the ones it holds:
+- frame A ends at the route, the input rows copied down, and signals the device's
+  timeline;
+- frame B runs the device's experts from a table where the host pool's are zero;
+- frame C waits for the host's timeline and adds the CPU's sum;
+- a worker thread takes the steps in order: it waits for frame A, computes the pairs as
+  `ggml_quants.h` does a GGUF's matmuls (int8 activations, integer dots; the float
+  reference with `GQ_EXACT=1`), from the host pool's rows as the file has them, writes
+  their weighted sum and signals.
+
+A round trip of the two timelines measured 7 us on the card. The host pool is cached
+system RAM (it was write-combined, which made the CPU's reads 25 times slower; the
+device reads both at the same speed). A prompt chunk keeps the full table and reads the
+host pool over PCIe. Only a GGUF's block types take it (colibri's formats keep the
+device's reads); `COLI_VK_HYBRID=0` turns it off, `COLI_VK_HYBRID_THREADS` sizes the
+worker's team (OpenMP's by default). The chain's line says how many steps and pairs it
+took and the CPU's time.
+
+Measured on the RTX PRO 4000 with an i5-13500 (Qwen3.8 IQ2_XS, the defaults, on and off
+started one after the other): decode 42.2/42.5 against 40.4/41.0 tok/s with the team on
+OpenMP's 14 threads, 44 to 45 with the regions' rows in chunks; the same greedy tokens
+(160 of them) on and off. The CPU spends about 155 us a pair (IQ2_S gate and up 86 us,
+Q2_0 down 28 us): the device's own experts take less, so a step waits for the CPU.
+
 **The integer form.** A GGUF's experts run, where the device accelerates packed 4 x 8
 integer dot products (`VK_KHR_shader_integer_dot_product`,
 `integerDotProduct4x8BitPackedSignedAccelerated`), in the CPU's integer form

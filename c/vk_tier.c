@@ -1979,6 +1979,32 @@ int vkt_dev_table(int layer, uint32_t *ent) {
     }
     return n;
 }
+int vkt_dev_table_hybrid(int layer, uint32_t *ent, VktHostExpert *hx) {
+    if (!T.on || layer < 0 || layer >= T.c.layers || !ent || !hx) return -1;
+    int n = 0;
+    for (int e = 0; e < T.c.experts; e++) {
+        VSlot *v = slot(layer, e);
+        uint32_t *o = ent + (size_t)e * COLI_VK_XB_ENTRY;
+        memset(o, 0, COLI_VK_XB_ENTRY * sizeof *o);
+        memset(&hx[e], 0, sizeof hx[e]);
+        if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex) continue;
+        n++;
+        if (v->host) {   /* the CPU's, where its three tensors are block types it has rows of */
+            ColiVkTensor *t[3]; ColiVkTensorInfo ti[3]; const void *r[3]; int ok = 1;
+            coli_vk_xb_expert_tensors(v->ex, &t[0], &t[1], &t[2]);
+            for (int k = 0; k < 3 && ok; k++)
+                ok = t[k] && coli_vk_tensor_info(t[k], &ti[k]) && ti[k].fmt >= 100 && ti[k].fmt < 164 &&
+                     (r[k] = coli_vk_tensor_host_rows(t[k], NULL)) != NULL;
+            if (ok && ti[0].fmt == ti[1].fmt) {
+                hx[e] = (VktHostExpert){r[0], r[1], r[2], ti[0].fmt - 100, ti[2].fmt - 100,
+                                        (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4};
+                continue;
+            }
+        }
+        if (!coli_vk_xb_expert_entry(v->ex, o)) return -1;
+    }
+    return n;
+}
 /* issue()'s books for pairs it never saw: a forward's start, the tick, heat, routed and
  * served (the device took every resident one) */
 void vkt_dev_count(int layer, int S, int K, const int *idx) {

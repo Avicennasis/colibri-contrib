@@ -302,7 +302,15 @@ void vkt_ram_gave(void);
 unsigned vkt_epoch(void);
 int  vkt_dev_table(int layer, uint32_t *entries);
 void vkt_dev_count(int layer, int S, int K, const int *idx);
+/* The dense chain's hybrid steps (vk_dmoe.h): an expert of the host pool the CPU can
+ * compute in place (a GGUF block type: its rows as the file has them, in system RAM) gets
+ * a zero entry, so the device skips it, and its rows in hx[e]; every other expert's entry
+ * as vkt_dev_table gives it, its hx[e] zero. The count is vkt_dev_table's. */
+typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; } VktHostExpert;   /* rgu, rd: bytes a row */
+int  vkt_dev_table_hybrid(int layer, uint32_t *entries, VktHostExpert *hx);
 #else
+typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; } VktHostExpert;   /* rgu, rd: bytes a row */
+static inline int vkt_dev_table_hybrid(int l,uint32_t *e,VktHostExpert *h){(void)l;(void)e;(void)h;return -1;}
 static inline int  vkt_wanted(void){return 0;}
 static inline int  vkt_init(const VktConfig *c, uint32_t *const *h){(void)c;(void)h;return 0;}
 static inline int  vkt_ready(void){return 0;}

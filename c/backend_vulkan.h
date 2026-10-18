@@ -392,6 +392,13 @@ int coli_vk_device_shares_ram(void);
 /* VK_KHR_shader_integer_dot_product on the primary device: 0 none, 1 supported, 2 with
  * the packed 4 x 8 signed dot accelerated (COLI_VK_IDOT=0 leaves the extension off). */
 int coli_vk_idot(void);
+/* Timeline semaphores on the primary device (the dense chain's hybrid steps). */
+int coli_vk_timeline(void);
+/* A tensor of the tier's host pool as the CPU reads it: its rows in system RAM (and its
+ * scales, for a format that has them), the layout of its format; NULL for any other. */
+const void *coli_vk_tensor_host_rows(const ColiVkTensor *t, const void **scales);
+/* An expert's three tensors (gate, up, down), for coli_vk_tensor_host_rows. */
+void coli_vk_xb_expert_tensors(const ColiVkExpert *e, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d);
 /* The largest DEVICE_LOCAL heap in bytes (for a budget without VK_EXT_memory_budget). */
 size_t coli_vk_device_local_bytes(void);
 const char *coli_vk_device_name(void);

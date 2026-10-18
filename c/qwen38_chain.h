@@ -1476,6 +1476,7 @@ static void q38c_report(Model *m) {
                 q38c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
                 ch->dm.steps, ch->dm.big_steps, st.moe_i8, st.dev_bytes / 1048576.0, dl);
         vkc_kv_report(&ch->ks);
+        vkc_dmoe_hyb_report(q38c_name(ch), &ch->dm);
         vkc_prof_print();
         vkc_device(was);
     }

@@ -46,7 +46,7 @@ static const char *const pipe_file[P_NPIPE] = {
     "chain_ew.spv", "chain_qsa.spv", "chain_ple.spv", "qmatmul.spv"};
 #define VKC_GEMM_MAX 4
 #define VKC_DNREC_MAX 8
-#define VKC_FRAMES 4
+#define VKC_FRAMES 16
 #define VKC_BIND 8
 #define VKC_TRACK 64
 #define VKC_PROF_Q 512
@@ -86,6 +86,7 @@ typedef struct {
     VkcBuf *stage; size_t stage_used;
     int inflight, open;
     unsigned long long serial;
+    uint64_t wait_h, sig_g;           /* hybrid steps: the host's value this frame waits for, the value it signals */
     VkQueryPool qp; int nq; unsigned char kind[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF: a timestamp after each op */
     uint32_t shape[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF=2: a matmul's (fmt, O, I) slot in prof_sh, else 0 */
 } VkcFrame;
@@ -109,6 +110,9 @@ typedef struct {
     int moe_xs, moe_xs_bd; uint8_t moe_tried[2][10];          /* their largest staging floats (0: the device cannot); made once asked for */
     VkShaderModule mod_moe_i8; VkPipeline moe_i8[10]; uint8_t moe_i8_tried[10];   /* chain_moe_i8.spv, by its codes' size */
     int idot, idot_set;                                       /* the integer form on (vkc_moe_set_idot: -1 = the device's default) */
+    /* hybrid steps (vkc_hybrid_*): a timeline the device signals (its frames' sig_g) and one
+     * the host signals (their wait_h), and the next frame's wait */
+    VkSemaphore tsem_g, tsem_h; uint64_t next_wait_h;
     /* a prompt chunk's routed experts (vkc_moe_rows): chain_moe_rows.comp, and the block
      * formats' grouped GEMMs (qmatmul_grp_bd.comp: [0] down, [1] gate+up) a pipeline per
      * (pass, ggml type), made on first use */
@@ -207,6 +211,20 @@ static int memtype_host_visible(uint32_t t) {
 }
 
 static void track_reset(void) { KC.nwr = KC.nrd = 0; }
+/* the hybrid steps' timeline functions (Vulkan 1.2 core, taken from the device, not the
+ * loader's list: an older loader keeps the chain without them), the primary device's */
+static PFN_vkCreateSemaphore p_vkCreateSemaphore; static PFN_vkDestroySemaphore p_vkDestroySemaphore;
+static PFN_vkGetSemaphoreCounterValue p_vkGetSemaphoreCounterValue; static PFN_vkWaitSemaphores p_vkWaitSemaphores;
+static PFN_vkSignalSemaphore p_vkSignalSemaphore;
+static VkDevice g_hyb_dev; static VkSemaphore g_hyb_g, g_hyb_h;
+static int hyb_load(VkDevice dev) {
+    p_vkCreateSemaphore = (PFN_vkCreateSemaphore)vkGetDeviceProcAddr(dev, "vkCreateSemaphore");
+    p_vkDestroySemaphore = (PFN_vkDestroySemaphore)vkGetDeviceProcAddr(dev, "vkDestroySemaphore");
+    p_vkGetSemaphoreCounterValue = (PFN_vkGetSemaphoreCounterValue)vkGetDeviceProcAddr(dev, "vkGetSemaphoreCounterValue");
+    p_vkWaitSemaphores = (PFN_vkWaitSemaphores)vkGetDeviceProcAddr(dev, "vkWaitSemaphores");
+    p_vkSignalSemaphore = (PFN_vkSignalSemaphore)vkGetDeviceProcAddr(dev, "vkSignalSemaphore");
+    return p_vkCreateSemaphore && p_vkDestroySemaphore && p_vkGetSemaphoreCounterValue && p_vkWaitSemaphores && p_vkSignalSemaphore;
+}
 static void zero_now(VkcBuf *b);
 
 VkcBuf *vkc_buf(size_t bytes, int kind) {
@@ -475,6 +493,7 @@ int vkc_init(void) {
         KC.moe_xs_bd = xs > 8192 ? 8192 : xs >= 1024 ? xs : 0;
     }
     KC.idot = g_kd == 0 ? coli_vk_idot() : 0; KC.idot_set = -1;
+    { const char *ie = getenv("COLI_VK_IDOT"); if (ie && *ie == '1') KC.idot_set = 1; }   /* where supported, not only accelerated (tests) */
     /* the MLA, KDA and mHC shaders, optional: without one only its ops decline */
     for (int i = 0; i < PM_N; i++) {
         char path[1200];
@@ -531,6 +550,15 @@ int vkc_init(void) {
         VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         if (vkAllocateCommandBuffers(KC.dev, &ca, &KC.fr[i].cmd) != VK_SUCCESS ||
             vkCreateFence(KC.dev, &fi, NULL, &KC.fr[i].fence) != VK_SUCCESS) return 0;
+    }
+    if (g_kd == 0 && coli_vk_timeline() && hyb_load(KC.dev)) {
+        VkSemaphoreTypeCreateInfo st = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+        VkSemaphoreCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &st};
+        if (p_vkCreateSemaphore(KC.dev, &sci, NULL, &KC.tsem_g) != VK_SUCCESS || p_vkCreateSemaphore(KC.dev, &sci, NULL, &KC.tsem_h) != VK_SUCCESS) {
+            if (KC.tsem_g) p_vkDestroySemaphore(KC.dev, KC.tsem_g, NULL);
+            KC.tsem_g = KC.tsem_h = VK_NULL_HANDLE;
+        }
+        g_hyb_dev = KC.dev; g_hyb_g = KC.tsem_g; g_hyb_h = KC.tsem_h;
     }
     {
         const char *e = getenv("COLI_VK_CHAIN_PROF");
@@ -651,8 +679,13 @@ int vkc_begin(void) {
     f->open = 1;
     KC.cur = i;
     KC.bound = VK_NULL_HANDLE;
+    f->wait_h = KC.next_wait_h; f->sig_g = 0; KC.next_wait_h = 0;
     /* after everything submitted earlier on this queue (and the host's writes) */
     barrier_now(f->cmd, ALL_STAGES, ALL_RW);
+    if (f->wait_h) {   /* and the host's writes made after the submission, before its signal (vkc_hybrid_signal) */
+        VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT, .dstAccessMask = ALL_RW};
+        vkCmdPipelineBarrier(f->cmd, VK_PIPELINE_STAGE_HOST_BIT, ALL_STAGES, 0, 1, &hb, 0, NULL, 0, NULL);
+    }
     track_reset();
     if (KC.prof && f->qp) {
         vkCmdResetQueryPool(f->cmd, f->qp, 0, VKC_PROF_Q);
@@ -678,11 +711,46 @@ int vkc_submit(int wait) {
     }
     vkResetFences(KC.dev, 1, &f->fence);
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &f->cmd};
+    /* a hybrid step's frame: it waits for the host's value, or signals the device's */
+    VkTimelineSemaphoreSubmitInfo tsi = {.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    VkPipelineStageFlags wst = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if (f->wait_h || f->sig_g) {
+        si.pNext = &tsi;
+        if (f->wait_h) { tsi.waitSemaphoreValueCount = 1; tsi.pWaitSemaphoreValues = &f->wait_h;
+                         si.waitSemaphoreCount = 1; si.pWaitSemaphores = &KC.tsem_h; si.pWaitDstStageMask = &wst; }
+        if (f->sig_g) { tsi.signalSemaphoreValueCount = 1; tsi.pSignalSemaphoreValues = &f->sig_g;
+                        si.signalSemaphoreCount = 1; si.pSignalSemaphores = &KC.tsem_g; }
+    }
     VkResult r = (VkResult)coli_vk_queue_submit_dev(g_kd, KC.queue, &si, f->fence);   /* the backend's lock, staged uploads */
     if (r != VK_SUCCESS) { lose("queue submit", r); return 0; }
     f->inflight = 1;
     KC.st.frames++;
     return wait ? frame_wait(f) : 1;
+}
+
+/* ---- hybrid steps (vk_chain.h) ---------------------------------------------------- */
+int vkc_hybrid_ready(void) { return vkc_ready() && KC.tsem_g && KC.tsem_h; }
+int vkc_hybrid_submit(uint64_t g) {
+    if (KC.cur < 0 || !KC.tsem_g) return 0;
+    KC.fr[KC.cur].sig_g = g;
+    return vkc_submit(0);
+}
+void vkc_hybrid_wait_next(uint64_t h) { KC.next_wait_h = h; }
+/* the host's side, from any thread: the primary device's two timelines */
+int vkc_hybrid_host_wait(uint64_t g) {
+    if (!g_hyb_dev) return 0;
+    uint64_t v = 0;
+    for (int i = 0; i < 20000; i++) {   /* a few hundred microseconds spinning, then the driver's wait */
+        if (p_vkGetSemaphoreCounterValue(g_hyb_dev, g_hyb_g, &v) != VK_SUCCESS) return 0;
+        if (v >= g) return 1;
+    }
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_hyb_g, .pValues = &g};
+    return p_vkWaitSemaphores(g_hyb_dev, &wi, 60ull * 1000000000ull) == VK_SUCCESS;
+}
+int vkc_hybrid_host_signal(uint64_t h) {
+    if (!g_hyb_dev) return 0;
+    VkSemaphoreSignalInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g_hyb_h, .value = h};
+    return p_vkSignalSemaphore(g_hyb_dev, &si) == VK_SUCCESS;
 }
 
 /* Measured on an RTX PRO 4000 (Qwen3.6-35B-A3B int4-g64, every expert on the device, 128
@@ -2374,6 +2442,10 @@ void vkc_shutdown(void) {
         if (f->fence) vkDestroyFence(KC.dev, f->fence, NULL);
         if (f->qp) vkDestroyQueryPool(KC.dev, f->qp, NULL);
     }
+    if (KC.tsem_g) p_vkDestroySemaphore(KC.dev, KC.tsem_g, NULL);
+    if (KC.tsem_h) p_vkDestroySemaphore(KC.dev, KC.tsem_h, NULL);
+    if (g_kd == 0) { g_hyb_dev = VK_NULL_HANDLE; g_hyb_g = g_hyb_h = VK_NULL_HANDLE; }
+    KC.tsem_g = KC.tsem_h = VK_NULL_HANDLE;
     if (KC.dummy) buf_release(KC.dummy);
     for (int k = 0; k < 3; k++) {
         VkaPool *P = &KC.pool[k].p;

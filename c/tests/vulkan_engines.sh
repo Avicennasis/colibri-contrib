@@ -1767,6 +1767,13 @@ qwen36_gguf_chain_gates() {
   CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF, pipelines made before the tier" all GQ_EXACT=1 \
     COLI_VK_CHAIN_PREWARM=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
   grep -q "pipelines made before the expert tier" vk.log || { cat vk.log; fail "chain qwen36 GGUF: no pipeline made before the tier"; }
+  # the hybrid steps (vk_dmoe.h): the experts the tier leaves in the host pool (on a device
+  # that shares the host's RAM, COLI_VK_TIER_HOST=1) computed by the CPU in place, beside
+  # the device's, both with the float sums GQ_EXACT=1 gives the CPU: the CPU's tokens
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF, the host pool's experts on the CPU" all GQ_EXACT=1 COLI_VK_TIER_GB=0.0004 \
+    COLI_VK_TIER_HOST=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "host pool on, [1-9]" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no expert in the host pool"; }
+  grep -q "hybrid layer steps, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no pair on the CPU"; }
 }
 family_qwen_chain() {
   make qwen36 qwen38 tests/test_vk_chain VK=1
