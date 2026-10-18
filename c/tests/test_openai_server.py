@@ -3382,6 +3382,22 @@ class HTTPTest(unittest.TestCase):
         self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
+    def test_rejects_a_non_boolean_include_usage(self):
+        # #2123: bool("false") is True, so a string turned the usage frame on; numbers,
+        # arrays and objects passed as booleans. Both endpoints answer a named 400.
+        routes = (("/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}]}),
+                  ("/v1/completions", {"prompt": "Hi"}))
+        for path, fields in routes:
+            for value in ("false", 0, 1, [], {}):
+                with self.subTest(path=path, value=value):
+                    with self.assertRaises(HTTPError) as caught:
+                        self.request(path, {"model": "test-model", **fields, "stream": True,
+                                            "stream_options": {"include_usage": value}})
+                    self.addCleanup(caught.exception.close)
+                    self.assertEqual(caught.exception.code, 400)
+                    self.assertEqual(json.load(caught.exception)["error"]["param"],
+                                     "stream_options.include_usage")
+
     def _request_with_raw_metadata(self, path, fields, metadata):
         # Build the wire bytes directly: constructing a Python integer first
         # would trip the caller's digit guard before the HTTP request existed.
