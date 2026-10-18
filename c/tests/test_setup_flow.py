@@ -22,6 +22,7 @@ import socket
 import subprocess
 import sys
 import tarfile
+import shutil
 import tempfile
 import threading
 import time
@@ -2063,6 +2064,34 @@ class CommandLine(HomeTestCase):
         result = self.coli("start")
         self.assertEqual(result.returncode, 1)
         self.assertIn("coli setup", result.stderr)
+
+
+class LinuxVulkanHeadersTests(unittest.TestCase):
+    """#2122: a Nix shell's vulkan.h sits in the store, outside /usr/include and
+    /usr/local/include; the compiler the build uses finds it, so setup asks it."""
+
+    def test_the_compiler_finds_a_header_on_its_include_path(self):
+        cc = shutil.which("cc") or shutil.which("gcc")
+        if not cc:
+            self.skipTest("no C compiler")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "vulkan"))
+            open(os.path.join(tmp, "vulkan", "vulkan.h"), "w").close()
+            with mock.patch.dict(os.environ, {"CPATH": tmp}):
+                self.assertTrue(setup_flow._cc_finds_vulkan_h(cc))
+        self.assertFalse(setup_flow._cc_finds_vulkan_h(None))
+        self.assertFalse(setup_flow._cc_finds_vulkan_h("/nonexistent/cc"))
+
+    def test_toolchain_takes_the_compilers_answer(self):
+        real_isfile = os.path.isfile
+        def isfile(path):   # nothing in the usual directories
+            return False if path.endswith(os.path.join("vulkan", "vulkan.h")) else real_isfile(path)
+        with mock.patch.object(setup_flow.sys, "platform", "linux"), \
+                mock.patch.object(setup_flow.os.path, "isfile", side_effect=isfile), \
+                mock.patch.object(setup_flow, "_cc_finds_vulkan_h", return_value=True) as asked:
+            tc = setup_flow.toolchain(here=str(C_DIR))
+        self.assertTrue(tc["vulkan_headers"])
+        asked.assert_called_once()
 
 
 class WindowsToolchainTests(unittest.TestCase):

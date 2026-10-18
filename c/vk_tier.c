@@ -1790,6 +1790,22 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     }
     if (fit > all) fit = all;
     if (fit > fit_raw) fit = fit_raw;
+    /* streaming (below): the engine's load hook and the GEMM route, unless COLI_VK_TIER_STREAM=0 */
+    ColiVkXbStats xs0; coli_vk_xb_stats(&xs0);
+    const char *se0 = getenv("COLI_VK_TIER_STREAM");
+    int can_stream = !(se0 && *se0 == '0') && T.c.load && T.c.release && xs0.gemm_rows > 0;
+    if (fit_raw < 4 && fit < all && can_stream && T.exp_bytes && !T.xmax && room >= 4.0 * (double)T.exp_bytes) {
+        /* fewer experts than streaming's least (two residents, two staging slots), with the
+         * device's room for that least: stream every cold expert through it, the budget
+         * raised to it (#2183: a budget below one expert, set so that a test streams; below
+         * two it turned the tier off, below four it left the cold experts on the CPU) */
+        char hb[32], hn[32];
+        double least = 4.0 * (double)T.exp_bytes;
+        fprintf(stderr, "[VK] tier %s: the budget (%s) holds fewer experts than streaming needs; %s for two residents "
+                        "and two staging slots, every other expert streamed\n",
+                eng, human(want, hb, sizeof hb), human(least, hn, sizeof hn));
+        want = least; fit = fit_raw = 4;
+    }
     if (fit < 2) {
         char hb[32], he[32];
         fprintf(stderr, "[VK] tier %s: no room for experts (budget %s, %s each; COLI_VK_TIER_GB sets it), the experts stay on the CPU\n",
