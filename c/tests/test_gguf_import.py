@@ -50,7 +50,7 @@ def blocks(name, shape, rng, std=0.02):
     return raw.reshape(*shape[:-1], nb * size)
 
 
-def write_model(path, rng, dense=False, same_gate_up=False):
+def write_model(path, rng, dense=False, same_gate_up=False, token=None):
     """dense: llama.cpp's qwen35 (a dense model of the family): an MLP per layer instead of the
     experts, and no output.weight (the head tied to token_embd), as the small checkpoints ship.
     same_gate_up: every layer's expert up in its gate's type (layer 0 IQ2_XXS, the others
@@ -69,6 +69,8 @@ def write_model(path, rng, dense=False, same_gate_up=False):
         w.add_uint32(p + k, v)
     w.add_float32(p + "rope.freq_base", 1e7); w.add_float32(p + "attention.layer_norm_rms_epsilon", 1e-6)
     toks = [f"<0x{b:02X}>" if b < 256 else f"t{b}" for b in range(VOCAB - 3)] + ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]
+    if token:   # token: one of the vocabulary's words in its place (a non-ASCII one, say)
+        toks[VOCAB - 4] = token
     w.add_tokenizer_model("gpt2"); w.add_token_list(toks)
     w.add_token_types([1] * (VOCAB - 3) + [3, 3, 3]); w.add_token_merges([])
     w.add_eos_token_id(VOCAB - 1); w.add_bos_token_id(VOCAB - 3)
@@ -152,6 +154,25 @@ class GgufImport(unittest.TestCase):
             self.assertTrue(any(a["content"] == "<|im_end|>" and a["special"] for a in tok["added_tokens"]))
         self.assertTrue((self.dir / "copy" / "model.colibri.gguf").is_file())
         self.assertFalse((self.dir / "link" / "model.colibri.gguf").exists())
+
+    def test_import_writes_utf8_whatever_the_locale(self):
+        """#2189: Path.write_text took the locale's code page (cp1252 on that Windows box) and
+        the byte tokenizer's characters (U+0100 and up) stopped the import; a child Python whose
+        locale is ASCII (no UTF-8 mode, no locale coercion) must write the same files."""
+        src = self.dir / "tiny-non-ascii.gguf"
+        write_model(src, np.random.default_rng(11), token="\u0120caf\u00e9\u0100")
+        env = {**os.environ, "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0", "LC_ALL": "C", "LANG": "C"}
+        env.pop("PYTHONIOENCODING", None)
+        dirs = {}
+        for label, e in (("utf8", {**os.environ, "PYTHONUTF8": "1"}), ("ascii", env)):
+            dirs[label] = self.dir / f"link-{label}"
+            p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(src), str(dirs[label]), "--mode", "link"],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=e)
+            self.assertEqual(p.returncode, 0, f"{label}: " + p.stdout.decode("utf-8", "replace")[-2000:])
+        for f in ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "gguf.json"):
+            self.assertEqual((dirs["ascii"] / f).read_bytes(), (dirs["utf8"] / f).read_bytes(), f)
+        tok = json.loads((dirs["ascii"] / "tokenizer.json").read_text(encoding="utf-8"))
+        self.assertIn("\u0120caf\u00e9\u0100", tok["model"]["vocab"])
 
     def test_same_tokens_from_file_link_and_copy(self):
         for env in ({}, {"GQ_EXACT": "1"}):

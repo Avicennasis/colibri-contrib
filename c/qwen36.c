@@ -7439,8 +7439,7 @@ int main(int argc, char **argv) {
             char *arena = NULL; jval *r = json_parse(buf, &arena);
             const char *g = r ? jstr(r, "gguf") : NULL;
             if (!g || !*g) { fprintf(stderr, "%s: no \"gguf\" path\n", gj); return 1; }
-            if (g[0] == '/') snprintf(gguf_path, sizeof gguf_path, "%s", g);
-            else snprintf(gguf_path, sizeof gguf_path, "%s/%s", snap, g);
+            gguf_path_join(gguf_path, sizeof gguf_path, snap, g);
             free(arena); gguf_dir = 1;
         }
     }
