@@ -244,7 +244,7 @@ With `COLI_VULKAN=1` every MoE engine (qwen36, qwen38, inkling, olmoe, kimi_k3, 
 |---|---|---|
 | `COLI_VK_TIER` | on with `COLI_VULKAN=1` | `0`: no tier; the routed experts stay on the CPU (the dense trunk still uses the device). |
 | `COLI_VK_TIER_GB` | measured | The tier's budget in GiB, within what the device can hold. Unset: on a discrete GPU, the free device-local memory (`VK_EXT_memory_budget`) less `COLI_VK_TIER_RESERVE_GB` and the dense weights still to be placed; on an integrated GPU or Lavapipe, whose device memory is the host's RAM, a quarter of what `MemAvailable` leaves once the engine's expert cache has grown to its size and the dense weights are placed, less 2 GiB. |
-| `COLI_VK_TIER_RESERVE_GB` | `1` | Device memory left to everything but the experts (scratch, KV mirrors, the driver), on top of the dense weights. |
+| `COLI_VK_TIER_RESERVE_GB` | `1` | Device memory left to everything but the experts (scratch, KV mirrors, the driver), on top of the dense weights and, on qwen38 with the dense chain, the chain's KV mirror at the context's capacity (at most a quarter of the free memory) and a 512-row prompt chunk. |
 | `COLI_VK_TIER_RATE` | `16` | Promotions per token at most (a prompt's forward gets this many per prompt token); each copies one expert on the engine thread before the uploader thread writes it to the device. |
 | `COLI_VK_TIER_WARM` | on | `0`: no warm start; the tier fills as experts pass by. |
 | `COLI_VK_TIER_FILL` | on | The warm start fills the device: the history's experts first, hottest first, then the room left with the experts no history named, one of each layer in turn, so a first run starts with the device full and a model whose experts all fit goes up whole. `0`: the history's experts only. |
