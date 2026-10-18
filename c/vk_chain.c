@@ -897,18 +897,69 @@ static int copy_bytes(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t
 int vkc_copy(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t n) {
     return copy_bytes(dst, doff * 4, src, soff * 4, n * 4);
 }
+/* ---- a grid of regions in one dispatch (chain_copy2d.comp), made on first use ----
+ * A prompt chunk's K and V rows go into the head-major cache as a region per (row, head):
+ * a copy command with 16384 regions of 512 bytes took 3.3 ms on an RTX PRO 4000 (OLMoE,
+ * a chunk of 1024 rows, four of them a layer). Regions on a grid (one length; the
+ * destination and the source moving by fixed steps along an inner and an outer index)
+ * take one dispatch from VKC_CP2_MIN regions; any other list keeps the copy command. */
+#define VKC_CP2_MIN 64
+static struct { VkShaderModule mod; VkPipeline pipe; int tried; } g_cp2[2];
+#define CP2 (g_cp2[g_kd])
+static VkPipeline cp2_pipe(void) {
+    if (CP2.pipe || CP2.tried || !vkc_ready()) return CP2.pipe;
+    CP2.tried = 1;
+    if ((CP2.mod = load_module(KC.core.spv_path, "chain_copy2d.spv"))) CP2.pipe = make_pipe(CP2.mod, NULL);
+    return CP2.pipe;
+}
+static void cp2_shutdown(void) {
+    if (CP2.pipe) vkDestroyPipeline(KC.dev, CP2.pipe, NULL);
+    if (CP2.mod) vkDestroyShaderModule(KC.dev, CP2.mod, NULL);
+    memset(&CP2, 0, sizeof CP2);
+}
+typedef struct { uint32_t d0, s0; int32_t dh, sh, dq, sq; uint32_t len, per, n; } VkcCp2;
+/* the regions' grid, when they are one: region i = (q, h) = (i / per, i % per) */
+static int cp2_grid(const VkcRegion *r, int n, VkcCp2 *g) {
+    if (n < VKC_CP2_MIN || !r[0].n) return 0;
+    long long L = (long long)r[0].n, d0 = (long long)r[0].dst, s0 = (long long)r[0].src;
+    long long dh = (long long)r[1].dst - d0, sh = (long long)r[1].src - s0;
+    int per = 1;
+    while (per < n && (long long)r[per].dst - (long long)r[per - 1].dst == dh && (long long)r[per].src - (long long)r[per - 1].src == sh) per++;
+    if (n % per) return 0;
+    int Q = n / per;
+    long long dq = Q > 1 ? (long long)r[per].dst - d0 : 0, sq = Q > 1 ? (long long)r[per].src - s0 : 0;
+    const long long I32 = 2147483647LL;
+    if (llabs(dh) * (per - 1) + llabs(dq) * (Q - 1) > I32 || llabs(sh) * (per - 1) + llabs(sq) * (Q - 1) > I32) return 0;
+    if ((long long)n * L > 4294967295LL) return 0;
+    for (int i = 0; i < n; i++) {
+        long long q = i / per, h = i % per;
+        if ((long long)r[i].n != L || (long long)r[i].dst != d0 + q * dq + h * dh || (long long)r[i].src != s0 + q * sq + h * sh) return 0;
+        if ((long long)r[i].dst + L > 4294967295LL || (long long)r[i].src + L > 4294967295LL) return 0;
+    }
+    *g = (VkcCp2){(uint32_t)d0, (uint32_t)s0, (int32_t)dh, (int32_t)sh, (int32_t)dq, (int32_t)sq, (uint32_t)L, (uint32_t)per, (uint32_t)n};
+    return 1;
+}
 int vkc_copy_regions(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n) {
     VkcFrame *f = open_frame();
     if (!f || KC.lost) return 0;
     if (n < 1) return 1;
+    for (int i = 0; i < n; i++)
+        if ((r[i].dst + r[i].n) * 4 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) {
+            fprintf(stderr, "[VK] chain: copy region out of range\n"); return 0;
+        }
+    VkcCp2 g;
+    const char *e = getenv("COLI_VK_COPY_GRID");   /* 0: every list through the copy command */
+    if (dst != src && !(e && *e == '0') && cp2_grid(r, n, &g) && cp2_pipe()) {
+        KC.kind = PK_COPY;
+        VkcBind bd[2] = {B(src, 0), B(dst, 1)};
+        uint32_t gx, gy; grid(((uint64_t)g.n * g.len + 255) / 256, &gx, &gy);
+        if (!record(CP2.pipe, bd, 2, &g, sizeof g, gx, gy, 1)) return 0;
+        KC.st.copy_grids++;
+        return 1;
+    }
     VkBufferCopy *c = malloc((size_t)n * sizeof *c);
     if (!c) return 0;
-    for (int i = 0; i < n; i++) {
-        if ((r[i].dst + r[i].n) * 4 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) {
-            fprintf(stderr, "[VK] chain: copy region out of range\n"); free(c); return 0;
-        }
-        c[i] = (VkBufferCopy){r[i].src * 4, r[i].dst * 4, r[i].n * 4};
-    }
+    for (int i = 0; i < n; i++) c[i] = (VkBufferCopy){r[i].src * 4, r[i].dst * 4, r[i].n * 4};
     VkBuffer rb = src->buf, wb = dst->buf;
     hazard(f, &rb, 1, &wb, 1);
     vkCmdCopyBuffer(f->cmd, src->buf, dst->buf, (uint32_t)n, c);
@@ -1769,6 +1820,14 @@ int vkc_prewarm(const VkcPrewarm *pw) {
             if (g) { ok = record(g, gb, 5, &gp, sizeof gp, 1, 1, 1); n += ok; }
         }
     }
+    /* a prompt chunk's K/V rows into the cache (vkc_copy_regions' grid), launched with no regions */
+    if (ok && cp2_pipe()) {
+        VkcCp2 g = {0};
+        g.len = g.per = 1;
+        VkcBind cb[2] = {B(x, 0), B(y, 1)};
+        KC.kind = PK_COPY;
+        ok = record(CP2.pipe, cb, 2, &g, sizeof g, 1, 1, 1); n += ok;
+    }
     ok = ok && vkc_submit(1);
     VkcBuf *all[] = {x, w, y, ids, rw, tab, hid};
     for (size_t k = 0; k < sizeof all / sizeof *all; k++) if (all[k]) vkc_free(all[k]);
@@ -2551,6 +2610,7 @@ void vkc_shutdown(void) {
     if (KC.cpool) vkDestroyCommandPool(KC.dev, KC.cpool, NULL);
     kx_shutdown();
     kab_shutdown();
+    cp2_shutdown();
     ke_shutdown();
     kf_shutdown();
     kva_shutdown();

@@ -205,6 +205,31 @@ static void test_rope(void) {
     vkc_free(xb); vkc_free(cb); free(x); free(ref); free(cs); free(y);
 }
 
+/* vkc_copy_regions: a prompt chunk's K rows into a head-major cache (a region per row and
+ * head: a grid, one dispatch from 64 regions), the same few (the copy command), a list off
+ * the grid (the copy command), and a grid with COLI_VK_COPY_GRID=0; exact. */
+static void test_copy_regions(int S, int H, int hd, int DR, int pb, int shuffle, int env_off) {
+    size_t ns = (size_t)S * H * hd, nd = (size_t)H * DR * hd;
+    float *src = fvec(ns, 1.f), *ref = fvec(nd, 1.f);
+    VkcBuf *sb = up(src, ns), *db = up(ref, nd);
+    VkcRegion *rg = malloc(sizeof *rg * (size_t)S * H);
+    for (int s = 0; s < S; s++) for (int h = 0; h < H; h++)
+        rg[s * H + h] = (VkcRegion){((size_t)h * DR + pb + s) * hd, (size_t)s * H * hd + (size_t)h * hd, (size_t)hd};
+    if (shuffle) { VkcRegion t = rg[0]; rg[0] = rg[S * H - 1]; rg[S * H - 1] = t; }
+    for (int i = 0; i < S * H; i++) memcpy(ref + rg[i].dst, src + rg[i].src, rg[i].n * sizeof(float));
+    if (env_off) setenv("COLI_VK_COPY_GRID", "0", 1);
+    VkcStats a, b; vkc_stats(&a);
+    vkc_begin(); int ok = vkc_copy_regions(db, sb, rg, S * H); vkc_submit(1);
+    vkc_stats(&b);
+    if (env_off) unsetenv("COLI_VK_COPY_GRID");
+    float *y = down(db, 0, nd);
+    int grid = S * H >= 64 && !shuffle && !env_off, same = !memcmp(y, ref, nd * sizeof(float));
+    CHECK(ok && same && (b.copy_grids - a.copy_grids) == (unsigned long long)grid,
+          "copy_regions S %d H %d hd %d%s%s: %s, %llu grid dispatches (want %d)", S, H, hd, shuffle ? " off the grid" : "",
+          env_off ? " COLI_VK_COPY_GRID=0" : "", same ? "same" : "differs", b.copy_grids - a.copy_grids, grid);
+    vkc_free(sb); vkc_free(db); free(src); free(ref); free(rg); free(y);
+}
+
 /* An automatic chunk must not force 64 rows when even one row exhausts the
  * measured budget. Explicit overrides and small caps remain exact. */
 static void test_chunk_rows(void) {
@@ -3271,6 +3296,11 @@ int main(int argc, char **argv) {
     }
     test_rope();
     test_chunk_rows();
+    test_copy_regions(100, 4, 32, 256, 7, 0, 0);   /* a prompt chunk's grid */
+    test_copy_regions(70, 1, 48, 128, 3, 0, 0);    /* one head: rows alone */
+    test_copy_regions(3, 4, 32, 64, 0, 0, 0);      /* a few: the copy command */
+    test_copy_regions(100, 4, 32, 256, 7, 1, 0);   /* off the grid */
+    test_copy_regions(100, 4, 32, 256, 7, 0, 1);   /* COLI_VK_COPY_GRID=0 */
     test_attn(1, 0, 16, 0); test_attn(1, 140, 32, 0); test_attn(5, 200, 64, 0); test_attn(6, 9, 256, 1); test_attn(130, 3, 24, 0);
     /* prompt chunks on the matrix units where the device has them (chain_attn_flash, from
      * 16 rows): Qwen3.6's heads (hd 256, 8 query heads per kv head) from position 0 and

@@ -1,0 +1,24 @@
+#version 450
+// vkc_copy_regions' grid (vk_chain.c, cp2_grid): n regions of len floats, region i at
+// (q, h) = (i / per, i % per) copying src[s0 + q*sq + h*sh ..] to dst[d0 + q*dq + h*dh ..],
+// one invocation a float. A prompt chunk's K and V rows into the head-major cache are
+// such a grid (a region per row and head), one dispatch instead of a copy command with
+// a region each.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Src { float s[]; };
+layout(std430, binding = 1) writeonly buffer Dst { float d[]; };
+
+layout(push_constant) uniform Pc {
+    uint d0, s0;
+    int dh, sh, dq, sq;
+    uint len, per, n;
+} p;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u;
+    if (gid >= p.n * p.len) return;
+    uint i = gid / p.len, j = gid - i * p.len;
+    int q = int(i / p.per), h = int(i - uint(q) * p.per);
+    d[p.d0 + uint(q * p.dq + h * p.dh) + j] = s[p.s0 + uint(q * p.sq + h * p.sh) + j];
+}
