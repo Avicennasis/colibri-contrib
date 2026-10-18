@@ -5353,6 +5353,10 @@ size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); 
 /* elements per block of a block format (shaders/blockdec.glsl), 0 for any other format */
 int coli_vk_block_elems(int fmt) { return !bd_fmt(fmt) || !bd_shaders() ? 0 : fmt == 203 ? 64 : fmt >= 200 ? 128 : (int)BD_BLK[fmt - 100]; }
 void *coli_vk_block_table_dev(int dev) { return bd_shaders() ? (void *)bdtab_buf(dev == 1 ? 1 : 0) : NULL; }
+uint64_t coli_vk_block_table_addr(int dev) {   /* the primary device's (vk_addr's) */
+    VkBuffer b = !dev && bd_shaders() && G.has_bda ? bdtab_buf(0) : VK_NULL_HANDLE;
+    return b ? vk_addr(b) : 0;
+}
 /* vq2's codebooks (two 256 x 8 int8, row-major) into the table buffer. The table is built
  * once, at the first block-format tensor: call this before (the tier's start); -1 when a
  * table is already on a device with other books. */

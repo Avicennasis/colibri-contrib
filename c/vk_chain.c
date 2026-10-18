@@ -107,6 +107,11 @@ typedef struct {
     VkShaderModule mod_moe; VkPipeline moe, moe_bd;           /* chain_moe.comp: the routed experts, by address (bufferDeviceAddress);
                                                                  moe_bd with the block formats' paths (BD = 1) */
     int moe_xs, moe_xs_bd, moe_tried, moe_bd_tried;           /* their staging floats (0: the device cannot); built once asked for */
+    /* a prompt chunk's routed experts (vkc_moe_rows): chain_moe_rows.comp, and the block
+     * formats' grouped GEMMs (qmatmul_grp_bd.comp: [0] down, [1] gate+up) a pipeline per
+     * (pass, ggml type), made on first use */
+    VkShaderModule mod_rows, mod_grp[2]; VkPipeline rows; VkPipeline grp[2][64]; uint8_t grp_tried[2][64];
+    int rows_tried;
     int discrete;                     /* a discrete card: vkc_prewarm's default */
     VkPipeline pipe[P_NPIPE];
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
@@ -211,7 +216,8 @@ VkcBuf *vkc_buf(size_t bytes, int kind) {
     if (!b) return NULL;
     b->kind = kind; b->bytes = bytes; b->d = g_kd;
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes,
-        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,   /* vkc_moe_rows' dispatches */
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     if (vkCreateBuffer(KC.dev, &bi, NULL, &b->buf) != VK_SUCCESS) { free(b); return NULL; }
     VkMemoryRequirements req;
@@ -1481,6 +1487,8 @@ static int moe_build(void) { return moe_build_bd(0); }
  * Qwen3.8-Flash-Next's tier filling its 24 GiB ran chain_moe's three passes in 190, 115 and
  * 65 us a layer, against 65, 35 and 6 in a process with room, and its one-row decode went
  * from 13.9 to 27.6 tok/s with them made before the tier. */
+static int rows_make(void);
+static VkPipeline grp_pipe(int v, int t);
 int vkc_prewarm(const VkcPrewarm *pw) {
     const char *e = getenv("COLI_VK_CHAIN_PREWARM");   /* 1 on any device (tests), 0 never */
     if (!vkc_ready() || !pw || !(e && *e ? *e != '0' : KC.discrete)) return 0;
@@ -1514,6 +1522,32 @@ int vkc_prewarm(const VkcPrewarm *pw) {
     }
     /* DeltaNet's recurrence, made (its launch wants a layer's state) */
     if (ok && pw->dn_kd > 0 && pw->dn_kd <= 256) n += dnrec_pipe(pw->dn_kd) != VK_NULL_HANDLE;
+    /* a prompt chunk's experts (vkc_moe_rows), made and launched once with no rows: a
+     * pipeline made later, with the tier holding the card, slowed every launch after it,
+     * the decode's too (Qwen3.8-Flash-Next on an RTX PRO 4000: 37.7 -> 25.5 tok/s once its
+     * first prompt made these), and one made here but first launched there still cost the
+     * decode 6 to 16% (38.9 -> 36.6, 40.6 -> 34.2 tok/s). The plan with no pairs leaves at
+     * once; the grouped GEMMs get an item of expert 0 with no rows and no input (I 0), whose
+     * table entry has only the block table's address for the decoders' tables: nothing is
+     * read past them, nothing written. */
+    if (ok && (pw->ex_gu || pw->ex_dn) && rows_make()) {
+        struct { int mode, S, K, E, D, I, t_off, imax, i_off, i_row, w_off, w_row, y_off, y_row; uint32_t tab_lo, tab_hi; } rp =
+            {0, 0, 1, 1, 64, 64, 0, 1, 0, 1, 0, 1, 0, 64, 0, 0};
+        VkcBind rb[7] = {B(ids, 0), B(tab, 0), B(hid, 1), B(y, 1), B(w, 1), B(x, 1), B(rw, 1)};
+        ok = record(KC.rows, rb, 7, &rp, sizeof rp, 1, 1, 1); n += ok;
+        uint64_t ta = coli_vk_block_table_addr(g_kd);
+        uint32_t et[16] = {0};
+        et[14] = (uint32_t)ta; et[15] = (uint32_t)(ta >> 32);
+        ok = ok && vkc_zero(w, 0, 4) && vkc_write(tab, 0, et, sizeof et);
+        struct { int I, O; float limit; int ibase, kgat, rpw; } gp = {0, 1, 0.f, 0, 0, 0};
+        VkcBind gb[5] = {B(x, 0), B(w, 0), B(tab, 0), B(hid, 1), B(ids, 0)};
+        for (int t = 0; t < 64 && ok; t++)
+            for (int v = 0; v < 2 && ok; v++) {
+                if (!((v ? pw->ex_gu : pw->ex_dn) >> t & 1)) continue;
+                VkPipeline g = grp_pipe(v, t);
+                if (g) { ok = record(g, gb, 5, &gp, sizeof gp, 1, 1, 1); n += ok; }
+            }
+    }
     ok = ok && vkc_submit(1);
     VkcBuf *all[] = {x, w, y, ids, rw, tab, hid};
     for (size_t k = 0; k < sizeof all / sizeof *all; k++) if (all[k]) vkc_free(all[k]);
@@ -1567,6 +1601,122 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
     VkcBind bd2[7] = {B(NULL, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 0), B(y, 1), bt};
     grid((uint64_t)p->S * ((p->D + 255) / 256), &gx, &gy);
     return record(mp, bd2, 7, &pc, sizeof pc, gx, gy, 1);
+}
+/* ---- a prompt chunk's routed experts (chain_moe_rows.comp, qmatmul_grp*_bd.comp) ------ */
+/* the ggml types bdstep.glsl decodes */
+static int bd_type(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42; }
+/* the grouped GEMM's pipeline for pass v (1 gate+up, 0 down) and ggml type t */
+static VkPipeline grp_pipe(int v, int t) {
+    static const char *file[2] = {"qmatmul_grp_bd.spv", "qmatmul_grp_gate_up_bd.spv"};
+    if (t < 0 || t >= 64 || !bd_type(t)) return VK_NULL_HANDLE;
+    if (!KC.grp_tried[v][t]) {
+        KC.grp_tried[v][t] = 1;
+        if (!KC.mod_grp[v]) KC.mod_grp[v] = load_module(KC.core.spv_path, file[v]);
+        int32_t c = t;
+        VkSpecializationMapEntry me = {0, 0, 4};
+        VkSpecializationInfo si = {1, &me, 4, &c};
+        if (KC.mod_grp[v]) KC.grp[v][t] = make_pipe(KC.mod_grp[v], &si);
+    }
+    return KC.grp[v][t];
+}
+/* One dispatch whose group counts the device wrote (args at byte off of a buffer an earlier
+ * dispatch of the frame wrote): the bindings' hazards as record's, and a barrier the
+ * indirect read waits on. */
+static int record_indirect(VkPipeline pipe, const VkcBind *bd, int n, const void *pc, size_t pcb, VkcBuf *args, size_t off) {
+    VkcFrame *f = open_frame();
+    if (!f || KC.lost) return 0;
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT};
+    vkCmdPipelineBarrier(f->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    KC.st.barriers++;
+    /* record's own work with an empty grid, then the indirect dispatch in its place */
+    VkDescriptorSet set = alloc_set(f);
+    if (!set) { fprintf(stderr, "[VK] chain: out of descriptor sets\n"); return 0; }
+    VkBuffer rd[VKC_BIND], wr[VKC_BIND]; int nr = 0, nw = 0;
+    VkDescriptorBufferInfo bi[VKC_BIND];
+    VkWriteDescriptorSet w[VKC_BIND];
+    for (int i = 0; i < VKC_BIND; i++) {
+        if (i < n && bd[i].buf) {
+            bi[i] = (VkDescriptorBufferInfo){bd[i].buf, bd[i].off, bd[i].range ? bd[i].range : VK_WHOLE_SIZE};
+            if (bd[i].written) wr[nw++] = bd[i].buf; else rd[nr++] = bd[i].buf;
+        } else bi[i] = (VkDescriptorBufferInfo){KC.dummy->buf, 0, VK_WHOLE_SIZE};
+        w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+            .dstBinding = (uint32_t)i, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &bi[i]};
+    }
+    rd[nr++] = args->buf;
+    vkUpdateDescriptorSets(KC.dev, VKC_BIND, w, 0, NULL);
+    hazard(f, rd, nr, wr, nw);
+    if (KC.bound != pipe) { vkCmdBindPipeline(f->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe); KC.bound = pipe; }
+    vkCmdBindDescriptorSets(f->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, KC.pl, 0, 1, &set, 0, NULL);
+    if (pcb) vkCmdPushConstants(f->cmd, KC.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)pcb, pc);
+    vkCmdDispatchIndirect(f->cmd, args->buf, off);
+    args->last_frame = KC.serial;
+    KC.st.ops++;
+    prof_mark(f, KC.kind);
+    return 1;
+}
+/* chain_moe_rows.comp's pipeline, made on first use (a device with bufferDeviceAddress, the
+ * block formats' table and the grouped GEMMs' shared memory); COLI_VK_CHAIN_GEMM_BD=0 keeps a
+ * prompt's experts on the host's step as its dense rows */
+#define ROWS_GRP_SHARED 35648u   /* qmatmul_grp_gate_up_bd.comp's tiles and tables (backend_vulkan.c's GRP_BD_SHARED) */
+static int rows_make(void) {
+    if (!vkc_ready() || !KC.core.bda || !coli_vk_block_table_addr(g_kd)) return 0;
+    if (!KC.rows_tried) {
+        KC.rows_tried = 1;
+        const char *g = getenv("COLI_VK_CHAIN_GEMM_BD");
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
+        if (!(g && *g == '0') && pp.limits.maxComputeSharedMemorySize >= ROWS_GRP_SHARED &&
+            (KC.mod_rows = load_module(KC.core.spv_path, "chain_moe_rows.spv"))) KC.rows = make_pipe(KC.mod_rows, NULL);
+    }
+    return KC.rows != VK_NULL_HANDLE;
+}
+int vkc_moe_rows_ready(int gfmt, int dfmt) {
+    return gfmt >= 100 && dfmt >= 100 && rows_make() && grp_pipe(1, gfmt - 100) && grp_pipe(0, dfmt - 100);
+}
+void vkc_moe_rows_free(VkcMoeRows *r) {
+    VkcBuf **b[7] = {&r->cnt, &r->amap, &r->items, &r->etab, &r->aux, &r->hid, &r->yk};
+    for (int k = 0; k < 7; k++) if (*b[k]) { vkc_free(*b[k]); *b[k] = NULL; }
+}
+int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r, VkcBuf *y, const VkcMoe *p) {
+    KC.kind = PK_MOE;
+    int E = p->E;
+    if (p->S < 1 || p->K < 1 || p->K > VKC_ROUTE_KMAX || E < 1 || E > VKC_ROUTE_EMAX || p->act != 0 || p->D % 64 ||
+        p->I % 64 || p->t_off < 0 || p->x_off || !x || !ids || !w || !table || !y || !r || !vkc_moe_rows_ready(p->gfmt, p->dfmt)) return 0;
+    size_t pairs = (size_t)p->S * p->K;
+    int nob1 = (p->I + 31) / 32, nob0 = (p->D + 63) / 64;
+    /* a pass's items at most: every expert's partial tile and the pairs' whole ones */
+    size_t imax = ((pairs + 31) / 32 + (size_t)E) * (size_t)(nob1 > nob0 ? nob1 : nob0);
+    if (imax > 65535 * 16) return 0;
+    uint64_t ta = coli_vk_block_table_addr(g_kd);
+    if (!vkc_reserve(&r->cnt, (size_t)3 * E * 4, VKC_DEV) || !vkc_reserve(&r->amap, pairs * 4, VKC_DEV) ||
+        !vkc_reserve(&r->items, 2 * imax * 16, VKC_DEV) || !vkc_reserve(&r->etab, (size_t)32 * E * 4, VKC_DEV) ||
+        !vkc_reserve(&r->aux, 32, VKC_DEV) || !vkc_reserve(&r->hid, pairs * p->I * 4, VKC_DEV) ||
+        !vkc_reserve(&r->yk, pairs * p->D * 4, VKC_DEV)) return 0;
+    struct { int mode, S, K, E, D, I, t_off, imax, i_off, i_row, w_off, w_row, y_off, y_row; uint32_t tab_lo, tab_hi; } pc =
+        {0, p->S, p->K, E, p->D, p->I, p->t_off, (int)imax, p->i_off, p->i_row, p->w_off, p->w_row, p->y_off, p->y_row,
+         (uint32_t)ta, (uint32_t)(ta >> 32)};
+    uint32_t gp = (uint32_t)((pairs + 255) / 256);
+    /* count, plan, scatter: their tables in r */
+    VkcBind sb[7] = {B(ids, 0), B(table, 0), B(r->cnt, 1), B(r->amap, 1), B(r->items, 1), B(r->etab, 1), B(r->aux, 1)};
+    int ok = vkc_zero(r->cnt, 0, (size_t)E) && record(KC.rows, sb, 7, &pc, sizeof pc, gp, 1, 1);
+    pc.mode = 1; ok = ok && record(KC.rows, sb, 7, &pc, sizeof pc, 1, 1, 1);
+    pc.mode = 2; ok = ok && record(KC.rows, sb, 7, &pc, sizeof pc, gp, 1, 1);
+    /* gate+up: the tokens' rows gathered by amap into the packed hidden rows */
+    struct { int I, O; float limit; int ibase, kgat, rpw; } pg = {p->D, p->I, p->limit, 0, p->K, 0};
+    size_t eb0 = (size_t)16 * E * 4;   /* the down pass's table */
+    VkcBind gb[5] = {B(x, 0), B(r->items, 0), {r->etab->buf, 0, eb0, 0}, B(r->hid, 1), B(r->amap, 0)};
+    r->etab->last_frame = KC.serial;
+    ok = ok && record_indirect(grp_pipe(1, p->gfmt - 100), gb, 5, &pg, sizeof pg, r->aux, 0);
+    /* down: the packed hidden rows into the pairs' rows (amap) */
+    struct { int I, O; float limit; int ibase, kgat, rpw; } pd = {p->I, p->D, 0.f, (int)imax, p->K, 0};
+    VkcBind db[5] = {B(r->hid, 0), B(r->items, 0), {r->etab->buf, eb0, eb0, 0}, B(r->yk, 1), B(r->amap, 0)};
+    ok = ok && record_indirect(grp_pipe(0, p->dfmt - 100), db, 5, &pd, sizeof pd, r->aux, 16);
+    /* the rows' sums over their experts, in rank order */
+    pc.mode = 3;
+    VkcBind yb[7] = {B(ids, 0), B(table, 0), B(NULL, 0), B(NULL, 0), B(w, 0), B(r->yk, 0), B(y, 1)};
+    ok = ok && record(KC.rows, yb, 7, &pc, sizeof pc, (uint32_t)p->S * (uint32_t)((p->D + 255) / 256), 1, 1);
+    return ok;
 }
 int vkc_ares_ready(void) { return vkc_ready() && KC.mpipe[PM_ARES]; }
 int vkc_ares_mix(VkcBuf *x, VkcBuf *blk, VkcBuf *prm, VkcBuf *y, const VkcAres *p) {
@@ -2184,6 +2334,12 @@ void vkc_shutdown(void) {
     if (KC.mod_bd) vkDestroyShaderModule(KC.dev, KC.mod_bd, NULL);
     if (KC.moe) vkDestroyPipeline(KC.dev, KC.moe, NULL);
     if (KC.moe_bd) vkDestroyPipeline(KC.dev, KC.moe_bd, NULL);
+    if (KC.rows) vkDestroyPipeline(KC.dev, KC.rows, NULL);
+    if (KC.mod_rows) vkDestroyShaderModule(KC.dev, KC.mod_rows, NULL);
+    for (int v = 0; v < 2; v++) {
+        for (int t = 0; t < 64; t++) if (KC.grp[v][t]) vkDestroyPipeline(KC.dev, KC.grp[v][t], NULL);
+        if (KC.mod_grp[v]) vkDestroyShaderModule(KC.dev, KC.mod_grp[v], NULL);
+    }
     if (KC.mod_moe) vkDestroyShaderModule(KC.dev, KC.mod_moe, NULL);
     if (KC.mod_gemm) vkDestroyShaderModule(KC.dev, KC.mod_gemm, NULL);
     if (KC.mod_dnrec) vkDestroyShaderModule(KC.dev, KC.mod_dnrec, NULL);

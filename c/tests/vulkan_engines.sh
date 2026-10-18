@@ -1695,21 +1695,25 @@ chain_gate() {  # <engine> <tag> <tol 0|1> <env...> -- <argv...>   (CPUENV: the 
   echo "OK $tag: tokens = CPU$lg, $(chain_count "$eng" vk.log) chain forwards"
 }
 
-# dmoe_gate <engine> <tag> all|some|none <env...> -- <argv...>: chain_gate, and how many layer
-# steps ran their routed experts in the frame (vk_dmoe.h): all (no routed expert on the
-# host), some (beside host steps: the tier holds every expert of some layers only), none
+# dmoe_gate <engine> <tag> all|some|rows|none <env...> -- <argv...>: chain_gate, and how many
+# layer steps ran their routed experts in the frame (vk_dmoe.h): all (no routed expert on the
+# host), some (beside host steps: the tier holds every expert of some layers only), rows (a
+# prompt chunk's in the frame and none on the host where the device has vkc_moe_rows' grouped
+# GEMMs, the chunk's on the host beside the decode steps' in the frame where it has not), none
 dmoe_gate() {
   local eng=$1 tag=$2 want=$3; shift 3
   chain_gate "$eng" "$tag" 1 "$@"
-  local n h
+  local n h c
   n=$(sed -n "s/^\[VK\] $eng chain: .* \([0-9]*\) layer steps with the routed experts in the frame.*/\1/p" vk.log | tail -1)
   h=$(sed -n "s/^\[VK\] $eng chain: .* \([0-9.]*\) ms of routed experts on the host.*/\1/p" vk.log | tail -1)
+  c=$(sed -n "s/^\[VK\] $eng chain: .* in the frame (\([0-9]*\) of them a prompt chunk's).*/\1/p" vk.log | tail -1)
   case $want in
     all) [ "${n:-0}" -gt 0 ] && [ "$h" = 0.0 ] ;;
     some) [ "${n:-0}" -gt 0 ] && [ "${h:-0.0}" != 0.0 ] ;;
+    rows) [ "${n:-0}" -gt 0 ] && { { [ "${c:-0}" -gt 0 ] && [ "$h" = 0.0 ]; } || { [ "${c:-0}" = 0 ] && [ "${h:-0.0}" != 0.0 ]; }; } ;;
     *) [ "${n:-0}" = 0 ] ;;
-  esac || { cat vk.log; fail "$tag: ${n:-?} layer steps in the frame, ${h:-?} ms of routed experts on the host (wanted $want)"; }
-  echo "OK $tag: ${n:-0} layer steps with the routed experts in the frame, ${h:-?} ms of routed experts on the host"
+  esac || { cat vk.log; fail "$tag: ${n:-?} layer steps in the frame (${c:-?} a prompt chunk's), ${h:-?} ms of routed experts on the host (wanted $want)"; }
+  echo "OK $tag: ${n:-0} layer steps with the routed experts in the frame (${c:-0} a prompt chunk's), ${h:-?} ms of routed experts on the host"
 }
 
 # lost_gate <engine> <tag> <frame> <env...> -- <argv...>: the device "lost" at the given
@@ -1750,6 +1754,13 @@ qwen36_gguf_chain_gates() {
   for cap in 1 8; do
     CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF cap=$cap" all GQ_EXACT=1 SNAP=qwen36_gguf_tiny -- $cap 8 qwen36_gguf_tiny/ref.json
   done
+  # a prompt chunk of 12 rows, past VKC_DMOE_ROWS: its routed experts in the frame through
+  # vkc_moe_rows' grouped GEMMs on a device with their shared memory, the host's step on
+  # one without (Lavapipe's 32 KiB): the same tokens either way
+  echo '{"prompt_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], "full_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]}' \
+    > qwen36_gguf_tiny/ref12.json
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF, a prompt of 12 rows" rows GQ_EXACT=1 SNAP=qwen36_gguf_tiny \
+    -- 8 8 qwen36_gguf_tiny/ref12.json
   # the pipelines vk_chain.c makes at first use made before the tier instead (a discrete
   # card's default, vkc_prewarm), each but the recurrence launched there once: the same
   # tokens after them

@@ -1133,7 +1133,7 @@ f32 throughout, as the CPU's f32 path.
 | `COLI_VK_CHAIN_LAYERS` | what fits | The engines on [the partial chain](#a-partial-chain): the first N layers on the device, the CPU the rest and the head. Unset or `auto`: the most layers the device's free memory holds (every layer when they fit, the chain as before); `n`: n layers; `0`: the chain off. |
 | `COLI_VK_CHAIN_FLASH` | `16` | Rows from which a forward's plain causal attention runs on the matrix units (`chain_attn_flash.comp`: query heads of one kv head folded into 16-row tiles, K/V staged once per block as f16, two passes); `0` never. Needs cooperative matrices at subgroup size 64; otherwise, and for a selection list, a window, a ring or a sink, the blocked shader or `chain_attn.comp`. On a Radeon 8060S (Qwen3.6, 1011-token prompt) the attention went from 186 ms (`chain_attnb`) to 22 ms, the first token from 2.08 to 1.85 s, perplexity unchanged (7.65). |
 | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
-| `COLI_VK_CHAIN_MOE` | on where supported | A decode step's (or a short verify's) MoE layer whose experts the tier holds all of runs its routing and experts in the frame, with no host step ([below](#the-routed-experts-in-the-frame-vk_dmoeh)); `0`: the host routes as before. |
+| `COLI_VK_CHAIN_MOE` | on where supported | A decode step's (or a short verify's) MoE layer whose experts the tier holds all of runs its routing and experts in the frame, with no host step, and a GGUF's prompt chunk too on qwen36 and qwen38 ([below](#the-routed-experts-in-the-frame-vk_dmoeh)); `0`: the host routes as before. |
 | `COLI_VK_SUBGROUP` | on where the size varies | Every chain pipeline requires the subgroup size the device reports (`VK_EXT_subgroup_size_control`), where the device has more than one. Without it an Intel Iris Xe (Windows driver 101.7076) compiled the chain's GEMVs at another size than the shaders read: Qwen3.6 answered garbage with the chain on and correctly with it off. `0`: the driver's choice. |
 | `COLI_VK_CHAIN_GEMV2` | on where supported | `0`: the int8 decode matrices keep `chain_gemv.comp` instead of `chain_gemv2.comp` (rows a workgroup by the matrix's length). On a Radeon 8060S (Qwen3.6, a 256-token answer, int8 trunk) decode went from 36.8 to 39.0 tok/s; at int4 (`COLI_DENSE_BITS=4`) it measured slower, so it takes int8 only. It stages x in the device's shared memory, up to 64 KiB (#1998). |
 | `COLI_VK_CHAIN_SPIN_US` | `2000` | How long a wait on a chain frame polls the fence before blocking. |
@@ -1937,6 +1937,44 @@ so, a token is one frame.
 - The books follow at the frame's end, from the ids that come down with it: the history
   (`.coli_usage`), the HITS bitmap, the tier's heat (`vkt_dev_count`); the tier's line
   counts them as `in the dense chain: N routed experts with no host step`.
+
+A prompt chunk (more than 8 rows) of a GGUF takes the frame the same way on qwen36 and
+qwen38: `vkc_moe_rows` (`chain_moe_rows.comp`) counts the chunk's (row, expert) pairs by
+expert on the device, plans each expert's tiles of 32 rows and writes the two passes'
+dispatch sizes, then the block formats' grouped GEMMs (`qmatmul_grp_gate_up_bd.comp`,
+`qmatmul_grp_bd.comp`, the tier's own) run gate and up, then down, over those tiles with
+indirect dispatches, and a last pass sums each row's experts in rank order. No row leaves
+the device. A layer whose types have no grouped GEMM (a GGUF's IQ1_M layers) keeps the
+host's step for that chunk; the rest of the forward stays in the frame. It needs the
+grouped GEMMs' 34.8 KiB of shared memory (not Lavapipe's 32 KiB, where every layer keeps
+the host's step) and turns off with `COLI_VK_CHAIN_GEMM_BD=0`. Its pipelines are made and
+launched once, with no rows, before the tier fills the card (`vkc_prewarm`, from the file's
+expert types): made after, they slowed every kernel of the frame, decode included, and
+made before but first launched after, they still cost the decode 6 to 16%.
+
+Measured on an RTX PRO 4000 Blackwell SFF (70 W, a virtual GPU whose speed moves from one
+server start to the next), three runs a start. Qwen3.6-35B-A3B, a prompt of 467 tokens,
+every expert on the card:
+
+| | prefill before | prefill now | decode now |
+|---|---|---|---|
+| UD-Q4_K_M | 450 to 485 tok/s | 676 to 681 tok/s | 70.2 to 71.2 tok/s |
+| UD-IQ2_XXS | 460 to 515 tok/s | 706 to 721 tok/s | 82.3 to 83.8 tok/s |
+
+Qwen3.8 Next IQ2_XS, a prompt of 507 tokens, 19.7 GiB of experts on the card and 15 GiB
+in the host pool (prompt chunks of 151 rows), the chunk's experts on the host's step and
+in the frame started one after the other, four pairs (prefill / decode):
+
+| pair | host's step | in the frame |
+|---|---|---|
+| 1 | 66.5 / 25.8 tok/s | 92.2 / 36.7 tok/s |
+| 2 | 80.9 / 37.0 tok/s | 92.8 / 36.3 tok/s |
+| 3 | 73.7 / 32.8 tok/s | 85.6 / 32.8 tok/s |
+| 4 | 85.6 / 39.2 tok/s | 90.3 / 36.2 tok/s |
+
+The prefill gains in every pair (5 to 39%); the decode stays within what the card moves by
+between starts. With 151-row chunks each chunk reads the host pool's experts over PCIe
+again: larger chunks are the next lever there.
 
 A layer the tier holds only part of keeps the host's step, in the same forward: the frame
 ends there as before. The table follows the tier: an eviction or an upload changes its

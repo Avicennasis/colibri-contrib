@@ -540,7 +540,7 @@ static void q38c_prewarm(Model *m, const Q38Chain *ch) {
     Cfg *c = &m->c;
     int dn = 0;
     for (int i = 0; i < c->layers; i++) dn |= !c->is_attn[i];
-    VkcPrewarm pw = {0, c->experts > 0 ? (g_q38_gguf ? 2 : 1) : 0, dn ? c->dn_kdim : 0};
+    VkcPrewarm pw = {0, c->experts > 0 ? (g_q38_gguf ? 2 : 1) : 0, dn ? c->dn_kdim : 0, 0, 0};
     Q38Weight *w[Q38C_TAIL > Q38C_MATS ? Q38C_TAIL : Q38C_MATS];
     for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
         int nw = q38c_mats(m, i, w);
@@ -549,6 +549,16 @@ static void q38c_prewarm(Model *m, const Q38Chain *ch) {
     if (ch->head) {
         int nw = q38c_tail_mats(m, w, 0);
         for (int k = 0; k < nw; k++) { int f = q38_vk_eligible(w[k]) ? q38_vk_fmt(w[k]) : 0; if (f >= 100 && f < 164) pw.types |= 1ull << (f - 100); }
+    }
+    /* a GGUF's experts, as the file has them: a prompt chunk's grouped GEMMs (vk_dmoe.h) */
+    for (int i = 0; g_q38_gguf && i < c->layers; i++) {
+        const char *kn[2] = {"ffn_gate_exps", "ffn_down_exps"};
+        for (int k = 0; k < 2; k++) {
+            char nm[64]; snprintf(nm, sizeof nm, "blk.%d.%s.weight", i, kn[k]);
+            const gguf_tensor *t = gguf_find(&g_q38gg, nm);
+            int b = t ? gq_r16_base(t->type) : -1, ty = t ? (b >= 0 ? b : t->type) : -1;
+            if (ty >= 0 && ty < 64) *(k ? &pw.ex_dn : &pw.ex_gu) |= 1ull << ty;
+        }
     }
     vkc_prewarm(&pw);
 }
@@ -1068,6 +1078,7 @@ static void q38c_kv_down(Q38Chain *ch, Model *m, int i, int n, int pb) {
 static int q38c_dmoe(Q38Chain *ch, Model *m, int rows) {
     Cfg *c = &m->c;
     if (ch->d || c->experts <= 0 || rt_fp || qt_ready()) return 0;
+    ch->dm.big = g_q38_gguf;   /* a prompt chunk too: a GGUF's experts through the grouped GEMMs */
     return vkc_dmoe_prepare(&ch->dm, ch->lo, ch->nl, c->experts, c->topk, c->hidden, c->inter, rows);
 }
 static void q38c_dmoe_done(Q38Chain *ch, Model *m, int from, int to, int n, int pb) {
@@ -1251,9 +1262,9 @@ static void q38c_report(Model *m) {
         VkcStats st; vkc_stats(&st);
         fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                         "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %llu layer steps with "
-                        "the routed experts in the frame, %.1f MiB on the device\n",
+                        "the routed experts in the frame (%llu of them a prompt chunk's), %.1f MiB on the device\n",
                 q38c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
-                ch->dm.steps, st.dev_bytes / 1048576.0);
+                ch->dm.steps, ch->dm.big_steps, st.dev_bytes / 1048576.0);
         vkc_kv_report(&ch->ks);
         vkc_prof_print();
         vkc_device(was);

@@ -745,6 +745,7 @@ VK_SPV   += shaders/chain_ares.spv
 VK_SPV   += shaders/chain_route.spv
 # the routed experts on the device, their weights by address (vk_chain.h: vkc_moe)
 VK_SPV   += shaders/chain_moe.spv
+VK_SPV   += shaders/chain_moe_rows.spv
 # a GGUF's dense matrices on the chain, one pipeline per block type (vk_chain.c: matmul_bd)
 VK_SPV   += shaders/chain_gemv_bd.spv shaders/qmatmul_gemm_bd.spv
 # the expert batch's grouped GEMM for a GGUF's experts, down and gate+up (backend_vulkan.c)

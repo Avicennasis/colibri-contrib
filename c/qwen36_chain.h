@@ -501,13 +501,20 @@ static void q36c_prewarm(Model *m, const Q36Chain *ch) {
     Cfg *c = &m->c;
     int dn = 0;
     for (int i = 0; i < c->n_layers; i++) dn |= !c->is_attn[i];
-    VkcPrewarm pw = {0, c->n_experts > 0 ? (g_gguf ? 2 : 1) : 0, dn ? c->dn_kdim : 0};
+    VkcPrewarm pw = {0, c->n_experts > 0 ? (g_gguf ? 2 : 1) : 0, dn ? c->dn_kdim : 0, 0, 0};
     const void *wq; const float *sc;
     for (int i = ch->lo; i < ch->lo + ch->n; i++) {
         QW *ws[16]; int nw = q36c_layer_qws(m, i, ws);
         for (int k = 0; k < nw; k++) { int f = vk_qw_fmt(ws[k], &wq, &sc); if (f >= 100 && f < 164) pw.types |= 1ull << (f - 100); }
     }
     if (ch->head) { int f = vk_qw_fmt(&m->lm_head, &wq, &sc); if (f >= 100 && f < 164) pw.types |= 1ull << (f - 100); }
+    /* a GGUF's experts, as the file has them: a prompt chunk's grouped GEMMs (vk_dmoe.h) */
+    for (int i = 0; g_gguf && m->gqx && i < c->n_layers; i++) {
+        int bg = gq_r16_base(m->gqx[i].tg), bd = gq_r16_base(m->gqx[i].td);
+        int tg = bg >= 0 ? bg : m->gqx[i].tg, td = bd >= 0 ? bd : m->gqx[i].td;
+        if (tg >= 0 && tg < 64) pw.ex_gu |= 1ull << tg;
+        if (td >= 0 && td < 64) pw.ex_dn |= 1ull << td;
+    }
     vkc_prewarm(&pw);
 }
 static void q36c_place(Model *m) {
@@ -829,6 +836,7 @@ static int q36c_dmoe(Q36Chain *ch, Model *m, int rows) {
     int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1;
     if (ch->d || E <= 0 || g_cache_route || g_route_agree || c->has_bias || qq_active() || qt_ready() ||
         (ng > 1 && (ng > 64 || E % ng || c->topk_group < 1 || c->topk_group > ng))) return 0;
+    ch->dm.big = g_gguf;   /* a prompt chunk too: a GGUF's experts through the grouped GEMMs */
     return vkc_dmoe_prepare(&ch->dm, ch->lo, ch->n, E, c->topk, c->hidden, c->inter, rows);
 }
 /* After the frame that ran layers [from, to) for n rows from pb: the K/V rows and the
@@ -1047,9 +1055,9 @@ static void q36c_report(Model *m) {
         VkcStats st; vkc_stats(&st);
         fprintf(stderr, "[VK] %s chain: %llu forwards, %llu frames (%llu ops, %llu matmuls, %llu tiled GEMM), "
                         "%.1f ms waiting for the device, %.1f ms of routed experts on the host, %llu layer steps with "
-                        "the routed experts in the frame, %.1f MiB on the device\n",
+                        "the routed experts in the frame (%llu of them a prompt chunk's), %.1f MiB on the device\n",
                 q36c_name(ch), ch->forwards, st.frames, st.ops, st.matmuls, st.gemms, st.wait_ms, ch->host_ms,
-                ch->dm.steps, st.dev_bytes / 1048576.0);
+                ch->dm.steps, ch->dm.big_steps, st.dev_bytes / 1048576.0);
         vkc_kv_report(&ch->ks);
         vkc_prof_print();
         vkc_device(was);

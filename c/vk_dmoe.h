@@ -8,7 +8,10 @@
  * layer whose experts the tier holds all of on the chain's device, the frame instead
  * routes (vkc_route) and computes the experts (vkc_moe) itself and goes on to the next
  * layer: one frame for the whole forward when every layer qualifies, which the tier's
- * warm start makes the usual case on a device that holds the model.
+ * warm start makes the usual case on a device that holds the model. An engine that sets
+ * big gets a prompt chunk's rows the same way, each layer whose experts are block formats
+ * (a GGUF's) through vkc_moe_rows' grouped GEMMs; a layer whose formats have none
+ * takes the host's step in that chunk, as every layer did before.
  *
  * The engine keeps what is its own: its router's parameters (VkcRoute), its expert's
  * activation (VkcMoe), the conditions under which its host routing has state the device
@@ -47,8 +50,16 @@ typedef struct {
     uint8_t *on;                   /* per layer: the tier holds all of its experts here */
     uint32_t *tabh;                /* their entries, as the tier gave them at `epoch` */
     unsigned epoch; int read, dirty, off;
-    VkcBuf *tab, *rid, *rwt, *hid, *y;   /* the table, ids [L][rows][K] (down), weights, hidden rows, the routed sum */
+    VkcBuf *tab, *rid, *rwt, *hid, *y;   /* the table, ids [L][cap][K] (down), weights, hidden rows, the routed sum */
     unsigned long long steps;      /* layer steps that ran so */
+    /* big: the engine takes a step of more than VKC_DMOE_ROWS rows too (a prompt chunk),
+     * its layers through vkc_moe_rows when their experts are block formats; cap the rows
+     * the buffers hold a layer (VKC_DMOE_ROWS, or the step's) */
+    int big, cap;
+    int big_step;                  /* this step's rows are more than VKC_DMOE_ROWS */
+    uint8_t *rows_off;             /* per layer, in a big step: its formats have no grouped GEMM (the host's step) */
+    VkcMoeRows rows;
+    unsigned long long big_steps;  /* layer steps of more than VKC_DMOE_ROWS rows */
 } VkcDmoe;
 
 static int vkc_dmoe_wanted(void) {
@@ -72,11 +83,14 @@ static int vkc_dmoe_read(VkcDmoe *d) {
     d->epoch = vkt_epoch(); d->read = 1; d->dirty = 1;
     return 1;
 }
+/* layer i's gate/up and down formats, from its first entry (a layer's experts share them) */
+static int vkc_dmoe_fmt(const VkcDmoe *d, int i, int w) { return (int)d->tabh[(size_t)i * d->E * COLI_VK_XB_ENTRY + w]; }
 /* For a step of `rows` rows on the primary device: whether any of layers lo..lo+L-1 takes
  * it; reads the tier's table again when its residents changed. 0 for good when the
  * device cannot read the tier's experts by address. */
 static int vkc_dmoe_prepare(VkcDmoe *d, int lo, int L, int E, int K, int D, int I, int rows) {
-    if (!vkc_dmoe_wanted() || d->off || rows > VKC_DMOE_ROWS || L < 1 || vkc_device_now() != 0 || !vkt_ready() ||
+    int big = rows > VKC_DMOE_ROWS;
+    if (!vkc_dmoe_wanted() || d->off || (big && !d->big) || L < 1 || vkc_device_now() != 0 || !vkt_ready() ||
         !vkc_moe_ready() || !vkc_route_ready() || K < 1 || K > VKC_ROUTE_KMAX || E < K || E > VKC_ROUTE_EMAX) return 0;
     if (d->on && (d->lo != lo || d->L != L || d->E != E || d->K != K)) { d->off = 1; return 0; }
     d->lo = lo; d->L = L; d->E = E; d->K = K;
@@ -84,13 +98,27 @@ static int vkc_dmoe_prepare(VkcDmoe *d, int lo, int L, int E, int K, int D, int 
     int any = 0;
     for (int i = 0; i < L; i++) any |= d->on[i];
     if (!any) return 0;
-    size_t r = VKC_DMOE_ROWS;
+    /* a big step: the layers whose formats have the grouped GEMMs run here, the others
+     * (a GGUF's IQ1_M layers, say) take the host's step */
+    if (big && (D % 64 || I % 64)) return 0;
+    if (big) {
+        if (!d->rows_off && !(d->rows_off = calloc((size_t)L, 1))) return 0;
+        int some = 0;
+        for (int i = 0; i < L; i++) {
+            d->rows_off[i] = d->on[i] && !vkc_moe_rows_ready(vkc_dmoe_fmt(d, i, 12), vkc_dmoe_fmt(d, i, 15));
+            some |= d->on[i] && !d->rows_off[i];
+        }
+        if (!some) return 0;
+    }
+    d->big_step = big;
+    size_t r = VKC_DMOE_ROWS, rc = big ? (size_t)rows : r;
     if ((!d->tab && !(d->tab = vkc_buf((size_t)L * E * COLI_VK_XB_ENTRY * sizeof(uint32_t), VKC_DEV))) ||
-        !vkc_reserve(&d->rid, (size_t)L * r * K * sizeof(int), VKC_DOWN) || !vkc_reserve(&d->rwt, r * K * sizeof(float), VKC_DEV) ||
-        !vkc_reserve(&d->hid, r * K * ((size_t)I + D) * sizeof(float), VKC_DEV) || !vkc_reserve(&d->y, r * (size_t)D * sizeof(float), VKC_DEV)) {
+        !vkc_reserve(&d->rid, (size_t)L * rc * K * sizeof(int), VKC_DOWN) || !vkc_reserve(&d->rwt, rc * K * sizeof(float), VKC_DEV) ||
+        !vkc_reserve(&d->hid, r * K * ((size_t)I + D) * sizeof(float), VKC_DEV) || !vkc_reserve(&d->y, rc * (size_t)D * sizeof(float), VKC_DEV)) {
         d->off = 1;
         return 0;
     }
+    d->cap = (int)rc;
     return 1;
 }
 /* The table into the device, in a frame just begun: read again first when the tier's
@@ -107,7 +135,8 @@ static int vkc_dmoe_upload(VkcDmoe *d) {
 /* Whether layer `layer` runs its experts in the frame: all of them on the device, in the
  * table the frame has (the tier's residents unchanged since it was read). */
 static int vkc_dmoe_on(const VkcDmoe *d, int layer) {
-    return d->on && !d->off && d->epoch == vkt_epoch() && layer >= d->lo && layer < d->lo + d->L && d->on[layer - d->lo];
+    return d->on && !d->off && d->epoch == vkt_epoch() && layer >= d->lo && layer < d->lo + d->L && d->on[layer - d->lo] &&
+           !(d->big_step && d->rows_off && d->rows_off[layer - d->lo]);
 }
 /* Layer `layer` for n rows: route the logits lg (n rows of E from 0, bias as rt's
  * has_bias says) and run the experts on x (n rows of D from 0) into d->y. rt gives the
@@ -115,24 +144,31 @@ static int vkc_dmoe_on(const VkcDmoe *d, int layer) {
  * a, b), D and I; the rest is filled here. */
 static int vkc_dmoe_layer(VkcDmoe *d, int layer, int n, VkcBuf *lg, VkcBuf *bias, VkcBuf *x,
                           const VkcRoute *rt, const VkcMoe *mp) {
-    int i = layer - d->lo, io = i * VKC_DMOE_ROWS * d->K;
+    int i = layer - d->lo, io = i * d->cap * d->K;
     VkcRoute r = *rt;
     r.S = n; r.E = d->E; r.K = d->K; r.l_off = 0; r.l_row = d->E; r.i_off = io; r.i_row = d->K; r.w_off = 0; r.w_row = d->K;
     VkcMoe m = *mp;
     m.S = n; m.K = d->K; m.t_off = i * d->E; m.x_off = 0; m.x_row = mp->D; m.i_off = io; m.i_row = d->K;
     m.w_off = 0; m.w_row = d->K; m.y_off = 0; m.y_row = mp->D;
-    if (!m.gfmt && d->tabh) m.gfmt = (int)d->tabh[(size_t)i * d->E * COLI_VK_XB_ENTRY + 12];   /* the layer's gate/up format */
+    if (!m.gfmt && d->tabh) m.gfmt = vkc_dmoe_fmt(d, i, 12);   /* the layer's gate/up format */
+    if (n > VKC_DMOE_ROWS) {   /* a prompt chunk: the grouped GEMMs (vkc_dmoe_prepare checked the layer's formats) */
+        m.dfmt = vkc_dmoe_fmt(d, i, 15); m.E = d->E;
+        if (!vkc_route(lg, bias, d->rid, d->rwt, &r) || !vkc_moe_rows(x, d->rid, d->rwt, d->tab, &d->rows, d->y, &m)) return 0;
+        d->steps++; d->big_steps++;
+        return 1;
+    }
     if (!vkc_route(lg, bias, d->rid, d->rwt, &r) || !vkc_moe(x, d->rid, d->rwt, d->tab, d->hid, d->y, &m)) return 0;
     d->steps++;
     return 1;
 }
 /* Layer `layer`'s ids (n rows of K, rank order, -1 for an empty slot) once its frame is done. */
 static const int *vkc_dmoe_ids(const VkcDmoe *d, int layer) {
-    return (const int *)vkc_ptr(d->rid) + (size_t)(layer - d->lo) * VKC_DMOE_ROWS * d->K;
+    return (const int *)vkc_ptr(d->rid) + (size_t)(layer - d->lo) * d->cap * d->K;
 }
 static void vkc_dmoe_free(VkcDmoe *d) {
     vkc_free(d->tab); vkc_free(d->rid); vkc_free(d->rwt); vkc_free(d->hid); vkc_free(d->y);
-    free(d->on); free(d->tabh);
+    vkc_moe_rows_free(&d->rows);
+    free(d->on); free(d->tabh); free(d->rows_off);
     memset(d, 0, sizeof *d);
 }
 #endif
