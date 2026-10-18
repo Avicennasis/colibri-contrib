@@ -1900,7 +1900,11 @@ family_qwen_chain_sanitize() {
   csan qwen36 "asan chain qwen36 int4-g64 planar" COLI_DENSE_I8=0 SNAP=qwen36_tiny64_c ./qwen36 8 4 qwen36_tiny64/ref_full.json
   csan qwen36 "asan chain qwen36 dense model" COLI_DENSE_I8=0 SNAP=qwen38_27b_tiny_c ./qwen36 8 8 qwen38_27b_tiny/ref_full.json
   qwen36_gguf_tiny
-  csan qwen36 "asan chain qwen36 GGUF" GQ_EXACT=1 SNAP=qwen36_gguf_tiny ./qwen36 1 8 qwen36_gguf_tiny/ref.json
+  # the block formats' tiled GEMM stays out of the sanitized run: llvmpipe builds a shader
+  # at its first launch, inside the frame's wait, and five of them under ASan outlasted its
+  # five minutes (the unsanitized family runs them)
+  csan qwen36 "asan chain qwen36 GGUF" GQ_EXACT=1 COLI_VK_CHAIN_GEMM_BD=0 COLI_VK_TIER_GEMM_BD=0 SNAP=qwen36_gguf_tiny \
+    ./qwen36 1 8 qwen36_gguf_tiny/ref.json
   csan qwen38 "asan chain qwen38 batch=0" Q38_PREFILL_BATCH=0 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json
   csan qwen38 "asan chain qwen38 int8 trunk, chunks of 3" Q38_TRUNK_MIN_KB=0 COLI_VK_CHAIN_ROWS=3 SNAP=qwen38_tiny ./qwen38 4 8 qwen38_tiny/ref.json
   csan qwen38 "asan chain qwen38 MTP reject" Q38_MTP=1 Q38_MTP_FORCE=reject SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
