@@ -1,4 +1,6 @@
 #include "backend_cuda.h"
+#define COLI_CUDA_CHAIN_NO_WRAPPERS
+#include "cuda_chain.h"   /* CcExpert, CcMoe: the chain's routed experts (coli_cuda_moe_async) */
 #include "fp8_format.h"   /* FP8_BLOCK: the shared fmt=8 scale-block edge (see that header) */
 
 #include "backend_gpu_compat.h"
@@ -2921,6 +2923,174 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
         quant_matmul<<<grid, 256, 0, st>>>(y_dev, x_dev, t->weights, t->scales, t->fmt, S, t->I, t->O,
                                             row_bytes(t->fmt, t->I), t->gs, t->ng);
     return cuda_ok(cudaGetLastError(), "chain gemm launch");
+}
+
+/* A resident tensor's device copy for the dense chain's routed experts (cuda_chain.cu's
+ * table of CcExpert): its weights, its scales and the scales' group size (fmt 4). */
+extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs) {
+    if (!t || !t->weights) return 0;
+    if (w) *w = t->weights;
+    if (sc) *sc = t->scales;
+    if (gs) *gs = t->gs;
+    return 1;
+}
+
+/* The dense chain's routed experts (cuda_chain.cu: cc_moe; cuda_chain.h: CcMoe): every
+ * (row, slot) pair of a decode step whose expert the table holds, gate and up, then down,
+ * each a warp per output row (MOE_RPW rows a warp, eight warps a block, the pair's input
+ * row in shared memory, a shuffle reduction), then each row's sum in rank order. The
+ * formats are the CUDA tier's: 1 int8 rows and 2 int4 rows (a scale per row), 4 int4
+ * with a scale per gs inputs (gs a multiple of 16: a lane's 16 weights sit in one
+ * group), 8 fp8-e4m3 with a scale per 128 x 128 block (a warp's 128 weights a step sit
+ * in one), its values from a shared copy of c_e4m3. The sums are the CPU's up to the
+ * order of the float additions. */
+#define MOE_RPW 2
+#define MOE_ROWS (8 * MOE_RPW)
+#define MOE_DIM_MAX CC_MOE_DIM_MAX
+/* row o's dot with xs (n inputs), this lane's share; FMT 2/4 scaled by group here, 1/2/8
+ * by row or block where noted */
+template<int FMT>
+__device__ __forceinline__ float moe_lane_dot(const uint8_t *__restrict__ row, const float *__restrict__ sc, int gs, int ng,
+                                              int o, int n, const float *xs, const float *slut) {
+    int lane = threadIdx.x & 31;
+    float acc = 0.f;
+    if (FMT == 1) {
+        for (int i0 = lane * 16; i0 < n; i0 += 512) {
+            int4 v = *reinterpret_cast<const int4 *>(row + i0);
+            const int8_t *b = reinterpret_cast<const int8_t *>(&v);
+            #pragma unroll
+            for (int k = 0; k < 16; k++) acc += xs[i0 + k] * (float)b[k];
+        }
+    } else if (FMT == 2 || FMT == 4) {
+        for (int i0 = lane * 16; i0 < n; i0 += 512) {
+            uint2 v = *reinterpret_cast<const uint2 *>(row + i0 / 2);
+            float part = 0.f;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                unsigned bb = ((k < 4 ? v.x : v.y) >> (8 * (k & 3))) & 255u;
+                int lo = (int)(bb & 15u), hi = (int)(bb >> 4);
+                part += xs[i0 + 2 * k] * (float)(lo & 8 ? lo - 16 : lo) + xs[i0 + 2 * k + 1] * (float)(hi & 8 ? hi - 16 : hi);
+            }
+            acc += FMT == 4 ? part * sc[(size_t)o * ng + i0 / gs] : part;
+        }
+    } else if (FMT == 8) {
+        int nb = (n + 127) >> 7;
+        for (int b0 = 0; b0 < n; b0 += 128) {
+            int i0 = b0 + lane * 4;
+            float part = 0.f;
+            if (i0 < n) {
+                uchar4 q = *reinterpret_cast<const uchar4 *>(row + i0);
+                part = xs[i0] * slut[q.x] + xs[i0 + 1] * slut[q.y] + xs[i0 + 2] * slut[q.z] + xs[i0 + 3] * slut[q.w];
+            }
+            acc += part * sc[(size_t)(o >> 7) * nb + (b0 >> 7)];
+        }
+    }
+    return acc;
+}
+__device__ __forceinline__ float moe_warp_sum(float v) {
+    for (int off = 16; off > 0; off >>= 1) v += f8_shfl_down(v, off);
+    return v;
+}
+template<int FMT>
+__device__ __forceinline__ size_t moe_row_bytes(int n) { return FMT == 2 || FMT == 4 ? (size_t)n / 2 : (size_t)n; }
+
+/* gate and up for pair a = blockIdx.y (row a / K, slot a % K): hid[a][o] = silu(g) * u */
+template<int FMT>
+__global__ static void __launch_bounds__(256) moe_gu_k(const CcExpert *__restrict__ tab, const float *__restrict__ x,
+        const int *__restrict__ ids, float *__restrict__ hid, CcMoe p) {
+    extern __shared__ float sm[];
+    int a = blockIdx.y, s = a / p.K, k = a - s * p.K;
+    int e = ids[p.i_off + s * p.i_row + k];
+    if (e < 0) return;
+    CcExpert ex = tab[p.t_off + e];
+    if (!ex.g) return;
+    float *xs = sm, *slut = sm + p.D;
+    for (int i = threadIdx.x; i < p.D; i += 256) xs[i] = x[p.x_off + (size_t)s * p.x_row + i];
+    if (FMT == 8) slut[threadIdx.x] = c_e4m3[threadIdx.x];
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, ng = FMT == 4 ? (p.D + p.gs - 1) / p.gs : 1;
+    size_t rb = moe_row_bytes<FMT>(p.D);
+    for (int r = 0; r < MOE_RPW; r++) {
+        int o = blockIdx.x * MOE_ROWS + r * 8 + warp;
+        if (o >= p.I) break;
+        float g = moe_warp_sum(moe_lane_dot<FMT>((const uint8_t *)ex.g + o * rb, ex.gs, p.gs, ng, o, p.D, xs, slut));
+        float u = moe_warp_sum(moe_lane_dot<FMT>((const uint8_t *)ex.u + o * rb, ex.us, p.gs, ng, o, p.D, xs, slut));
+        if (lane == 0) {
+            if (FMT == 1 || FMT == 2) { g *= ex.gs[o]; u *= ex.us[o]; }
+            hid[(size_t)a * p.I + o] = (g / (1.f + expf(-g))) * u;
+        }
+    }
+}
+/* down for pair a: hid[S*K + a][o] (D outputs) from hid[a] (I inputs) */
+template<int FMT>
+__global__ static void __launch_bounds__(256) moe_dn_k(const CcExpert *__restrict__ tab, const int *__restrict__ ids,
+        float *__restrict__ hid, CcMoe p) {
+    extern __shared__ float sm[];
+    int a = blockIdx.y, s = a / p.K, k = a - s * p.K;
+    int e = ids[p.i_off + s * p.i_row + k];
+    if (e < 0) return;
+    CcExpert ex = tab[p.t_off + e];
+    if (!ex.g) return;
+    float *xs = sm, *slut = sm + p.I;
+    for (int i = threadIdx.x; i < p.I; i += 256) xs[i] = hid[(size_t)a * p.I + i];
+    if (FMT == 8) slut[threadIdx.x] = c_e4m3[threadIdx.x];
+    __syncthreads();
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, ng = FMT == 4 ? (p.I + p.gs - 1) / p.gs : 1;
+    size_t rb = moe_row_bytes<FMT>(p.I), dn = (size_t)p.S * p.K * p.I;
+    for (int r = 0; r < MOE_RPW; r++) {
+        int o = blockIdx.x * MOE_ROWS + r * 8 + warp;
+        if (o >= p.D) break;
+        float v = moe_warp_sum(moe_lane_dot<FMT>((const uint8_t *)ex.d + o * rb, ex.ds, p.gs, ng, o, p.I, xs, slut));
+        if (lane == 0) {
+            if (FMT == 1 || FMT == 2) v *= ex.ds[o];
+            hid[dn + (size_t)a * p.D + o] = v;
+        }
+    }
+}
+/* y[s] = the host's row (or 0), then each held slot's w * down, in rank order */
+__global__ static void moe_sum_k(const CcExpert *__restrict__ tab, const int *__restrict__ ids, const float *__restrict__ w,
+        const float *__restrict__ hid, const float *__restrict__ hy, float *__restrict__ y, CcMoe p) {
+    int s = blockIdx.y, d = blockIdx.x * 256 + threadIdx.x;
+    if (d >= p.D) return;
+    size_t dn = (size_t)p.S * p.K * p.I;
+    float v = p.h_off >= 0 ? hy[p.h_off + (size_t)s * p.D + d] : 0.f;
+    for (int k = 0; k < p.K; k++) {
+        int e = ids[p.i_off + s * p.i_row + k];
+        if (e < 0 || !tab[p.t_off + e].g) continue;
+        v += w[p.w_off + s * p.w_row + k] * hid[dn + (size_t)(s * p.K + k) * p.D + d];
+    }
+    y[p.y_off + (size_t)s * p.y_row + d] = v;
+}
+template<int FMT>
+static int moe_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, const CcMoe *p, cudaStream_t st) {
+    size_t sg = ((size_t)p->D + (FMT == 8 ? 256 : 0)) * sizeof(float), sd = ((size_t)p->I + (FMT == 8 ? 256 : 0)) * sizeof(float);
+    dim3 gg((unsigned)((p->I + MOE_ROWS - 1) / MOE_ROWS), (unsigned)(p->S * p->K)), gd((unsigned)((p->D + MOE_ROWS - 1) / MOE_ROWS), (unsigned)(p->S * p->K));
+    moe_gu_k<FMT><<<gg, 256, sg, st>>>(tab, x, ids, hid, *p);
+    moe_dn_k<FMT><<<gd, 256, sd, st>>>(tab, ids, hid, *p);
+    return cuda_ok(cudaGetLastError(), "chain moe launch");
+}
+extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
+                                   float *hid, float *y, const float *hy, const CcMoe *p, void *stream) {
+    if (fault_injected()) return 0;
+    if (!tab || !ids || !hid || !p || p->S < 1 || p->K < 1 || p->D < 32 || p->I < 32 || p->D % 32 || p->I % 32 || p->act) return 0;
+    if (p->fmt == 4 && (p->gs < 16 || p->gs % 16)) return 0;
+    if (p->fmt != 1 && p->fmt != 2 && p->fmt != 4 && p->fmt != 8) return 0;
+    if (p->D > MOE_DIM_MAX || p->I > MOE_DIM_MAX) return 0;   /* an input row in 48 KiB of shared memory, the fp8 table beside it */
+    DeviceContext *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+    cudaStream_t st = (cudaStream_t)stream;
+    if (p->parts & 1) {
+        if (!x) return 0;
+        int ok = p->fmt == 1 ? moe_launch<1>(tab, x, ids, hid, p, st) : p->fmt == 2 ? moe_launch<2>(tab, x, ids, hid, p, st)
+               : p->fmt == 4 ? moe_launch<4>(tab, x, ids, hid, p, st) : moe_launch<8>(tab, x, ids, hid, p, st);
+        if (!ok) return 0;
+    }
+    if (p->parts & 2) {
+        if (!w || !y || (p->h_off >= 0 && !hy)) return 0;
+        moe_sum_k<<<dim3((unsigned)((p->D + 255) / 256), (unsigned)p->S), 256, 0, st>>>(tab, ids, w, hid, hy, y, *p);
+        if (!cuda_ok(cudaGetLastError(), "chain moe sum launch")) return 0;
+    }
+    return 1;
 }
 
 /* ==== resident-pipeline primitives (Inc.0, 2026-07-13) ====

@@ -5125,7 +5125,7 @@ static void trunk_offer_dense(Model *m){
      * (docs/qwen36-cuda-tier.md). A hand-written COLI_PLACE naming shexp is
      * still obeyed when the offer is made. */
     { const char *so = getenv("Q36_OFFER_SHEXP"), *cc = getenv("COLI_CUDA_CHAIN");   /* the chain runs it on the device, beside the host's experts */
-      if ((so && *so == '1') || (cc && *cc == '1'))
+      if ((so && *so == '1') || !(cc && *cc == '0'))
         for (int i = 0; i < c->n_layers; i++) {
             Layer *l = &m->L[i];
             size_t bg = qdw_bytes(&l->sh_g), bu = qdw_bytes(&l->sh_u), bd = qdw_bytes(&l->sh_d);
@@ -7809,7 +7809,7 @@ int main(int argc, char **argv) {
          * the device (qt_dn_gpu_step). Measured motivation: with the trunk in
          * VRAM the CPU still spent ~8 of 39 ms/token on these steps -- not
          * arithmetic, host round trips, thirty per token. */
-        /* COLI_CUDA_CHAIN=1: every layer on the device as one chain (qwen36_cuda_chain.h),
+        /* the CUDA chain (on unless COLI_CUDA_CHAIN=0): every layer on the device as one chain (qwen36_cuda_chain.h),
          * set up here, after the tier placed the trunk; it owns the DeltaNet state, so the
          * per-layer step below is not set up beside it. */
         int chain_up = 0;

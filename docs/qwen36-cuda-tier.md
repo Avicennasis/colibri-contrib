@@ -322,7 +322,7 @@ cards would keep the MoE gain without that price. Cold, two cards win either
 way (45.3 against 52.3 ms), since more experts are resident at once. For the
 record, Ollama 0.34.4 on the same pair shows the same shape: 38.1 tok/s on the
 3070 alone, 36.6-37.5 on both cards, 33.0 on the Quadro alone.
-## The dense chain on the card (`COLI_CUDA_CHAIN=1`)
+## The dense chain on the card (`COLI_CUDA_CHAIN`, on by default)
 
 With the trunk in VRAM and `Q36_DN_GPU=1`, a decode token still crossed the bus about
 seventy times: every attention projection (`qt_dense_matmul`: the input up, the kernel,
@@ -415,6 +415,56 @@ read at 120 GB/s. `gemv_i8_rows` (backend_cuda.cu: a warp per output row, 16 byt
 lane, the activation in shared memory) reads them at 330-418 GB/s, and the device's part
 of a token is 5.7 ms. What is left is the routed experts on the host (9.9 ms: the tier's
 groups and the CPU's share) and the routing, launches and forty waits (about 3 ms).
+
+### The routed experts in the frame (`COLI_CUDA_CHAIN_MOE`, on by default)
+
+The chain above still ended its frame at every MoE layer: the router's logits down, the
+host's routing, the tier's groups and the CPU's share, the sum back up. For a step of up
+to 8 rows (decode, a verify) the frame now routes and computes the experts itself, as
+the Vulkan chain does (docs/vulkan.md, "The routed experts in the frame"):
+
+- `cc_route` (`cuda_chain.cu`, the port of `chain_route.comp`): softmax, group-limited
+  top-k, renormalization, the lower expert on a tie, one block per row.
+- `cc_moe` (`backend_cuda.cu`: `moe_gu_k`, `moe_dn_k`, `moe_sum_k`): every (row, slot)
+  pair whose expert the table holds, gate and up, then down, a warp per output row, in
+  the tier's formats (1 int8 rows, 2 int4 rows, 4 int4 with a scale per 64, 8 fp8 with
+  its 128 x 128 block scales); then each row's sum in the tier's order (the host's
+  misses, then the device's slots in rank order).
+- The table: one `CcExpert` per expert of every layer, the device addresses of a
+  resident's weights and scales (`qt_chain_resident`, the table's `tensor_dev`), built
+  again when the tier's residency changed (`qt_chain_epoch`). The tier is held for the
+  forward (`qt_chain_hold`): an eviction clears the flag at once and moves the epoch, but
+  no swap writes into a resident's buffers until the forward is done.
+- A layer whose experts are all in the table has no host step. A layer with some
+  elsewhere (VRAM was short) signals the host once its routes and rows are down
+  (`cc_signal`: a one-thread kernel writes a word of host memory after a system fence).
+  The host computes the slots the table lacks as the tier's misses always were
+  (`qt_cpu_misses`: the RAM cache, the disk) while the device computes its own, writes
+  its rows into an UP buffer and its word; the device waits for the word (`cc_wait_host`)
+  before the sum. The host serves a layer after recording the next one, so the device
+  has that layer queued when the answer lands. A round trip costs about 8 us a layer.
+- The books the host's step kept (the tier's heat, hits and LFRU tick: `qt_chain_count`;
+  the resident collection; the hot-pin counts) follow from the ids after the frame, with
+  the K/V rows into the host's cache.
+
+It is off with cache routing or the agreement meter (their state crosses tokens on the
+host), a gate bias, more groups than the kernel keeps, or a tier on more than one card.
+`COLI_CUDA_CHAIN_MOE=0` keeps the host's step. The greedy text is the same either way.
+
+**Measured** (RTX PRO 4000 Blackwell 24 GB, i5-13500, Qwen3.6-35B-A3B int4-g64, two runs
+of `bench_stream.py` each, two rounds):
+
+| | decode tok/s | prefill tok/s |
+|---|---|---|
+| per matrix (`COLI_CUDA_CHAIN=0`) | 33.6-34.2 | 60 |
+| the chain, the host's step (`COLI_CUDA_CHAIN_MOE=0`) | 58.9-59.5 | 71 |
+| the chain, the experts in the frame (the default) | 85.3-86.0 | 71 |
+| the same, `CUDA_EXPERT_GB=8` (a third of the experts in VRAM) | 48.9-50.0 | 63 |
+| the host's step at `CUDA_EXPERT_GB=8` | 45.1-45.7 | 63 |
+
+With every expert in VRAM a decode token is the device's 10 ms. With a third of them,
+the CPU computes two thirds of the slots (about 10 ms a token) and the layer after waits
+for them: the hybrid step overlaps the device's experts with the host's, not the layers.
 
 ## The residents follow the prompt (`QT_PREFILL_REPLAN=1`)
 

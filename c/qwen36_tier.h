@@ -201,6 +201,25 @@ void qt_stats_mark(void);
 /* One telemetry block on stderr: residency, hits/misses, uploads per device. */
 void qt_stats(void);
 
+/* The dense chain's routed experts (the engines' *_cuda_chain.h: cc_route, cc_moe): the
+ * chain computes the residents on its device by address and the host the rest.
+ *   qt_chain_epoch     moves with every change of residency: the chain's table is stale
+ *   qt_chain_resident  expert eid of layer, resident on CUDA ordinal device: its tensors
+ *   qt_chain_hold      1 before a forward that reads the table, 0 after: no swap writes
+ *                      into a resident while one is held (an eviction clears the flag at
+ *                      once and moves the epoch, its buffers wait)
+ *   qt_chain_count     the books qt_issue keeps for K routed ids of one row (-1 skipped):
+ *                      the heat of the residents, hits and misses, the LFRU tick at layer 0
+ *   qt_chain_format    the residents' format as the backend holds them (1 int8, 2 int4,
+ *                      4 int4 per gs inputs, 8 fp8-e4m3) and gs
+ *   qt_chain_devices   the tier's device count */
+unsigned qt_chain_epoch(void);
+int  qt_chain_resident(int layer, int eid, int device, struct ColiCudaTensor **g, struct ColiCudaTensor **u, struct ColiCudaTensor **d);
+void qt_chain_hold(int on);
+void qt_chain_count(int layer, const int *eids, int K);
+int  qt_chain_format(int *fmt, int *gs);
+int  qt_chain_devices(void);
+
 #else /* !COLI_CUDA: inline stubs, engine stays CPU-only */
 
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
@@ -230,6 +249,13 @@ static inline void *qt_dense_tensor(int a,int*b){(void)a;(void)b;return NULL;}
 static inline void *qt_dnproj_tensor(int a,int*b){(void)a;(void)b;return NULL;}
 static inline void *qt_lmhead_tensor(int*b){(void)b;return NULL;}
 static inline int  qt_ready(void){return 0;}
+static inline unsigned qt_chain_epoch(void){return 0;}
+struct ColiCudaTensor;
+static inline int  qt_chain_resident(int a,int b,int c,struct ColiCudaTensor**g,struct ColiCudaTensor**u,struct ColiCudaTensor**d){(void)a;(void)b;(void)c;(void)g;(void)u;(void)d;return 0;}
+static inline void qt_chain_hold(int a){(void)a;}
+static inline void qt_chain_count(int a,const int*b,int c){(void)a;(void)b;(void)c;}
+static inline int  qt_chain_format(int*a,int*b){(void)a;(void)b;return 0;}
+static inline int  qt_chain_devices(void){return 0;}
 static inline int  qt_streaming(void){return 0;}
 static inline int  qt_experts_on(void){return 0;}
 static inline void qt_source_planar(int a){(void)a;}

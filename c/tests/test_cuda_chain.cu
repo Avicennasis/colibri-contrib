@@ -21,6 +21,8 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <thread>
+#include <atomic>
 
 static int fails;
 static void ck(int ok, const char *what) { if (ok) { printf("  ok   %s\n", what); return; } printf("  FAIL %s\n", what); fails++; }
@@ -211,6 +213,72 @@ static std::vector<float> down(CcBuf *b, size_t n) {
     return v;
 }
 static std::vector<float> rnd(size_t n, unsigned seed, float scale = 1.f) { std::vector<float> v(n); unsigned s = seed; for (auto &x : v) x = frand(&s) * scale; return v; }
+
+/* the router's pick (chain_route.comp's rules: the lower expert on a tie, groups by their two best) */
+static void ref_route(const float *l, const float *bias, int *ids, float *w, const CcRoute *p) {
+    std::vector<float> sc(p->E), pk(p->E);
+    for (int s = 0; s < p->S; s++) {
+        const float *lr = l + p->l_off + s * p->l_row;
+        auto lg = [&](int e) { float v = lr[e]; if (p->has_bias == 2) v += bias[p->b_off + e]; return v / p->temp; };
+        if (p->kind == 0) {
+            float m = -3.4e38f; for (int e = 0; e < p->E; e++) m = fmaxf(m, lg(e));
+            double sum = 0; for (int e = 0; e < p->E; e++) { sc[e] = expf(lg(e) - m); sum += sc[e]; }
+            for (int e = 0; e < p->E; e++) sc[e] = (float)(sc[e] / sum);
+        } else for (int e = 0; e < p->E; e++) { float v = lg(e); sc[e] = p->kind == 1 ? 1.f / (1.f + expf(-v)) : sqrtf(v > 20.f ? v : logf(1.f + expf(v))); }
+        for (int e = 0; e < p->E; e++) pk[e] = sc[e] + (p->has_bias == 1 ? bias[p->b_off + e] : 0.f);
+        if (p->n_group > 1) {
+            int per = p->E / p->n_group; std::vector<float> gv(p->n_group); std::vector<int> keep(p->n_group, 0);
+            for (int g = 0; g < p->n_group; g++) { float b1 = -3.4e38f, b2 = -3.4e38f; for (int e = g * per; e < g * per + per; e++) { if (pk[e] > b1) { b2 = b1; b1 = pk[e]; } else if (pk[e] > b2) b2 = pk[e]; } gv[g] = b1 + b2; }
+            for (int k = 0; k < p->topk_group; k++) { int bg = -1; float bv = -3.4e38f; for (int g = 0; g < p->n_group; g++) if (!keep[g] && gv[g] > bv) { bv = gv[g]; bg = g; } keep[bg] = 1; }
+            for (int e = 0; e < p->E; e++) if (!keep[e / per]) pk[e] = -3.4e38f;
+        }
+        std::vector<int> ch(p->K); float sum = 0;
+        for (int k = 0; k < p->K; k++) {
+            int be = -1; float bv = -3.4e38f;
+            for (int e = 0; e < p->E; e++) { int used = 0; for (int j = 0; j < k; j++) used |= ch[j] == e; if (!used && pk[e] > bv) { bv = pk[e]; be = e; } }
+            ch[k] = be; sum += be >= 0 ? sc[be] : 0.f;
+        }
+        float div = sum + p->norm_eps; int nrm = (p->norm == 1 || (p->norm == 2 && p->K > 1)) && div > 0.f;
+        for (int k = 0; k < p->K; k++) { float x = ch[k] >= 0 ? sc[ch[k]] : 0.f; if (nrm) x /= div; ids[p->i_off + s * p->i_row + k] = ch[k]; w[p->w_off + s * p->w_row + k] = x * p->scale; }
+    }
+}
+/* e4m3's values (quant.h's E4M3_LUT): sign, four exponent bits (bias 7), three mantissa bits */
+static float e4m3(int b) {
+    int sg = b & 0x80, ex = (b >> 3) & 15, m = b & 7;
+    float v = ex == 0 ? ldexpf((float)m / 8.f, -6) : (ex == 15 && m == 7) ? NAN : ldexpf(1.f + m / 8.f, ex - 7);
+    return sg ? -v : v;
+}
+/* one expert matrix [O][I] in a tier format, its values for the reference (dq) and the tensor */
+static ColiCudaTensor *moe_mat(int fmt, int gs, int I, int O, unsigned seed, std::vector<float> &dq) {
+    unsigned s = seed; dq.assign((size_t)O * I, 0.f);
+    ColiCudaTensor *t = NULL; int ok = 0;
+    if (fmt == 1) {
+        std::vector<int8_t> q((size_t)O * I); std::vector<float> sc(O);
+        for (int o = 0; o < O; o++) { sc[o] = 0.01f + 0.005f * frand(&s); for (int i = 0; i < I; i++) { q[(size_t)o * I + i] = (int8_t)(frand(&s) * 100); dq[(size_t)o * I + i] = q[(size_t)o * I + i] * sc[o]; } }
+        ok = coli_cuda_tensor_upload(&t, q.data(), sc.data(), 1, I, O, 0);
+    } else if (fmt == 2 || fmt == 4) {
+        int ng = fmt == 4 ? I / gs : 1;
+        std::vector<uint8_t> q((size_t)O * I / 2); std::vector<float> sc((size_t)O * ng);
+        for (auto &v : sc) v = 0.05f + 0.02f * frand(&s);
+        for (int o = 0; o < O; o++) for (int i = 0; i < I; i += 2) {
+            int a = (int)(frand(&s) * 7.9f), b = (int)(frand(&s) * 7.9f);
+            q[((size_t)o * I + i) / 2] = (uint8_t)((a + 8) | ((b + 8) << 4));   /* offset binary, the upload's form */
+            float sa = sc[(size_t)o * ng + (fmt == 4 ? i / gs : 0)], sb = sc[(size_t)o * ng + (fmt == 4 ? (i + 1) / gs : 0)];
+            dq[(size_t)o * I + i] = a * sa; dq[(size_t)o * I + i + 1] = b * sb;
+        }
+        ok = fmt == 4 ? coli_cuda_tensor_upload_g(&t, q.data(), sc.data(), 4, I, O, 0, gs) : coli_cuda_tensor_upload(&t, q.data(), sc.data(), 2, I, O, 0);
+    } else {
+        int nbI = (I + 127) / 128, nbO = (O + 127) / 128;
+        std::vector<uint8_t> q((size_t)O * I); std::vector<float> sc((size_t)nbO * nbI);
+        for (auto &v : sc) v = 0.004f + 0.002f * frand(&s);
+        for (int o = 0; o < O; o++) for (int i = 0; i < I; i++) {
+            int b; do { b = (int)((frand(&s) * 0.5f + 0.5f) * 255.f) & 255; } while ((b & 0x7f) == 0x7f || ((b >> 3) & 15) > 12);
+            q[(size_t)o * I + i] = (uint8_t)b; dq[(size_t)o * I + i] = e4m3(b) * sc[(size_t)(o / 128) * nbI + i / 128];
+        }
+        ok = coli_cuda_tensor_upload(&t, q.data(), sc.data(), 8, I, O, 0);
+    }
+    return ok ? t : NULL;
+}
 
 int main(void) {
     int dev = 0;
@@ -410,6 +478,124 @@ int main(void) {
         ck(T->begin() && T->ple(NULL, hb, NULL, NULL, gb, nb, cb, rb, &cv) && T->submit(1) &&
            maxdiff(down(hb, hyp.size()).data(), rh.data(), hyp.size()) < 1e-5 && maxdiff(down(rb, ring.size()).data(), rr.data(), ring.size()) < 1e-6, "the dilated convolution, the ring carried, the copy after row 1");
         T->free(kb); T->free(hb); T->free(vb); T->free(pb); T->free(gb); T->free(nb); T->free(cb); T->free(rb);
+    }
+    printf("route\n");
+    {
+        struct { int S, E, K, kind, has_bias, n_group, topk_group, norm; float temp, scale; const char *what; } cases[] = {
+            {3, 256, 8, 0, 0, 0, 0, 1, 1.f, 1.f, "softmax, top 8 of 256, normalized (Qwen3.6)"},
+            {2, 512, 10, 0, 0, 0, 0, 1, 1.f, 1.f, "softmax, top 10 of 512 (Qwen3.8)"},
+            {2, 64, 6, 1, 1, 8, 4, 1, 1.f, 2.5f, "sigmoid, a bias for the pick, 4 of 8 groups, scaled"},
+            {1, 100, 4, 2, 2, 0, 0, 2, 0.7f, 1.f, "sqrt(softplus), the bias in the logit, a temperature"},
+        };
+        for (auto &cs : cases) {
+            CcRoute p = {cs.S, cs.E, cs.K, cs.kind, 5, cs.E + 3, 2, cs.has_bias, 1, cs.K + 2, 3, cs.K + 1, cs.n_group, cs.topk_group, cs.norm, cs.temp, cs.scale, 1e-20f};
+            std::vector<float> l = rnd((size_t)5 + cs.S * (cs.E + 3), 101 + cs.E, 4.f), b = rnd(cs.E + 2, 202, 0.5f);
+            std::vector<int> rid((size_t)1 + cs.S * (cs.K + 2), -7); std::vector<float> rw((size_t)3 + cs.S * (cs.K + 1), -7.f);
+            ref_route(l.data(), b.data(), rid.data(), rw.data(), &p);
+            CcBuf *lb = up(l), *bb = up(b), *ib = T->buf(rid.size() * 4, CC_DEV), *wb = T->buf(rw.size() * 4, CC_DEV);
+            int ok = T->begin() && T->route(lb, cs.has_bias ? bb : NULL, ib, wb, &p) && T->submit(1);
+            std::vector<int> gi(rid.size()); std::vector<float> gw = down(wb, rw.size());
+            T->read(ib, 0, gi.data(), gi.size() * 4);
+            int same = 1; double wd = 0;
+            for (int s = 0; s < cs.S; s++) for (int k = 0; k < cs.K; k++) {
+                same &= gi[1 + s * (cs.K + 2) + k] == rid[1 + s * (cs.K + 2) + k];
+                wd = fmax(wd, fabs(gw[3 + s * (cs.K + 1) + k] - rw[3 + s * (cs.K + 1) + k]));
+            }
+            if (!(ok && same && wd < 1e-6)) {
+                printf("  (route: ok %d, weights off by %.3g)\n", ok, wd);
+                for (int s = 0; s < cs.S; s++) for (int k = 0; k < cs.K; k++) {
+                    int a = gi[1 + s * (cs.K + 2) + k], b = rid[1 + s * (cs.K + 2) + k];
+                    if (a != b) printf("  (row %d slot %d: device %d, CPU %d, scores %.9g %.9g)\n", s, k, a, b, a >= 0 && a < cs.E ? l[5 + s * (cs.E + 3) + a] : 0.f, b >= 0 ? l[5 + s * (cs.E + 3) + b] : 0.f);
+                }
+            }
+            ck(ok && same && wd < 1e-6, cs.what);
+            T->free(lb); T->free(bb); T->free(ib); T->free(wb);
+        }
+    }
+    printf("moe\n");
+    {
+        { float lut[256]; for (int b = 0; b < 256; b++) lut[b] = e4m3(b); coli_cuda_fp8_set_lut(lut); }   /* fmt 8 uploads need it */
+        const int S = 2, K = 3, E = 6, D = 256, I = 128;
+        unsigned seed = 300;
+        for (int fmt : {1, 2, 4, 8}) {
+            int gs = fmt == 4 ? 64 : 0;
+            std::vector<std::vector<float>> G(E), U(E), Dn(E);
+            std::vector<ColiCudaTensor *> tg(E), tu(E), td(E);
+            std::vector<CcExpert> tab(E + 2);   /* the layer's entries start at t_off 2 */
+            int made = 1;
+            for (int e = 0; e < E; e++) {
+                tg[e] = moe_mat(fmt, gs, D, I, seed++, G[e]); tu[e] = moe_mat(fmt, gs, D, I, seed++, U[e]); td[e] = moe_mat(fmt, gs, I, D, seed++, Dn[e]);
+                made &= tg[e] && tu[e] && td[e];
+                CcExpert &x = tab[2 + e]; memset(&x, 0, sizeof x);
+                if (made) { T->tensor_dev(tg[e], &x.g, &x.gs, NULL); T->tensor_dev(tu[e], &x.u, &x.us, NULL); T->tensor_dev(td[e], &x.d, &x.ds, NULL); }
+            }
+            ck(made, fmt == 1 ? "int8 experts resident" : fmt == 2 ? "int4 experts resident" : fmt == 4 ? "int4 experts with a scale per 64 resident" : "fp8 experts resident");
+            if (!made) continue;
+            std::vector<float> x = rnd((size_t)S * D + 4, 400 + fmt), hy = rnd((size_t)S * D, 500 + fmt), w = {0.5f, 0.3f, 0.2f, 0.7f, 0.2f, 0.1f};
+            std::vector<int> ids = {4, 1, -1, 0, 5, 2};   /* row 0's last slot empty */
+            /* experts 1 and 5 not on the device: the host's (its rows in hy) */
+            std::vector<CcExpert> part = tab; memset(&part[2 + 1], 0, sizeof(CcExpert)); memset(&part[2 + 5], 0, sizeof(CcExpert));
+            auto expert = [&](int e, const float *xr, std::vector<float> &out) {
+                std::vector<float> h(I); out.assign(D, 0.f);
+                for (int o = 0; o < I; o++) { double g = 0, u = 0; for (int i = 0; i < D; i++) { g += xr[i] * G[e][(size_t)o * D + i]; u += xr[i] * U[e][(size_t)o * D + i]; } h[o] = (float)(g / (1 + exp(-g)) * u); }
+                for (int o = 0; o < D; o++) { double v = 0; for (int i = 0; i < I; i++) v += h[i] * Dn[e][(size_t)o * I + i]; out[o] = (float)v; }
+            };
+            std::vector<float> ref_full((size_t)S * D, 0.f), ref_part((size_t)S * D, 0.f), ye;
+            for (int s = 0; s < S; s++) {
+                for (int d = 0; d < D; d++) ref_part[(size_t)s * D + d] = hy[(size_t)s * D + d];
+                for (int k = 0; k < K; k++) {
+                    int e = ids[s * K + k]; if (e < 0) continue;
+                    expert(e, x.data() + 4 + (size_t)s * D, ye);
+                    for (int d = 0; d < D; d++) { ref_full[(size_t)s * D + d] += w[s * K + k] * ye[d]; if (e != 1 && e != 5) ref_part[(size_t)s * D + d] += w[s * K + k] * ye[d]; }
+                }
+            }
+            CcBuf *tb = T->buf(tab.size() * sizeof(CcExpert), CC_DEV), *pb = T->buf(part.size() * sizeof(CcExpert), CC_DEV);
+            CcBuf *xb = up(x), *ib = T->buf(ids.size() * 4, CC_DEV), *wb = up(w), *hb = T->buf((size_t)S * K * (I + D) * 4, CC_DEV);
+            CcBuf *yb = T->buf(((size_t)S * D + 8) * 4, CC_DEV), *hyb = up(hy, CC_UP);
+            int ok = tb && pb && T->begin() && T->write(tb, 0, tab.data(), tab.size() * sizeof(CcExpert)) && T->write(pb, 0, part.data(), part.size() * sizeof(CcExpert)) &&
+                     T->write(ib, 0, ids.data(), ids.size() * 4) && T->submit(1);
+            CcMoe m = {S, K, D, I, fmt, gs, 0, 3, 2, 4, D, 0, K, 0, K, 8, D, -1};
+            ok = ok && T->begin() && T->moe(tb, xb, ib, wb, hb, yb, NULL, &m) && T->submit(1);
+            std::vector<float> y = down(yb, (size_t)S * D + 8);
+            double scale = 0; for (float v : ref_full) scale = fmax(scale, fabs(v));
+            ck(ok && maxdiff(y.data() + 8, ref_full.data(), (size_t)S * D) < 2e-5 * scale + 1e-6, "every slot on the device, rank order, an empty slot");
+            CcMoe m1 = m; m1.parts = 1; CcMoe m2 = m; m2.parts = 2; m2.h_off = 0;
+            ok = T->begin() && T->moe(pb, xb, ib, wb, hb, yb, hyb, &m1) && T->submit(0) && T->begin() && T->moe(pb, xb, ib, wb, hb, yb, hyb, &m2) && T->submit(1);
+            y = down(yb, (size_t)S * D + 8);
+            ck(ok && maxdiff(y.data() + 8, ref_part.data(), (size_t)S * D) < 2e-5 * scale + 1e-6, "two of the table's experts the host's: its rows plus the device's slots");
+            for (int e = 0; e < E; e++) { coli_cuda_tensor_free(tg[e]); coli_cuda_tensor_free(tu[e]); coli_cuda_tensor_free(td[e]); }
+            T->free(tb); T->free(pb); T->free(xb); T->free(ib); T->free(wb); T->free(hb); T->free(yb); T->free(hyb);
+        }
+    }
+    printf("signal, wait_host\n");
+    {
+        /* a hybrid step's shape: the device signals, the host answers in an UP buffer and
+         * its word, the device's next op reads the answer; eight rounds in one frame */
+        /* (the answer copied UP -> DEV: a copy between two host buffers is the runtime's on the
+         * host, after the stream's earlier work, which here waits for the host) */
+        CcBuf *df = T->buf(64, CC_DOWN), *hf = T->buf(64, CC_UP), *ans = T->buf(64 * 4, CC_UP), *dst = T->buf(8 * 64 * 4, CC_DEV);
+        volatile unsigned *dw = (volatile unsigned *)T->ptr(df), *hw = (volatile unsigned *)T->ptr(hf);
+        float *aw = (float *)T->ptr(ans);
+        int ok = df && hf && ans && dst && T->begin();
+        for (int r = 0; r < 8 && ok; r++) ok = T->signal(df, 3, 100 + r) && T->wait_host(hf, 5, 100 + r) && T->copy(dst, (size_t)r * 64, ans, 0, 64);
+        ok = ok && T->submit(0);
+        std::thread host([&] {
+            for (int r = 0; r < 8; r++) {
+                while (dw[3] < (unsigned)(100 + r)) { }
+                for (int i = 0; i < 64; i++) aw[i] = (float)(r * 1000 + i);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                hw[5] = 100 + r;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                /* the copy has read the answer once the next round's signal is seen (or the frame ends) */
+                if (r < 7) while (dw[3] < (unsigned)(101 + r)) { }
+            }
+        });
+        ok = ok && T->finish();
+        host.join();
+        std::vector<float> gotv = down(dst, 8 * 64); const float *got = gotv.data(); int same = 1;
+        for (int r = 0; r < 8; r++) for (int i = 0; i < 64; i++) same &= got[r * 64 + i] == (float)(r * 1000 + i);
+        ck(ok && same, "eight rounds: each answer read after its word, before the next");
+        T->free(df); T->free(hf); T->free(ans); T->free(dst);
     }
     printf("lost\n");
     {

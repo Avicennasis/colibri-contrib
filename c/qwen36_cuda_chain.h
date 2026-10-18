@@ -1,6 +1,6 @@
 /* qwen36_cuda_chain.h -- Qwen3.6's layers as a dense chain on a CUDA device (cuda_chain.h).
  * Included once by qwen36.c in a COLI_CUDA build, after the CPU forward it stands in
- * for; COLI_CUDA_CHAIN=1 asks for it (q36cc_setup decides, at startup, after the tier
+ * for; on unless COLI_CUDA_CHAIN=0 (q36cc_setup decides, at startup, after the tier
  * placed the trunk). The CUDA twin of qwen36_chain.h: the same frames, the same
  * crossings, the same state contract, so the engine wires both chains the same way.
  *
@@ -25,7 +25,7 @@
  *
  * The matrices are the tier's resident copies (qt_dense_tensor and friends): the
  * chain needs every projection of every layer, the shared expert's three matrices
- * and lm_head on ONE device, so COLI_CUDA_CHAIN=1 also offers the shared expert to
+ * and lm_head on ONE device, so the chain (on unless COLI_CUDA_CHAIN=0) also offers the shared expert to
  * the placer (Q36_OFFER_SHEXP's effect) and declines, naming the first matrix on the
  * CPU, when the placement left anything behind (COLI_PLACE=auto on an 8 GB card
  * takes the whole 35B trunk). It uploads itself the router's matrix, the DeltaNet b|a
@@ -70,14 +70,28 @@ typedef struct {
     CcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkvz, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin;
     CcBuf *h2d, *lgd, *kvd, *outd, *xd, *lfd, *routed, *cs;
     float *host_routed;
+    /* the routed experts in the frame (q36cc_dm_*): the tier's residents on this device by
+     * address ([L][E] entries, the host's copy of who is in it, the layers with some expert
+     * elsewhere), the routes ([L][rows][K], on the device and down), the experts' rows,
+     * their sum, and a hybrid layer's host rows and words */
+    int dm_on, dm_fmt, dm_gs, dm_read, dm_held;
+    unsigned dm_epoch, dm_seq;
+    CcExpert *dm_host; uint8_t *dm_res; int *dm_part;
+    CcBuf *dm_tab, *dm_ids, *dm_w, *dm_idsd, *dm_wd, *dm_hid, *dm_y, *dm_hy, *dm_dfl, *dm_hfl;
+    float *dm_g, *dm_u, *dm_hh;
+    unsigned long long dm_steps, dm_hyb, dm_pairs;   /* layer steps in the frame, the hybrid ones, slots the host computed */
+    double dm_host_ms, dm_spin_ms;
     unsigned long long forwards, frames, fault_at, dec_n;   /* dec_n: one-row forwards (decode tokens) */
     double wait_ms, host_ms, dec_wait_ms, dec_host_ms;      /* and their shares of the waits and the host's experts */
 } Q36CChain;
 
 static int g_cuda_chain = 0;     /* COLI_CUDA_CHAIN asked for it and the chain is up */
 static Q36CChain *q36cc_of(Model *m) { return (Q36CChain *)m->cchain; }
+static int q36cc_dm_able(Q36CChain *ch, Model *m);
 
-static int q36cc_env_on(void) { const char *e = getenv("COLI_CUDA_CHAIN"); return e && *e == '1'; }
+/* on unless COLI_CUDA_CHAIN=0: the chain took 34 -> 59 tok/s of decode on Qwen3.6-35B int4-g64, 85 with its
+ * routed experts in the frame (an RTX PRO 4000); q36cc_setup declines where it cannot run */
+static int q36cc_env_on(void) { const char *e = getenv("COLI_CUDA_CHAIN"); return !(e && *e == '0'); }
 static int q36cc_rows_env(void) {
     const char *e = getenv("COLI_CUDA_CHAIN_ROWS");
     int r = e && *e ? atoi(e) : 256;
@@ -292,6 +306,9 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     ch->dn_where = Q36CC_HOST; ch->host_zero = 0;
     { const char *e = getenv("COLI_CUDA_CHAIN_FAULT"); ch->fault_at = e && *e ? strtoull(e, NULL, 10) : 0; }
     ch->ok = 1;
+    ch->dm_on = q36cc_dm_able(ch, m);
+    if (ch->dm_on) fprintf(stderr, "[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, "
+                                   "format %d, group %d; COLI_CUDA_CHAIN_MOE=0: the host's step)\n", ch->dm_fmt, ch->dm_gs);
     fprintf(stderr, "[chain] qwen36: %d layers on CUDA device %d (%d attention), lm_head too; %.1f MiB of parameters, "
                     "%.1f MiB of router, b|a and gate rows, %.0f MB of DeltaNet state\n",
             L, ch->dev, ch->n_attn, np * 4 / 1048576.0, own / 1048576.0,
@@ -502,17 +519,156 @@ static int q36cc_shared(Q36CChain *ch, Model *m, Layer *l, int i, int n) {
     return ok;
 }
 /* x += routed + gate * shared, as moe() leaves `out` and layers_forward_range adds it */
-static int q36cc_combine(Q36CChain *ch, Model *m, int i, int n) {
+static int q36cc_combine(Q36CChain *ch, Model *m, int i, int n, CcBuf *routed) {
     Cfg *c = &m->c;
     int flags = (c->n_experts > 0 ? 1 : 0) | (c->shared_inter > 0 ? 2 : 0) | (m->L[i].sh_gate && c->shared_inter > 0 ? 4 : 0);
     CcEw p = {CC_EW_COMBINE, n * c->hidden, c->hidden, 1, flags, 1, 0, 0, 0, 0, 0, 1.f};
-    return cc_ew(ch->x, ch->x, ch->routed, ch->ds, ch->sgd, &p);
+    return cc_ew(ch->x, ch->x, routed, ch->ds, ch->sgd, &p);
 }
 /* COLI_CUDA_CHAIN_FAULT=n: the n-th frame fails (for the tests) */
 static int q36cc_frame_begin(Q36CChain *ch) {
     ch->frames++;
     if (ch->fault_at && ch->frames == ch->fault_at) { fprintf(stderr, "[chain] qwen36: fault injected at frame %llu\n", ch->frames); return 0; }
     return cc_begin();
+}
+
+/* ---- the routed experts in the frame (cuda_chain.h: cc_route, cc_moe) -----------------
+ * A step of up to Q36CC_DM_ROWS rows (decode, a verify) routes on the device and runs the
+ * tier's residents on the chain's device there, by address from a table of the tier's
+ * tensors: built again when the tier's epoch moved, the tier held for the forward (no
+ * swap writes into a resident while it runs). A layer whose experts are all in the table
+ * has no host step at all. A layer with some elsewhere (hybrid) signals the host once its
+ * routes and rows are down; the host computes the slots the table lacks as the tier's
+ * misses always were (qt_cpu_misses: the RAM cache, the disk) while the device computes
+ * the rest, and answers in an UP buffer the device waits for before the sum (the host's
+ * misses, then the device's slots in rank order: qt_take's order). The host serves a
+ * hybrid layer after recording the next one, so the device has that layer queued when the
+ * answer lands. The books the host's step kept (the tier's heat, hits and LFRU tick, the
+ * resident collection, the hot-pin counts) follow from the ids after the frame, with the
+ * K/V rows. Off with cache routing or the agreement meter, a gate bias, groups the kernel
+ * does not keep, a tier on more than one device, a format the kernels do not take, or
+ * COLI_CUDA_CHAIN_MOE=0. */
+#define Q36CC_DM_ROWS 8
+static int q36cc_dm_wanted(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_CHAIN_MOE"); on = !(e && *e == '0'); }
+    return on;
+}
+static int q36cc_dm_able(Q36CChain *ch, Model *m) {
+    Cfg *c = &m->c; int E = c->n_experts, K = c->topk, ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1;
+    if (!q36cc_dm_wanted() || !cc_moe_ready() || E <= 0 || E > CC_ROUTE_EMAX || K < 1 || K > 32 || g_cache_route || g_route_agree ||
+        c->has_bias || !qt_experts_on() || qt_chain_devices() != 1) return 0;
+    if (ng > 1 && (ng > 64 || E % ng || c->topk_group < 1 || c->topk_group > ng)) return 0;
+    if (!qt_chain_format(&ch->dm_fmt, &ch->dm_gs)) return 0;
+    if (c->hidden % 32 || c->inter % 32 || c->hidden > CC_MOE_DIM_MAX || c->inter > CC_MOE_DIM_MAX ||
+        (ch->dm_fmt == 4 && (ch->dm_gs < 16 || ch->dm_gs % 16))) return 0;
+    return 1;
+}
+static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
+    Cfg *c = &m->c; int kvo = c->kv_heads * c->k_head_dim;
+    if (!c->is_attn[i]) return;
+    const float *kv = (const float *)cc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
+    for (int s = 0; s < n; s++) for (int h = 0; h < c->kv_heads; h++) {
+        size_t dst = ((size_t)h * m->max_t + pb + s) * c->k_head_dim, src = (size_t)s * kvo + (size_t)h * c->k_head_dim;
+        memcpy(m->K[i] + dst, kv + src, c->k_head_dim * sizeof(float));
+        memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
+    }
+}
+/* the step's buffers, and the table when the tier's residents moved (the tier held) */
+static int q36cc_dm_begin(Q36CChain *ch, Model *m) {
+    Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, K = c->topk, D = c->hidden, I = c->inter;
+    size_t r = (size_t)ch->rows, ne = (size_t)L * E, F = sizeof(float);
+    if (!ch->dm_host) {
+        ch->dm_host = malloc(ne * sizeof(CcExpert)); ch->dm_res = calloc(ne, 1); ch->dm_part = calloc(L, sizeof(int));
+        ch->dm_g = falloc(I); ch->dm_u = falloc(I); ch->dm_hh = falloc(D);
+        if (!ch->dm_host || !ch->dm_res || !ch->dm_part) return 0;
+    }
+    if (!cc_reserve(&ch->dm_ids, (size_t)L * r * K * 4, CC_DEV) || !cc_reserve(&ch->dm_w, (size_t)L * r * K * F, CC_DEV) ||
+        !cc_reserve(&ch->dm_idsd, (size_t)L * r * K * 4, CC_DOWN) || !cc_reserve(&ch->dm_wd, (size_t)L * r * K * F, CC_DOWN) ||
+        !cc_reserve(&ch->dm_hid, r * K * (size_t)(I + D) * F, CC_DEV) || !cc_reserve(&ch->dm_y, r * D * F, CC_DEV) ||
+        !cc_reserve(&ch->dm_hy, r * D * F, CC_UP) || !cc_reserve(&ch->dm_dfl, 64, CC_DOWN) || !cc_reserve(&ch->dm_hfl, 64, CC_UP) ||
+        !cc_reserve(&ch->dm_tab, ne * sizeof(CcExpert), CC_DEV)) return 0;
+    if (!ch->dm_held) { qt_chain_hold(1); ch->dm_held = 1; }
+    unsigned ep = qt_chain_epoch();
+    if (ch->dm_read && ep == ch->dm_epoch) return 1;
+    for (int i = 0; i < L; i++) {
+        int miss = 0;
+        for (int e = 0; e < E; e++) {
+            CcExpert *x = &ch->dm_host[(size_t)i * E + e];
+            ColiCudaTensor *g, *u, *d;
+            memset(x, 0, sizeof *x);
+            int on = qt_chain_resident(i, e, ch->dev, &g, &u, &d) && cc_tensor_dev(g, &x->g, &x->gs, NULL) &&
+                     cc_tensor_dev(u, &x->u, &x->us, NULL) && cc_tensor_dev(d, &x->d, &x->ds, NULL);
+            if (!on) memset(x, 0, sizeof *x);
+            ch->dm_res[(size_t)i * E + e] = (uint8_t)on; miss |= !on;
+        }
+        ch->dm_part[i] = miss;
+    }
+    if (!cc_begin() || !cc_write(ch->dm_tab, 0, ch->dm_host, ne * sizeof(CcExpert)) || !cc_submit(1)) return 0;
+    ch->dm_epoch = ep; ch->dm_read = 1;
+    return 1;
+}
+static void q36cc_dm_end(Q36CChain *ch) { if (ch->dm_held) { qt_chain_hold(0); ch->dm_held = 0; } }
+/* layer i's router, routing, shared expert and the device's experts; *v: the host's word
+ * a hybrid layer waits for (0: none) */
+static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsigned *v) {
+    Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
+    int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1, io = i * ch->rows * K;
+    CcRoute rp = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, ng, ng > 1 ? c->topk_group : 1, 1, 1.f, 1.f, 0.f};
+    CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1};
+    int ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp) &&
+             cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K);
+    *v = 0;
+    if (ok && ch->dm_part[i]) { *v = ++ch->dm_seq; ok = cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D) && cc_signal(ch->dm_dfl, 0, *v); }
+    ok = ok && q36cc_shared(ch, m, l, i, n) && cc_moe(ch->dm_tab, ch->h2, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
+    if (ok && *v) ok = cc_wait_host(ch->dm_hfl, 0, *v);
+    CcMoe ms = mp; ms.parts = 2; ms.h_off = *v ? 0 : -1;
+    ok = ok && cc_moe(ch->dm_tab, NULL, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, ch->dm_hy, &ms);
+    ch->dm_steps++;
+    return ok;
+}
+/* the host's share of hybrid layer i: once the device's word says its routes and rows are
+ * down, the slots the table lacks (the tier's misses), its rows up, its word */
+static int q36cc_dm_serve(Q36CChain *ch, Model *m, int i, int n, unsigned v) {
+    Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk;
+    volatile unsigned *dw = (volatile unsigned *)cc_ptr(ch->dm_dfl);
+    double t0 = tm_now();
+    for (unsigned long spin = 0; *dw < v; spin++)
+        if ((spin & 0xFFFFu) == 0 && (cc_lost() || tm_now() - t0 > 60e3)) {
+            fprintf(stderr, "[chain] qwen36: the device did not reach layer %d's routes in 60 s\n", i);
+            return 0;
+        }
+    double t1 = tm_now();
+    const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
+    const float *w = (const float *)cc_ptr(ch->dm_wd) + (size_t)i * ch->rows * K, *x = (const float *)cc_ptr(ch->h2d);
+    for (int s = 0; s < n; s++) {
+        uint32_t mask = 0; int any = 0;
+        for (int k = 0; k < K; k++) { int e = ids[s * K + k]; if (e < 0 || ch->dm_res[(size_t)i * E + e]) mask |= 1u << k; else { any = 1; ch->dm_pairs++; } }
+        float *o = ch->host_routed + (size_t)s * D;
+        memset(o, 0, (size_t)D * sizeof(float));
+        if (any) qt_cpu_misses(m, i, x + (size_t)s * D, ids + s * K, w + s * K, mask, o, ch->dm_g, ch->dm_u, ch->dm_hh);
+    }
+    memcpy(cc_ptr(ch->dm_hy), ch->host_routed, (size_t)n * D * sizeof(float));
+    __sync_synchronize();   /* the rows (write-combined memory) before the word */
+    ((volatile unsigned *)cc_ptr(ch->dm_hfl))[0] = v;
+    __sync_synchronize();
+    double t2 = tm_now();
+    ch->dm_hyb++; ch->dm_spin_ms += t1 - t0; ch->dm_host_ms += t2 - t1; ch->host_ms += t2 - t1;
+    return 1;
+}
+/* after the frame: every layer's books from its ids, and the K/V rows */
+static void q36cc_dm_books(Q36CChain *ch, Model *m, int n, int pb) {
+    Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, K = c->topk;
+    for (int i = 0; i < L; i++) {
+        q36cc_kv_down(ch, m, i, n, pb);
+        const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
+        for (int s = 0; s < n; s++) {
+            const int *idx = ids + s * K;
+            if (m->resident_collecting) for (int k = 0; k < K; k++) if (idx[k] >= 0) m->seen[(int64_t)i * E + idx[k]] = 1;
+            if (!m->hot_pinned && m->freq) for (int k = 0; k < K; k++) if (idx[k] >= 0) m->freq[(int64_t)i * E + idx[k]]++;
+            qt_chain_count(i, idx, K);
+        }
+    }
 }
 
 /* Every layer for S rows from host rows xh, the last nlogits rows' logits into `logit`;
@@ -560,13 +716,22 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 }
             }
         }
+        /* a decode-sized step: the routed experts in the frame (the table before the frame) */
+        int dm = E > 0 && ch->dm_on && n <= Q36CC_DM_ROWS;
+        if (dm && !q36cc_dm_begin(ch, m)) {
+            if (cc_lost()) goto lost;
+            fprintf(stderr, "[chain] qwen36: the routed experts' buffers or table refused; the host's step from here on\n");
+            q36cc_dm_end(ch); ch->dm_on = dm = 0;
+        }
         if (!q36cc_frame_begin(ch) || !cc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
             !q36cc_push_state(ch, m, pb)) goto lost;
-        int ok = 1, pending = 0;
+        int ok = 1, pending = 0, pend_i = -1;   /* pend_i: the hybrid layer the host serves after recording the next */
+        unsigned pend_v = 0;
+        CcBuf *routed = ch->routed;              /* where the layer before left its routed sum */
         for (int i = 0; i < L && ok; i++) {
             Layer *l = &m->L[i];
             if (pending) {
-                ok = q36cc_combine(ch, m, i - 1, n);
+                ok = q36cc_combine(ch, m, i - 1, n, routed);
                 if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(i - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
             }
             ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps);
@@ -576,6 +741,13 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             ok = ok && cc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
             if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)i * 3 + 1) * D, ch->x, (size_t)(n - 1) * D, D);
             ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps);
+            if (ok && dm) {   /* routed in the frame, the residents here; a hybrid layer's host share once the next is recorded */
+                unsigned v = 0;
+                ok = q36cc_dm_layer(ch, m, l, i, n, &v);
+                if (ok && pend_v) ok = q36cc_dm_serve(ch, m, pend_i, n, pend_v);
+                pend_i = i; pend_v = v; routed = ch->dm_y; pending = 1;
+                continue;
+            }
             if (ok && E > 0) {
                 ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) &&
                      cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
@@ -599,13 +771,14 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 double t2 = tm_now();
                 tm_add(n, 2, t2 - t1); ch->host_ms += t2 - t1;
                 ok = ok && q36cc_frame_begin(ch);
+                routed = ch->routed;
             } else if (ok) {
                 ok = q36cc_shared(ch, m, l, i, n);
                 if (ok && i + 1 < L) ok = cc_submit(0) && q36cc_frame_begin(ch);
             }
             pending = 1;
         }
-        if (ok) ok = q36cc_combine(ch, m, L - 1, n);
+        if (ok) ok = q36cc_combine(ch, m, L - 1, n, routed);
         if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(L - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
         if (ok && want_x) ok = cc_copy(ch->xd, 0, ch->x, 0, (size_t)n * D);
         int last = c0 + n == S;
@@ -617,9 +790,12 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                  cc_matmul(ch->t_lm, ch->fin, (size_t)dst * D, ch->outd, (size_t)dst * c->vocab, lo_n);
         }
         double t0 = tm_now();
-        ok = ok && cc_submit(1);
+        ok = ok && cc_submit(0);
+        if (ok && pend_v) ok = q36cc_dm_serve(ch, m, pend_i, n, pend_v);   /* the last hybrid layer's, the tail recorded */
+        ok = ok && cc_finish();
         ch->wait_ms += tm_now() - t0;
         if (!ok) goto lost;
+        if (dm) q36cc_dm_books(ch, m, n, pb);
         if (E == 0) for (int i = 0; i < L; i++) {           /* a dense model reads its K/V rows back here */
             if (!c->is_attn[i]) continue;
             const float *kv = (const float *)cc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
@@ -634,6 +810,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         ch->dn_where = Q36CC_DEV; ch->host_zero = 0;
         if (last) memcpy(logit, cc_ptr(ch->outd), (size_t)nlogits * c->vocab * sizeof(float));
     }
+    q36cc_dm_end(ch);
     if (lf) fwrite(cc_ptr(ch->lfd), sizeof(float), (size_t)L * 3 * D, lf);
     ch->snap_valid = snapped;
     ch->forwards++;
@@ -641,6 +818,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     return L;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     if (!cc_lost()) cc_finish();
+    q36cc_dm_end(ch);
     q36cc_recover(m, pos_base);
     return 0;
 }
@@ -653,4 +831,8 @@ static void q36cc_report(Model *m) {
                     "%.1f ms of routed experts on the host, %.1f MiB on the device; per decode token %.2f ms waiting, %.2f ms of experts (%llu tokens)\n",
             ch->forwards, st.frames, st.ops, st.matmuls, ch->wait_ms, ch->host_ms, st.dev_bytes / 1048576.0,
             ch->dec_n ? ch->dec_wait_ms / ch->dec_n : 0.0, ch->dec_n ? ch->dec_host_ms / ch->dec_n : 0.0, ch->dec_n);
+    if (ch->dm_steps)
+        fprintf(stderr, "[chain] qwen36: %llu layer steps with the routed experts in the frame, %llu of them hybrid "
+                        "(%llu slots on the host in %.1f ms, %.1f ms waiting for the device's routes)\n",
+                ch->dm_steps, ch->dm_hyb, ch->dm_pairs, ch->dm_host_ms, ch->dm_spin_ms);
 }
