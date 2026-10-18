@@ -2798,8 +2798,14 @@ static void bench_bd(void) {
         ColiVkTensor **t = calloc(nm, sizeof *t);
         uint8_t *w = malloc(rb * O);
         for (size_t i = 0; i < rb * O; i++) w[i] = (uint8_t)rnd();
-        int ok = 1;
-        for (int j = 0; j < nm && ok; j++) ok = coli_vk_tensor_ensure(&t[j], w, NULL, fmt, I, O, 0);
+        int ok = 1, host = getenv("COLI_VK_BENCH_HOST") && coli_vk_tier_host_pool();   /* the tier's host pool: read over PCIe */
+        for (int j = 0; j < nm && ok; j++) {
+            if (!host) { ok = coli_vk_tensor_ensure(&t[j], w, NULL, fmt, I, O, 0); continue; }
+            uint8_t *rows; size_t stride; float *sc;
+            ok = coli_vk_tier_tensor_pad(2, &t[j], fmt, I, O, 0, 0, 0, &rows, &stride, &sc);
+            for (int o = 0; ok && o < O; o++) memcpy(rows + (size_t)o * stride, w + (size_t)o * rb, rb);
+            if (ok) *sc = 1.f;
+        }
         const char *se = getenv("COLI_VK_BENCH_S");   /* rows of x: a verify's 2 to 4 */
         int S = se && atoi(se) > 0 ? atoi(se) : 1;
         float *x = fvec((size_t)S * I, 1.f);
@@ -2811,8 +2817,8 @@ static void bench_bd(void) {
             double t0 = bnow(); vkc_submit(1); double dt = bnow() - t0;
             if (dt < best) best = dt;
         }
-        if (ok) printf("bench fmt %3d [%6d x %5d] x %2d: %.1f us per matrix, %.1f GB/s of weights\n", fmt, O, I, nm,
-                       best * 1e6 / nm, (double)rb * O * nm / best / 1e9);
+        if (ok) printf("bench fmt %3d [%6d x %5d] x %2d%s: %.1f us per matrix, %.1f GB/s of weights\n", fmt, O, I, nm,
+                       host ? " (host RAM)" : "", best * 1e6 / nm, (double)rb * O * nm / best / 1e9);
         else printf("bench fmt %d [%d x %d]: refused\n", fmt, O, I);
         for (int j = 0; j < nm; j++) if (t[j]) coli_vk_tensor_free(t[j]);
         if (xb) vkc_free(xb); if (yb) vkc_free(yb); free(t); free(w); free(x);
