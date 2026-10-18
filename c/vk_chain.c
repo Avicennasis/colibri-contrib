@@ -108,6 +108,7 @@ typedef struct {
                                                                  moe_bd with the block formats' paths (BD = 1) */
     int moe_xs, moe_xs_bd, moe_tried, moe_bd_tried;           /* their staging floats (0: the device cannot); built once asked for */
     int discrete;                     /* a discrete card: vkc_prewarm's default */
+    int gv2_all;                      /* chain_gemv2 for every int8 decode matrix it takes (COLI_VK_CHAIN_GEMV2=1, or not NVIDIA) */
     VkPipeline pipe[P_NPIPE];
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
@@ -387,6 +388,10 @@ int vkc_init(void) {
         KC.fence_ns = pp.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU ? 20000000000ULL
                     : VKC_SANITIZED ? 900000000000ULL : 300000000000ULL;
         KC.discrete = pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+        /* chain_gemv2 takes every int8 decode matrix but on NVIDIA, where chain_gemv.comp
+         * was faster for all but a few long rows (matmul_in) */
+        const char *g2 = getenv("COLI_VK_CHAIN_GEMV2");
+        KC.gv2_all = (g2 && *g2 == '1') || pp.vendorID != 0x10DE;
     }
     KC.align = KC.core.ssbo_align > 16 ? KC.core.ssbo_align : 16;
     VkDescriptorSetLayoutBinding b[VKC_BIND];
@@ -995,15 +1000,22 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
              (ti->rowWords / 4) * per / 4 + (ti->rowWords / 4) * per / 32 <= KC.gemv4_xs;   /* the row staged with its pads */
     KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
     int xv = ti->I / 4 + ti->I / 32;   /* a row of x staged, with chain_gemv2's padding */
+    /* a matrix of few long rows: a row a workgroup with every lane on it (an RTX PRO 4000,
+     * Qwen3.8's 320 x 10240 hyper-connection mixer: 20 workgroups of 16 rows 34 us, 320 of
+     * one row 15) */
+    int few = (ti->O + 15) / 16 < 128 && ti->I / 16 >= 256;
+    /* On NVIDIA chain_gemv.comp takes the other int8 matrices: an RTX PRO 4000 ran them
+     * faster there (Qwen3.8's 10240 x 320 hyper-connection rows 21 -> 14 us, its 512 x 2560
+     * router 11 -> 5, 10240 x 2560 90 -> 71), decode Qwen3.8 IQ2_XS 39.5/44.4 -> 45.5/45.6
+     * tok/s and Qwen3.6's int8 trunk 62.2/61.9 -> 65.2/65.0. A Radeon 8060S measured
+     * chain_gemv2 faster (docs/vulkan.md). */
     int g2 = path < 0 && KC.gv2 && S <= 4 && ti->fmt == 1 &&   /* int4 measured slower than chain_gemv here */
-             ti->I % 32 == 0 && xv <= KC.gv2_floats / 4 && ti->rowWords % 4 == 0;
+             ti->I % 32 == 0 && xv <= KC.gv2_floats / 4 && ti->rowWords % 4 == 0 && (KC.gv2_all || few);
     if (g2) {
         /* rows a workgroup: short matrices in small blocks, so they still fill the device;
-         * 0 for a matrix of few long rows, a row a workgroup with every lane on it (an RTX
-         * PRO 4000, Qwen3.8's 320 x 10240 hyper-connection mixer: 20 workgroups of 16 rows
-         * 34 us, 320 of one row 15) */
+         * 0 for a matrix of few long rows */
         int rpw = ti->O <= 1024 ? 16 : ti->O <= 4096 ? 32 : 64;
-        if ((ti->O + 15) / 16 < 128 && ti->I / 16 >= 256) rpw = 0;
+        if (few) rpw = 0;
         /* a speculative verify's rows (S <= 4) share each weight load */
         int nr = S <= 4 && S * xv <= KC.gv2_floats / 4 ? S : 1;
         struct { int fmt, S, I, O, rowWords, gs, rpw, nr; } pc8 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, rpw, nr};
