@@ -1979,9 +1979,20 @@ int vkt_dev_table(int layer, uint32_t *ent) {
     }
     return n;
 }
+/* the share of the host pool's experts the device keeps reading over PCIe in a hybrid
+ * step (COLI_VK_HYBRID_PCIE, 0..1): a step with several such pairs splits them, so the two
+ * sides finish closer together. A pair costs the CPU about 140 us and the device about 150
+ * over PCIe (an RTX PRO 4000 and an i5-13500, Qwen3.8 IQ2_XS); decode with the share at 0,
+ * 0.3, 0.5, 0.7: 45.3, 46.3, 46.1, 46.0 tok/s, with the MTP head's 3-row verifies 43.8,
+ * 45.9, 45.0, 43.9. */
+static double hybrid_pcie_share(void) {
+    static double f = -1;
+    if (f < 0) { const char *e = getenv("COLI_VK_HYBRID_PCIE"); f = e && *e ? atof(e) : 0.3; if (f < 0) f = 0; if (f > 1) f = 1; }
+    return f;
+}
 int vkt_dev_table_hybrid(int layer, uint32_t *ent, VktHostExpert *hx) {
     if (!T.on || layer < 0 || layer >= T.c.layers || !ent || !hx) return -1;
-    int n = 0;
+    int n = 0; const double pf = hybrid_pcie_share();
     for (int e = 0; e < T.c.experts; e++) {
         VSlot *v = slot(layer, e);
         uint32_t *o = ent + (size_t)e * COLI_VK_XB_ENTRY;
@@ -1989,7 +2000,11 @@ int vkt_dev_table_hybrid(int layer, uint32_t *ent, VktHostExpert *hx) {
         memset(&hx[e], 0, sizeof hx[e]);
         if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex) continue;
         n++;
-        if (v->host) {   /* the CPU's, where its three tensors are block types it has rows of */
+        /* the device's share of the host pool by a hash of (layer, expert): the same split at
+         * every read of the table, the CPU's share spread over the experts */
+        uint32_t hsh = (uint32_t)(layer * 2654435761u) ^ (uint32_t)(e * 2246822519u);
+        hsh ^= hsh >> 15; hsh *= 2654435761u; hsh ^= hsh >> 13;
+        if (v->host && (double)(hsh & 0xffff) / 65536.0 >= pf) {   /* the CPU's, where its three tensors are block types it has rows of */
             ColiVkTensor *t[3]; ColiVkTensorInfo ti[3]; const void *r[3]; int ok = 1;
             coli_vk_xb_expert_tensors(v->ex, &t[0], &t[1], &t[2]);
             for (int k = 0; k < 3 && ok; k++)

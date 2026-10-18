@@ -2013,7 +2013,11 @@ device reads both at the same speed). A prompt chunk keeps the full table and re
 host pool over PCIe. Only a GGUF's block types take it (colibri's formats keep the
 device's reads); `COLI_VK_HYBRID=0` turns it off, `COLI_VK_HYBRID_THREADS` sizes the
 worker's team (OpenMP's by default). The chain's line says how many steps and pairs it
-took and the CPU's time.
+took and the CPU's time. A share of the host pool's experts (`COLI_VK_HYBRID_PCIE`, 0.3,
+by a hash of layer and expert) stays with the device over PCIe, so a step with several
+such pairs splits them between the two sides; decode with the share at 0, 0.3, 0.5 and 0.7
+measured 45.3, 46.3, 46.1 and 46.0 tok/s, with the MTP head's 3-row verifies 43.8, 45.9,
+45.0 and 43.9.
 
 Measured on the RTX PRO 4000 with an i5-13500 (Qwen3.8 IQ2_XS, the defaults, on and off
 started one after the other): decode 42.2/42.5 against 40.4/41.0 tok/s with the team on
