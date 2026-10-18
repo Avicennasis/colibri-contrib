@@ -2985,14 +2985,38 @@ class PhysicalCpuCountTest(unittest.TestCase):
              mock.patch("sys.stderr"):
             self.assertEqual(physical_cpu_count(), 1)
 
-    def test_apple_silicon_prefers_performance_cores(self):
+    @staticmethod
+    def _darwin(values):
         def sysctl(command, **kwargs):
-            value = "8\n" if command[-1] == "hw.perflevel0.logicalcpu" else "10\n"
+            if command[-1] not in values:
+                raise subprocess.CalledProcessError(1, command)
             return subprocess.CompletedProcess(args=command, returncode=0,
-                                               stdout=value, stderr="")
-        with mock.patch("resource_plan.subprocess.run", side_effect=sysctl), \
+                                               stdout=f"{values[command[-1]]}\n", stderr="")
+        return sysctl
+
+    def test_apple_silicon_prefers_performance_cores(self):
+        # an M1 Max: 8 P-cores and 2 E-cores, hw.physicalcpu 10
+        values = {"hw.nperflevels": 2, "hw.perflevel0.logicalcpu": 8, "hw.perflevel1.logicalcpu": 2,
+                  "hw.physicalcpu": 10}
+        with mock.patch("resource_plan.subprocess.run", side_effect=self._darwin(values)), \
              mock.patch.object(sys, "platform", "darwin"):
             self.assertEqual(physical_cpu_count(), 8)
+
+    def test_apple_silicon_three_tiers_takes_every_tier_but_efficiency(self):
+        # #2194, an M6: 2 Super, 4 Performance, 6 Efficiency; perflevel0 alone gave 2
+        values = {"hw.nperflevels": 3, "hw.perflevel0.logicalcpu": 2, "hw.perflevel1.logicalcpu": 4,
+                  "hw.perflevel2.logicalcpu": 6, "hw.physicalcpu": 12}
+        with mock.patch("resource_plan.subprocess.run", side_effect=self._darwin(values)), \
+             mock.patch.object(sys, "platform", "darwin"):
+            self.assertEqual(physical_cpu_count(), 6)
+
+    def test_apple_one_tier_is_every_core_and_older_macos_reads_perflevel0(self):
+        one = {"hw.nperflevels": 1, "hw.perflevel0.logicalcpu": 8, "hw.physicalcpu": 8}
+        old = {"hw.perflevel0.logicalcpu": 6, "hw.physicalcpu": 8}   # no hw.nperflevels
+        for values, want in ((one, 8), (old, 6)):
+            with mock.patch("resource_plan.subprocess.run", side_effect=self._darwin(values)), \
+                 mock.patch.object(sys, "platform", "darwin"):
+                self.assertEqual(physical_cpu_count(), want)
 
 
 if __name__ == "__main__":

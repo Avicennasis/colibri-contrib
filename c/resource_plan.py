@@ -2907,13 +2907,25 @@ def physical_cpu_count():
         except (OSError, ValueError, AttributeError) as error:
             _physical_cores_warn(f"Windows core probe failed: {error}")
     if sys.platform == "darwin":
-        # Apple Silicon's performance cores pace barriered expert matmuls. The
-        # physical count includes efficiency cores, which is not the useful
-        # OpenMP team size for this workload.
+        # Apple Silicon: every core but the efficiency tier's paces barriered expert
+        # matmuls (omp_tune.h coli_physical_cores, the same rule). The tiers are
+        # hw.perflevel0 .. hw.perflevel(N-1), fastest first, the last the efficiency
+        # cores: two on an M1-M4 (perflevel0 alone), three on an M6 (2 Super + 4
+        # Performance, #2194); one tier is every core.
+        def sysctl_int(name):
+            result = subprocess.run(["sysctl", "-n", name], text=True, capture_output=True,
+                                    check=True, timeout=5)
+            return int(result.stdout.strip())
         try:
-            result = subprocess.run(["sysctl", "-n", "hw.perflevel0.logicalcpu"],
-                                    text=True, capture_output=True, check=True, timeout=5)
-            cores = int(result.stdout.strip())
+            levels = sysctl_int("hw.nperflevels")
+            cores = sum(sysctl_int(f"hw.perflevel{i}.logicalcpu")
+                        for i in range(min(max(levels - 1, 1), 16))) if levels >= 1 else 0
+            if cores > 0:
+                return cores
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+        try:
+            cores = sysctl_int("hw.perflevel0.logicalcpu")
             if cores > 0:
                 return cores
         except (OSError, ValueError, subprocess.SubprocessError):

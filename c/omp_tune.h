@@ -110,12 +110,24 @@ static int coli_physical_cores(void)
     return cores;
 
 #elif defined(__APPLE__)
-    /* hw.perflevel0.logicalcpu = i core PERFORMANCE. Su Apple Silicon
-     * hw.physicalcpu li conta tutti, E-core compresi (10 su un M1 Max), e con
-     * una barriera per matmul e' il thread piu' lento a dettare il passo: gli
-     * E-core rallentano la squadra invece di aiutarla (#707, -4.2% decode).
-     * Su Intel Mac perflevel* non esiste: li' hw.physicalcpu e' corretto. */
-    int v = 0; size_t sz = sizeof(v);
+    /* Apple Silicon: every core but the efficiency tier's. hw.physicalcpu counts
+     * the E-cores too (10 on an M1 Max), and with a barrier per matmul the slowest
+     * thread sets the pace: the E-cores slowed the team (#707, -4.2% decode). The
+     * tiers are hw.perflevel0 .. hw.perflevel(N-1), fastest first, the last the
+     * efficiency cores: an M1-M4 has two (perflevel0, its P-cores), an M6 three
+     * (2 Super, 4 Performance, 6 Efficiency: 6, not perflevel0's 2, #2194); one
+     * tier is every core. An Intel Mac has no perflevel*: hw.physicalcpu. */
+    int n = 0; size_t sz = sizeof(n);
+    if (sysctlbyname("hw.nperflevels", &n, &sz, NULL, 0) == 0 && n >= 1) {
+        int tot = 0, last = n > 1 ? n - 1 : 1;
+        for (int i = 0; i < last && i < 16; i++) {
+            char nm[48]; snprintf(nm, sizeof nm, "hw.perflevel%d.logicalcpu", i);
+            int c = 0; sz = sizeof(c);
+            if (sysctlbyname(nm, &c, &sz, NULL, 0) == 0 && c > 0) tot += c;
+        }
+        if (tot > 0) return tot;
+    }
+    int v = 0; sz = sizeof(v);
     if (sysctlbyname("hw.perflevel0.logicalcpu", &v, &sz, NULL, 0) == 0 && v > 0) return v;
     v = 0; sz = sizeof(v);
     if (sysctlbyname("hw.physicalcpu", &v, &sz, NULL, 0) == 0 && v > 0) return v;
