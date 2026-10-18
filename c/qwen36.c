@@ -5125,7 +5125,7 @@ static void trunk_offer_dense(Model *m){
      * (docs/qwen36-cuda-tier.md). A hand-written COLI_PLACE naming shexp is
      * still obeyed when the offer is made. */
     { const char *so = getenv("Q36_OFFER_SHEXP"), *cc = getenv("COLI_CUDA_CHAIN");   /* the chain runs it on the device, beside the host's experts */
-      if ((so && *so == '1') || (cc && *cc == '1'))
+      if ((so && *so == '1') || !(cc && *cc == '0'))
         for (int i = 0; i < c->n_layers; i++) {
             Layer *l = &m->L[i];
             size_t bg = qdw_bytes(&l->sh_g), bu = qdw_bytes(&l->sh_u), bd = qdw_bytes(&l->sh_d);
@@ -7462,6 +7462,23 @@ int main(int argc, char **argv) {
         g_gguf = 1; g_ssm_a_direct = 1; g_dn_tiled = 1;
         fprintf(stderr, "[gguf] %s: %d file(s), %d tensors, read in place (native ggml types, no conversion)\n",
                 gp, g_gg.n_files, g_gg.n_tensors);
+        /* The CUDA tier and the CUDA chain take no ggml block types (int8, int4, fp8): a
+         * CUDA run of a GGUF computed every routed expert on the CPU (Qwen3.6-35B-A3B
+         * UD-IQ2_XXS, RTX PRO 4000: 13.7 tok/s of decode, 87 on the Vulkan chain). A build
+         * with both backends (the Windows CUDA package's) runs a GGUF on Vulkan when CUDA
+         * was asked for and COLI_VULKAN was not set; COLI_VULKAN=0 keeps CUDA. */
+        {   const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
+            if (cu && *cu == '1' && !(vk && *vk)) {
+#if defined(COLI_CUDA) && defined(COLI_VULKAN)
+                setenv("COLI_VULKAN", "1", 1); setenv("COLI_CUDA", "0", 1);
+                fprintf(stderr, "[gguf] the CUDA backend has no ggml block types: this GGUF runs on Vulkan, the same card "
+                                "(COLI_VULKAN=0 keeps CUDA, the routed experts then on the CPU)\n");
+#else
+                fprintf(stderr, "[gguf] the CUDA backend has no ggml block types: this GGUF's routed experts run on the CPU "
+                                "(a VK=1 build runs them on the card through Vulkan)\n");
+#endif
+            }
+        }
     }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
@@ -7808,7 +7825,7 @@ int main(int argc, char **argv) {
          * the device (qt_dn_gpu_step). Measured motivation: with the trunk in
          * VRAM the CPU still spent ~8 of 39 ms/token on these steps -- not
          * arithmetic, host round trips, thirty per token. */
-        /* COLI_CUDA_CHAIN=1: every layer on the device as one chain (qwen36_cuda_chain.h),
+        /* the CUDA chain (on unless COLI_CUDA_CHAIN=0): every layer on the device as one chain (qwen36_cuda_chain.h),
          * set up here, after the tier placed the trunk; it owns the DeltaNet state, so the
          * per-layer step below is not set up beside it. */
         int chain_up = 0;

@@ -543,7 +543,7 @@ static int fcc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated
 }
 static void fcc_stats(CcStats *st) { memset(st, 0, sizeof *st); st->frames = (unsigned long long)fake_chain_frames; st->ops = (unsigned long long)fake_chain_ops; st->dev_bytes = fake_chain_dev_bytes; }
 static const ColiCudaChainOps fake_chain_table = {
-    sizeof(ColiCudaChainOps), fcc_init, fcc_ready, fcc_lost, fcc_shutdown, fcc_device, fcc_device_now,
+    CC_OPS_BASE_SIZE /* no routed experts in the frame here: the engines' host step */, fcc_init, fcc_ready, fcc_lost, fcc_shutdown, fcc_device, fcc_device_now,
     fcc_buf, fcc_free, fcc_reserve, fcc_ptr, fcc_bytes, fcc_begin, fcc_submit, fcc_finish,
     fcc_copy, fcc_zero, fcc_copy_regions, fcc_write, fcc_read,
     fcc_matmul, fcc_norm, fcc_rope, fcc_attn, fcc_dnconv, fcc_dnrec, fcc_ew, fcc_stats,

@@ -88,6 +88,52 @@ typedef struct { int mode, ID, R, b0, half_, S, pos_base, budget, IQ, q_off, q_r
 /* chain_ple.comp (mode 0: the gate over S*C (row, stream) pairs; mode 1: the convolution) */
 typedef struct { int mode, S, C, H, CK, NG, keys_off, hyp_off, val_off, snap_row, snap_off; float eps;
                  int prm_off, conv_off, ring_off; } CcPle;
+/* chain_route.comp (vk_chain.h's VkcRoute, field for field): every MoE engine's routing
+ * for S rows of E logits (l_off + s*l_row): kind 0 softmax, 1 sigmoid, 2 sqrt(softplus)
+ * of logit / temp; the bias (b_off) added for the pick only with has_bias 1, to the
+ * logit with 2; with n_group > 1 the topk_group best groups' experts only; the K best
+ * picks, the lower expert on a tie, in rank order into ids (i_off + s*i_row, -1 for a
+ * slot no finite pick fills), their scores into w (w_off + s*w_row), divided by their
+ * sum plus norm_eps with norm 1 (when that is above 0) or norm 2 (from K > 1 only),
+ * times scale. ids holds ints. */
+#define CC_ROUTE_EMAX 1024
+#define CC_ROUTE_KMAX 32
+typedef struct {
+    int S, E, K, kind;
+    int l_off, l_row, b_off, has_bias;
+    int i_off, i_row, w_off, w_row;
+    int n_group, topk_group, norm;
+    float temp, scale, norm_eps;
+} CcRoute;
+/* A routed expert as a device holds it (the CUDA tier's resident tensors: their weights
+ * and scales, coli_cuda_tensor_dev); g NULL: not on the device (the host computes it). */
+typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; } CcExpert;
+/* A layer's routed experts on the device for S rows (cc_moe): x (x_off + s*x_row, D
+ * floats) routed to ids and w as cc_route writes them (i_off + s*i_row, w_off + s*w_row,
+ * K each); expert e is entry t_off + e of the table (E of them), its matrices of format fmt (1 int8
+ * rows, 2 int4 rows, 4 int4 with a scale per gs inputs, 8 fp8-e4m3 with a scale per
+ * 128 x 128 block: the tier's formats), D and I multiples of 32 up to CC_MOE_DIM_MAX. hid holds S*K rows of
+ * I floats (silu(gate) * up, act 0, the only one) and then S*K rows of D (down's
+ * output). parts 1: the experts the table holds; parts 2: y (y_off + s*y_row) = the
+ * host's row (hy at h_off + s*D, h_off >= 0; else 0) plus each slot the table holds,
+ * w * down's output, in rank order (the CPU tier's order: its misses, then the device's
+ * results); 3 both. A slot whose id is -1 or whose entry is not on the device adds
+ * nothing. */
+#define CC_MOE_DIM_MAX 12032   /* D and I: an input row and the fp8 table in 48 KiB of shared memory */
+typedef struct {
+    int S, K, D, I, fmt, gs, act, parts;
+    int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row, h_off;
+    int E;   /* the layer's experts: a step of more than CC_MOE_FRAME_ROWS rows sorts its slots by expert */
+} CcMoe;
+/* More rows than this (a prompt chunk): the slots sorted by expert and each expert's rows
+ * through the tensor cores' GEMM where the device has it (gate and up, then down); hid
+ * then also holds the sort's integers, cc_moe_hid_floats in all. */
+#define CC_MOE_FRAME_ROWS 8
+static inline size_t cc_moe_hid_floats(int S, int K, int D, int I, int E) {
+    size_t A = (size_t)S * K, n = A * (size_t)(I + D);
+    if (S > CC_MOE_FRAME_ROWS) n += 3 * (size_t)E + 2 + 2 * ((A + 63) / 64 + (size_t)(E < (int)A ? E : (int)A)) + 2 * A;
+    return n;
+}
 /* one copy over n regions (a KV row per head, say); offsets and counts in floats */
 typedef struct { size_t dst, src, n; } CcRegion;
 /* counters, for the engines' [chain] lines */
@@ -135,7 +181,23 @@ typedef struct ColiCudaChainOps {
     /* Qwen3.8's two: the QSA indexer's block keys and selections, the PLE gate and convolution */
     int  (*qsa)(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p);
     int  (*ple)(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated, CcBuf *normv, CcBuf *conv, CcBuf *ring, const CcPle *p);
+    /* The routed experts in the frame (optional: a table that ends before them has none).
+     * tab: CcExpert entries (written with write, offsets in floats as ever: an entry is
+     * sizeof(CcExpert) / 4 of them). signal: once the frame's earlier ops are done, word
+     * `word` of a DOWN buffer holds v (the host polls it); wait_host: the frame's later
+     * ops wait until word `word` of an UP buffer is at least v (the host writes it). A
+     * hybrid step: route, signal, the device's experts, wait_host, the sum with the
+     * host's rows; the host computes its experts between the two. */
+    int  (*route)(CcBuf *logits, CcBuf *bias, CcBuf *ids, CcBuf *w, const CcRoute *p);
+    int  (*moe)(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p);
+    int  (*signal)(CcBuf *flag, size_t word, unsigned v);
+    int  (*wait_host)(CcBuf *flag, size_t word, unsigned v);
+    /* a resident tensor's device copy, for a CcExpert: its weights, scales and the scales'
+     * group size (fmt 4); 0 for none */
+    int  (*tensor_dev)(const ColiCudaTensor *t, const void **w, const float **sc, int *gs);
 } ColiCudaChainOps;
+/* the table's size without the optional ops: a backend at least this big has the chain */
+#define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
 
 /* The backend's table; NULL from a backend without the chain. Optional in the DLL
  * loader, like every entry point added after the first release. */
@@ -145,7 +207,7 @@ COLI_CUDA_DLLEXPORT const ColiCudaChainOps *coli_cuda_chain_ops(void);
 #ifndef COLI_CUDA_CHAIN_NO_WRAPPERS
 static inline const ColiCudaChainOps *cc_ops(void) {
     static const ColiCudaChainOps *t; static int asked;
-    if (!asked) { asked = 1; t = coli_cuda_chain_ops(); if (t && t->size < sizeof *t) t = NULL; }
+    if (!asked) { asked = 1; t = coli_cuda_chain_ops(); if (t && t->size < CC_OPS_BASE_SIZE) t = NULL; }
     return t;
 }
 static inline int cc_available(void) { return cc_ops() != NULL; }
@@ -178,6 +240,13 @@ static inline int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const 
 static inline void cc_stats(CcStats *st) { const ColiCudaChainOps *t = cc_ops(); if (t) t->stats(st); else memset(st, 0, sizeof *st); }
 static inline int cc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p) { const ColiCudaChainOps *t = cc_ops(); return t ? t->qsa(src, w, pk, cs, sc, sel, p) : 0; }
 static inline int cc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated, CcBuf *normv, CcBuf *conv, CcBuf *ring, const CcPle *p) { const ColiCudaChainOps *t = cc_ops(); return t ? t->ple(keys, hyp, val, prm, gated, normv, conv, ring, p) : 0; }
+/* the routed experts in the frame: a backend whose table has them */
+static inline int cc_moe_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, tensor_dev) + sizeof t->tensor_dev; }
+static inline int cc_route(CcBuf *l, CcBuf *b, CcBuf *ids, CcBuf *w, const CcRoute *p) { return cc_moe_ready() ? cc_ops()->route(l, b, ids, w, p) : 0; }
+static inline int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid, CcBuf *y, CcBuf *hy, const CcMoe *p) { return cc_moe_ready() ? cc_ops()->moe(tab, x, ids, w, hid, y, hy, p) : 0; }
+static inline int cc_signal(CcBuf *flag, size_t word, unsigned v) { return cc_moe_ready() ? cc_ops()->signal(flag, word, v) : 0; }
+static inline int cc_wait_host(CcBuf *flag, size_t word, unsigned v) { return cc_moe_ready() ? cc_ops()->wait_host(flag, word, v) : 0; }
+static inline int cc_tensor_dev(const ColiCudaTensor *w, const void **p, const float **sc, int *gs) { return cc_moe_ready() ? cc_ops()->tensor_dev(w, p, sc, gs) : 0; }
 #endif
 
 #ifdef __cplusplus
