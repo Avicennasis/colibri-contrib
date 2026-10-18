@@ -416,10 +416,19 @@ typedef struct {
     int S, K, D, I, act;
     float limit, a, b;
     int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row;
-    int rpw;   /* outputs a workgroup: 0 = 64 (measured best for the block formats too: tests and benches set it) */
+    int rpw;   /* outputs a workgroup, both passes: 0 = 64, or the block formats' own by pass (vkc_moe) */
     int blocks;   /* 1: the experts are block formats (a GGUF's): the pipeline with their decoders */
+    int gfmt;     /* the layer's gate/up format (100 + a ggml type), 0 unknown: picks the block path's shape */
 } VkcMoe;
 int vkc_moe_ready(void);
+/* The pipelines vk_chain.c otherwise makes at first use, made now, while the device still
+ * has room: the block formats' GEMV and tiled GEMM for the ggml types in `types` (bit t for
+ * format 100 + t), chain_moe's pipeline (moe 1: colibri's formats, 2: the block formats'),
+ * DeltaNet's recurrence for key dimension dn_kd (0: none). An engine calls it once its dense
+ * chain is placed, before its expert tier fills the device. A discrete card's default
+ * (COLI_VK_CHAIN_PREWARM=1 on any device, 0 never); the pipelines made. */
+typedef struct { uint64_t types; int moe, dn_kd; } VkcPrewarm;
+int vkc_prewarm(const VkcPrewarm *w);
 /* 1 = a GGUF's block-format matrices take a prompt's rows through the tiled GEMM
  * (qmatmul_gemm_bd.comp), else only the GEMV's few rows a step suit them */
 int vkc_gemm_bd_ready(void);

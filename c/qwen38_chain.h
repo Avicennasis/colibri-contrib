@@ -169,6 +169,29 @@ static int q38c_chunk_rows(Q38Chain *ch, Model *m) {
          + ((size_t)c->experts + 3 * (size_t)c->shared_inter + c->hidden + 1) * sizeof(float);
     return vkc_chunk_rows(q38c_name(ch), row);
 }
+/* What the chain allocates at its first forward, after the tier has filled the device:
+ * the KV mirror whole at the context's capacity (at most a quarter of the device's free
+ * memory, past which vkc_kv_plan splits it anyway) and a prompt chunk of 512 rows. The
+ * tier leaves it free (VktConfig.chain_bytes). Without it the tier took all but 1 GiB,
+ * the mirror was split (its attention twice the time) and the chunks were 151 rows: on
+ * an RTX PRO 4000, Qwen3.8 IQ2_XS at 64K of context decoded at 32 to 36 tok/s beside a
+ * 19.8 GiB tier and at 40 beside 16 GiB, its prefill 87 against 115 tok/s. */
+static size_t q38c_late_bytes(Model *m, int ctx) {
+    Q38Chain *ch = q38c_of(m, 0);
+    if (!ch || ctx < 1) return 0;
+    Cfg *c = &m->c;
+    size_t kvo = (size_t)c->kv_heads * c->head_dim, idx = (size_t)c->idx_dim;
+    size_t nb = (size_t)ctx / (c->idx_ratio > 0 ? c->idx_ratio : 1) + 1;
+    size_t kv = (size_t)ch->n_attn * (((2 * kvo + idx) * (size_t)ctx + idx * nb) * sizeof(float)), q = vkc_dev_avail() / 4;
+    if (kv > q) kv = q;
+    /* a row's scratch counted as q38c_chunk_rows counts it, at this context's capacity */
+    int keep = ch->rows, cap = m->kv_cap;
+    m->kv_cap = ctx;
+    ch->rows = 1; g_q38c_count = 0; q38c_bufs(ch, m, 1); long long b1 = g_q38c_count;
+    ch->rows = 2; g_q38c_count = 0; q38c_bufs(ch, m, 2); long long b2 = g_q38c_count;
+    g_q38c_count = -1; ch->rows = keep; m->kv_cap = cap;
+    return kv + 512 * (size_t)(b2 - b1);
+}
 /* Plan and allocate the KV mirror before sizing a prompt chunk. */
 static int q38c_mirror(Q38Chain *ch, Model *m) {
     Cfg *c = &m->c; int kvo = c->kv_heads * c->head_dim;
@@ -533,6 +556,25 @@ static int q38c_layers(Model *m) { (void)m; return g_q38c_ran; }
  * chain off, nothing of it on the device, nothing more going up (every byte left to the
  * tier). A model the chain declines keeps today's path (the caller's vkc_init, the
  * decline at its first forward). */
+/* The pipelines the chain makes at first use, made once its layers are placed and before
+ * the tier fills the device (vk_chain.h, vkc_prewarm): the block formats' for the types of
+ * its matrices, the experts' in the frame, DeltaNet's recurrence. */
+static void q38c_prewarm(Model *m, const Q38Chain *ch) {
+    Cfg *c = &m->c;
+    int dn = 0;
+    for (int i = 0; i < c->layers; i++) dn |= !c->is_attn[i];
+    VkcPrewarm pw = {0, c->experts > 0 ? (g_q38_gguf ? 2 : 1) : 0, dn ? c->dn_kdim : 0};
+    Q38Weight *w[Q38C_TAIL > Q38C_MATS ? Q38C_TAIL : Q38C_MATS];
+    for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
+        int nw = q38c_mats(m, i, w);
+        for (int k = 0; k < nw; k++) { int f = q38_vk_eligible(w[k]) ? q38_vk_fmt(w[k]) : 0; if (f >= 100 && f < 164) pw.types |= 1ull << (f - 100); }
+    }
+    if (ch->head) {
+        int nw = q38c_tail_mats(m, w, 0);
+        for (int k = 0; k < nw; k++) { int f = q38_vk_eligible(w[k]) ? q38_vk_fmt(w[k]) : 0; if (f >= 100 && f < 164) pw.types |= 1ull << (f - 100); }
+    }
+    vkc_prewarm(&pw);
+}
 static void q38c_start(Model *m) {
     if (!g_vk_chain || qt_ready()) return;
     Cfg *c = &m->c; int L = c->layers;
@@ -546,6 +588,20 @@ static void q38c_start(Model *m) {
     g_q38c_fitted = 1;
     int partial = vkc_fit_partial(&g_q38c_fit), n0 = g_q38c_fit.n;
     if (!n0) { g_vk_chain = 0; g_q38_vk_noup = 1; free(lb); free(mb); return; }   /* the chain off: its pipelines never come up */
+    /* Every layer and the head on the device: the MTP head's drafts cost more than they
+     * save there. Its layer runs on the CPU (attention, the routed experts it keeps there,
+     * its mixers) for each draft and each accepted row, against a device forward whose
+     * verify of three rows costs little more than a plain step. An RTX PRO 4000,
+     * Qwen3.8-Flash-Next IQ2_XS: plain decode 34.9 tok/s, with the head's two drafts 24.3
+     * to 26.2, the prompt 81 against 64 tok/s (the head reads each prompt row on the CPU).
+     * Unset, Q38_MTP leaves the head off there, before its matrices and its experts' pool
+     * take the device's memory; Q38_MTP=1 drafts anyway. */
+    const char *mtp_env = getenv("Q38_MTP");
+    if (m->mtp && !(mtp_env && *mtp_env) && g_vk_chain == COLI_VK_CHAIN_ON && !partial && n0 == L) {
+        m->mtp = 0;
+        fprintf(stderr, "[qwen38] speculative decoding with the MTP head: off (the dense chain runs every layer on the "
+                        "device and the head would run on the CPU; Q38_MTP=1 drafts anyway)\n");
+    }
     if (!vkc_init()) { g_vk_chain = 0; g_q38c_fitted = 0; free(lb); free(mb); return; }   /* the per-matrix path, as before */
     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
      * n0, with that device's free memory (the tier there sizes itself after the placement) */
@@ -562,6 +618,7 @@ static void q38c_start(Model *m) {
     free(lb); free(mb);
     Q38Chain *ch = q38c_setup(m);
     if (!ch) { vkc_shutdown(); g_vk_chain = 0; }
+    else q38c_prewarm(m, ch);
     if (g_q38c_fit2_on) {
         vkc_device(1);
         if (!ch || ch->nl < n0) {

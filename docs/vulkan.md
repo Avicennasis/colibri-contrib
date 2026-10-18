@@ -494,7 +494,7 @@ the device, since no Vulkan tier runs.
 |---|---|---|
 | `COLI_VK_TIER` | on with `COLI_VULKAN=1` | `0`: no tier, the routed experts stay on the CPU (the dense trunk still uses the device). |
 | `COLI_VK_TIER_GB` | measured | The tier's budget in GiB, within what the device can hold. Unset: below. |
-| `COLI_VK_TIER_RESERVE_GB` | `1` | Device memory left to everything else (scratch, KV mirrors, the driver) on top of the dense weights the engine still has to place. |
+| `COLI_VK_TIER_RESERVE_GB` | `1` | Device memory left to everything else (scratch, KV mirrors, the driver) on top of the dense weights the engine still has to place and, on qwen38, the chain's KV mirror and a prompt chunk. |
 | `COLI_VK_TIER_RATE` | `16` | Promotions per token at most (a prompt's forward gets this many per prompt token): each copies one expert on the engine thread. |
 | `COLI_VK_TIER_BALANCE` | on | `0`: the device takes every resident expert of a step even when it is the slower side (see below). |
 | `COLI_VK_TIER_WARM` | on | `0`: no warm start; the tier fills as experts pass by. |
@@ -1135,7 +1135,7 @@ f32 throughout, as the CPU's f32 path.
 | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
 | `COLI_VK_CHAIN_MOE` | on where supported | A decode step's (or a short verify's) MoE layer whose experts the tier holds all of runs its routing and experts in the frame, with no host step ([below](#the-routed-experts-in-the-frame-vk_dmoeh)); `0`: the host routes as before. |
 | `COLI_VK_SUBGROUP` | on where the size varies | Every chain pipeline requires the subgroup size the device reports (`VK_EXT_subgroup_size_control`), where the device has more than one. Without it an Intel Iris Xe (Windows driver 101.7076) compiled the chain's GEMVs at another size than the shaders read: Qwen3.6 answered garbage with the chain on and correctly with it off. `0`: the driver's choice. |
-| `COLI_VK_CHAIN_GEMV2` | on where supported | `0`: the int8 decode matrices keep `chain_gemv.comp` instead of `chain_gemv2.comp` (rows a workgroup by the matrix's length). On a Radeon 8060S (Qwen3.6, a 256-token answer, int8 trunk) decode went from 36.8 to 39.0 tok/s; at int4 (`COLI_DENSE_BITS=4`) it measured slower, so it takes int8 only. It stages x in the device's shared memory, up to 64 KiB (#1998). |
+| `COLI_VK_CHAIN_GEMV2` | on where supported | `0`: the int8 decode matrices keep `chain_gemv.comp` instead of `chain_gemv2.comp` (rows a workgroup by the matrix's length). On a Radeon 8060S (Qwen3.6, a 256-token answer, int8 trunk) decode went from 36.8 to 39.0 tok/s; at int4 (`COLI_DENSE_BITS=4`) it measured slower, so it takes int8 only. It stages x in the device's shared memory, up to 64 KiB (#1998). On NVIDIA it takes only a matrix of few long rows (Qwen3.8's 320 x 10240 hyper-connection mixer) and `chain_gemv.comp` the rest, which an RTX PRO 4000 ran faster (decode Qwen3.8 IQ2_XS 39.5/44.4 to 45.5/45.6 tok/s, Qwen3.6's int8 trunk 62.2/61.9 to 65.2/65.0); `1` gives it every int8 matrix there too. |
 | `COLI_VK_CHAIN_SPIN_US` | `2000` | How long a wait on a chain frame polls the fence before blocking. |
 | `COLI_VK_CHAIN_PROF` | off | `1`: one `[VK] chain profile` line of device time per kind of op (timestamps). |
 | `COLI_VK_KV_SPLIT` | on | `0`: never split the KV cache past the device's budget ([below](#a-kv-cache-past-the-devices-budget)); the whole mirrors, and past the budget the chain declines. |
@@ -2113,6 +2113,24 @@ took:
 ```
 [VK] qwen36 chain: prompt chunks of up to 8192 rows (325 KiB a row; 7.30 GiB free on the device or in RAM, half of it at most; COLI_VK_CHAIN_ROWS sets it, COLI_VK_CHAIN_ROWS_MAX caps it at 8192)
 ```
+
+On qwen38 the tier also leaves what the chain allocates at its first forward: the KV
+mirror whole at the context's capacity (at most a quarter of the device's free memory;
+past that `vk_kvsplit.h` splits it anyway) and a chunk of 512 rows. The tier's line says
+how much (`3.83 GiB left for the dense chain's KV mirror and a prompt chunk`). Before,
+the tier took all but `COLI_VK_TIER_RESERVE_GB`, the chain then split its KV mirror (the
+attention took twice the time) and its chunks were 151 rows. Qwen3.8 Next IQ2_XS on an
+RTX PRO 4000, 64K of context, a 507-token prompt, the defaults, two pairs started one
+after the other:
+
+| | tier | prefill | decode |
+|---|---|---|---|
+| the tier takes the device | 19.78 GiB, KV split, chunks of 151 rows | 90.9, 88.8 tok/s | 36.8, 36.7 tok/s |
+| it leaves the chain's KV and a chunk | 15.95 GiB, KV whole, chunks of 512 rows | 105.8, 111.3 tok/s | 39.4, 43.1 tok/s |
+
+A sweep of `COLI_VK_TIER_GB` on the same card put the best decode at 16 GiB (40.4 tok/s;
+18 GiB 37.5, 14 GiB 37.8, 10 GiB 31.8): smaller, more experts go over PCIe from the host
+pool; larger, the chain's KV no longer fits.
 
 The engines whose prefill blocks the prompt before the chain hand it the chain's chunk
 when the chunk comes from the budget: MiMo instead of `MIMO_CHUNK`'s 64 rows, GLM-5.3

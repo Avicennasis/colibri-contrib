@@ -1717,8 +1717,8 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.main_layers == T.c.layers) T.c.extra_layers = 0;
 
     /* The budget. Discrete: what VK_EXT_memory_budget says is free on the device,
-     * minus a reserve (scratch, KV mirrors, driver) and the dense weights still to
-     * come. Integrated (device memory is host RAM): a quarter of what the RAM has
+     * minus a reserve (scratch, KV mirrors, driver), the dense weights still to come and
+     * what the dense chain allocates at its first forward (chain_bytes). Integrated (device memory is host RAM): a quarter of what the RAM has
      * left after the engine's expert cache has grown to its size and the dense
      * weights are placed, so the tier never takes what the CPU cache needs.
      * COLI_VK_TIER_GB replaces either, within what the device can hold. */
@@ -1728,7 +1728,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     double heap_free = have ? (bud - used) * 1e9 : (double)coli_vk_device_local_bytes() * 0.8;
     T.uma = coli_vk_device_shares_ram();
     double reserve = env_gb("COLI_VK_TIER_RESERVE_GB", 1.0) * GiB;
-    double room = heap_free - reserve - (double)T.c.dense_bytes;
+    double room = heap_free - reserve - (double)T.c.dense_bytes - (double)T.c.chain_bytes;
     double want;
     const char *cap = getenv("COLI_VK_TIER_GB");
     if (cap && *cap) want = atof(cap) * GiB;
@@ -1872,6 +1872,8 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         fprintf(stderr, "; %d layer%s in %d other form%s, each expert in the room of the biggest",
                 other, other == 1 ? "" : "s", T.nform - 2, T.nform == 3 ? "" : "s");
     }
+    if (T.c.chain_bytes) fprintf(stderr, "; %s left for the dense chain's KV mirror and a prompt chunk",
+                                 human((double)T.c.chain_bytes, hb, sizeof hb));
     fprintf(stderr, "), %s, %s queue, up to %d promotions per token%s%s",
             T.uma ? (cap && *cap ? "shared RAM (COLI_VK_TIER_GB)" : "shared RAM: a quarter of what the expert cache leaves")
                   : "device memory", coli_vk_xb_queue_shared() ? "shared" : "own", T.rate,

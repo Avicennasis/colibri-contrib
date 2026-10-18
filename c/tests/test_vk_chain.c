@@ -1638,7 +1638,7 @@ static void test_moe(const char *what, int D, int I, int E, int S, int K, int fg
     VkcBuf *ib = vkc_buf((size_t)S * irow * 4, VKC_DEV), *wb = vkc_buf((size_t)S * wrow * 4, VKC_DEV);
     VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * yrow * 4, VKC_DEV);
     VkcRoute rp = {S, E, K, 0, 0, lrow, 0, 0, 0, irow, 1, wrow, 1, 1, 1, 1.f, 1.f, 0.f};
-    VkcMoe mp = {S, K, D, I, act, limit, a, b, t_off, 2, xrow, 0, irow, 1, wrow, 1, yrow, 0, 0};
+    VkcMoe mp = {S, K, D, I, act, limit, a, b, t_off, 2, xrow, 0, irow, 1, wrow, 1, yrow, 0, 0, 0};
     /* the route and the experts in frames of their own, timed: a frame past the fence
      * wait's 20 s loses the device, and the line says which of the two took the time */
     struct timespec ts0, ts1, ts2;
@@ -2656,11 +2656,15 @@ static void test_kvs_cold(void) {
 #include <time.h>
 static double bnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void bench_gemv(void) {
-    int shapes[3][2] = {{2560, 10240}, {6144, 2560}, {2560, 640}};
-    int fmts[3] = {1, 4, 11};
-    for (int f = 0; f < 3; f++) for (int k = 0; k < 3; k++) {
+    int shapes[3][2] = {{2560, 10240}, {6144, 2560}, {2560, 640}}, nsh = 3;
+    int fmts[3] = {1, 4, 11}, nf = 3;
+    const char *she = getenv("COLI_VK_BENCH_SHAPE");   /* "O I": one shape of your own */
+    if (she && *she) { int o = 0, i = 0; if (sscanf(she, "%d %d", &o, &i) == 2 && o > 0 && i > 0) { shapes[0][0] = i; shapes[0][1] = o; nsh = 1; } }
+    const char *fe = getenv("COLI_VK_BENCH_FMTS");      /* one of 1, 4, 10, 11 */
+    if (fe && *fe) { fmts[0] = atoi(fe); nf = 1; }
+    for (int f = 0; f < nf; f++) for (int k = 0; k < nsh; k++) {
         int I = shapes[k][0], O = shapes[k][1], fmt = fmts[f], gs = fmt == 4 ? 64 : 0, nm = 24;
-        size_t rb = fmt == 1 ? (size_t)I : fmt == 4 ? (size_t)I / 2 : (size_t)I * 2;
+        size_t rb = fmt == 1 ? (size_t)I : fmt == 4 ? (size_t)I / 2 : fmt == 10 ? (size_t)I * 4 : (size_t)I * 2;
         ColiVkTensor **t = calloc(nm, sizeof *t);
         uint8_t *w = malloc(rb * O); float *sc = malloc((size_t)O * (I / 64 + 1) * sizeof(float));
         for (size_t i = 0; i < rb * O; i++) w[i] = (uint8_t)rnd();
@@ -2768,12 +2772,16 @@ static void bench_dn(void) {
 
 /* COLI_VK_CHAIN_BENCH=moe: the routed experts in the frame (vkc_route + vkc_moe) at
  * Qwen3.8-Flash-Next's shapes, a GGUF's experts (IQ2_S gate/up, Q2_0 down; COLI_VK_BENCH_FMTS
- * "122 142" sets them), random blocks, S rows of K = 10 experts of 64. */
+ * "122 142" sets them), random blocks, S rows of K = 10 experts of 256, each layer of the
+ * frame its own route: a forward's experts come from memory, not from the cache a route
+ * used again would leave them in (that measured gate and up at 550 GB/s on a card that
+ * reads 415). rpw 0: the engine's own shape (vkc_moe). */
 static void bench_moe(void) {
-    int D = 2560, I = 640, E = 64, K = 10, fg = 122, fd = 142, rpw = 32;
-    const char *fe = getenv("COLI_VK_BENCH_FMTS"), *sh = getenv("COLI_VK_BENCH_MOE");   /* "D I K rpw" */
+    int D = 2560, I = 640, E = 256, K = 10, fg = 122, fd = 142, rpw = 0;
+    const char *fe = getenv("COLI_VK_BENCH_FMTS"), *sh = getenv("COLI_VK_BENCH_MOE");   /* "D I K rpw E" */
     if (fe && *fe) sscanf(fe, "%d %d", &fg, &fd);
-    if (sh && *sh) sscanf(sh, "%d %d %d %d", &D, &I, &K, &rpw);
+    if (sh && *sh) sscanf(sh, "%d %d %d %d %d", &D, &I, &K, &rpw, &E);
+    if (E < K) E = K;
     if (!vkc_moe_ready() || !coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { printf("bench moe: no expert batch here\n"); return; }
     ColiVkTensor **tg = calloc(E, sizeof *tg), **tu = calloc(E, sizeof *tu), **td = calloc(E, sizeof *td);
     ColiVkExpert **ex = calloc(E, sizeof *ex);
@@ -2791,19 +2799,20 @@ static void bench_moe(void) {
     VkcBuf *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
     vkc_begin(); vkc_write(tb, 0, tab, (size_t)E * COLI_VK_XB_ENTRY * 4); vkc_submit(1);
     for (int S = 1; S <= 3; S++) {
-        float *lg = fvec((size_t)S * E, 3.f), *x = fvec((size_t)S * D, 1.f);
-        VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D);
-        VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DEV), *wb = vkc_buf((size_t)S * K * 4, VKC_DEV);
+        int nl = 48;   /* a forward's layers in one frame, each its own route */
+        float *lg = fvec((size_t)S * E * nl, 3.f), *x = fvec((size_t)S * D, 1.f);
+        VkcBuf *lb = up(lg, (size_t)S * E * nl), *xb = up(x, (size_t)S * D);
+        VkcBuf *ib = vkc_buf((size_t)S * K * 4 * nl, VKC_DEV), *wb = vkc_buf((size_t)S * K * 4 * nl, VKC_DEV);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * D * 4, VKC_DEV);
-        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 1, K, 1, 1, 1, 1.f, 1.f, 0.f};
-        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, rpw, 1};   /* block-format experts */
+        VkcRoute rp = {S * nl, E, K, 0, 0, E, 0, 0, 0, K, 1, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, rpw, 1, fg};   /* block-format experts */
         vkc_begin(); ok = vkc_route(lb, NULL, ib, wb, &rp) && vkc_submit(1);
-        double best = 1e9; int nl = 48;   /* a forward's layers in one frame */
-        for (int r = 0; r < 4 && ok; r++) {
+        double best = 1e9;
+        for (int r = -1; r < 4 && ok; r++) {   /* r -1 untimed: a driver may finish the pipeline on its first frames */
             vkc_begin();
-            for (int l = 0; l < nl && ok; l++) ok = vkc_moe(xb, ib, wb, tb, hb, yb, &mp);
+            for (int l = 0; l < nl && ok; l++) { mp.i_off = mp.w_off = l * S * K; ok = vkc_moe(xb, ib, wb, tb, hb, yb, &mp); }
             double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
-            if (dt < best) best = dt;
+            if (r >= 0 && dt < best) best = dt;
         }
         double bytes = (double)S * K * (2.0 * rg * I + (double)rd * D);   /* every pair's weights once */
         if (ok) printf("bench moe fmt %d/%d S %d K %d [D %d I %d]: %.1f us per layer, %.1f GB/s of pair weights\n",
@@ -2813,6 +2822,30 @@ static void bench_moe(void) {
     vkc_free(tb);
     for (int e = 0; e < E; e++) { if (ex[e]) coli_vk_xb_expert_free(ex[e]); }
     free(tg); free(tu); free(td); free(ex); free(tab); free(wg); free(wd);
+}
+
+/* COLI_VK_CHAIN_BENCH=route: the router's pick (vkc_route), 48 one-row routes in a frame
+ * as a forward's layers run them: E experts (COLI_VK_BENCH_E, 512 by default), top 10,
+ * softmax, the ids in host-readable memory as vk_dmoe.h keeps them. */
+static void bench_route(void) {
+    const char *ee = getenv("COLI_VK_BENCH_E");
+    int E = ee && atoi(ee) > 0 && atoi(ee) <= VKC_ROUTE_EMAX ? atoi(ee) : 512, K = 10, nl = 48, ok = 1;
+    float *lg = fvec((size_t)E * nl, 3.f);
+    VkcBuf *lb = up(lg, (size_t)E * nl), *ib = vkc_buf((size_t)K * 4 * nl, VKC_DOWN), *wb = vkc_buf((size_t)K * 4 * nl, VKC_DEV);
+    double best = 1e9;
+    for (int r = -1; r < 5 && ok && lb && ib && wb; r++) {   /* r -1 untimed */
+        vkc_begin();
+        for (int l = 0; l < nl && ok; l++) {
+            VkcRoute rp = {1, E, K, 0, l * E, E, 0, 0, l * K, K, l * K, K, 1, 1, 1, 1.f, 1.f, 0.f};
+            ok = vkc_route(lb, NULL, ib, wb, &rp);
+        }
+        double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+        if (r >= 0 && dt < best) best = dt;
+    }
+    if (ok) printf("bench route E %d K %d: %.1f us a route (%d in a frame)\n", E, K, best * 1e6 / nl, nl);
+    else printf("bench route: refused\n");
+    if (lb) vkc_free(lb); if (ib) vkc_free(ib); if (wb) vkc_free(wb);
+    free(lg);
 }
 
 /* COLI_VK_CHAIN_BENCH=bd: the block formats' GEMV (a GGUF's matrices) at the shapes of
@@ -2968,6 +3001,7 @@ int main(int argc, char **argv) {
         if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "bd")) bench_bd();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "moe")) bench_moe();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dn")) bench_dn();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "route")) bench_route();
         else bench_gemv();
         vkc_shutdown(); coli_vk_shutdown(); return 0;
     }

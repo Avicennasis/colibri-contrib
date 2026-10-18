@@ -3032,6 +3032,13 @@ static VktFmt q38_vk_native_fmt(Model *m,int begin,int end,size_t *ram_expert){
     }
     return f;
 }
+/* the context the chain's KV mirror will hold: the cache's when it is there, else what a
+ * server allocates at its start (q38_serve_ensure_kv) */
+static int q38_vk_chain_ctx(const Model *m){
+    if(m->max_t>0)return m->max_t;
+    int n=qwen38_max_ctx();
+    return n>m->c.max_positions?m->c.max_positions:n;
+}
 static void q38_vk_tier_start(Model *m,int cap){
     if(!g_vk_ready||qt_ready()){
         if(g_vk_ready&&qt_ready())
@@ -3093,6 +3100,7 @@ static void q38_vk_tier_start(Model *m,int cap){
                   .max_rows=q38_moe_prefill_rows(c,q38_prefill_batch_rows())*c->topk,
                   .ram_reserve=ram_expert*(size_t)cap*(size_t)c->layers,
                   .dense_bytes=q38_vk_dense_bytes(m),
+                  .chain_bytes=g_vk_chain?q38c_late_bytes(m,q38_vk_chain_ctx(m)):0,
                   .in_ram=q38_vk_in_ram,.ram_ctx=m,
                   .load=q38_vk_load,.release=q38_vk_release,.load_ctx=m,.load_batch=q38_vk_load_batch,
                   .layer_gate_up=lgu,.layer_down=ldn};

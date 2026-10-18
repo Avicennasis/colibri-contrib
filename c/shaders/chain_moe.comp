@@ -56,6 +56,7 @@ layout(push_constant) uniform P {
     int mode, S, K, D, I, act;
     float limit, a, b;
     int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row, rpw;
+    int spl;   // the block path: about this many 32-weight steps a lane (vk_chain.c's, by pass)
 } p;
 
 // an entry: 32 words (coli_vk_xb_expert_entry): [0..1] gate rows, [2..3] its scales,
@@ -345,9 +346,10 @@ void main() {
     wd = wd && g_staged;
     uint o0 = uint(t * rpw);
     if (BD != 0 && fmt >= 100 && fmt < 164 && bs_has(fmt - 100) && n % 32 == 0 && g_staged) {
-        /* about eight steps a lane (measured: the latency of a step's loads wants work beside it) */
-        uint steps = uint(n) / 32u, lpr = 1u;
-        while (lpr * 2u <= uint(sgs) && lpr * 8u < steps) lpr *= 2u;
+        /* about spl steps a lane (measured: the latency of a step's loads wants work beside
+         * it), and lanes enough that the workgroup's subgroups all have rows of the rpw */
+        uint steps = uint(n) / 32u, lpr = 1u, spl = uint(max(p.spl, 1));
+        while (lpr * 2u <= uint(sgs) && (lpr * spl < steps || uint(nsg) * (uint(sgs) / lpr) > uint(rpw))) lpr *= 2u;
         uint rg = uint(sgs) / lpr, rr = uint(lane) / lpr, jj = uint(lane) % lpr;
         for (uint base = uint(sg) * rg; base < uint(rpw); base += uint(nsg) * rg) {   // uniform in the subgroup
             uint r = base + rr, o = o0 + r, oc = min(o, uint(O) - 1u);
