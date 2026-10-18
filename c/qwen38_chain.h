@@ -565,6 +565,20 @@ static void q38c_start(Model *m) {
     g_q38c_fitted = 1;
     int partial = vkc_fit_partial(&g_q38c_fit), n0 = g_q38c_fit.n;
     if (!n0) { g_vk_chain = 0; g_q38_vk_noup = 1; free(lb); free(mb); return; }   /* the chain off: its pipelines never come up */
+    /* Every layer and the head on the device: the MTP head's drafts cost more than they
+     * save there. Its layer runs on the CPU (attention, the routed experts it keeps there,
+     * its mixers) for each draft and each accepted row, against a device forward whose
+     * verify of three rows costs little more than a plain step. An RTX PRO 4000,
+     * Qwen3.8-Flash-Next IQ2_XS: plain decode 34.9 tok/s, with the head's two drafts 24.3
+     * to 26.2, the prompt 81 against 64 tok/s (the head reads each prompt row on the CPU).
+     * Unset, Q38_MTP leaves the head off there, before its matrices and its experts' pool
+     * take the device's memory; Q38_MTP=1 drafts anyway. */
+    const char *mtp_env = getenv("Q38_MTP");
+    if (m->mtp && !(mtp_env && *mtp_env) && g_vk_chain == COLI_VK_CHAIN_ON && !partial && n0 == L) {
+        m->mtp = 0;
+        fprintf(stderr, "[qwen38] speculative decoding with the MTP head: off (the dense chain runs every layer on the "
+                        "device and the head would run on the CPU; Q38_MTP=1 drafts anyway)\n");
+    }
     if (!vkc_init()) { g_vk_chain = 0; g_q38c_fitted = 0; free(lb); free(mb); return; }   /* the per-matrix path, as before */
     /* the layers the primary leaves, on COLI_VK_DEV2's device: a fit of its own from layer
      * n0, with that device's free memory (the tier there sizes itself after the placement) */
