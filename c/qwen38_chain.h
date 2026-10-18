@@ -611,7 +611,8 @@ static void q38c_prewarm(Model *m, const Q38Chain *ch) {
     Cfg *c = &m->c;
     int dn = 0;
     for (int i = 0; i < c->layers; i++) dn |= !c->is_attn[i];
-    VkcPrewarm pw = {.moe = c->experts > 0 ? (g_q38_gguf ? 2 : 1) : 0, .dn_kd = dn ? c->dn_kdim : 0};
+    VkcPrewarm pw = {.moe = c->experts > 0 ? (g_q38_gguf ? 2 : 1) : 0, .dn_kd = dn ? c->dn_kdim : 0,
+                     .attn_hd = c->head_dim, .attn_gq = c->kv_heads > 0 ? c->q_heads / c->kv_heads : 0};
     Q38Weight *w[Q38C_TAIL > Q38C_MATS ? Q38C_TAIL : Q38C_MATS];
     for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
         int nw = q38c_mats(m, i, w);
