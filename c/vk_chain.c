@@ -413,7 +413,7 @@ int vkc_init(void) {
     {
         const char *e = getenv("COLI_VK_CHAIN_GEMV");
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
-        int xs = (int)(pp.limits.maxComputeSharedMemorySize / 16);
+        int xs = (int)((pp.limits.maxComputeSharedMemorySize - 128) / 16);   /* past the subgroups' 32 sums */
         if (xs > 4096) xs = 4096;
         if (!(e && *e == '0') && xs >= 256 && (KC.mod_gemv4 = load_module(KC.core.spv_path, "chain_gemv.spv"))) {
             int32_t v = xs;
@@ -994,15 +994,20 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
              (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) &&
              (ti->rowWords / 4) * per / 4 + (ti->rowWords / 4) * per / 32 <= KC.gemv4_xs;   /* the row staged with its pads */
     KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
+    int xv = ti->I / 4 + ti->I / 32;   /* a row of x staged, with chain_gemv2's padding */
     int g2 = path < 0 && KC.gv2 && S <= 4 && ti->fmt == 1 &&   /* int4 measured slower than chain_gemv here */
-             ti->I % 32 == 0 && ti->I <= KC.gv2_floats && ti->rowWords % 4 == 0;
+             ti->I % 32 == 0 && xv <= KC.gv2_floats / 4 && ti->rowWords % 4 == 0;
     if (g2) {
-        /* rows a workgroup: short matrices in small blocks, so they still fill the device */
+        /* rows a workgroup: short matrices in small blocks, so they still fill the device;
+         * 0 for a matrix of few long rows, a row a workgroup with every lane on it (an RTX
+         * PRO 4000, Qwen3.8's 320 x 10240 hyper-connection mixer: 20 workgroups of 16 rows
+         * 34 us, 320 of one row 15) */
         int rpw = ti->O <= 1024 ? 16 : ti->O <= 4096 ? 32 : 64;
+        if ((ti->O + 15) / 16 < 128 && ti->I / 16 >= 256) rpw = 0;
         /* a speculative verify's rows (S <= 4) share each weight load */
-        int nr = S <= 4 && S * ti->I <= KC.gv2_floats ? S : 1;
+        int nr = S <= 4 && S * xv <= KC.gv2_floats / 4 ? S : 1;
         struct { int fmt, S, I, O, rowWords, gs, rpw, nr; } pc8 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, rpw, nr};
-        ok = record(KC.gv2, bd, 4, &pc8, sizeof pc8, (uint32_t)((ti->O + rpw - 1) / rpw), (uint32_t)((S + nr - 1) / nr), 1);
+        ok = record(KC.gv2, bd, 4, &pc8, sizeof pc8, (uint32_t)(rpw ? (ti->O + rpw - 1) / rpw : ti->O), (uint32_t)((S + nr - 1) / nr), 1);
     }
     else if (v4) {
         /* each workgroup stages x once: give it enough rows that the staging does not
@@ -1015,6 +1020,10 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
         struct { int fmt, S, I, O, rowWords, gs, lpr; } pc7 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, lpr};
         int rows_wg = 256 / lpr;   /* at least, at subgroups of 64 */
         int wg = (ti->O + rows_wg - 1) / rows_wg; if (wg > 1024) wg = 1024;
+        /* a few long rows: a row a workgroup, every lane on it (lpr 0), where the rows would
+         * leave the device short of workgroups: a decode's or a verify's rows (a prompt's
+         * would stage x once a row of W) */
+        if (!(e && *e) && S <= 4 && wg < 128 && nq >= 256) { pc7.lpr = 0; wg = ti->O; }
         ok = record(KC.gemv4, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)S, 1);
     }
     else if (path >= 0 && KC.tg && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
