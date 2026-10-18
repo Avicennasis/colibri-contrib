@@ -4281,6 +4281,7 @@ static void xb_grp_init(XbCtx *X) {
  * takes it too. The grouped sets xb_grp_init makes, made here when it did not (no
  * cooperative matrices). COLI_VK_XB_GROUPED_BD=0 keeps the per-expert dispatches. */
 #define GRP_BD_SHARED 35648u   /* the gate+up variant's tiles and bdstep.glsl's tables */
+#define GEMM_BD_SHARED 44544u  /* qmatmul_gemm_bd.comp's tiles and tables (vk_chain.c's too) */
 static void xb_grp_bd_init(XbCtx *X) {
     const char *e = getenv("COLI_VK_XB_GROUPED_BD");
     if (X->d || !G.has_bda || !bd_shaders() || (e && *e == '0')) return;
@@ -4355,7 +4356,7 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
          * shared memory); COLI_VK_TIER_GEMM_BD=0 keeps the GEMVs */
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(X->d ? G2.phys : G.phys, &pp);
         const char *ge = getenv("COLI_VK_TIER_GEMM_BD");
-        if (!X->d && !(ge && *ge == '0') && pp.limits.maxComputeSharedMemorySize >= 44544) {
+        if (!X->d && !(ge && *ge == '0') && pp.limits.maxComputeSharedMemorySize >= GEMM_BD_SHARED) {
             char gm[1100]; derive_dir_file(X->spv, "qmatmul_gemm_bd.spv", gm, sizeof gm);
             X->sh_mm_bd = load_spv(X->dev, gm);
         }
