@@ -494,9 +494,26 @@ static void q36c_start(Model *m) {
 }
 /* After the dense-host decision, before the tier: the chain's N layers (and the head)
  * on the device now, so the tier sizes its budget from what is left. */
+/* The pipelines the chain makes at first use, made once its layers are placed and before
+ * the tier fills the device (vk_chain.h, vkc_prewarm): the block formats' for the types of
+ * its matrices, the experts' in the frame, DeltaNet's recurrence. */
+static void q36c_prewarm(Model *m, const Q36Chain *ch) {
+    Cfg *c = &m->c;
+    int dn = 0;
+    for (int i = 0; i < c->n_layers; i++) dn |= !c->is_attn[i];
+    VkcPrewarm pw = {0, c->n_experts > 0 ? (g_gguf ? 2 : 1) : 0, dn ? c->dn_kdim : 0};
+    const void *wq; const float *sc;
+    for (int i = ch->lo; i < ch->lo + ch->n; i++) {
+        QW *ws[16]; int nw = q36c_layer_qws(m, i, ws);
+        for (int k = 0; k < nw; k++) { int f = vk_qw_fmt(ws[k], &wq, &sc); if (f >= 100 && f < 164) pw.types |= 1ull << (f - 100); }
+    }
+    if (ch->head) { int f = vk_qw_fmt(&m->lm_head, &wq, &sc); if (f >= 100 && f < 164) pw.types |= 1ull << (f - 100); }
+    vkc_prewarm(&pw);
+}
 static void q36c_place(Model *m) {
     if (!g_q36c_fit_on || !g_q36c_fit.n || !g_vk_chain) return;
     Q36Chain *ch = q36c_setup(m);
+    if (ch) q36c_prewarm(m, ch);
     if (!g_q36c_fit2_on) return;
     int lo = g_q36c_fit.n, n2 = g_q36c_fit2.n;
     vkc_device(1);

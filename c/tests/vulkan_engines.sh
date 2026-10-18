@@ -1750,6 +1750,12 @@ qwen36_gguf_chain_gates() {
   for cap in 1 8; do
     CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF cap=$cap" all GQ_EXACT=1 SNAP=qwen36_gguf_tiny -- $cap 8 qwen36_gguf_tiny/ref.json
   done
+  # the pipelines vk_chain.c makes at first use made before the tier instead (a discrete
+  # card's default, vkc_prewarm), each but the recurrence launched there once: the same
+  # tokens after them
+  CPUENV=GQ_EXACT=1 dmoe_gate qwen36 "chain qwen36 GGUF, pipelines made before the tier" all GQ_EXACT=1 \
+    COLI_VK_CHAIN_PREWARM=1 SNAP=qwen36_gguf_tiny -- 8 8 qwen36_gguf_tiny/ref.json
+  grep -q "pipelines made before the expert tier" vk.log || { cat vk.log; fail "chain qwen36 GGUF: no pipeline made before the tier"; }
 }
 family_qwen_chain() {
   make qwen36 qwen38 tests/test_vk_chain VK=1

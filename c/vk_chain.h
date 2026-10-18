@@ -421,6 +421,14 @@ typedef struct {
     int gfmt;     /* the layer's gate/up format (100 + a ggml type), 0 unknown: picks the block path's shape */
 } VkcMoe;
 int vkc_moe_ready(void);
+/* The pipelines vk_chain.c otherwise makes at first use, made now, while the device still
+ * has room: the block formats' GEMV and tiled GEMM for the ggml types in `types` (bit t for
+ * format 100 + t), chain_moe's pipeline (moe 1: colibri's formats, 2: the block formats'),
+ * DeltaNet's recurrence for key dimension dn_kd (0: none). An engine calls it once its dense
+ * chain is placed, before its expert tier fills the device. A discrete card's default
+ * (COLI_VK_CHAIN_PREWARM=1 on any device, 0 never); the pipelines made. */
+typedef struct { uint64_t types; int moe, dn_kd; } VkcPrewarm;
+int vkc_prewarm(const VkcPrewarm *w);
 /* 1 = a GGUF's block-format matrices take a prompt's rows through the tiled GEMM
  * (qmatmul_gemm_bd.comp), else only the GEMV's few rows a step suit them */
 int vkc_gemm_bd_ready(void);
