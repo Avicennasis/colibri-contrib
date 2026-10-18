@@ -354,6 +354,9 @@ static uint32_t kc_shared_limit(void) {
     return pp.limits.maxComputeSharedMemorySize;
 }
 
+/* qmatmul_gemm_bd.comp's fixed shared memory, held to the compiled shader's by
+ * tests/test_vk_shared_memory.py: a device with less keeps the GEMV for a prompt's rows */
+#define GEMM_BD_SHARED 44544u
 int vkc_init(void) {
     if (KC.ready) return !KC.lost;
     if (!coli_vk_core_dev(g_kd, &KC.core)) return 0;
@@ -441,7 +444,7 @@ int vkc_init(void) {
             KC.bdv_xs = xs;
         /* the tiled GEMM for a prompt's rows: its tiles and bdstep's tables, 43.5 KiB */
         const char *g = getenv("COLI_VK_CHAIN_GEMM_BD");
-        if (KC.bd && !(g && *g == '0') && pp.limits.maxComputeSharedMemorySize >= 44544)
+        if (KC.bd && !(g && *g == '0') && pp.limits.maxComputeSharedMemorySize >= GEMM_BD_SHARED)
             KC.mod_bdg = load_module(KC.core.spv_path, "qmatmul_gemm_bd.spv");
     }
     /* the routed experts by address (chain_moe.comp): a device with bufferDeviceAddress
