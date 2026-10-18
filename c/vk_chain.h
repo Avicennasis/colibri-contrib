@@ -419,20 +419,65 @@ typedef struct {
     int rpw;   /* outputs a workgroup, both passes: 0 = 64, or the block formats' own by pass (vkc_moe) */
     int blocks;   /* 1: the experts are block formats (a GGUF's): the pipeline with their decoders */
     int gfmt;     /* the layer's gate/up format (100 + a ggml type), 0 unknown: picks the block path's shape */
+    int dfmt, E;  /* vkc_moe_rows: down's format, and the layer's experts (its table's entries from t_off) */
+    int stage_n;  /* the widest input row its staging is sized for: 0 = D's or I's, < 0 = the device's largest */
 } VkcMoe;
 int vkc_moe_ready(void);
+/* A prompt chunk's routed experts, every row on the device (chain_moe_rows.comp): the
+ * pairs counted and planned by expert there, gate+up and down as the block formats'
+ * grouped GEMMs (qmatmul_grp_gate_up_bd.comp, qmatmul_grp_bd.comp) over the tiles of each
+ * expert's rows, dispatched with the counts the device wrote, then each row's sum over its
+ * experts in rank order. p as vkc_moe's with x_off 0, act 0, E, gfmt and dfmt (the layer's
+ * experts' block formats), D and I multiples of 64; y as vkc_moe's. The tables and the
+ * rows' hidden and down outputs live in *r between calls (vkc_moe_rows_free). 0 when the
+ * device lacks the pipelines (vkc_moe_rows_ready) or a parameter is out of range. */
+typedef struct { VkcBuf *cnt, *amap, *items, *etab, *aux, *hid, *yk; } VkcMoeRows;
+int vkc_moe_rows_ready(int gfmt, int dfmt);
+int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r, VkcBuf *y, const VkcMoe *p);
+void vkc_moe_rows_free(VkcMoeRows *r);
 /* The pipelines vk_chain.c otherwise makes at first use, made now, while the device still
  * has room: the block formats' GEMV and tiled GEMM for the ggml types in `types` (bit t for
  * format 100 + t), chain_moe's pipeline (moe 1: colibri's formats, 2: the block formats'),
- * DeltaNet's recurrence for key dimension dn_kd (0: none). An engine calls it once its dense
- * chain is placed, before its expert tier fills the device. A discrete card's default
- * (COLI_VK_CHAIN_PREWARM=1 on any device, 0 never); the pipelines made. */
-typedef struct { uint64_t types; int moe, dn_kd; } VkcPrewarm;
+ * DeltaNet's recurrence for key dimension dn_kd (0: none), and a prompt chunk's grouped
+ * GEMMs (vkc_moe_rows) for the experts' gate/up types ex_gu and down types ex_dn, or for our
+ * own formats (ex_ours). An engine
+ * calls it once its dense chain is placed, before its expert tier fills the device. A
+ * discrete card's default (COLI_VK_CHAIN_PREWARM=1 on any device, 0 never); the pipelines
+ * made. */
+typedef struct {
+    uint64_t types; int moe, dn_kd; uint64_t ex_gu, ex_dn;
+    int ex_ours;                /* the experts are our own formats (1, 2, 4): their grouped GEMMs (qmatmul_grp_q.comp) */
+    int gemv_i[16], n_gemv_i;   /* the GEMV's widths of x (a matrix's I) the types meet: its staging sizes */
+    int moe_d, moe_i;           /* the experts' D and I: chain_moe's staging size (0: the device's largest) */
+} VkcPrewarm;
+/* a width of x the model's GEMVs meet, once (vkc_prewarm makes the staging size it takes) */
+static inline void vkc_prewarm_width(VkcPrewarm *pw, int I) {
+    for (int k = 0; k < pw->n_gemv_i; k++) if (pw->gemv_i[k] == I) return;
+    if (I > 0 && pw->n_gemv_i < 16) pw->gemv_i[pw->n_gemv_i++] = I;
+}
 int vkc_prewarm(const VkcPrewarm *w);
 /* 1 = a GGUF's block-format matrices take a prompt's rows through the tiled GEMM
  * (qmatmul_gemm_bd.comp), else only the GEMV's few rows a step suit them */
 int vkc_gemm_bd_ready(void);
 int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p);
+/* A GGUF's experts (blocks, gfmt and dfmt both types bdstep_i8.glsl has) in the CPU's
+ * integer form: the input rows quantized to int8 per 32, packed 4 x 8 integer dot products
+ * (ggml_quants.h's gq_quant_act_ref and gq_dot_i8, the same integers and scales). On by
+ * default where the device accelerates them (vkc_moe_idot: 0 none, 1 supported, 2
+ * accelerated; COLI_VK_IDOT=0 leaves the extension off); vkc_moe_set_idot(1) asks for it
+ * where supported, 0 never, -1 the default (tests). */
+void vkc_moe_set_idot(int on);
+int vkc_moe_idot(void);
+/* Hybrid steps (vk_dmoe.h): a frame that signals the device's timeline at its end, and the
+ * next frame waiting for the host's, so the CPU computes a part of a layer between them
+ * while the device runs the rest; the values rise with every step. The host's side, from
+ * any thread (the primary device's timelines): vkc_hybrid_host_wait until the device has
+ * signalled g, vkc_hybrid_host_signal h. */
+int  vkc_hybrid_ready(void);
+int  vkc_hybrid_submit(uint64_t g);
+void vkc_hybrid_wait_next(uint64_t h);
+int  vkc_hybrid_host_wait(uint64_t g);
+int  vkc_hybrid_host_signal(uint64_t h);
 
 /* ---- attention residuals and SiTU-GLU (chain_ares.comp) ----------------------------
  * Kimi K3's residual stream (AttnRes) and its activation, for S rows:
@@ -775,6 +820,8 @@ typedef struct {
     unsigned long long attn_flash;     /* attention calls through chain_attn_flash (matrix units) */
     unsigned long long attn_slices;    /* extra submissions that cut a long attention (COLI_VK_ATTN_SLICE) */
     unsigned long long tile_gemms;     /* prompt matmuls through chain_gemm.comp (matrix units) */
+    unsigned long long moe_i8;         /* routed-expert layer steps in the CPU's integer form (chain_moe_i8) */
+    unsigned long long gemv_i8;        /* a GGUF's dense GEMVs in it (chain_gemv_bd_i8) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

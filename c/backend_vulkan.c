@@ -423,6 +423,10 @@ static struct {
      * (measured: decode attention 7.8s at 7.6 GB resident -> 17.8s at 15.2 GB).
      * VK_EXT_memory_budget lets the tier fill stop at a reserve instead of guessing. */
     int has_prio, has_budget, has_hostmem;
+    /* VK_KHR_shader_integer_dot_product on (COLI_VK_IDOT=0 leaves it off): 1, 2 with the
+     * packed 4 x 8 signed dot accelerated (coli_vk_idot) */
+    int has_idot;
+    int has_tsem;                /* timelineSemaphore on: the dense chain's hybrid steps (vk_chain.c) */
     float prio;                  /* priority applied to the NEXT allocations (class knob) */
     /* the routed-expert tier's queue (coli_vk_xb_*): family, index, whether it is the
      * main queue after all, and its timestamp bits; device limits its batches respect */
@@ -534,8 +538,10 @@ static int pick_memtype_cached(VkPhysicalDevice phys) {
 }
 
 /* System RAM the device reads over PCIe (HOST_VISIBLE|HOST_COHERENT, not DEVICE_LOCAL,
- * write-combined before cached: the host writes it once, the device reads it): the
- * tier's host pool. -1 when every host-visible type is device-local (an integrated GPU,
+ * cached before write-combined): the tier's host pool. The CPU computes its experts in
+ * place (vk_dmoe.h's hybrid steps), which write-combined memory made 25 times slower
+ * (6.7 ms an expert of Qwen3.8 against 0.16); an RTX PRO 4000 reads both at the same
+ * 9.7 to 10.9 GB/s over PCIe 4.0 x8. -1 when every host-visible type is device-local (an integrated GPU,
  * a CPU device: their tier pool is that memory already). */
 static int pick_memtype_sys(VkPhysicalDevice phys) {
     VkPhysicalDeviceMemoryProperties m;
@@ -546,7 +552,7 @@ static int pick_memtype_sys(VkPhysicalDevice phys) {
         if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) || !(f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
             (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) || (m.memoryHeaps[m.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
             continue;
-        if (!(f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) return (int)i;
+        if (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) return (int)i;
         if (best < 0) best = (int)i;
     }
     return best;
@@ -1124,6 +1130,9 @@ int coli_vk_init(const char *spv_path) {
 #ifdef VK_EXT_memory_budget
                 if (!strcmp(ep[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) G.has_budget = 1;
 #endif
+#ifdef VK_KHR_shader_integer_dot_product
+                if (!strcmp(ep[i].extensionName, VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) G.has_idot = 1;
+#endif
 #ifdef VK_EXT_external_memory_host
                 if (!strcmp(ep[i].extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) G.has_hostmem = 1;
 #endif
@@ -1198,6 +1207,13 @@ int coli_vk_init(const char *spv_path) {
     v12f.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES; v12f.pNext = &sscf;
     v12f.shaderFloat16 = VK_TRUE; v12f.vulkanMemoryModel = VK_TRUE;
     v12f.bufferDeviceAddress = G.has_bda ? VK_TRUE : VK_FALSE;
+    {   /* timeline semaphores, where the device has them (core in 1.2): the chain's hybrid steps */
+        VkPhysicalDeviceTimelineSemaphoreFeatures tq = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+        VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &tq};
+        VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(G.phys, &pp);
+        if (pp.apiVersion >= VK_API_VERSION_1_2) { vkGetPhysicalDeviceFeatures2(G.phys, &f2); G.has_tsem = tq.timelineSemaphore != 0; }
+    }
+    v12f.timelineSemaphore = G.has_tsem ? VK_TRUE : VK_FALSE;
 #endif
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = nqi, .pQueueCreateInfos = qis};
@@ -1209,6 +1225,33 @@ int coli_vk_init(const char *spv_path) {
 #endif
 #ifdef VK_EXT_memory_budget
     if (G.has_budget) dext[ndext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+#endif
+#ifdef VK_KHR_shader_integer_dot_product
+    /* the chain's routed experts in the CPU's integer form (chain_moe_i8.spv): the feature,
+     * and whether its packed 4 x 8 signed dot is accelerated (the default then) */
+    VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR idf = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR};
+    {
+        const char *ie = getenv("COLI_VK_IDOT");
+        if (G.has_idot && !(ie && *ie == '0')) {
+            VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &idf};
+            vkGetPhysicalDeviceFeatures2(G.phys, &f2);
+            VkPhysicalDeviceShaderIntegerDotProductPropertiesKHR ip = {
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES_KHR};
+            VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &ip};
+            vkGetPhysicalDeviceProperties2(G.phys, &p2);
+            G.has_idot = idf.shaderIntegerDotProduct ? (ip.integerDotProduct4x8BitPackedSignedAccelerated ? 2 : 1) : 0;
+        } else G.has_idot = 0;
+        if (G.has_idot) {
+            dext[ndext++] = VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
+            idf = (VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR){
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR,
+                .pNext = (void *)di.pNext, .shaderIntegerDotProduct = VK_TRUE};
+            di.pNext = &idf;
+        }
+    }
+#else
+    G.has_idot = 0;
 #endif
 #ifdef VK_EXT_external_memory_host
     /* host memory the device reads in place (no copy): measured by the harness
@@ -1229,6 +1272,10 @@ int coli_vk_init(const char *spv_path) {
         if (vkCreateDevice(G.phys, &dc, NULL, &G.dev) != VK_SUCCESS) { G.has_coop = 0; G.has_bda = 0; G.dev = VK_NULL_HANDLE; }
     }
 #endif
+    /* the timeline semaphores without the matrix units' device (whose Vulkan 1.2 features
+     * carry them): a feature struct of their own */
+    VkPhysicalDeviceTimelineSemaphoreFeatures tsf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+    if (!G.dev && G.has_tsem) { tsf.timelineSemaphore = VK_TRUE; tsf.pNext = (void *)di.pNext; di.pNext = &tsf; }
     /* bufferDeviceAddress without the matrix units: the dense chain's routed experts read
      * the tier's weights by address (chain_moe.comp). COLI_VK_BDA=0 leaves it off; a
      * device that refuses it comes up without it. */
@@ -3805,6 +3852,18 @@ int coli_vk_device_integrated(void) {
     vkGetPhysicalDeviceProperties(G.phys, &p);
     return p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
 }
+/* The integer dot product on the primary device: 0 none, 1 supported, 2 accelerated. */
+int coli_vk_idot(void) { return G.dev ? G.has_idot : 0; }
+/* Timeline semaphores on the primary device. */
+int coli_vk_timeline(void) { return G.dev ? G.has_tsem : 0; }
+/* The host's view of a tensor in the tier's host pool: its rows (and scales) in system RAM,
+ * where the CPU can read them; NULL for any other tensor. */
+const void *coli_vk_tensor_host_rows(const ColiVkTensor *t, const void **scales) {
+    if (scales) *scales = NULL;
+    if (!t || !t->pool || !t->pool->host || !t->wmap) return NULL;
+    if (scales) *scales = t->smap;
+    return t->wmap;
+}
 /* An integrated GPU or a CPU device (Lavapipe): its "device memory" is host RAM. */
 int coli_vk_device_shares_ram(void) {
     if (!G.phys) return 0;
@@ -3867,6 +3926,10 @@ struct ColiVkExpert {
     ColiVkExpert *prev, *next;
     struct XbCtx *X;               /* the device's batch it belongs to */
 };
+/* An expert's three tensors (gate, up, down). */
+void coli_vk_xb_expert_tensors(const ColiVkExpert *e, ColiVkTensor **g, ColiVkTensor **u, ColiVkTensor **d) {
+    *g = e ? e->g : NULL; *u = e ? e->u : NULL; *d = e ? e->d : NULL;
+}
 typedef struct { VkBuffer buf; VkDeviceMemory mem; void *ptr; size_t region; } XbBuf;
 typedef struct XbCtx {
     /* the device (0 = G, 1 = G2) and what the batch needs of it, set by xb_bind */
@@ -4023,21 +4086,37 @@ static int xb_reserve(XbCtx *X, size_t xr, size_t ir, size_t yr) {
     if (xr <= X->x.region && ir <= X->g.region && yr <= X->y.region) return 1;
     size_t nx, ni, ny;
     if (!xb_sizes(X, xr, ir, yr, &nx, &ni, &ny)) return 0;   /* one window cannot address it */
+    size_t ox = X->x.region, oi = X->g.region, oy = X->y.region;
     int ok = 1;
     if (nx != X->x.region) ok &= xb_buf(X, &X->x, nx, X->mt_host, 1);
     if (ni != X->g.region) ok &= xb_buf(X, &X->g, ni, X->mt_dev, 0) && xb_buf(X, &X->u, ni, X->mt_dev, 0) &&
                                  xb_buf(X, &X->h, ni, X->mt_dev, 0);
     if (ny != X->y.region) ok &= xb_buf(X, &X->y, ny, X->mt_cached, 1);
-    if (!ok) {   /* out of device memory: no batch from here on */
+    if (!ok) {
+        /* Out of device memory for the growth: the sizes before it back (the room its
+         * frees left), this step's experts on the CPU and the batch kept for the next. A
+         * step that needed more (an MTP head's prompt rows beside a full card) used to stop
+         * the tier for good. Only where the old sizes do not come back does the batch stop. */
+        XbBuf *bs[5] = {&X->x, &X->g, &X->u, &X->h, &X->y};
+        size_t old[5] = {ox, oi, oi, oi, oy};
+        uint32_t mt[5] = {X->mt_host, X->mt_dev, X->mt_dev, X->mt_dev, X->mt_cached};
+        int mp[5] = {1, 0, 0, 0, 1}, back = ox && oi && oy;
+        for (int k = 0; k < 5; k++)   /* every grown buffer freed first, so the old sizes have their room */
+            if (bs[k]->region != old[k] && bs[k]->buf) {
+                vkDestroyBuffer(X->dev, bs[k]->buf, NULL); vkFreeMemory(X->dev, bs[k]->mem, NULL); memset(bs[k], 0, sizeof *bs[k]);
+            }
+        for (int k = 0; k < 5 && back; k++) if (bs[k]->region != old[k]) back = xb_buf(X, bs[k], old[k], mt[k], mp[k]);
         fprintf(stderr, "[VK] %sexpert batch: scratch of %.1f MiB failed, %s\n", X->d ? "dev2 " : "",
-                (double)(nx + 3 * ni + ny) * 2 / 1048576.0, X->d ? "the second device stops" : "the tier stops");
-        X->ready = 0;
-        return 0;
+                (double)(nx + 3 * ni + ny) * 2 / 1048576.0,
+                back ? "this step's experts on the CPU (the batch keeps its scratch)"
+                     : X->d ? "the second device stops" : "the tier stops");
+        if (!back) { X->ready = 0; return 0; }
+        ok = 0;
     }
     for (ColiVkExpert *e = X->live; e; e = e->next) xb_write_sets(e);
     xb_write_act_set(X);
     if (X->v4_set) xb_write_v4_set(X);
-    return 1;
+    return ok;
 }
 
 static int xb_layout(XbCtx *X, int nbind, unsigned dynmask, size_t pc, VkDescriptorSetLayout *dsl, VkPipelineLayout *pl) {
@@ -5354,6 +5433,10 @@ size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); 
 /* elements per block of a block format (shaders/blockdec.glsl), 0 for any other format */
 int coli_vk_block_elems(int fmt) { return !bd_fmt(fmt) || !bd_shaders() ? 0 : fmt == 203 ? 64 : fmt >= 200 ? 128 : (int)BD_BLK[fmt - 100]; }
 void *coli_vk_block_table_dev(int dev) { return bd_shaders() ? (void *)bdtab_buf(dev == 1 ? 1 : 0) : NULL; }
+uint64_t coli_vk_block_table_addr(int dev) {   /* the primary device's (vk_addr's) */
+    VkBuffer b = !dev && bd_shaders() && G.has_bda ? bdtab_buf(0) : VK_NULL_HANDLE;
+    return b ? vk_addr(b) : 0;
+}
 /* vq2's codebooks (two 256 x 8 int8, row-major) into the table buffer. The table is built
  * once, at the first block-format tensor: call this before (the tier's start); -1 when a
  * table is already on a device with other books. */

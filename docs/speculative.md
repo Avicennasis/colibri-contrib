@@ -81,11 +81,25 @@ The engine loads the head by default when the checkpoint has one and the whole m
 loaded, and says so when it cannot; `Q38_MTP=0` leaves it unread, and `Q38_MTP=1` refuses a
 checkpoint without one (see [qwen38.md](qwen38.md#speculative-decoding-with-the-mtp-head)).
 With the Vulkan dense chain running every layer and the lm_head on the device, the head
-stays off unless `Q38_MTP=1` asks for it: its layer runs on the CPU, once per draft and
-once per accepted row, against a device forward whose verify of three rows costs little
-more than a plain step. On an RTX PRO 4000 with Qwen3.8-Flash-Next IQ2_XS, plain decoding
-ran at 34.9 tok/s and the head's two drafts at 24.3 to 26.2; the prompt at 81 against
-64 tok/s, the head reading each prompt row on the CPU.
+stays off unless `Q38_MTP=1` asks for it. With it, the head's layer runs on the device
+too (`q38c_mtp_rows`): its input (the embedding's norm and `fc_embedding` added to each
+stream's norm and `fc_hidden`), its attention over its own K/V mirror (the KV split's last
+attention ordinal, its own RoPE base), its routed experts in the frame once the tier holds
+all of them (the tier keeps an MTP head's experts whole there, `VktConfig.extra_whole`),
+its mixer and the lm_head. `Q38_MTP_CHAIN=0` runs the head's layer on the CPU instead,
+once per draft and once per accepted row.
+
+The head still does not pay for itself beside the full chain: a verify of three rows costs
+about two and a half plain steps there (each row routes its own experts), and the head
+reads every prompt row. An RTX PRO 4000 with Qwen3.8-Flash-Next IQ2_XS, a 507-token
+prompt, two drafts, 2.89 tokens a forward (95% of the drafts accepted), the three settings
+started in turn twice (prefill / decode, tok/s):
+
+| | first | second |
+|---|---|---|
+| the head off (the default) | 88.8 / 33.8 to 35.3 | 94.2 / 37.1 to 38.0 |
+| the head's layer on the CPU (`Q38_MTP_CHAIN=0`) | 76.8 to 80.2 / 26.7 to 30.5 | 72.0 to 76.4 / 24.8 to 27.9 |
+| the head's layer on the device | 71.7 / 29.0 to 32.4 | 77.7 / 35.6 to 40.1 |
 Its first draft reads the model's four streams at the last fed position with the picked
 token. Each next draft reads the head's own streams from the row before, in place of the
 model's (only the verify computes those), with the draft just proposed. Those deeper
@@ -153,6 +167,7 @@ state is the one plain decoding leaves.
 
 | Variable | Default | Effect |
 |---|---|---|
+| `Q38_MTP_CHAIN` | on | qwen38 with the MTP head on beside a dense chain that holds every layer: the head's layer runs on the device (`q38c_mtp_rows`); `0`: on the CPU. |
 | `Q38_MTP` | on when the checkpoint has the head, off beside a dense chain that holds every layer | `0`: plain decoding, the head unread; `1`: the head, and a checkpoint without one is refused. The RAM plan (`coli plan`) prices the head when it is on: its dense tensors and its own expert cache (`Q38_MTP_CAP`, the layers' cap by default, at the head's FP8 record). |
 | `Q38_MTP_DRAFTS` | `2` | qwen38 with the MTP head on: the MTP head's drafts per verify, `1` to `3`, or `0` / `auto` for the gate's pick. |
 | `COLI_LOOKUP` | `1` | Prompt-lookup drafts (qwen38, qwen36), and colibri's n-gram drafts from the same lookup and gate when it has no MTP head; always gated. `0` turns them off. |

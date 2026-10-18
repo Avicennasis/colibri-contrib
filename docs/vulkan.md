@@ -1133,7 +1133,7 @@ f32 throughout, as the CPU's f32 path.
 | `COLI_VK_CHAIN_LAYERS` | what fits | The engines on [the partial chain](#a-partial-chain): the first N layers on the device, the CPU the rest and the head. Unset or `auto`: the most layers the device's free memory holds (every layer when they fit, the chain as before); `n`: n layers; `0`: the chain off. |
 | `COLI_VK_CHAIN_FLASH` | `16` | Rows from which a forward's plain causal attention runs on the matrix units (`chain_attn_flash.comp`: query heads of one kv head folded into 16-row tiles, K/V staged once per block as f16, two passes); `0` never. Needs cooperative matrices at subgroup size 64; otherwise, and for a selection list, a window, a ring or a sink, the blocked shader or `chain_attn.comp`. On a Radeon 8060S (Qwen3.6, 1011-token prompt) the attention went from 186 ms (`chain_attnb`) to 22 ms, the first token from 2.08 to 1.85 s, perplexity unchanged (7.65). |
 | `COLI_VK_CHAIN_GEMV` | on | `0`: the decode matrices take `qmatmul.comp`'s GEMV instead of `chain_gemv.comp`'s. |
-| `COLI_VK_CHAIN_MOE` | on where supported | A decode step's (or a short verify's) MoE layer whose experts the tier holds all of runs its routing and experts in the frame, with no host step ([below](#the-routed-experts-in-the-frame-vk_dmoeh)); `0`: the host routes as before. |
+| `COLI_VK_CHAIN_MOE` | on where supported | A decode step's (or a short verify's) MoE layer whose experts the tier holds all of runs its routing and experts in the frame, with no host step, and a GGUF's prompt chunk too on qwen36 and qwen38 ([below](#the-routed-experts-in-the-frame-vk_dmoeh)); `0`: the host routes as before. |
 | `COLI_VK_SUBGROUP` | on where the size varies | Every chain pipeline requires the subgroup size the device reports (`VK_EXT_subgroup_size_control`), where the device has more than one. Without it an Intel Iris Xe (Windows driver 101.7076) compiled the chain's GEMVs at another size than the shaders read: Qwen3.6 answered garbage with the chain on and correctly with it off. `0`: the driver's choice. |
 | `COLI_VK_CHAIN_GEMV2` | on where supported | `0`: the int8 decode matrices keep `chain_gemv.comp` instead of `chain_gemv2.comp` (rows a workgroup by the matrix's length). On a Radeon 8060S (Qwen3.6, a 256-token answer, int8 trunk) decode went from 36.8 to 39.0 tok/s; at int4 (`COLI_DENSE_BITS=4`) it measured slower, so it takes int8 only. It stages x in the device's shared memory, up to 64 KiB (#1998). On NVIDIA it takes only a matrix of few long rows (Qwen3.8's 320 x 10240 hyper-connection mixer) and `chain_gemv.comp` the rest, which an RTX PRO 4000 ran faster (decode Qwen3.8 IQ2_XS 39.5/44.4 to 45.5/45.6 tok/s, Qwen3.6's int8 trunk 62.2/61.9 to 65.2/65.0); `1` gives it every int8 matrix there too. |
 | `COLI_VK_CHAIN_SPIN_US` | `2000` | How long a wait on a chain frame polls the fence before blocking. |
@@ -1938,6 +1938,53 @@ so, a token is one frame.
   (`.coli_usage`), the HITS bitmap, the tier's heat (`vkt_dev_count`); the tier's line
   counts them as `in the dense chain: N routed experts with no host step`.
 
+A prompt chunk (more than 8 rows) takes the frame the same way on qwen36 and qwen38, a
+GGUF's experts and our own formats': `vkc_moe_rows` (`chain_moe_rows.comp`) counts the chunk's (row, expert) pairs by
+expert on the device, plans each expert's tiles of 32 rows and writes the two passes'
+dispatch sizes, then the block formats' grouped GEMMs (`qmatmul_grp_gate_up_bd.comp`,
+`qmatmul_grp_bd.comp`, the tier's own; for int8 rows, int4 rows and int4 per gs,
+`qmatmul_grp_q.comp` and its `GATE_UP` build, the same structure with `qmatmul.comp`'s
+formats and the scales from the expert table) run gate and up, then down, over those
+tiles with indirect dispatches, and a last pass sums each row's experts in rank order.
+The tier's own grouped GEMM for our formats (`qmatmul_grp.comp`, the matrix units) needs
+subgroups of 64, so on NVIDIA a prompt's int4 experts went one expert at a time through
+the host's step. No row leaves
+the device. A layer whose types have no grouped GEMM (a GGUF's IQ1_M layers) keeps the
+host's step for that chunk; the rest of the forward stays in the frame. It needs the
+grouped GEMMs' 34.8 KiB of shared memory (not Lavapipe's 32 KiB, where every layer keeps
+the host's step) and turns off with `COLI_VK_CHAIN_GEMM_BD=0`. Its pipelines are made and
+launched once, with no rows, before the tier fills the card (`vkc_prewarm`, from the file's
+expert types): made after, they slowed every kernel of the frame, decode included, and
+made before but first launched after, they still cost the decode 6 to 16%.
+
+Measured on an RTX PRO 4000 Blackwell SFF (70 W, a virtual GPU whose speed moves from one
+server start to the next), three runs a start. Qwen3.6-35B-A3B, a prompt of 467 tokens,
+every expert on the card:
+
+| | prefill before | prefill now | decode now |
+|---|---|---|---|
+| UD-Q4_K_M | 450 to 485 tok/s | 676 to 681 tok/s | 70.2 to 71.2 tok/s |
+| UD-IQ2_XXS | 460 to 515 tok/s | 706 to 721 tok/s | 82.3 to 83.8 tok/s |
+| int4-g64 (ours) | 308 to 313 tok/s | 740 to 750 tok/s | 57.7 to 60.4 tok/s |
+
+The int4-g64 row's teacher-forced loss after a 600-token prompt (125 tokens scored,
+`PPL=1`) is 3.2181 nats a token either way.
+
+Qwen3.8 Next IQ2_XS, a prompt of 507 tokens, 19.7 GiB of experts on the card and 15 GiB
+in the host pool (prompt chunks of 151 rows), the chunk's experts on the host's step and
+in the frame started one after the other, four pairs (prefill / decode):
+
+| pair | host's step | in the frame |
+|---|---|---|
+| 1 | 66.5 / 25.8 tok/s | 92.2 / 36.7 tok/s |
+| 2 | 80.9 / 37.0 tok/s | 92.8 / 36.3 tok/s |
+| 3 | 73.7 / 32.8 tok/s | 85.6 / 32.8 tok/s |
+| 4 | 85.6 / 39.2 tok/s | 90.3 / 36.2 tok/s |
+
+The prefill gains in every pair (5 to 39%); the decode stays within what the card moves by
+between starts. With 151-row chunks each chunk reads the host pool's experts over PCIe
+again: larger chunks are the next lever there.
+
 A layer the tier holds only part of keeps the host's step, in the same forward: the frame
 ends there as before. The table follows the tier: an eviction or an upload changes its
 epoch (`vkt_epoch`), and the next step writes the table again. It is off for PILOT (its
@@ -1950,6 +1997,134 @@ fit a device whole, where their layers keep the tier's step.
 
 The device opens with `bufferDeviceAddress` wherever it has it now (before, only with
 the matrix units, for the grouped GEMM); `COLI_VK_BDA=0` still opens it without.
+
+**Hybrid steps: the host pool's experts on the CPU.** The tier's host pool holds the
+experts the card has no room for in system RAM, which the device reads over PCIe: 10 to
+11 GB/s on an RTX PRO 4000 at PCIe 4.0 x8, at any size (`COLI_VK_BENCH_HOST`). With
+Qwen3.8 Next IQ2_XS on that card about 7% of a decode step's pairs and 11% of a 3-row
+verify's come from there, and each layer that has one waits for it: skipping them
+(wrong tokens, the right times) took decode from 38.5 to 50.1 tok/s and an MTP verify's
+forward from 70 to about 45 ms. In a step of up to 8 rows (`vk_dmoe.h`), where the device
+has timeline semaphores, the CPU now computes those pairs in place while the device
+computes the ones it holds:
+- frame A ends at the route, the input rows copied down, and signals the device's
+  timeline;
+- frame B runs the device's experts from a table where the host pool's are zero;
+- frame C waits for the host's timeline and adds the CPU's sum;
+- a worker thread takes the steps in order: it waits for frame A, computes the pairs as
+  `ggml_quants.h` does a GGUF's matmuls (int8 activations, integer dots; the float
+  reference with `GQ_EXACT=1`), from the host pool's rows as the file has them, writes
+  their weighted sum and signals.
+
+A round trip of the two timelines measured 7 us on the card. The host pool is cached
+system RAM (it was write-combined, which made the CPU's reads 25 times slower; the
+device reads both at the same speed). A prompt chunk keeps the full table and reads the
+host pool over PCIe. Only a GGUF's block types take it (colibri's formats keep the
+device's reads); `COLI_VK_HYBRID=0` turns it off, `COLI_VK_HYBRID_THREADS` sizes the
+worker's team (OpenMP's by default). The chain's line says how many steps and pairs it
+took and the CPU's time. A share of the host pool's experts (`COLI_VK_HYBRID_PCIE`, 0.3,
+by a hash of layer and expert) stays with the device over PCIe, so a step with several
+such pairs splits them between the two sides; decode with the share at 0, 0.3, 0.5 and 0.7
+measured 45.3, 46.3, 46.1 and 46.0 tok/s, with the MTP head's 3-row verifies 43.8, 45.9,
+45.0 and 43.9.
+
+Measured on the RTX PRO 4000 with an i5-13500 (Qwen3.8 IQ2_XS, the defaults, on and off
+started one after the other): decode 42.2/42.5 against 40.4/41.0 tok/s with the team on
+OpenMP's 14 threads, 44 to 45 with the regions' rows in chunks; the same greedy tokens
+(160 of them) on and off. The CPU spends about 155 us a pair (IQ2_S gate and up 86 us,
+Q2_0 down 28 us): the device's own experts take less, so a step waits for the CPU.
+
+**The integer form.** A GGUF's experts run, where the device accelerates packed 4 x 8
+integer dot products (`VK_KHR_shader_integer_dot_product`,
+`integerDotProduct4x8BitPackedSignedAccelerated`), in the CPU's integer form
+(`chain_moe_i8.spv`, `bdstep_i8.glsl`), as `ggml_quants.h` computes them by default:
+- each input row (x for gate and up, the activation for down) is quantized to int8 in
+  blocks of 32 as `gq_quant_act_ref` does it (d = amax / 127, codes rounded to nearest
+  even and clamped to +-127, their sum per 16), in shared memory instead of the float row;
+- each type's weights are the integers and scales of `gq_unpack_row` (a scale and a min
+  per 16), and a group's sum `dx * (sw * sum(w8 * xq) - mw * xs)` is formed with exact
+  integer inner sums (`dotPacked4x8EXT`).
+
+Against the CPU's integer form, `tests/test_vk_chain`'s `moe i8` cases agree to about
+2e-7 for every type it decodes (Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, IQ3_S, IQ4_NL,
+IQ4_XS, Q2_0), where the float form differs by about 1e-2: on the device the experts now
+give what the CPU gives. Both of a layer's formats must have the form (else the float
+pipeline runs that layer); a prompt chunk's grouped GEMMs keep their float sums.
+`COLI_VK_IDOT=0` leaves the extension off; a device that supports it without
+acceleration (Lavapipe) keeps the float form unless a test asks (`vkc_moe_set_idot`).
+The chain's line counts the layer steps that took it (`N in the integer form`).
+
+Measured on the RTX PRO 4000 (`COLI_VK_CHAIN_BENCH=moe`, the float form with
+`COLI_VK_IDOT=0`), a layer's experts in microseconds:
+
+| experts (gate+up / down) | D | 1 row | 2 rows | 3 rows |
+|---|---|---|---|---|
+| IQ2_S / Q2_0 | 2560 | 98.6 -> 67.2 | 170 -> 118 | 244 -> 178 |
+| IQ2_XXS / Q6_K | 2048 | 65.8 -> 60.4 | 117 -> 105 | 177 -> 143 |
+| Q4_K / Q6_K | 2048 | 75.6 -> 69.3 | 128 -> 120 | 193 -> 165 |
+| IQ4_XS / IQ4_XS | 2560 | 106 -> 99.6 | 187 -> 180 | 268 -> 283 |
+
+A GGUF's dense GEMV (`chain_gemv_bd_i8.spv`, `chain_gemv_bd.comp` with `-DIDOT`) takes the
+same form there: up to four rows of x (a verify's) quantized into shared memory, and each
+32-weight step decoded once for all of them (`bsi_step` loops over `BSI_NR` rows; the
+experts' kernel is its one-row case). The rows' codes take a quarter of the floats' room,
+so a verify's rows no longer fill the shared memory, and the integer products cost less
+than the conversions. IQ4_XS and IQ4_NL look their values up and keep the float form for
+one row (44.2 us against 46.8). The codes are the CPU's to the bit: a Vulkan division
+may be 2.5 ulp off and an fma need not be fused (Lavapipe's are not), and either moved a
+code at a tie now and then, so `bsi_div` makes `127 / amax` and `amax / 127` exact with
+the integer remainder of the mantissas' quotient. `tests/test_vk_chain`'s `matmul_bd i8`
+cases, every type at 1, 3 and 4 rows, agree with `gq_matmul`'s integer path to under
+2e-5, on the RTX and on Lavapipe. A GEMV of 10240 x 2560 in microseconds (float form ->
+integer form):
+
+| type | 1 row | 2 rows | 3 rows | 4 rows |
+|---|---|---|---|---|
+| IQ2_S | 52.0 -> 29.9 | 67.2 -> 39.7 | 87.3 -> 46.2 | 232.7 -> 58.3 |
+| IQ2_XXS | 48.1 -> 25.4 | 60.8 -> 36.8 | 81.7 -> 46.4 | 232.2 -> 54.0 |
+| Q2_0 | 40.0 -> 29.0 | 51.6 -> 32.8 | 72.7 -> 39.8 | 217.8 -> 47.2 |
+| Q4_K | 46.9 -> 42.2 | 62.5 -> 45.0 | 82.1 -> 50.2 | 149.1 -> 59.0 |
+| Q6_K | 68.1 -> 63.1 | 90.0 -> 67.3 | 113.2 -> 72.1 | 262.4 -> 81.6 |
+| Q8_0 | 74.6 -> 73.2 | 87.0 -> 75.6 | 104.8 -> 78.9 | 272.5 -> 98.9 |
+| IQ4_XS | 44.5 (kept) | 59.7 -> 51.2 | 80.8 -> 58.0 | 231.1 -> 66.2 |
+
+**Staging sizes.** `chain_moe.comp` stages a row of x in shared memory, and so does
+`chain_gemv_bd.comp` (a GGUF's dense GEMV). Both pipelines used to be built at the
+device's largest staging (48 KiB on NVIDIA, with bdstep.glsl's 8.5 KiB of tables), which
+left two workgroups an SM. Now each is made per size: the smallest of 256 to 4096 vec4s
+that holds its rows (`kc_stage` in `vk_chain.c`), so four workgroups fit an SM at
+Qwen3.8's and Qwen3.6's widths. `vkc_prewarm` gets the widths from the engine (each
+matrix's input width, the experts' D and I) and makes and launches those sizes before the
+tier fills the card.
+
+Measured on the RTX PRO 4000 (`tests/test_vk_chain`'s `COLI_VK_CHAIN_BENCH=moe`, one binary
+with the staging forced to the old size and to the new), a layer's experts in
+microseconds (K 10 of 256 at D 2560 I 640, K 8 of 256 at D 2048 I 512):
+
+| experts (gate+up / down) | D | 1 row | 2 rows | 3 rows |
+|---|---|---|---|---|
+| IQ2_S / Q2_0 | 2560 | 112 -> 96 | 207 -> 167 | 311 -> 243 |
+| Q4_K / Q6_K | 2560 | 146 -> 119 | 253 -> 222 | 397 -> 325 |
+| IQ2_XXS / Q6_K | 2048 | 77 -> 66 | 135 -> 119 | 197 -> 178 |
+| Q8_0 / Q8_0 | 2048 | 103 -> 98 | 194 -> 169 | 292 -> 284 |
+
+The dense GEMV takes the small sizes only for one row of IQ2_XXS or IQ2_S, whose decoders
+wait on their grid reads (10240 x 2560: 61.2 -> 48.4 and 66.4 -> 52.0 us). The other
+formats read at the memory's rate and lose with more workgroups an SM (IQ4_XS and IQ4_NL
+3 to 4% for one row, Q8_0 40% for two), so they keep the largest.
+
+In the engine (decode tok/s, a 467-token prompt and 127 tokens, the old sizes and the new
+started one after the other, two pairs, three runs each):
+
+| model | old sizes | new sizes |
+|---|---|---|
+| Qwen3.6 UD-IQ2_XXS | 83.6, 82.0 | 87.0, 86.7 |
+| Qwen3.6 UD-Q4_K_M | 70.6, 71.1 | 71.9, 71.4 |
+| Qwen3.6 int4-g64 (colibri's container) | 61.5, 61.7 | 61.6, 62.1 |
+| Qwen3.8 Next IQ2_XS (507-token prompt) | 35.1, 38.1 | 41.4, 38.2 |
+
+The prefill did not move. On Qwen3.8 the card's own spread between starts is as large as
+the change.
 
 Measured on a Radeon 780M (RADV, OLMoE-1B-7B int8, every expert on the device, a
 25-token prompt and 100 decode steps, warm, the same binary):

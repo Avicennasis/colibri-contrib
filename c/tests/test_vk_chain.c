@@ -1638,7 +1638,7 @@ static void test_moe(const char *what, int D, int I, int E, int S, int K, int fg
     VkcBuf *ib = vkc_buf((size_t)S * irow * 4, VKC_DEV), *wb = vkc_buf((size_t)S * wrow * 4, VKC_DEV);
     VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * yrow * 4, VKC_DEV);
     VkcRoute rp = {S, E, K, 0, 0, lrow, 0, 0, 0, irow, 1, wrow, 1, 1, 1, 1.f, 1.f, 0.f};
-    VkcMoe mp = {S, K, D, I, act, limit, a, b, t_off, 2, xrow, 0, irow, 1, wrow, 1, yrow, 0, 0, 0};
+    VkcMoe mp = {S, K, D, I, act, limit, a, b, t_off, 2, xrow, 0, irow, 1, wrow, 1, yrow, 0, 0, 0, 0, 0, 0};
     /* the route and the experts in frames of their own, timed: a frame past the fence
      * wait's 20 s loses the device, and the line says which of the two took the time */
     struct timespec ts0, ts1, ts2;
@@ -2699,6 +2699,208 @@ static void bd_fix(int t, uint8_t *b) {
     }
     #undef F16AT
 }
+/* vkc_moe_rows (a prompt chunk's routed experts on the device) against vkc_moe (chain_moe,
+ * whose block path the GGUF gates hold to the CPU's): S rows of K experts of E, the experts
+ * random blocks of gate/up type tg and down type td with sane scale fields, the same route */
+static void test_moe_rows(int tg, int td, int S, int K, int E, int D, int I) {
+    int fg = 100 + tg, fd = 100 + td;
+    if (!vkc_moe_rows_ready(fg, fd)) { printf("moe rows %s/%s: not on this device\n", gq_type_name(tg), gq_type_name(td)); return; }
+    if (!coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { CHECK(0, "moe rows: the expert batch did not start at D %d I %d", D, I); return; }
+    size_t rg = (size_t)gq_row_bytes(tg, D), rd = (size_t)gq_row_bytes(td, I);
+    int bg = GQ_TYPES[tg].bytes, bdn = GQ_TYPES[td].bytes;
+    uint8_t *wg = malloc(rg * I), *wu = malloc(rg * I), *wd = malloc(rd * D);
+    ColiVkTensor **t = calloc((size_t)3 * E, sizeof *t);
+    ColiVkExpert **ex = calloc((size_t)E, sizeof *ex);
+    uint32_t *tab = calloc((size_t)E * COLI_VK_XB_ENTRY, 4);
+    int ok = wg && wu && wd && t && ex && tab;
+    for (int e = 0; e < E && ok; e++) {
+        for (size_t i = 0; i < rg * I; i++) { wg[i] = (uint8_t)rnd(); wu[i] = (uint8_t)rnd(); }
+        for (size_t i = 0; i < rd * D; i++) wd[i] = (uint8_t)rnd();
+        for (size_t b = 0; b + (size_t)bg <= rg * I; b += (size_t)bg) { bd_fix(tg, wg + b); bd_fix(tg, wu + b); }
+        for (size_t b = 0; b + (size_t)bdn <= rd * D; b += (size_t)bdn) bd_fix(td, wd + b);
+        ok = coli_vk_tensor_ensure(&t[3 * e], wg, NULL, fg, D, I, 0) && coli_vk_tensor_ensure(&t[3 * e + 1], wu, NULL, fg, D, I, 0) &&
+             coli_vk_tensor_ensure(&t[3 * e + 2], wd, NULL, fd, I, D, 0) && (ex[e] = coli_vk_xb_expert(t[3 * e], t[3 * e + 1], t[3 * e + 2])) &&
+             coli_vk_xb_expert_entry(ex[e], tab + (size_t)e * COLI_VK_XB_ENTRY);
+    }
+    if (!ok) { CHECK(0, "moe rows %s/%s: the experts did not go up", gq_type_name(tg), gq_type_name(td)); goto done; }
+    {
+        float *lg = fvec((size_t)S * E, 2.f), *x = fvec((size_t)S * D, 1.f);
+        VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D), *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
+        VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DOWN), *wb = vkc_buf((size_t)S * K * 4, VKC_DEV);
+        VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *y0 = vkc_buf((size_t)S * D * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * D * 4, VKC_DOWN);
+        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 0, 1, fg, fd, E, 0};
+        VkcMoeRows rr = {0};
+        vkc_moe_set_idot(0);   /* against chain_moe's float form: the grouped GEMMs' sums */
+        ok = vkc_begin() && vkc_write(tb, 0, tab, (size_t)E * COLI_VK_XB_ENTRY * 4) && vkc_route(lb, NULL, ib, wb, &rp) &&
+             vkc_moe(xb, ib, wb, tb, hb, y0, &mp) && vkc_moe_rows(xb, ib, wb, tb, &rr, y1, &mp) && vkc_submit(1);
+        vkc_moe_set_idot(-1);
+        CHECK(ok, "moe rows %s/%s S %d: the frame failed", gq_type_name(tg), gq_type_name(td), S);
+        if (ok) {
+            const float *a = vkc_ptr(y0), *b = vkc_ptr(y1);
+            double mx = 0, ref = 0;
+            for (size_t i = 0; i < (size_t)S * D; i++) { double d = fabs((double)a[i] - b[i]); if (d > mx) mx = d; if (fabs(a[i]) > ref) ref = fabs(a[i]); }
+            CHECK(mx <= 1e-4 * (ref > 1 ? ref : 1), "moe rows %s/%s S %d: max |diff| %.3g of %.3g against chain_moe",
+                  gq_type_name(tg), gq_type_name(td), S, mx, ref);
+            printf("moe rows %s/%s S %d K %d E %d: max |diff| %.3g of %.3g against chain_moe\n", gq_type_name(tg), gq_type_name(td), S, K, E, mx, ref);
+        }
+        vkc_moe_rows_free(&rr);
+        VkcBuf *fr[] = {lb, xb, tb, ib, wb, hb, y0, y1};
+        for (size_t k = 0; k < sizeof fr / sizeof *fr; k++) if (fr[k]) vkc_free(fr[k]);
+        free(lg); free(x);
+    }
+done:
+    /* an expert gives its three tensors back with it; one without an expert, alone */
+    for (int e = 0; e < E && t && ex; e++) {
+        if (ex[e]) coli_vk_xb_expert_free(ex[e]);
+        else for (int k = 0; k < 3; k++) if (t[3 * e + k]) coli_vk_tensor_free(t[3 * e + k]);
+    }
+    free(t); free(ex); free(tab); free(wg); free(wu); free(wd);
+}
+/* The same for our own formats (qmatmul_grp_q.comp): int8 rows (fmt 1), int4 rows (2), int4
+ * with a scale per gs inputs (4), against chain_moe's float form of the same experts */
+static void test_moe_rows_q(int fmt, int gs, int S, int K, int E, int D, int I) {
+    if (!vkc_moe_rows_ready(fmt, fmt)) { printf("moe rows fmt %d: not on this device\n", fmt); return; }
+    if (!coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { CHECK(0, "moe rows fmt %d: the expert batch did not start", fmt); return; }
+    size_t rg = fmt == 1 ? (size_t)D : (size_t)D / 2, rd = fmt == 1 ? (size_t)I : (size_t)I / 2;
+    size_t ng = fmt == 4 ? (size_t)D / gs : 1, nd = fmt == 4 ? (size_t)I / gs : 1;
+    uint8_t *wg = malloc(rg * I), *wu = malloc(rg * I), *wd = malloc(rd * D);
+    float *sg = malloc((size_t)I * ng * 4), *su = malloc((size_t)I * ng * 4), *sd = malloc((size_t)D * nd * 4);
+    ColiVkTensor **t = calloc((size_t)3 * E, sizeof *t);
+    ColiVkExpert **ex = calloc((size_t)E, sizeof *ex);
+    uint32_t *tab = calloc((size_t)E * COLI_VK_XB_ENTRY, 4);
+    int ok = wg && wu && wd && sg && su && sd && t && ex && tab;
+    for (int e = 0; e < E && ok; e++) {
+        for (size_t i = 0; i < rg * I; i++) { wg[i] = (uint8_t)rnd(); wu[i] = (uint8_t)rnd(); }
+        for (size_t i = 0; i < rd * D; i++) wd[i] = (uint8_t)rnd();
+        for (size_t i = 0; i < (size_t)I * ng; i++) { sg[i] = 0.002f + 0.002f * (rnd() & 255) / 255.f; su[i] = 0.002f + 0.002f * (rnd() & 255) / 255.f; }
+        for (size_t i = 0; i < (size_t)D * nd; i++) sd[i] = 0.002f + 0.002f * (rnd() & 255) / 255.f;
+        int g = fmt == 4 ? gs : 0;
+        ok = coli_vk_tensor_ensure(&t[3 * e], wg, sg, fmt, D, I, g) && coli_vk_tensor_ensure(&t[3 * e + 1], wu, su, fmt, D, I, g) &&
+             coli_vk_tensor_ensure(&t[3 * e + 2], wd, sd, fmt, I, D, g) && (ex[e] = coli_vk_xb_expert(t[3 * e], t[3 * e + 1], t[3 * e + 2])) &&
+             coli_vk_xb_expert_entry(ex[e], tab + (size_t)e * COLI_VK_XB_ENTRY);
+    }
+    if (!ok) { CHECK(0, "moe rows fmt %d: the experts did not go up", fmt); goto done; }
+    {
+        float *lg = fvec((size_t)S * E, 2.f), *x = fvec((size_t)S * D, 1.f);
+        VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D), *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
+        VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DOWN), *wb = vkc_buf((size_t)S * K * 4, VKC_DEV);
+        VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *y0 = vkc_buf((size_t)S * D * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * D * 4, VKC_DOWN);
+        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 0, 0, fmt, fmt, E, 0};
+        VkcMoeRows rr = {0};
+        ok = vkc_begin() && vkc_write(tb, 0, tab, (size_t)E * COLI_VK_XB_ENTRY * 4) && vkc_route(lb, NULL, ib, wb, &rp) &&
+             vkc_moe(xb, ib, wb, tb, hb, y0, &mp) && vkc_moe_rows(xb, ib, wb, tb, &rr, y1, &mp) && vkc_submit(1);
+        CHECK(ok, "moe rows fmt %d S %d: the frame failed", fmt, S);
+        if (ok) {
+            const float *a = vkc_ptr(y0), *b = vkc_ptr(y1);
+            double mx = 0, ref = 0;
+            for (size_t i = 0; i < (size_t)S * D; i++) { double d = fabs((double)a[i] - b[i]); if (d > mx) mx = d; if (fabs(a[i]) > ref) ref = fabs(a[i]); }
+            CHECK(mx <= 1e-4 * (ref > 1 ? ref : 1), "moe rows fmt %d S %d: max |diff| %.3g of %.3g against chain_moe", fmt, S, mx, ref);
+            printf("moe rows fmt %d gs %d S %d K %d E %d: max |diff| %.3g of %.3g against chain_moe\n", fmt, gs, S, K, E, mx, ref);
+        }
+        vkc_moe_rows_free(&rr);
+        VkcBuf *fr[] = {lb, xb, tb, ib, wb, hb, y0, y1};
+        for (size_t k = 0; k < sizeof fr / sizeof *fr; k++) if (fr[k]) vkc_free(fr[k]);
+        free(lg); free(x);
+    }
+done:
+    for (int e = 0; e < E && t && ex; e++) {
+        if (ex[e]) coli_vk_xb_expert_free(ex[e]);
+        else for (int k = 0; k < 3; k++) if (t[3 * e + k]) coli_vk_tensor_free(t[3 * e + k]);
+    }
+    free(t); free(ex); free(tab); free(wg); free(wu); free(wd); free(sg); free(su); free(sd);
+}
+/* A GGUF's experts in the CPU's integer form (chain_moe_i8: vkc_moe_set_idot(1)) against
+ * the CPU's own: each input row quantized as gq_quant_act_ref does it, each expert row
+ * through gq_unpack_row and gq_dot_i8, SwiGLU, down the same way, the rank-order sum; and
+ * the float form's distance from it, which the integer one must beat. */
+static void test_moe_i8(int tg, int td, int S, int K, int E, int D, int I) {
+    int fg = 100 + tg, fd = 100 + td;
+    if (!vkc_moe_idot()) { printf("moe i8 %s/%s: no integer dot product on this device\n", gq_type_name(tg), gq_type_name(td)); return; }
+    if (!coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { CHECK(0, "moe i8: the expert batch did not start at D %d I %d", D, I); return; }
+    size_t rg = (size_t)gq_row_bytes(tg, D), rd = (size_t)gq_row_bytes(td, I);
+    int bg = GQ_TYPES[tg].bytes, bdn = GQ_TYPES[td].bytes;
+    uint8_t *wg = malloc(rg * I * E), *wu = malloc(rg * I * E), *wd = malloc(rd * D * E);
+    ColiVkTensor **t = calloc((size_t)3 * E, sizeof *t);
+    ColiVkExpert **ex = calloc((size_t)E, sizeof *ex);
+    uint32_t *tab = calloc((size_t)E * COLI_VK_XB_ENTRY, 4);
+    int ok = wg && wu && wd && t && ex && tab;
+    for (int e = 0; e < E && ok; e++) {
+        uint8_t *g = wg + rg * I * e, *u = wu + rg * I * e, *dn = wd + rd * D * e;
+        for (size_t i = 0; i < rg * I; i++) { g[i] = (uint8_t)rnd(); u[i] = (uint8_t)rnd(); }
+        for (size_t i = 0; i < rd * D; i++) dn[i] = (uint8_t)rnd();
+        for (size_t b = 0; b + (size_t)bg <= rg * I; b += (size_t)bg) { bd_fix(tg, g + b); bd_fix(tg, u + b); }
+        for (size_t b = 0; b + (size_t)bdn <= rd * D; b += (size_t)bdn) bd_fix(td, dn + b);
+        ok = coli_vk_tensor_ensure(&t[3 * e], g, NULL, fg, D, I, 0) && coli_vk_tensor_ensure(&t[3 * e + 1], u, NULL, fg, D, I, 0) &&
+             coli_vk_tensor_ensure(&t[3 * e + 2], dn, NULL, fd, I, D, 0) && (ex[e] = coli_vk_xb_expert(t[3 * e], t[3 * e + 1], t[3 * e + 2])) &&
+             coli_vk_xb_expert_entry(ex[e], tab + (size_t)e * COLI_VK_XB_ENTRY);
+    }
+    if (!ok) { CHECK(0, "moe i8 %s/%s: the experts did not go up", gq_type_name(tg), gq_type_name(td)); goto done; }
+    {
+        float *lg = fvec((size_t)S * E, 2.f), *x = fvec((size_t)S * D, 1.f);
+        VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D), *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
+        VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DOWN), *wb = vkc_buf((size_t)S * K * 4, VKC_DOWN);
+        VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *y0 = vkc_buf((size_t)S * D * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * D * 4, VKC_DOWN);
+        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 0, 1, fg, fd, E, 0};
+        VkcStats s0, s1; vkc_stats(&s0);
+        vkc_moe_set_idot(1);
+        ok = vkc_begin() && vkc_write(tb, 0, tab, (size_t)E * COLI_VK_XB_ENTRY * 4) && vkc_route(lb, NULL, ib, wb, &rp) &&
+             vkc_moe(xb, ib, wb, tb, hb, y0, &mp) && vkc_submit(1);
+        vkc_stats(&s1);
+        vkc_moe_set_idot(0);
+        ok = ok && vkc_begin() && vkc_moe(xb, ib, wb, tb, hb, y1, &mp) && vkc_submit(1);
+        vkc_moe_set_idot(-1);
+        CHECK(ok && s1.moe_i8 > s0.moe_i8, "moe i8 %s/%s S %d: the frame failed or did not take the integer form",
+              gq_type_name(tg), gq_type_name(td), S);
+        if (ok) {
+            const int *ids = vkc_ptr(ib); const float *wts = vkc_ptr(wb);
+            float *ref = calloc((size_t)S * D, sizeof *ref), *h = malloc((size_t)I * sizeof *h);
+            int8_t *w8 = malloc((size_t)(D > I ? D : I)), *xq = malloc((size_t)(D > I ? D : I));
+            float *sw = malloc((size_t)(D > I ? D : I) / 16 * sizeof(float)), *mw = malloc((size_t)(D > I ? D : I) / 16 * sizeof(float));
+            float *dx = malloc((size_t)(D > I ? D : I) / 32 * sizeof(float)); int32_t *xs = malloc((size_t)(D > I ? D : I) / 16 * sizeof(int32_t));
+            int hg = gq_has_min(tg), hd = gq_has_min(td);
+            for (int s = 0; s < S; s++) {
+                gq_quant_act_ref(x + (size_t)s * D, D, xq, dx, xs);
+                int8_t *xq_s = malloc((size_t)D); float *dx_s = malloc((size_t)D / 32 * sizeof(float)); int32_t *xs_s = malloc((size_t)D / 16 * sizeof(int32_t));
+                memcpy(xq_s, xq, (size_t)D); memcpy(dx_s, dx, (size_t)D / 32 * sizeof(float)); memcpy(xs_s, xs, (size_t)D / 16 * sizeof(int32_t));
+                for (int k = 0; k < K; k++) {
+                    int e = ids[s * K + k];
+                    if (e < 0 || e >= E) continue;
+                    for (int o = 0; o < I; o++) {
+                        gq_unpack_row(tg, wg + rg * I * e + rg * o, D, w8, sw, mw);
+                        float gv = gq_dot_i8(w8, sw, mw, hg, xq_s, dx_s, xs_s, D);
+                        gq_unpack_row(tg, wu + rg * I * e + rg * o, D, w8, sw, mw);
+                        float uv = gq_dot_i8(w8, sw, mw, hg, xq_s, dx_s, xs_s, D);
+                        h[o] = gv / (1.f + expf(-gv)) * uv;
+                    }
+                    gq_quant_act_ref(h, I, xq, dx, xs);
+                    for (int o = 0; o < D; o++) {
+                        gq_unpack_row(td, wd + rd * D * e + rd * o, I, w8, sw, mw);
+                        ref[(size_t)s * D + o] += wts[s * K + k] * gq_dot_i8(w8, sw, mw, hd, xq, dx, xs, I);
+                    }
+                }
+                free(xq_s); free(dx_s); free(xs_s);
+            }
+            double ei = relerr(vkc_ptr(y0), ref, (size_t)S * D, 1e-6), ef = relerr(vkc_ptr(y1), ref, (size_t)S * D, 1e-6);
+            CHECK(!bad(vkc_ptr(y0), (size_t)S * D) && ei < 2e-4 && ei < ef, "moe i8 %s/%s S %d: err %.2e against the CPU's integer form (the float form %.2e)",
+                  gq_type_name(tg), gq_type_name(td), S, ei, ef);
+            printf("moe i8 %s/%s S %d K %d: err %.2e against the CPU's integer form (the float form %.2e)\n",
+                   gq_type_name(tg), gq_type_name(td), S, K, ei, ef);
+            free(ref); free(h); free(w8); free(xq); free(sw); free(mw); free(dx); free(xs);
+        }
+        VkcBuf *fr[] = {lb, xb, tb, ib, wb, hb, y0, y1};
+        for (size_t k = 0; k < sizeof fr / sizeof *fr; k++) if (fr[k]) vkc_free(fr[k]);
+        free(lg); free(x);
+    }
+done:
+    for (int e = 0; e < E && t && ex; e++) {
+        if (ex[e]) coli_vk_xb_expert_free(ex[e]);
+        else for (int k = 0; k < 3; k++) if (t[3 * e + k]) coli_vk_tensor_free(t[3 * e + k]);
+    }
+    free(t); free(ex); free(tab); free(wg); free(wu); free(wd);
+}
 static void test_matmul_bd(int t, int S, int I, int O) {
     int fmt = 100 + t, bl = GQ_TYPES[t].blck, by = GQ_TYPES[t].bytes;
     int64_t rbs = gq_row_bytes(t, I);
@@ -2714,7 +2916,9 @@ static void test_matmul_bd(int t, int S, int I, int O) {
     ColiVkTensor *tt = NULL;
     if (!coli_vk_tensor_ensure(&tt, w, NULL, fmt, I, O, 0)) { CHECK(0, "matmul_bd %s: upload", gq_type_name(t)); free(w); free(W); free(x); return; }
     VkcBuf *xb = up(x, (size_t)S * I), *yb = vkc_buf((size_t)S * O * 4, VKC_DEV);
+    vkc_moe_set_idot(0);   /* the float form, against the float dequantization */
     vkc_begin(); int ok = vkc_matmul(tt, xb, 0, yb, 0, S); vkc_submit(1);
+    vkc_moe_set_idot(-1);
     float *y = down(yb, 0, (size_t)S * O), *ref = malloc((size_t)S * O * sizeof *ref);
     for (int s = 0; s < S; s++) for (int o = 0; o < O; o++) {
         double a = 0; for (int i = 0; i < I; i++) a += (double)x[(size_t)s * I + i] * W[(size_t)o * I + i];
@@ -2724,6 +2928,33 @@ static void test_matmul_bd(int t, int S, int I, int O) {
     CHECK(ok && !bad(y, (size_t)S * O) && e < 1e-5, "matmul_bd %s S %d [%d x %d]: err %.2e", gq_type_name(t), S, O, I, e);
     coli_vk_tensor_free(tt); vkc_free(xb); vkc_free(yb);
     free(w); free(W); free(x); free(y); free(ref);
+}
+/* The dense GEMV in the CPU's integer form (chain_gemv_bd_i8: vkc_moe_set_idot(1)) against
+ * gq_matmul's integer path (gq_quant_act's int8 rows, gq_dot's integer sums) */
+static void test_matmul_bd_i8(int t, int S, int I, int O) {
+    int fmt = 100 + t, bl = GQ_TYPES[t].blck, by = GQ_TYPES[t].bytes;
+    size_t rb = (size_t)gq_row_bytes(t, I);
+    if (!vkc_moe_idot() || gq_exact_mode() || !gq_int_ok(t, I)) { printf("matmul_bd i8 %s: not here\n", gq_type_name(t)); return; }
+    uint8_t *w = malloc(rb * O);
+    for (size_t i = 0; i < rb * O; i++) w[i] = (uint8_t)rnd();
+    for (int o = 0; o < O; o++) for (int b = 0; b < I / bl; b++) bd_fix(t, w + (size_t)o * rb + (size_t)b * by);
+    float *x = fvec((size_t)S * I, 1.f), *ref = malloc((size_t)S * O * sizeof *ref);
+    gq_matmul(ref, x, w, t, S, I, O);
+    ColiVkTensor *tt = NULL;
+    if (!coli_vk_tensor_ensure(&tt, w, NULL, fmt, I, O, 0)) { CHECK(0, "matmul_bd i8 %s: upload", gq_type_name(t)); free(w); free(x); free(ref); return; }
+    VkcBuf *xb = up(x, (size_t)S * I), *yb = vkc_buf((size_t)S * O * 4, VKC_DEV);
+    VkcStats s0, s1; vkc_stats(&s0);
+    vkc_moe_set_idot(1);
+    vkc_begin(); int ok = vkc_matmul(tt, xb, 0, yb, 0, S); vkc_submit(1);
+    vkc_moe_set_idot(-1);
+    vkc_stats(&s1);
+    float *y = down(yb, 0, (size_t)S * O);
+    double e = relerr(y, ref, (size_t)S * O, 1e-6);
+    if (ok && s1.gemv_i8 == s0.gemv_i8) printf("matmul_bd i8 %s S %d [%d x %d]: not on this device (its shared memory)\n", gq_type_name(t), S, O, I);
+    else CHECK(ok && !bad(y, (size_t)S * O) && e < 2e-5, "matmul_bd i8 %s S %d [%d x %d]: err %.2e against the CPU's integer form",
+               gq_type_name(t), S, O, I, e);
+    coli_vk_tensor_free(tt); vkc_free(xb); vkc_free(yb);
+    free(w); free(x); free(y); free(ref);
 }
 static void test_bd(void) {
     const int types[] = {GQ_Q8_0, GQ_Q4_K, GQ_Q5_K, GQ_Q6_K, GQ_IQ2_XXS, GQ_IQ4_NL, GQ_IQ3_S, GQ_IQ2_S, GQ_IQ4_XS,
@@ -2736,6 +2967,7 @@ static void test_bd(void) {
         test_matmul_bd(t, 1, 16640, 9);     /* x past the staging (16 KiB floats at most): read from the buffer */
         test_matmul_bd(t, 70, 1280, 33);    /* a prompt's rows: the tiled GEMM, partial tiles both ways */
         test_matmul_bd(t, 130, 2560, 160);
+        if (k < 10) { test_matmul_bd_i8(t, 1, 2560, 130); test_matmul_bd_i8(t, 3, 1280, 33); test_matmul_bd_i8(t, 4, 256, 70); }
     }
     printf("matmul_bd: %zu block types\n", sizeof types / sizeof *types);
 }
@@ -2805,7 +3037,7 @@ static void bench_moe(void) {
         VkcBuf *ib = vkc_buf((size_t)S * K * 4 * nl, VKC_DEV), *wb = vkc_buf((size_t)S * K * 4 * nl, VKC_DEV);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * D * 4, VKC_DEV);
         VkcRoute rp = {S * nl, E, K, 0, 0, E, 0, 0, 0, K, 1, K, 1, 1, 1, 1.f, 1.f, 0.f};
-        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, rpw, 1, fg};   /* block-format experts */
+        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, rpw, 1, fg, fd, E, 0};   /* block-format experts */
         vkc_begin(); ok = vkc_route(lb, NULL, ib, wb, &rp) && vkc_submit(1);
         double best = 1e9;
         for (int r = -1; r < 4 && ok; r++) {   /* r -1 untimed: a driver may finish the pipeline on its first frames */
@@ -3193,6 +3425,22 @@ int main(int argc, char **argv) {
         test_moe("SwiGLU clamped", 256, 88, 6, 3, 2, 4, 4, 32, 0, 0.05f);
         test_moe("SiTU-GLU", 256, 88, 6, 1, 4, 1, 1, 32, 1, 0.f);
         test_moe("top-1, three rows", 256, 88, 8, 3, 1, 2, 2, 32, 0, 0.f);
+        /* a prompt chunk's rows through the grouped GEMMs, against chain_moe: K-quants,
+         * grid types and Q2_0, 40 rows (an expert's tiles past one) */
+        test_moe_rows(GQ_Q4_K, GQ_Q5_K, 40, 4, 12, 512, 256);
+        test_moe_rows(GQ_IQ2_S, GQ_Q2_0, 40, 4, 12, 512, 256);
+        test_moe_rows(GQ_Q8_0, GQ_Q6_K, 7, 2, 6, 256, 256);
+        /* and our own formats: int8 rows, int4 rows, int4 per 64 and per 32 (qmatmul_grp_q.comp) */
+        test_moe_rows_q(1, 0, 40, 4, 12, 512, 256);
+        test_moe_rows_q(2, 0, 40, 4, 12, 512, 256);
+        test_moe_rows_q(4, 64, 40, 4, 12, 512, 256);
+        test_moe_rows_q(4, 32, 7, 2, 6, 256, 256);
+        /* the integer form, every type it decodes, against the CPU's */
+        test_moe_i8(GQ_IQ2_S, GQ_Q2_0, 3, 4, 12, 512, 256);
+        test_moe_i8(GQ_Q4_K, GQ_Q6_K, 2, 4, 12, 512, 256);
+        test_moe_i8(GQ_Q5_K, GQ_Q8_0, 2, 3, 8, 512, 256);
+        test_moe_i8(GQ_IQ2_XXS, GQ_IQ4_NL, 2, 3, 8, 512, 256);
+        test_moe_i8(GQ_IQ3_S, GQ_IQ4_XS, 2, 3, 8, 512, 256);
         printf("moe done\n");
     }
     rng = rng_routed;

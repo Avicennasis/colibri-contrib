@@ -28,6 +28,10 @@
 // subgroup.
 // Every index is in range on every lane, the lanes a loop or a branch has left included
 // (a software device reads on inactive lanes too, at the index they hold).
+// IDOT (chain_moe_i8.spv, built with -DIDOT): the bdstep.glsl types in the CPU's integer
+// form (bdstep_i8.glsl): the input row quantized to int8 per 32 in shared memory (XQ uvec4s
+// of codes, no float staging: XS 4), packed 4 x 8 integer dot products. A module of its own,
+// since the integer dot product is a capability not every device has.
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_control_flow_attributes : enable
@@ -39,6 +43,9 @@ layout(constant_id = 0) const int XS = 4096;   // staged input floats (a multipl
 // pipeline); 0 leaves them out, so the other formats' pipeline stays as small as it was
 // (a software device compiles and runs every path it holds)
 layout(constant_id = 1) const int BD = 0;
+#ifdef IDOT
+layout(constant_id = 2) const int XQ = 256;   // uvec4s of the quantized row's codes: 16 XQ inputs at most
+#endif
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WRef4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer WRef { uint v[]; };
@@ -197,10 +204,46 @@ float g_acc;
 #define BS_ACC(w, i) g_acc += dot((w), xv4(i))
 #define BS_G(i) bdtab[i]
 #include "bdstep.glsl"
+#ifdef IDOT
+// the quantized row: codes (a uvec4 of padding after every 8, as the floats' staging),
+// the scale of each block of 32, the codes' sum of each group of 16
+shared uvec4 xq4[XQ + XQ / 8 + 1];
+shared float xdx[XQ / 2 + 1];
+shared int xsum[XQ + 1];
+bool g_idq;
+#define BSI_NR 1
+#define BSI_X(r, i) int(xq4[min(xsw((i) >> 2), uint(XQ + XQ / 8))][(i) & 3u])
+#define BSI_DX(r, b) xdx[min((b), uint(XQ / 2))]
+#define BSI_XS(r, g) xsum[min((g), uint(XQ))]
+#define BSI_ACC(r, v) g_acc += (v)
+#include "bdstep_i8.glsl"
+// the input row (src 0 x, 1 hid; n inputs from base) quantized as gq_quant_act_ref does: a
+// block of 32 a thread
+void quant_x(int src, int base, int n, int tid) {
+    for (int b = tid; b < n / 32; b += 256) {
+        float v[32]; float amax = 0.0;
+        [[unroll]] for (int k = 0; k < 32; k++) { v[k] = src == 0 ? x[base + 32 * b + k] : hid[base + 32 * b + k]; amax = max(amax, abs(v[k])); }
+        float d = bsi_div(amax, 127.0), id = bsi_id(amax);
+        int s0 = 0, s1 = 0; uint w[8];
+        [[unroll]] for (int k = 0; k < 8; k++) {
+            ivec4 c = clamp(ivec4(roundEven(vec4(v[4 * k], v[4 * k + 1], v[4 * k + 2], v[4 * k + 3]) * id)), ivec4(-127), ivec4(127));
+            int cs = c.x + c.y + c.z + c.w;
+            if (k < 4) s0 += cs; else s1 += cs;
+            w[k] = (uint(c.x) & 255u) | ((uint(c.y) & 255u) << 8) | ((uint(c.z) & 255u) << 16) | ((uint(c.w) & 255u) << 24);
+        }
+        xq4[xsw(uint(2 * b))] = uvec4(w[0], w[1], w[2], w[3]);
+        xq4[xsw(uint(2 * b + 1))] = uvec4(w[4], w[5], w[6], w[7]);
+        xdx[b] = d; xsum[2 * b] = s0; xsum[2 * b + 1] = s1;
+    }
+}
+#define BS_STEP(t, rb, q) { if (g_idq) bsi_step(t, rb, q); else bs_step(t, rb, q); }
+#else
+#define BS_STEP(t, rb, q) bs_step(t, rb, q)
+#endif
 void bs_mat(uint at) { uvec2 a = uvec2(tab[at], tab[at + 1u]); g_bw = WRef(a); g_bw4 = WRef4(a); g_b16 = (a.x & 15u) == 0u; }
 float bs_row(int t, uint rb, uint jj, uint lpr, uint nst) {
     g_acc = 0.0;
-    for (uint q = jj; q < nst; q += lpr) bs_step(t, rb, q);
+    for (uint q = jj; q < nst; q += lpr) BS_STEP(t, rb, q);
     return g_acc;
 }
 // gate and up of one row together: the two matrices' steps side by side, the staged x read once
@@ -209,8 +252,8 @@ vec2 bs_row2(int t, uvec2 ga, uvec2 ua, uint rb, uint jj, uint lpr, uint nst) {
     WRef wg = WRef(ga), wu = WRef(ua); WRef4 wg4 = WRef4(ga), wu4 = WRef4(ua);
     bool g16 = (ga.x & 15u) == 0u, u16 = (ua.x & 15u) == 0u;
     for (uint q = jj; q < nst; q += lpr) {
-        g_bw = wg; g_bw4 = wg4; g_b16 = g16; g_acc = g; bs_step(t, rb, q); g = g_acc;
-        g_bw = wu; g_bw4 = wu4; g_b16 = u16; g_acc = u; bs_step(t, rb, q); u = g_acc;
+        g_bw = wg; g_bw4 = wg4; g_b16 = g16; g_acc = g; BS_STEP(t, rb, q); g = g_acc;
+        g_bw = wu; g_bw4 = wu4; g_b16 = u16; g_acc = u; BS_STEP(t, rb, q); u = g_acc;
     }
     return vec2(g, u);
 }
@@ -340,12 +383,24 @@ void main() {
     uint fo = p.mode == 0 ? 12u : 15u;                  // the matrices' format words
     int fmt = int(tab[eb + fo]), rws = int(tab[eb + fo + 1u]), gs = int(tab[eb + fo + 2u]);
     bool wd = wide(fmt, rws, n);
+#ifdef IDOT
+    /* uniform: the pair's format */
+    g_idq = BD != 0 && fmt >= 100 && fmt < 164 && bsi_has(fmt - 100) && n % 32 == 0 && n <= 16 * XQ;
+    if (g_idq) { g_src = p.mode == 0 ? 0 : 1; g_base = p.mode == 0 ? p.x_off + s * p.x_row : j * p.I; g_n = n; g_staged = false;
+                 quant_x(g_src, g_base, n, tid); }
+    else
+#endif
     stage(p.mode == 0 ? 0 : 1, p.mode == 0 ? p.x_off + s * p.x_row : j * p.I, n, wd ? rws * int(vpw(fmt)) : n, tid);
     if (BD != 0 && fmt >= 100 && fmt < 164) bs_tables_fill(fmt - 100, tid);
     barrier();
     wd = wd && g_staged;
     uint o0 = uint(t * rpw);
-    if (BD != 0 && fmt >= 100 && fmt < 164 && bs_has(fmt - 100) && n % 32 == 0 && g_staged) {
+#ifdef IDOT
+    bool blk = g_staged || g_idq;
+#else
+    bool blk = g_staged;
+#endif
+    if (BD != 0 && fmt >= 100 && fmt < 164 && bs_has(fmt - 100) && n % 32 == 0 && blk) {
         /* about spl steps a lane (measured: the latency of a step's loads wants work beside
          * it), and lanes enough that the workgroup's subgroups all have rows of the rpw */
         uint steps = uint(n) / 32u, lpr = 1u, spl = uint(max(p.spl, 1));
