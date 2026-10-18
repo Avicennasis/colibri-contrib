@@ -2736,6 +2736,36 @@ static void test_bd(void) {
     printf("matmul_bd: %zu block types\n", sizeof types / sizeof *types);
 }
 
+/* COLI_VK_CHAIN_BENCH=dn: the DeltaNet recurrence at Qwen3.6's decode shape (32 value heads,
+ * 16 key heads, KD = VD = 128, one row), 30 layers' worth in one frame, each its own state */
+static void bench_dn(void) {
+    int VH = 32, KH = 16, KD = 128, VD = 128, n = 30;
+    const char *ve = getenv("COLI_VK_BENCH_VH");
+    if (ve && atoi(ve) > 0) { VH = atoi(ve); KH = VH / 2; }
+    const char *ke = getenv("COLI_VK_BENCH_KD");
+    if (ke && atoi(ke) > 0) KD = atoi(ke);
+    int Kt = KH * KD, CD = 2 * Kt + VH * VD;
+    float *cv = fvec((size_t)CD, 1.f), *ab = fvec((size_t)2 * VH, 1.f), *z = fvec((size_t)VH * VD, 1.f), *prm = fvec((size_t)2 * VH + VD, 0.3f);
+    VkcBuf *cb = up(cv, CD), *abb = up(ab, 2 * VH), *zb = up(z, (size_t)VH * VD), *pb = up(prm, (size_t)2 * VH + VD);
+    size_t SN = (size_t)VH * KD * VD;
+    VkcBuf *sb = vkc_buf(SN * 4 * n, VKC_DEV), *yb = vkc_buf((size_t)VH * VD * 4 * n, VKC_DEV);
+    double best = 1e9; int ok = 1;
+    for (int r = 0; r < 5 && ok; r++) {
+        vkc_begin();
+        for (int l = 0; l < n && ok; l++) {
+            VkcDnRec p1 = {1, VH, KH, VD, Kt, 0, CD, 0, 2 * VH, VH, 2 * VH, 0, VH * VD, l * VH * VD, VH * VD, -1, 0, 1e-6f,
+                           1.f / sqrtf((float)KD), (int)(SN * l), 0, 0};
+            ok = vkc_dnrec(KD, cb, abb, zb, sb, pb, yb, NULL, &p1);
+        }
+        double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+        if (dt < best) best = dt;
+    }
+    if (ok) printf("bench dn VH %d KD %d VD %d, one row: %.1f us a layer (%.1f GB/s of state read and written)\n",
+                   VH, KD, VD, best * 1e6 / n, 2.0 * SN * 4 * n / best / 1e9);
+    vkc_free(cb); vkc_free(abb); vkc_free(zb); vkc_free(pb); vkc_free(sb); vkc_free(yb);
+    free(cv); free(ab); free(z); free(prm);
+}
+
 /* COLI_VK_CHAIN_BENCH=moe: the routed experts in the frame (vkc_route + vkc_moe) at
  * Qwen3.8-Flash-Next's shapes, a GGUF's experts (IQ2_S gate/up, Q2_0 down; COLI_VK_BENCH_FMTS
  * "122 142" sets them), random blocks, S rows of K = 10 experts of 64. */
@@ -2789,12 +2819,14 @@ static void bench_moe(void) {
  * Qwen3.8's and Qwen3.6's dense matrices, random blocks (the time does not depend on the
  * values). COLI_VK_BENCH_FMTS="123 121" picks the formats (100 + ggml type). */
 static void bench_bd(void) {
-    int shapes[4][2] = {{2560, 10240}, {6144, 2560}, {2560, 640}, {2560, 32768}};
+    int shapes[4][2] = {{2560, 10240}, {6144, 2560}, {2560, 640}, {2560, 32768}}, nsh = 4;
+    const char *she = getenv("COLI_VK_BENCH_SHAPE");   /* "O I": one shape of your own */
+    if (she && *she) { int o = 0, i = 0; if (sscanf(she, "%d %d", &o, &i) == 2 && o > 0 && i > 0) { shapes[0][0] = i; shapes[0][1] = o; nsh = 1; } }
     int fmts[16] = {108, 112, 113, 114, 116, 120, 121, 122, 123, 142}, nf = 10;
     const char *e = getenv("COLI_VK_BENCH_FMTS");
     if (e && *e) { nf = 0; for (char *p = (char *)e; *p && nf < 16;) { long v = strtol(p, &p, 10); if (v) fmts[nf++] = (int)v; while (*p == ' ') p++; } }
-    for (int f = 0; f < nf; f++) for (int k = 0; k < 4; k++) {
-        int I = shapes[k][0], O = shapes[k][1], fmt = fmts[f], nm = k == 3 ? 4 : 24;
+    for (int f = 0; f < nf; f++) for (int k = 0; k < nsh; k++) {
+        int I = shapes[k][0], O = shapes[k][1], fmt = fmts[f], nm = (size_t)O * I > (64u << 20) ? 2 : k == 3 ? 4 : 24;
         if (!coli_vk_block_elems(fmt) || I % coli_vk_block_elems(fmt)) { printf("bench fmt %d: not a block format here\n", fmt); break; }
         size_t rb = coli_vk_tensor_row_bytes(fmt, I);
         ColiVkTensor **t = calloc(nm, sizeof *t);
@@ -2935,6 +2967,7 @@ int main(int argc, char **argv) {
     if (getenv("COLI_VK_CHAIN_BENCH")) {
         if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "bd")) bench_bd();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "moe")) bench_moe();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dn")) bench_dn();
         else bench_gemv();
         vkc_shutdown(); coli_vk_shutdown(); return 0;
     }

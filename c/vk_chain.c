@@ -87,6 +87,7 @@ typedef struct {
     int inflight, open;
     unsigned long long serial;
     VkQueryPool qp; int nq; unsigned char kind[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF: a timestamp after each op */
+    uint32_t shape[VKC_PROF_Q];   /* COLI_VK_CHAIN_PROF=2: a matmul's (fmt, O, I) slot in prof_sh, else 0 */
 } VkcFrame;
 
 typedef struct {
@@ -131,6 +132,8 @@ typedef struct {
     VkcStats st;
     int prof, kind; float ts_period; uint32_t ts_mask;
     double prof_ms[PK_N]; unsigned long long prof_n[PK_N];
+    /* COLI_VK_CHAIN_PROF=2: the matmuls' time by (fmt, rows of x, O, I), the slots' keys */
+    int prof_shapes; uint64_t prof_key[64]; double prof_sh_ms[64]; unsigned long long prof_sh_n[64];
 } VkcCtx;
 /* One context per device (vkc_device): 0 the primary, 1 COLI_VK_DEV2's, for the layers an
  * engine places there. Every call works on the current device's; a buffer remembers its
@@ -542,8 +545,8 @@ int vkc_init(void) {
         vkGetPhysicalDeviceQueueFamilyProperties((VkPhysicalDevice)KC.core.phys, &nqf, qf);
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
         uint32_t bits = KC.core.qfam < nqf ? qf[KC.core.qfam].timestampValidBits : 0;
-        if (e && *e == '1' && bits && pp.limits.timestampPeriod > 0) {
-            KC.prof = 1; KC.ts_period = pp.limits.timestampPeriod;
+        if (e && (*e == '1' || *e == '2') && bits && pp.limits.timestampPeriod > 0) {
+            KC.prof = *e == '2' ? 2 : 1; KC.ts_period = pp.limits.timestampPeriod;   /* 2: the matmuls by shape too */
             KC.ts_mask = bits >= 32 ? 0xffffffffu : (1u << bits) - 1;
             for (int i = 0; i < VKC_FRAMES; i++) {
                 VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
@@ -597,15 +600,25 @@ static int frame_wait(VkcFrame *f) {
             for (int i = 1; i < f->nq; i++) {
                 uint64_t d = (ts[i] - ts[i - 1]) & (KC.ts_mask == 0xffffffffu ? ~0ull : (uint64_t)KC.ts_mask);
                 KC.prof_ms[f->kind[i]] += (double)d * KC.ts_period / 1e6; KC.prof_n[f->kind[i]]++;
+                if (f->shape[i]) { KC.prof_sh_ms[f->shape[i] - 1] += (double)d * KC.ts_period / 1e6; KC.prof_sh_n[f->shape[i] - 1]++; }
             }
         f->nq = 0;
     }
     frame_reclaim(f);
     return 1;
 }
+static uint64_t g_prof_shape;   /* the matmul being recorded: (fmt, S, O, I), 0 outside one */
 static void prof_mark(VkcFrame *f, int kind) {
     if (!KC.prof || !f->qp || f->nq >= VKC_PROF_Q) return;
     vkCmdWriteTimestamp(f->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, f->qp, (uint32_t)f->nq);
+    uint32_t slot = 0;
+    if (KC.prof == 2 && g_prof_shape) {
+        int k = 0;
+        while (k < KC.prof_shapes && KC.prof_key[k] != g_prof_shape) k++;
+        if (k == KC.prof_shapes && k < 64) KC.prof_key[KC.prof_shapes++] = g_prof_shape;
+        if (k < 64) slot = (uint32_t)k + 1;
+    }
+    f->shape[f->nq] = slot;
     f->kind[f->nq++] = (unsigned char)kind;
 }
 int vkc_finish(void) {
@@ -1014,7 +1027,17 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
     KC.st.matmuls += ok; KC.st.gemms += ok && path >= 0;
     return ok;
 }
+static int vkc_matmul_in(ColiVkTensor *t, VkcBuf *x, size_t xo, VkcBuf *y, size_t yo, int S);
 int vkc_matmul(ColiVkTensor *t, VkcBuf *x, size_t xo, VkcBuf *y, size_t yo, int S) {
+    ColiVkTensorInfo ti;
+    if (KC.prof == 2 && vkc_tensor_info(t, &ti))
+        g_prof_shape = (uint64_t)(ti.fmt & 0xff) << 56 | (uint64_t)(S > 255 ? 255 : S) << 48 |
+                       (uint64_t)(ti.O & 0xffffff) << 24 | (uint64_t)(ti.I & 0xffffff);
+    int ok = vkc_matmul_in(t, x, xo, y, yo, S);
+    g_prof_shape = 0;
+    return ok;
+}
+static int vkc_matmul_in(ColiVkTensor *t, VkcBuf *x, size_t xo, VkcBuf *y, size_t yo, int S) {
     ColiVkTensorInfo ti;
     if (!open_frame() || KC.lost || S < 1 || S > 65535 || !vkc_tensor_info(t, &ti)) return 0;
     size_t xb = xo * 4, yb = yo * 4, xn = (size_t)S * ti.I * 4, yn = (size_t)S * ti.O * 4;
@@ -1226,9 +1249,13 @@ int vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, c
 static VkPipeline dnrec_pipe(int KD) {
     for (int i = 0; i < KC.ndnrec; i++) if (KC.dnrec_kd[i] == KD) return KC.dnrec[i];
     if (KC.ndnrec == VKC_DNREC_MAX) return VK_NULL_HANDLE;
-    int32_t kd = KD;
-    VkSpecializationMapEntry me = {0, 0, 4};
-    VkSpecializationInfo si = {1, &me, 4, &kd};
+    /* lanes a column: each thread's part of it at most 16 values (more spilled: 73 us a
+     * layer for KD 128 in one lane, 21 in eight) */
+    int nspl = 1;
+    while (nspl < 8 && KD / nspl > 16 && KD % (2 * nspl) == 0) nspl *= 2;
+    int32_t v[3] = {KD, nspl, 128 * nspl};
+    VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+    VkSpecializationInfo si = {3, me, sizeof v, v};
     VkPipeline p = make_pipe(KC.mod_dnrec, &si);
     if (!p) return VK_NULL_HANDLE;
     KC.dnrec[KC.ndnrec] = p; KC.dnrec_kd[KC.ndnrec++] = KD;
@@ -2028,6 +2055,17 @@ void vkc_prof_print(void) {
     for (int k = 0; k < PK_N; k++)
         if (KC.prof_n[k]) fprintf(stderr, " | %s %.1f ms (%llu)", pk_name[k], KC.prof_ms[k], KC.prof_n[k]);
     fprintf(stderr, "\n");
+    /* COLI_VK_CHAIN_PROF=2: the matmuls by shape, the costliest first */
+    for (int done = 0; done < KC.prof_shapes && done < 24; done++) {
+        int b = -1;
+        for (int k = 0; k < KC.prof_shapes; k++) if (KC.prof_sh_n[k] && (b < 0 || KC.prof_sh_ms[k] > KC.prof_sh_ms[b])) b = k;
+        if (b < 0) break;
+        uint64_t key = KC.prof_key[b];
+        fprintf(stderr, "[VK] chain profile: matmul fmt %d S %d [%d x %d]: %.1f ms over %llu, %.1f us each\n",
+                (int)(key >> 56), (int)((key >> 48) & 0xff), (int)((key >> 24) & 0xffffff), (int)(key & 0xffffff),
+                KC.prof_sh_ms[b], KC.prof_sh_n[b], KC.prof_sh_ms[b] * 1e3 / (double)KC.prof_sh_n[b]);
+        KC.prof_sh_n[b] = 0;   /* printed (the report runs once, at the end) */
+    }
 }
 
 void vkc_shutdown(void) {
