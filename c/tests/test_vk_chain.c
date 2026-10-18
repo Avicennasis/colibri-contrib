@@ -2820,6 +2820,30 @@ static void bench_moe(void) {
     free(tg); free(tu); free(td); free(ex); free(tab); free(wg); free(wd);
 }
 
+/* COLI_VK_CHAIN_BENCH=route: the router's pick (vkc_route), 48 one-row routes in a frame
+ * as a forward's layers run them: E experts (COLI_VK_BENCH_E, 512 by default), top 10,
+ * softmax, the ids in host-readable memory as vk_dmoe.h keeps them. */
+static void bench_route(void) {
+    const char *ee = getenv("COLI_VK_BENCH_E");
+    int E = ee && atoi(ee) > 0 && atoi(ee) <= VKC_ROUTE_EMAX ? atoi(ee) : 512, K = 10, nl = 48, ok = 1;
+    float *lg = fvec((size_t)E * nl, 3.f);
+    VkcBuf *lb = up(lg, (size_t)E * nl), *ib = vkc_buf((size_t)K * 4 * nl, VKC_DOWN), *wb = vkc_buf((size_t)K * 4 * nl, VKC_DEV);
+    double best = 1e9;
+    for (int r = -1; r < 5 && ok && lb && ib && wb; r++) {   /* r -1 untimed */
+        vkc_begin();
+        for (int l = 0; l < nl && ok; l++) {
+            VkcRoute rp = {1, E, K, 0, l * E, E, 0, 0, l * K, K, l * K, K, 1, 1, 1, 1.f, 1.f, 0.f};
+            ok = vkc_route(lb, NULL, ib, wb, &rp);
+        }
+        double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+        if (r >= 0 && dt < best) best = dt;
+    }
+    if (ok) printf("bench route E %d K %d: %.1f us a route (%d in a frame)\n", E, K, best * 1e6 / nl, nl);
+    else printf("bench route: refused\n");
+    if (lb) vkc_free(lb); if (ib) vkc_free(ib); if (wb) vkc_free(wb);
+    free(lg);
+}
+
 /* COLI_VK_CHAIN_BENCH=bd: the block formats' GEMV (a GGUF's matrices) at the shapes of
  * Qwen3.8's and Qwen3.6's dense matrices, random blocks (the time does not depend on the
  * values). COLI_VK_BENCH_FMTS="123 121" picks the formats (100 + ggml type). */
@@ -2973,6 +2997,7 @@ int main(int argc, char **argv) {
         if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "bd")) bench_bd();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "moe")) bench_moe();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dn")) bench_dn();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "route")) bench_route();
         else bench_gemv();
         vkc_shutdown(); coli_vk_shutdown(); return 0;
     }
