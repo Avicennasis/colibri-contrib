@@ -7772,7 +7772,10 @@ int main(int argc, char **argv) {
                                         : "[gpu] dense trunk -> CUDA (the routed experts stay on the CPU)\n");
         atexit(qt_shutdown);
         /* The placer predicted; measure before uploading a byte of trunk. */
-        if (!trunk_probe_gpu_wins(&m)) qt_trunk_withdraw("measured slower than the CPU");
+        if (!trunk_probe_gpu_wins(&m)) {
+            qt_trunk_withdraw("measured slower than the CPU");
+            qt_experts_withdraw("the device's GEMV measured slower than the CPU's");
+        }
         /* R4 role split: park the dense-i8 lm_head on COLI_LMHEAD_GPU. The
          * QW struct on m.lm_head holds the int8 rows + per-row scales the
          * CPU path uses; the GPU applies the identical semantics. */

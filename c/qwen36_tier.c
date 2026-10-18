@@ -520,6 +520,23 @@ void qt_trunk_withdraw(const char *why){
             why ? why : "withdrawn", back/1073741824.0);
 }
 
+/* The experts follow the trunk back to the CPU (#2211). The probe that withdrew the trunk
+ * times the same int8 GEMV the tier runs for a resident expert, a round trip over PCIe
+ * included, and the tier's share of a layer waits for it: on a GTX 1650 Max-Q (0.900 ms
+ * against 0.306 on the CPU) the tier with a tenth of the experts resident lost decode
+ * (9.2 against 10.9 tok/s) and prefill (14 against 46 tok/s). Only an automatic allowance
+ * is withdrawn: CUDA_EXPERT_GB as a number is the user's word. The engine calls this
+ * before its warm start, so nothing is resident yet; the tier stays up for nothing else
+ * and every expert call answers "not here". */
+void qt_experts_withdraw(const char *why){
+    const char *bg = getenv("CUDA_EXPERT_GB");
+    if(!G.on || G_trunk_only || (bg && strcmp(bg,"auto") && atof(bg) > 0)) return;
+    G_trunk_only = 1;
+    for(int i = 0; i < G.ndev; i++) G.budget[i] = 0;
+    fprintf(stderr,"[qtier] the experts stay on the CPU too (%s; CUDA_EXPERT_GB=<GB> keeps them on the device)\n",
+            why ? why : "withdrawn");
+}
+
 static void auto_place(int nl, int ne, int topk, const size_t *capacity, const uint32_t *heat0){
     size_t room[QT_MAX_DEV];
     for(int i = 0; i < G.ndev; i++){ room[i] = capacity[i]; G_trunk_bytes[i] = 0; }

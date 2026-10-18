@@ -141,7 +141,13 @@ a byte of trunk: one DeltaNet input projection is timed both ways on the
 device that would host it (ten GEMVs, best of three rounds, after a warm-up),
 one `[place] probe:` line reports both times, and if the GPU loses the whole
 automatic placement is withdrawn (`[place] trunk stays on the CPU`) and its
-bytes go back to the expert budget before the warmstart. Only the automatic
+bytes go back to the expert budget before the warmstart. The experts follow
+(`[qtier] the experts stay on the CPU too`) when their allowance is automatic:
+the tier computes a resident expert with the same int8 GEMV and a round trip
+over PCIe, and a layer waits for its share. On a GTX 1650 Max-Q (#2211; 0.900
+ms on the card against 0.306 on the CPU) the tier with a tenth of the experts
+resident lost decode (9.2 against 10.9 tok/s) and prefill (14 against 46).
+`CUDA_EXPERT_GB=<GB>` keeps them on the device. Only the automatic
 placement is questioned: a hand-written `COLI_PLACE` stands, and
 `COLI_TRUNK_PROBE=0` skips the probe. The pricing rule:
 
