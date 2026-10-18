@@ -107,6 +107,7 @@ typedef struct {
     VkShaderModule mod_moe; VkPipeline moe, moe_bd;           /* chain_moe.comp: the routed experts, by address (bufferDeviceAddress);
                                                                  moe_bd with the block formats' paths (BD = 1) */
     int moe_xs, moe_xs_bd, moe_tried, moe_bd_tried;           /* their staging floats (0: the device cannot); built once asked for */
+    int discrete;                     /* a discrete card: vkc_prewarm's default */
     VkPipeline pipe[P_NPIPE];
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
@@ -385,6 +386,7 @@ int vkc_init(void) {
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
         KC.fence_ns = pp.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU ? 20000000000ULL
                     : VKC_SANITIZED ? 900000000000ULL : 300000000000ULL;
+        KC.discrete = pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
     }
     KC.align = KC.core.ssbo_align > 16 ? KC.core.ssbo_align : 16;
     VkDescriptorSetLayoutBinding b[VKC_BIND];
@@ -1477,6 +1479,57 @@ static int moe_build_bd(int bd) {
     return *pp != VK_NULL_HANDLE;
 }
 static int moe_build(void) { return moe_build_bd(0); }
+
+/* The pipelines this file makes at first use, made now (vk_chain.h, vkc_prewarm): the block
+ * formats' GEMV (one to four rows of x) and tiled GEMM for the types asked, chain_moe's
+ * pipeline, DeltaNet's recurrence. Each but the recurrence is launched once, on work whose
+ * output nothing reads. Made at first use, after the expert tier and a prompt's scratch had
+ * filled a discrete card's memory, a pipeline got its code and its first launch's resources
+ * in system memory, and every launch after read them over the link: an RTX PRO 4000 with
+ * Qwen3.8-Flash-Next's tier filling its 24 GiB ran chain_moe's three passes in 190, 115 and
+ * 65 us a layer, against 65, 35 and 6 in a process with room, and its one-row decode went
+ * from 13.9 to 27.6 tok/s with them made before the tier. */
+int vkc_prewarm(const VkcPrewarm *pw) {
+    const char *e = getenv("COLI_VK_CHAIN_PREWARM");   /* 1 on any device (tests), 0 never */
+    if (!vkc_ready() || !pw || !(e && *e ? *e != '0' : KC.discrete)) return 0;
+    double t0 = vkc_now_ms();
+    int n = 0;
+    VkcBuf *x = vkc_buf(64 * 256 * 4, VKC_DEV), *w = vkc_buf((size_t)64 << 10, VKC_DEV), *y = vkc_buf(64 * 4, VKC_DEV),
+           *ids = vkc_buf(16, VKC_DEV), *rw = vkc_buf(16, VKC_DEV), *tab = vkc_buf(COLI_VK_XB_ENTRY * 4, VKC_DEV),
+           *hid = vkc_buf(2 * 64 * 4, VKC_DEV);
+    int ok = x && w && y && ids && rw && tab && hid && vkc_begin();
+    VkBuffer bt = ok && pw->types ? (VkBuffer)coli_vk_block_table_dev(g_kd) : VK_NULL_HANDLE;
+    if (ok && KC.bd && bt) {
+        VkcBind bd[4] = {{x->buf, 0, 0, 0}, {w->buf, 0, 0, 0}, {bt, 0, 0, 0}, {y->buf, 0, 0, 1}};
+        KC.kind = PK_GEMV;
+        for (int t = 0; t < 64 && ok; t++) {
+            if (!(pw->types >> t & 1)) continue;
+            for (int nr = 1; nr <= 4 && ok; nr++) {   /* one row of 256 weights (the zeroed buffer) */
+                VkPipeline v = bdv_pipe(t, nr, 64);
+                struct { int fmt, S, I, O, rowWords, gs, lpr, nr; } pc = {100 + t, nr, 256, 1, 64, 0, 1, nr};
+                if (v) { ok = record(v, bd, 4, &pc, sizeof pc, 1, 1, 1); n += ok; }
+            }
+            VkPipeline g = KC.mod_bdg ? bdg_pipe(t, 64) : VK_NULL_HANDLE;   /* the same row against 64 rows of x */
+            struct VkcPC pc = {100 + t, 64, 256, 1, 64, 0};
+            if (g && ok) { ok = record(g, bd, 4, &pc, sizeof pc, 1, 1, 1); n += ok; }
+        }
+    }
+    /* the experts' (1 colibri's formats, 2 the block formats'): a table without a resident
+     * entry, so every workgroup leaves at once */
+    if (ok && (pw->moe == 1 || pw->moe == 2) && moe_build_bd(pw->moe == 2)) {
+        VkcMoe p = {.S = 1, .K = 1, .D = 64, .I = 64, .x_row = 64, .i_row = 1, .w_row = 1, .y_row = 64, .blocks = pw->moe == 2};
+        ok = vkc_moe(x, ids, rw, tab, hid, y, &p); n += ok;
+    }
+    /* DeltaNet's recurrence, made (its launch wants a layer's state) */
+    if (ok && pw->dn_kd > 0 && pw->dn_kd <= 256) n += dnrec_pipe(pw->dn_kd) != VK_NULL_HANDLE;
+    ok = ok && vkc_submit(1);
+    VkcBuf *all[] = {x, w, y, ids, rw, tab, hid};
+    for (size_t k = 0; k < sizeof all / sizeof *all; k++) if (all[k]) vkc_free(all[k]);
+    if (!ok) return 0;
+    if (n) fprintf(stderr, "[VK] chain: %d pipelines made before the expert tier, in %.1f s (COLI_VK_CHAIN_PREWARM=0: at first use)\n",
+                   n, (vkc_now_ms() - t0) / 1e3);
+    return n;
+}
 int vkc_moe_ready(void) { return vkc_ready() && moe_build(); }
 int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBuf *y, const VkcMoe *p) {
     KC.kind = PK_MOE;

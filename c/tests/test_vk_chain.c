@@ -2774,9 +2774,10 @@ static void bench_dn(void) {
  * reads 415). rpw 0: the engine's own shape (vkc_moe). */
 static void bench_moe(void) {
     int D = 2560, I = 640, E = 256, K = 10, fg = 122, fd = 142, rpw = 0;
-    const char *fe = getenv("COLI_VK_BENCH_FMTS"), *sh = getenv("COLI_VK_BENCH_MOE");   /* "D I K rpw" */
+    const char *fe = getenv("COLI_VK_BENCH_FMTS"), *sh = getenv("COLI_VK_BENCH_MOE");   /* "D I K rpw E" */
     if (fe && *fe) sscanf(fe, "%d %d", &fg, &fd);
-    if (sh && *sh) sscanf(sh, "%d %d %d %d", &D, &I, &K, &rpw);
+    if (sh && *sh) sscanf(sh, "%d %d %d %d %d", &D, &I, &K, &rpw, &E);
+    if (E < K) E = K;
     if (!vkc_moe_ready() || !coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { printf("bench moe: no expert batch here\n"); return; }
     ColiVkTensor **tg = calloc(E, sizeof *tg), **tu = calloc(E, sizeof *tu), **td = calloc(E, sizeof *td);
     ColiVkExpert **ex = calloc(E, sizeof *ex);

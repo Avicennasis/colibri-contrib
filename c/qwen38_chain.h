@@ -533,6 +533,25 @@ static int q38c_layers(Model *m) { (void)m; return g_q38c_ran; }
  * chain off, nothing of it on the device, nothing more going up (every byte left to the
  * tier). A model the chain declines keeps today's path (the caller's vkc_init, the
  * decline at its first forward). */
+/* The pipelines the chain makes at first use, made once its layers are placed and before
+ * the tier fills the device (vk_chain.h, vkc_prewarm): the block formats' for the types of
+ * its matrices, the experts' in the frame, DeltaNet's recurrence. */
+static void q38c_prewarm(Model *m, const Q38Chain *ch) {
+    Cfg *c = &m->c;
+    int dn = 0;
+    for (int i = 0; i < c->layers; i++) dn |= !c->is_attn[i];
+    VkcPrewarm pw = {0, c->experts > 0 ? (g_q38_gguf ? 2 : 1) : 0, dn ? c->dn_kdim : 0};
+    Q38Weight *w[Q38C_TAIL > Q38C_MATS ? Q38C_TAIL : Q38C_MATS];
+    for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
+        int nw = q38c_mats(m, i, w);
+        for (int k = 0; k < nw; k++) { int f = q38_vk_eligible(w[k]) ? q38_vk_fmt(w[k]) : 0; if (f >= 100 && f < 164) pw.types |= 1ull << (f - 100); }
+    }
+    if (ch->head) {
+        int nw = q38c_tail_mats(m, w, 0);
+        for (int k = 0; k < nw; k++) { int f = q38_vk_eligible(w[k]) ? q38_vk_fmt(w[k]) : 0; if (f >= 100 && f < 164) pw.types |= 1ull << (f - 100); }
+    }
+    vkc_prewarm(&pw);
+}
 static void q38c_start(Model *m) {
     if (!g_vk_chain || qt_ready()) return;
     Cfg *c = &m->c; int L = c->layers;
@@ -562,6 +581,7 @@ static void q38c_start(Model *m) {
     free(lb); free(mb);
     Q38Chain *ch = q38c_setup(m);
     if (!ch) { vkc_shutdown(); g_vk_chain = 0; }
+    else q38c_prewarm(m, ch);
     if (g_q38c_fit2_on) {
         vkc_device(1);
         if (!ch || ch->nl < n0) {
