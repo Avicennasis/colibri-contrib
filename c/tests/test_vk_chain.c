@@ -2656,11 +2656,15 @@ static void test_kvs_cold(void) {
 #include <time.h>
 static double bnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void bench_gemv(void) {
-    int shapes[3][2] = {{2560, 10240}, {6144, 2560}, {2560, 640}};
-    int fmts[3] = {1, 4, 11};
-    for (int f = 0; f < 3; f++) for (int k = 0; k < 3; k++) {
+    int shapes[3][2] = {{2560, 10240}, {6144, 2560}, {2560, 640}}, nsh = 3;
+    int fmts[3] = {1, 4, 11}, nf = 3;
+    const char *she = getenv("COLI_VK_BENCH_SHAPE");   /* "O I": one shape of your own */
+    if (she && *she) { int o = 0, i = 0; if (sscanf(she, "%d %d", &o, &i) == 2 && o > 0 && i > 0) { shapes[0][0] = i; shapes[0][1] = o; nsh = 1; } }
+    const char *fe = getenv("COLI_VK_BENCH_FMTS");      /* one of 1, 4, 10, 11 */
+    if (fe && *fe) { fmts[0] = atoi(fe); nf = 1; }
+    for (int f = 0; f < nf; f++) for (int k = 0; k < nsh; k++) {
         int I = shapes[k][0], O = shapes[k][1], fmt = fmts[f], gs = fmt == 4 ? 64 : 0, nm = 24;
-        size_t rb = fmt == 1 ? (size_t)I : fmt == 4 ? (size_t)I / 2 : (size_t)I * 2;
+        size_t rb = fmt == 1 ? (size_t)I : fmt == 4 ? (size_t)I / 2 : fmt == 10 ? (size_t)I * 4 : (size_t)I * 2;
         ColiVkTensor **t = calloc(nm, sizeof *t);
         uint8_t *w = malloc(rb * O); float *sc = malloc((size_t)O * (I / 64 + 1) * sizeof(float));
         for (size_t i = 0; i < rb * O; i++) w[i] = (uint8_t)rnd();
@@ -2820,6 +2824,30 @@ static void bench_moe(void) {
     free(tg); free(tu); free(td); free(ex); free(tab); free(wg); free(wd);
 }
 
+/* COLI_VK_CHAIN_BENCH=route: the router's pick (vkc_route), 48 one-row routes in a frame
+ * as a forward's layers run them: E experts (COLI_VK_BENCH_E, 512 by default), top 10,
+ * softmax, the ids in host-readable memory as vk_dmoe.h keeps them. */
+static void bench_route(void) {
+    const char *ee = getenv("COLI_VK_BENCH_E");
+    int E = ee && atoi(ee) > 0 && atoi(ee) <= VKC_ROUTE_EMAX ? atoi(ee) : 512, K = 10, nl = 48, ok = 1;
+    float *lg = fvec((size_t)E * nl, 3.f);
+    VkcBuf *lb = up(lg, (size_t)E * nl), *ib = vkc_buf((size_t)K * 4 * nl, VKC_DOWN), *wb = vkc_buf((size_t)K * 4 * nl, VKC_DEV);
+    double best = 1e9;
+    for (int r = -1; r < 5 && ok && lb && ib && wb; r++) {   /* r -1 untimed */
+        vkc_begin();
+        for (int l = 0; l < nl && ok; l++) {
+            VkcRoute rp = {1, E, K, 0, l * E, E, 0, 0, l * K, K, l * K, K, 1, 1, 1, 1.f, 1.f, 0.f};
+            ok = vkc_route(lb, NULL, ib, wb, &rp);
+        }
+        double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+        if (r >= 0 && dt < best) best = dt;
+    }
+    if (ok) printf("bench route E %d K %d: %.1f us a route (%d in a frame)\n", E, K, best * 1e6 / nl, nl);
+    else printf("bench route: refused\n");
+    if (lb) vkc_free(lb); if (ib) vkc_free(ib); if (wb) vkc_free(wb);
+    free(lg);
+}
+
 /* COLI_VK_CHAIN_BENCH=bd: the block formats' GEMV (a GGUF's matrices) at the shapes of
  * Qwen3.8's and Qwen3.6's dense matrices, random blocks (the time does not depend on the
  * values). COLI_VK_BENCH_FMTS="123 121" picks the formats (100 + ggml type). */
@@ -2973,6 +3001,7 @@ int main(int argc, char **argv) {
         if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "bd")) bench_bd();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "moe")) bench_moe();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dn")) bench_dn();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "route")) bench_route();
         else bench_gemv();
         vkc_shutdown(); coli_vk_shutdown(); return 0;
     }
