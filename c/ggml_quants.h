@@ -637,21 +637,33 @@ static inline void gq_set_g(float *sw, float *mw, int g0, int ng, float s, float
 #define GQ_SIGN8(v) (GGML_SIGN8 + 8 * (v))
 static inline void gq_sign8_init(void) {}
 #if defined(__AVX2__)
-/* four 8-byte groups (grid rows g0..g3, sign bytes s0..s3) -> 32 signed int8 */
-static inline __m256i gq_grid4(const uint8_t *g0, const uint8_t *g1, const uint8_t *g2, const uint8_t *g3,
-                               int s0, int s1, int s2, int s3) {
-    uint64_t a, b, c, d;
-    memcpy(&a, g0, 8); memcpy(&b, g1, 8); memcpy(&c, g2, 8); memcpy(&d, g3, 8);
-    const __m256i v = _mm256_set_epi64x((long long)d, (long long)c, (long long)b, (long long)a);
-    /* the four sign bytes to a byte mask (bit j of byte k: element 8k+j negative) and a
-     * conditional negation, (v ^ m) - m: the values of _mm256_sign_epi8 against the
-     * GQ_SIGN8 rows, without reading four of them (the grids hold no -128) */
-    const uint32_t bits = (uint32_t)(s0 & 0xFF) | (uint32_t)(s1 & 0xFF) << 8 | (uint32_t)(s2 & 0xFF) << 16 | (uint32_t)(s3 & 0xFF) << 24;
+/* the four sign bytes (bit j of byte k: element 8k+j negative) applied to 32 grid bytes as a
+ * byte mask and a conditional negation, (v ^ m) - m: the values of _mm256_sign_epi8 against
+ * the GQ_SIGN8 rows, without reading four of them (the grids hold no -128) */
+static inline __m256i gq_signs4(__m256i v, uint32_t bits) {
     const __m256i pick = _mm256_set_epi64x(0x0303030303030303LL, 0x0202020202020202LL, 0x0101010101010101LL, 0);
     const __m256i bit = _mm256_set1_epi64x((long long)0x8040201008040201ULL);
     const __m256i m = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int)bits), pick), bit), bit);
     return _mm256_sub_epi8(_mm256_xor_si256(v, m), m);
 }
+static inline uint32_t gq_sbytes4(int s0, int s1, int s2, int s3) {
+    return (uint32_t)(s0 & 0xFF) | (uint32_t)(s1 & 0xFF) << 8 | (uint32_t)(s2 & 0xFF) << 16 | (uint32_t)(s3 & 0xFF) << 24;
+}
+/* four 8-byte groups (grid rows g0..g3, sign bytes s0..s3) -> 32 signed int8 */
+static inline __m256i gq_grid4(const uint8_t *g0, const uint8_t *g1, const uint8_t *g2, const uint8_t *g3,
+                               int s0, int s1, int s2, int s3) {
+    uint64_t a, b, c, d;
+    memcpy(&a, g0, 8); memcpy(&b, g1, 8); memcpy(&c, g2, 8); memcpy(&d, g3, 8);
+    return gq_signs4(_mm256_set_epi64x((long long)d, (long long)c, (long long)b, (long long)a), gq_sbytes4(s0, s1, s2, s3));
+}
+/* A sub-block's grid rows in one gather from their indices (four of 8 bytes, or eight of
+ * 4), for the types whose index takes its high bits from another field (IQ2_S, IQ3_S):
+ * the scalar index math and the loads and inserts gq_grid4 needs cost more than the
+ * gather there (one Zen 4 core, x86-64-v3 build: IQ2_S 2.50 -> 3.11 GB/s, IQ3_S 2.15 ->
+ * 4.14). Where the index is a plain byte or field (IQ2_XXS, IQ2_XS, IQ3_XXS) the loads
+ * were faster: gq_grid4 stays. */
+static inline __m256i gq_gather8x4(const uint8_t *grid, __m128i ix) { return _mm256_i32gather_epi64((const long long *)grid, ix, 8); }
+static inline __m256i gq_gather4x8(const uint8_t *grid, __m256i ix) { return _mm256_i32gather_epi32((const int *)grid, ix, 4); }
 /* 32 bytes -> low nibbles and high nibbles as two 32-byte vectors */
 static inline void gq_nib32(const uint8_t *p, __m256i *lo, __m256i *hi) {
     const __m256i m = _mm256_set1_epi8(0x0F), v = _mm256_loadu_si256((const __m256i *)p);
@@ -702,11 +714,10 @@ GQ_SB_FN __m256i gq_sb_iq2_xs(const uint8_t *b, float d, int ib, float *s) {
 GQ_SB_FN __m256i gq_sb_iq2_s(const uint8_t *b, float d, int ib, float *s) {
     const uint8_t *qs = b + 2, *sg = b + 34, *qh = b + 66, *sc = b + 74;
     for (int h = 0; h < 2; h++) { int si = 2 * ib + h; int v = (sc[si >> 1] >> (4 * (si & 1))) & 0x0F; s[h] = d * (0.5f + (float)v) * 0.25f; }
-    int k = 4 * ib; const uint8_t *G = GGML_IQ2S_GRID;
-    #define IX(kk) (qs[kk] | (((qh[(kk) >> 2] >> (2 * ((kk) & 3))) & 3) << 8))
-    __m256i v = gq_grid4(G + 8 * IX(k), G + 8 * IX(k + 1), G + 8 * IX(k + 2), G + 8 * IX(k + 3), sg[k], sg[k + 1], sg[k + 2], sg[k + 3]);
-    #undef IX
-    return v;
+    /* element k = 4 ib + j: index qs[k] | ((qh[ib] >> 2 j) & 3) << 8 */
+    const __m128i lo = _mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)gq_rd32(qs + 4 * ib)));
+    const __m128i hi = _mm_and_si128(_mm_srlv_epi32(_mm_set1_epi32(qh[ib]), _mm_setr_epi32(0, 2, 4, 6)), _mm_set1_epi32(3));
+    return gq_signs4(gq_gather8x4(GGML_IQ2S_GRID, _mm_or_si128(lo, _mm_slli_epi32(hi, 8))), gq_rd32(sg + 4 * ib));
 }
 GQ_SB_FN __m256i gq_sb_iq3_xxs(const uint8_t *b, float d, int ib, float *s) {
     const uint8_t *qs = b + 2, *ss = b + 66;
@@ -720,9 +731,10 @@ GQ_SB_FN __m256i gq_sb_iq3_xxs(const uint8_t *b, float d, int ib, float *s) {
 GQ_SB_FN __m256i gq_sb_iq3_s(const uint8_t *b, float d, int ib, float *s) {
     const uint8_t *qs = b + 2, *qh = b + 66, *sg = b + 74, *sc = b + 106;
     int v = (sc[ib >> 1] >> (4 * (ib & 1))) & 0x0F; s[0] = s[1] = d * (float)(1 + 2 * v);
-    uint8_t gb[32];
-    for (int j = 0; j < 8; j++) { int k = 8 * ib + j; int idx = qs[k] | (((qh[k >> 3] >> (k & 7)) & 1) << 8); memcpy(gb + 4 * j, GGML_IQ3S_GRID + 4 * idx, 4); }
-    return gq_grid4(gb, gb + 8, gb + 16, gb + 24, sg[4 * ib], sg[4 * ib + 1], sg[4 * ib + 2], sg[4 * ib + 3]);
+    /* element k = 8 ib + j: index qs[k] | ((qh[ib] >> j) & 1) << 8 */
+    const __m256i lo = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)(qs + 8 * ib)));
+    const __m256i hi = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32(qh[ib]), _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7)), _mm256_set1_epi32(1));
+    return gq_signs4(gq_gather4x8(GGML_IQ3S_GRID, _mm256_or_si256(lo, _mm256_slli_epi32(hi, 8))), gq_rd32(sg + 4 * ib));
 }
 GQ_SB_FN __m256i gq_sb_iq1_s(const uint8_t *b, float d, int ib, float *s) {
     const uint8_t *qs = b + 2, *qhp = b + 34;
