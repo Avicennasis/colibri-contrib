@@ -515,6 +515,7 @@ static void q36c_prewarm(Model *m, const Q36Chain *ch) {
         if (f >= 100 && f < 164) { pw.types |= 1ull << (f - 100); vkc_prewarm_width(&pw, m->lm_head.I); }
     }
     pw.moe_d = c->hidden; pw.moe_i = c->inter;
+    pw.ex_ours = c->n_experts > 0 && !g_gguf;   /* our formats' experts: their grouped GEMMs */
     /* a GGUF's experts, as the file has them: a prompt chunk's grouped GEMMs (vk_dmoe.h) */
     for (int i = 0; g_gguf && m->gqx && i < c->n_layers; i++) {
         int bg = gq_r16_base(m->gqx[i].tg), bd = gq_r16_base(m->gqx[i].td);
@@ -843,7 +844,7 @@ static int q36c_dmoe(Q36Chain *ch, Model *m, int rows) {
     int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1;
     if (ch->d || E <= 0 || g_cache_route || g_route_agree || c->has_bias || qq_active() || qt_ready() ||
         (ng > 1 && (ng > 64 || E % ng || c->topk_group < 1 || c->topk_group > ng))) return 0;
-    ch->dm.big = g_gguf;   /* a prompt chunk too: a GGUF's experts through the grouped GEMMs */
+    ch->dm.big = 1;   /* a prompt chunk too: a GGUF's experts and ours through the grouped GEMMs */
     return vkc_dmoe_prepare(&ch->dm, ch->lo, ch->n, E, c->topk, c->hidden, c->inter, rows);
 }
 /* After the frame that ran layers [from, to) for n rows from pb: the K/V rows and the

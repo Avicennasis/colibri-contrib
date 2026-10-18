@@ -118,6 +118,7 @@ typedef struct {
      * formats' grouped GEMMs (qmatmul_grp_bd.comp: [0] down, [1] gate+up) a pipeline per
      * (pass, ggml type), made on first use */
     VkShaderModule mod_rows, mod_grp[2]; VkPipeline rows; VkPipeline grp[2][64]; uint8_t grp_tried[2][64];
+    VkShaderModule mod_grpq[2]; VkPipeline grpq[2]; uint8_t grpq_tried[2];   /* qmatmul_grp_q.comp: our formats' (1, 2, 4) */
     int rows_tried;
     int discrete;                     /* a discrete card: vkc_prewarm's default */
     int gv2_all;                      /* chain_gemv2 for every int8 decode matrix it takes (COLI_VK_CHAIN_GEMV2=1, or not NVIDIA) */
@@ -1682,6 +1683,7 @@ static int moe_build(void) {
  * from 13.9 to 27.6 tok/s with them made before the tier. */
 static int rows_make(void);
 static VkPipeline grp_pipe(int v, int t);
+static VkPipeline grpq_pipe(int v);
 int vkc_prewarm(const VkcPrewarm *pw) {
     const char *e = getenv("COLI_VK_CHAIN_PREWARM");   /* 1 on any device (tests), 0 never */
     if (!vkc_ready() || !pw || !(e && *e ? *e != '0' : KC.discrete)) return 0;
@@ -1743,7 +1745,7 @@ int vkc_prewarm(const VkcPrewarm *pw) {
      * once; the grouped GEMMs get an item of expert 0 with no rows and no input (I 0), whose
      * table entry has only the block table's address for the decoders' tables: nothing is
      * read past them, nothing written. */
-    if (ok && (pw->ex_gu || pw->ex_dn) && rows_make()) {
+    if (ok && (pw->ex_gu || pw->ex_dn || pw->ex_ours) && rows_make()) {
         struct { int mode, S, K, E, D, I, t_off, imax, i_off, i_row, w_off, w_row, y_off, y_row; uint32_t tab_lo, tab_hi; } rp =
             {0, 0, 1, 1, 64, 64, 0, 1, 0, 1, 0, 1, 0, 64, 0, 0};
         VkcBind rb[7] = {B(ids, 0), B(tab, 0), B(hid, 1), B(y, 1), B(w, 1), B(x, 1), B(rw, 1)};
@@ -1760,6 +1762,11 @@ int vkc_prewarm(const VkcPrewarm *pw) {
                 VkPipeline g = grp_pipe(v, t);
                 if (g) { ok = record(g, gb, 5, &gp, sizeof gp, 1, 1, 1); n += ok; }
             }
+        /* our formats' grouped GEMMs: the same empty item (no rows, I 0: nothing read) */
+        for (int v = 0; v < 2 && ok && pw->ex_ours; v++) {
+            VkPipeline g = grpq_pipe(v);
+            if (g) { ok = record(g, gb, 5, &gp, sizeof gp, 1, 1, 1); n += ok; }
+        }
     }
     ok = ok && vkc_submit(1);
     VkcBuf *all[] = {x, w, y, ids, rw, tab, hid};
@@ -1837,6 +1844,19 @@ static VkPipeline grp_pipe(int v, int t) {
     }
     return KC.grp[v][t];
 }
+/* the grouped GEMM of our own formats (qmatmul_grp_q.comp, [0] down, [1] gate+up): one
+ * pipeline for 1, 2 and 4, the format the expert table's */
+static VkPipeline grpq_pipe(int v) {
+    static const char *file[2] = {"qmatmul_grp_q.spv", "qmatmul_grp_gate_up_q.spv"};
+    if (!KC.grpq_tried[v]) {
+        KC.grpq_tried[v] = 1;
+        if ((KC.mod_grpq[v] = load_module(KC.core.spv_path, file[v]))) KC.grpq[v] = make_pipe(KC.mod_grpq[v], NULL);
+    }
+    return KC.grpq[v];
+}
+static int our_fmt(int f) { return f == 1 || f == 2 || f == 4; }
+/* pass v's (1 gate+up, 0 down) pipeline for a matrix of format f: a GGUF's block type, or ours */
+static VkPipeline rows_pipe(int v, int f) { return f >= 100 ? grp_pipe(v, f - 100) : our_fmt(f) ? grpq_pipe(v) : VK_NULL_HANDLE; }
 /* One dispatch whose group counts the device wrote (args at byte off of a buffer an earlier
  * dispatch of the frame wrote): the bindings' hazards as record's, and a barrier the
  * indirect read waits on. */
@@ -1879,7 +1899,7 @@ static int record_indirect(VkPipeline pipe, const VkcBind *bd, int n, const void
  * prompt's experts on the host's step as its dense rows */
 #define ROWS_GRP_SHARED 35648u   /* qmatmul_grp_gate_up_bd.comp's tiles and tables (backend_vulkan.c's GRP_BD_SHARED) */
 static int rows_make(void) {
-    if (!vkc_ready() || !KC.core.bda || !coli_vk_block_table_addr(g_kd)) return 0;
+    if (!vkc_ready() || !KC.core.bda) return 0;
     if (!KC.rows_tried) {
         KC.rows_tried = 1;
         const char *g = getenv("COLI_VK_CHAIN_GEMM_BD");
@@ -1890,7 +1910,9 @@ static int rows_make(void) {
     return KC.rows != VK_NULL_HANDLE;
 }
 int vkc_moe_rows_ready(int gfmt, int dfmt) {
-    return gfmt >= 100 && dfmt >= 100 && rows_make() && grp_pipe(1, gfmt - 100) && grp_pipe(0, dfmt - 100);
+    /* a GGUF's block types (their decoders read the block table), or our formats (both matrices) */
+    int bd = gfmt >= 100 && dfmt >= 100 && coli_vk_block_table_addr(g_kd), q = our_fmt(gfmt) && our_fmt(dfmt);
+    return (bd || q) && rows_make() && rows_pipe(1, gfmt) && rows_pipe(0, dfmt);
 }
 void vkc_moe_rows_free(VkcMoeRows *r) {
     VkcBuf **b[7] = {&r->cnt, &r->amap, &r->items, &r->etab, &r->aux, &r->hid, &r->yk};
@@ -1925,11 +1947,11 @@ int vkc_moe_rows(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcMoeRows *r
     size_t eb0 = (size_t)16 * E * 4;   /* the down pass's table */
     VkcBind gb[5] = {B(x, 0), B(r->items, 0), {r->etab->buf, 0, eb0, 0}, B(r->hid, 1), B(r->amap, 0)};
     r->etab->last_frame = KC.serial;
-    ok = ok && record_indirect(grp_pipe(1, p->gfmt - 100), gb, 5, &pg, sizeof pg, r->aux, 0);
+    ok = ok && record_indirect(rows_pipe(1, p->gfmt), gb, 5, &pg, sizeof pg, r->aux, 0);
     /* down: the packed hidden rows into the pairs' rows (amap) */
     struct { int I, O; float limit; int ibase, kgat, rpw; } pd = {p->I, p->D, 0.f, (int)imax, p->K, 0};
     VkcBind db[5] = {B(r->hid, 0), B(r->items, 0), {r->etab->buf, eb0, eb0, 0}, B(r->yk, 1), B(r->amap, 0)};
-    ok = ok && record_indirect(grp_pipe(0, p->dfmt - 100), db, 5, &pd, sizeof pd, r->aux, 16);
+    ok = ok && record_indirect(rows_pipe(0, p->dfmt), db, 5, &pd, sizeof pd, r->aux, 16);
     /* the rows' sums over their experts, in rank order */
     pc.mode = 3;
     VkcBind yb[7] = {B(ids, 0), B(table, 0), B(NULL, 0), B(NULL, 0), B(w, 0), B(r->yk, 0), B(y, 1)};
@@ -2566,6 +2588,8 @@ void vkc_shutdown(void) {
     for (int v = 0; v < 2; v++) {
         for (int t = 0; t < 64; t++) if (KC.grp[v][t]) vkDestroyPipeline(KC.dev, KC.grp[v][t], NULL);
         if (KC.mod_grp[v]) vkDestroyShaderModule(KC.dev, KC.mod_grp[v], NULL);
+        if (KC.grpq[v]) vkDestroyPipeline(KC.dev, KC.grpq[v], NULL);
+        if (KC.mod_grpq[v]) vkDestroyShaderModule(KC.dev, KC.mod_grpq[v], NULL);
     }
     if (KC.mod_moe) vkDestroyShaderModule(KC.dev, KC.mod_moe, NULL);
     if (KC.mod_gemm) vkDestroyShaderModule(KC.dev, KC.mod_gemm, NULL);

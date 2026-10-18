@@ -1938,12 +1938,17 @@ so, a token is one frame.
   (`.coli_usage`), the HITS bitmap, the tier's heat (`vkt_dev_count`); the tier's line
   counts them as `in the dense chain: N routed experts with no host step`.
 
-A prompt chunk (more than 8 rows) of a GGUF takes the frame the same way on qwen36 and
-qwen38: `vkc_moe_rows` (`chain_moe_rows.comp`) counts the chunk's (row, expert) pairs by
+A prompt chunk (more than 8 rows) takes the frame the same way on qwen36 and qwen38, a
+GGUF's experts and our own formats': `vkc_moe_rows` (`chain_moe_rows.comp`) counts the chunk's (row, expert) pairs by
 expert on the device, plans each expert's tiles of 32 rows and writes the two passes'
 dispatch sizes, then the block formats' grouped GEMMs (`qmatmul_grp_gate_up_bd.comp`,
-`qmatmul_grp_bd.comp`, the tier's own) run gate and up, then down, over those tiles with
-indirect dispatches, and a last pass sums each row's experts in rank order. No row leaves
+`qmatmul_grp_bd.comp`, the tier's own; for int8 rows, int4 rows and int4 per gs,
+`qmatmul_grp_q.comp` and its `GATE_UP` build, the same structure with `qmatmul.comp`'s
+formats and the scales from the expert table) run gate and up, then down, over those
+tiles with indirect dispatches, and a last pass sums each row's experts in rank order.
+The tier's own grouped GEMM for our formats (`qmatmul_grp.comp`, the matrix units) needs
+subgroups of 64, so on NVIDIA a prompt's int4 experts went one expert at a time through
+the host's step. No row leaves
 the device. A layer whose types have no grouped GEMM (a GGUF's IQ1_M layers) keeps the
 host's step for that chunk; the rest of the forward stays in the frame. It needs the
 grouped GEMMs' 34.8 KiB of shared memory (not Lavapipe's 32 KiB, where every layer keeps
@@ -1960,6 +1965,10 @@ every expert on the card:
 |---|---|---|---|
 | UD-Q4_K_M | 450 to 485 tok/s | 676 to 681 tok/s | 70.2 to 71.2 tok/s |
 | UD-IQ2_XXS | 460 to 515 tok/s | 706 to 721 tok/s | 82.3 to 83.8 tok/s |
+| int4-g64 (ours) | 308 to 313 tok/s | 740 to 750 tok/s | 57.7 to 60.4 tok/s |
+
+The int4-g64 row's teacher-forced loss after a 600-token prompt (125 tokens scored,
+`PPL=1`) is 3.2181 nats a token either way.
 
 Qwen3.8 Next IQ2_XS, a prompt of 507 tokens, 19.7 GiB of experts on the card and 15 GiB
 in the host pool (prompt chunks of 151 rows), the chunk's experts on the host's step and

@@ -628,6 +628,7 @@ static void q38c_prewarm(Model *m, const Q38Chain *ch) {
         }
     }
     pw.moe_d = c->hidden; pw.moe_i = c->inter;
+    pw.ex_ours = c->experts > 0 && !g_q38_gguf;   /* our formats' experts: their grouped GEMMs */
     /* a GGUF's experts, as the file has them: a prompt chunk's grouped GEMMs (vk_dmoe.h) */
     for (int i = 0; g_q38_gguf && i < c->layers; i++) {
         const char *kn[2] = {"ffn_gate_exps", "ffn_down_exps"};
@@ -1164,7 +1165,7 @@ static void q38c_kv_down(Q38Chain *ch, Model *m, int i, int n, int pb) {
 static int q38c_dmoe(Q38Chain *ch, Model *m, int rows) {
     Cfg *c = &m->c;
     if (ch->d || c->experts <= 0 || rt_fp || qt_ready()) return 0;
-    ch->dm.big = g_q38_gguf;   /* a prompt chunk too: a GGUF's experts through the grouped GEMMs */
+    ch->dm.big = 1;   /* a prompt chunk too: a GGUF's experts and ours through the grouped GEMMs */
     return vkc_dmoe_prepare(&ch->dm, ch->lo, ch->nl, c->experts, c->topk, c->hidden, c->inter, rows);
 }
 static void q38c_dmoe_done(Q38Chain *ch, Model *m, int from, int to, int n, int pb) {

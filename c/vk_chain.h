@@ -439,12 +439,14 @@ void vkc_moe_rows_free(VkcMoeRows *r);
  * has room: the block formats' GEMV and tiled GEMM for the ggml types in `types` (bit t for
  * format 100 + t), chain_moe's pipeline (moe 1: colibri's formats, 2: the block formats'),
  * DeltaNet's recurrence for key dimension dn_kd (0: none), and a prompt chunk's grouped
- * GEMMs (vkc_moe_rows) for the experts' gate/up types ex_gu and down types ex_dn. An engine
+ * GEMMs (vkc_moe_rows) for the experts' gate/up types ex_gu and down types ex_dn, or for our
+ * own formats (ex_ours). An engine
  * calls it once its dense chain is placed, before its expert tier fills the device. A
  * discrete card's default (COLI_VK_CHAIN_PREWARM=1 on any device, 0 never); the pipelines
  * made. */
 typedef struct {
     uint64_t types; int moe, dn_kd; uint64_t ex_gu, ex_dn;
+    int ex_ours;                /* the experts are our own formats (1, 2, 4): their grouped GEMMs (qmatmul_grp_q.comp) */
     int gemv_i[16], n_gemv_i;   /* the GEMV's widths of x (a matrix's I) the types meet: its staging sizes */
     int moe_d, moe_i;           /* the experts' D and I: chain_moe's staging size (0: the device's largest) */
 } VkcPrewarm;

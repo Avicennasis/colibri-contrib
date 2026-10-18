@@ -753,6 +753,8 @@ VK_SPV   += shaders/chain_gemv_bd.spv shaders/qmatmul_gemm_bd.spv
 VK_SPV   += shaders/chain_gemv_bd_i8.spv
 # the expert batch's grouped GEMM for a GGUF's experts, down and gate+up (backend_vulkan.c)
 VK_SPV   += shaders/qmatmul_grp_bd.spv shaders/qmatmul_grp_gate_up_bd.spv
+# and for our own formats' experts on the chain's prompt chunks (vk_chain.c: vkc_moe_rows)
+VK_SPV   += shaders/qmatmul_grp_q.spv shaders/qmatmul_grp_gate_up_q.spv
 # inkling's chain ops (made on first use): the short convolution and the attention
 # with its relative-position bias
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
@@ -938,6 +940,9 @@ shaders/chain_moe_i8.spv: shaders/chain_moe.comp shaders/bdstep.glsl shaders/bds
 	$(GLSLC) --target-env=vulkan1.2 -DIDOT $< -o $@ || { [ -f $@ ] && touch $@ && \
 	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
 shaders/qmatmul_grp_gate_up_bd.spv: shaders/qmatmul_grp_bd.comp shaders/bdstep.glsl shaders/blockdec_table.h
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+shaders/qmatmul_grp_gate_up_q.spv: shaders/qmatmul_grp_q.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 shaders/%.spv: shaders/%.comp
