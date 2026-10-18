@@ -1989,6 +1989,44 @@ fit a device whole, where their layers keep the tier's step.
 The device opens with `bufferDeviceAddress` wherever it has it now (before, only with
 the matrix units, for the grouped GEMM); `COLI_VK_BDA=0` still opens it without.
 
+**Staging sizes.** `chain_moe.comp` stages a row of x in shared memory, and so does
+`chain_gemv_bd.comp` (a GGUF's dense GEMV). Both pipelines used to be built at the
+device's largest staging (48 KiB on NVIDIA, with bdstep.glsl's 8.5 KiB of tables), which
+left two workgroups an SM. Now each is made per size: the smallest of 256 to 4096 vec4s
+that holds its rows (`kc_stage` in `vk_chain.c`), so four workgroups fit an SM at
+Qwen3.8's and Qwen3.6's widths. `vkc_prewarm` gets the widths from the engine (each
+matrix's input width, the experts' D and I) and makes and launches those sizes before the
+tier fills the card.
+
+Measured on the RTX PRO 4000 (`tests/test_vk_chain`'s `COLI_VK_CHAIN_BENCH=moe`, one binary
+with the staging forced to the old size and to the new), a layer's experts in
+microseconds (K 10 of 256 at D 2560 I 640, K 8 of 256 at D 2048 I 512):
+
+| experts (gate+up / down) | D | 1 row | 2 rows | 3 rows |
+|---|---|---|---|---|
+| IQ2_S / Q2_0 | 2560 | 112 -> 96 | 207 -> 167 | 311 -> 243 |
+| Q4_K / Q6_K | 2560 | 146 -> 119 | 253 -> 222 | 397 -> 325 |
+| IQ2_XXS / Q6_K | 2048 | 77 -> 66 | 135 -> 119 | 197 -> 178 |
+| Q8_0 / Q8_0 | 2048 | 103 -> 98 | 194 -> 169 | 292 -> 284 |
+
+The dense GEMV takes the small sizes only for one row of IQ2_XXS or IQ2_S, whose decoders
+wait on their grid reads (10240 x 2560: 61.2 -> 48.4 and 66.4 -> 52.0 us). The other
+formats read at the memory's rate and lose with more workgroups an SM (IQ4_XS and IQ4_NL
+3 to 4% for one row, Q8_0 40% for two), so they keep the largest.
+
+In the engine (decode tok/s, a 467-token prompt and 127 tokens, the old sizes and the new
+started one after the other, two pairs, three runs each):
+
+| model | old sizes | new sizes |
+|---|---|---|
+| Qwen3.6 UD-IQ2_XXS | 83.6, 82.0 | 87.0, 86.7 |
+| Qwen3.6 UD-Q4_K_M | 70.6, 71.1 | 71.9, 71.4 |
+| Qwen3.6 int4-g64 (colibri's container) | 61.5, 61.7 | 61.6, 62.1 |
+| Qwen3.8 Next IQ2_XS (507-token prompt) | 35.1, 38.1 | 41.4, 38.2 |
+
+The prefill did not move. On Qwen3.8 the card's own spread between starts is as large as
+the change.
+
 Measured on a Radeon 780M (RADV, OLMoE-1B-7B int8, every expert on the device, a
 25-token prompt and 100 decode steps, warm, the same binary):
 

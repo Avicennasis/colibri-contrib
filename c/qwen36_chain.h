@@ -501,13 +501,20 @@ static void q36c_prewarm(Model *m, const Q36Chain *ch) {
     Cfg *c = &m->c;
     int dn = 0;
     for (int i = 0; i < c->n_layers; i++) dn |= !c->is_attn[i];
-    VkcPrewarm pw = {0, c->n_experts > 0 ? (g_gguf ? 2 : 1) : 0, dn ? c->dn_kdim : 0, 0, 0};
+    VkcPrewarm pw = {.moe = c->n_experts > 0 ? (g_gguf ? 2 : 1) : 0, .dn_kd = dn ? c->dn_kdim : 0};
     const void *wq; const float *sc;
     for (int i = ch->lo; i < ch->lo + ch->n; i++) {
         QW *ws[16]; int nw = q36c_layer_qws(m, i, ws);
-        for (int k = 0; k < nw; k++) { int f = vk_qw_fmt(ws[k], &wq, &sc); if (f >= 100 && f < 164) pw.types |= 1ull << (f - 100); }
+        for (int k = 0; k < nw; k++) {
+            int f = vk_qw_fmt(ws[k], &wq, &sc);
+            if (f >= 100 && f < 164) { pw.types |= 1ull << (f - 100); vkc_prewarm_width(&pw, ws[k]->I); }
+        }
     }
-    if (ch->head) { int f = vk_qw_fmt(&m->lm_head, &wq, &sc); if (f >= 100 && f < 164) pw.types |= 1ull << (f - 100); }
+    if (ch->head) {
+        int f = vk_qw_fmt(&m->lm_head, &wq, &sc);
+        if (f >= 100 && f < 164) { pw.types |= 1ull << (f - 100); vkc_prewarm_width(&pw, m->lm_head.I); }
+    }
+    pw.moe_d = c->hidden; pw.moe_i = c->inter;
     /* a GGUF's experts, as the file has them: a prompt chunk's grouped GEMMs (vk_dmoe.h) */
     for (int i = 0; g_gguf && m->gqx && i < c->n_layers; i++) {
         int bg = gq_r16_base(m->gqx[i].tg), bd = gq_r16_base(m->gqx[i].td);

@@ -588,16 +588,23 @@ static void q38c_prewarm(Model *m, const Q38Chain *ch) {
     Cfg *c = &m->c;
     int dn = 0;
     for (int i = 0; i < c->layers; i++) dn |= !c->is_attn[i];
-    VkcPrewarm pw = {0, c->experts > 0 ? (g_q38_gguf ? 2 : 1) : 0, dn ? c->dn_kdim : 0, 0, 0};
+    VkcPrewarm pw = {.moe = c->experts > 0 ? (g_q38_gguf ? 2 : 1) : 0, .dn_kd = dn ? c->dn_kdim : 0};
     Q38Weight *w[Q38C_TAIL > Q38C_MATS ? Q38C_TAIL : Q38C_MATS];
     for (int i = ch->lo; i < ch->lo + ch->nl; i++) {
         int nw = q38c_mats(m, i, w);
-        for (int k = 0; k < nw; k++) { int f = q38_vk_eligible(w[k]) ? q38_vk_fmt(w[k]) : 0; if (f >= 100 && f < 164) pw.types |= 1ull << (f - 100); }
+        for (int k = 0; k < nw; k++) {
+            int f = q38_vk_eligible(w[k]) ? q38_vk_fmt(w[k]) : 0;
+            if (f >= 100 && f < 164) { pw.types |= 1ull << (f - 100); vkc_prewarm_width(&pw, w[k]->cols); }
+        }
     }
     if (ch->head) {
         int nw = q38c_tail_mats(m, w, 0);
-        for (int k = 0; k < nw; k++) { int f = q38_vk_eligible(w[k]) ? q38_vk_fmt(w[k]) : 0; if (f >= 100 && f < 164) pw.types |= 1ull << (f - 100); }
+        for (int k = 0; k < nw; k++) {
+            int f = q38_vk_eligible(w[k]) ? q38_vk_fmt(w[k]) : 0;
+            if (f >= 100 && f < 164) { pw.types |= 1ull << (f - 100); vkc_prewarm_width(&pw, w[k]->cols); }
+        }
     }
+    pw.moe_d = c->hidden; pw.moe_i = c->inter;
     /* a GGUF's experts, as the file has them: a prompt chunk's grouped GEMMs (vk_dmoe.h) */
     for (int i = 0; g_q38_gguf && i < c->layers; i++) {
         const char *kn[2] = {"ffn_gate_exps", "ffn_down_exps"};

@@ -420,6 +420,7 @@ typedef struct {
     int blocks;   /* 1: the experts are block formats (a GGUF's): the pipeline with their decoders */
     int gfmt;     /* the layer's gate/up format (100 + a ggml type), 0 unknown: picks the block path's shape */
     int dfmt, E;  /* vkc_moe_rows: down's format, and the layer's experts (its table's entries from t_off) */
+    int stage_n;  /* the widest input row its staging is sized for: 0 = D's or I's, < 0 = the device's largest */
 } VkcMoe;
 int vkc_moe_ready(void);
 /* A prompt chunk's routed experts, every row on the device (chain_moe_rows.comp): the
@@ -442,7 +443,16 @@ void vkc_moe_rows_free(VkcMoeRows *r);
  * calls it once its dense chain is placed, before its expert tier fills the device. A
  * discrete card's default (COLI_VK_CHAIN_PREWARM=1 on any device, 0 never); the pipelines
  * made. */
-typedef struct { uint64_t types; int moe, dn_kd; uint64_t ex_gu, ex_dn; } VkcPrewarm;
+typedef struct {
+    uint64_t types; int moe, dn_kd; uint64_t ex_gu, ex_dn;
+    int gemv_i[16], n_gemv_i;   /* the GEMV's widths of x (a matrix's I) the types meet: its staging sizes */
+    int moe_d, moe_i;           /* the experts' D and I: chain_moe's staging size (0: the device's largest) */
+} VkcPrewarm;
+/* a width of x the model's GEMVs meet, once (vkc_prewarm makes the staging size it takes) */
+static inline void vkc_prewarm_width(VkcPrewarm *pw, int I) {
+    for (int k = 0; k < pw->n_gemv_i; k++) if (pw->gemv_i[k] == I) return;
+    if (I > 0 && pw->n_gemv_i < 16) pw->gemv_i[pw->n_gemv_i++] = I;
+}
 int vkc_prewarm(const VkcPrewarm *w);
 /* 1 = a GGUF's block-format matrices take a prompt's rows through the tiled GEMM
  * (qmatmul_gemm_bd.comp), else only the GEMV's few rows a step suit them */
