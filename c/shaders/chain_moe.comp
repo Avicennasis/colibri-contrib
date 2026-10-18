@@ -222,7 +222,7 @@ void quant_x(int src, int base, int n, int tid) {
     for (int b = tid; b < n / 32; b += 256) {
         float v[32]; float amax = 0.0;
         [[unroll]] for (int k = 0; k < 32; k++) { v[k] = src == 0 ? x[base + 32 * b + k] : hid[base + 32 * b + k]; amax = max(amax, abs(v[k])); }
-        float d = amax / 127.0, id = bsi_id(amax);
+        float d = bsi_div(amax, 127.0), id = bsi_id(amax);
         int s0 = 0, s1 = 0; uint w[8];
         [[unroll]] for (int k = 0; k < 8; k++) {
             ivec4 c = clamp(ivec4(roundEven(vec4(v[4 * k], v[4 * k + 1], v[4 * k + 2], v[4 * k + 3]) * id)), ivec4(-127), ivec4(127));

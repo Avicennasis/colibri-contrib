@@ -15,14 +15,35 @@
 #define BDSTEP_I8_GLSL
 #extension GL_EXT_integer_dot_product : require
 
-// 127 / amax as the CPU's float division rounds it (Vulkan allows a division 2.5 ulp off,
-// which moved a code at a tie now and then): one Newton step on the quotient's residual
-float bsi_id(float amax) {
-    if (amax <= 0.0) return 0.0;
-    precise float q = 127.0 / amax;
-    precise float r = fma(-q, amax, 127.0);
-    return fma(r, 1.0 / amax, q);
+// a / b rounded to nearest even, as the CPU's float division rounds it: Vulkan allows a
+// division 2.5 ulp off and an fma that is not fused (Lavapipe's), and an ulp of 127 / amax
+// moves a code at a tie. The quotient's 25 bits floor(ma 2^24 / mb) of the mantissas from
+// the device's division (a few units off), made exact by the remainder (small, so its low
+// 32 bits are all of it), bit by bit if the division were further off; the remainder's
+// sign for the sticky bit. For a, b or a quotient not positive and normal, the device's
+// division
+float bsi_div(float a, float b) {
+    uint ua = floatBitsToUint(a), ub = floatBitsToUint(b);
+    int e = int(ua >> 23) - int(ub >> 23);
+    uint ma = (ua & 0x7FFFFFu) | 0x800000u, mb = (ub & 0x7FFFFFu) | 0x800000u;
+    if (ma < mb) { ma <<= 1; e--; }
+    if ((ua >> 23) - 1u > 253u || (ub >> 23) - 1u > 253u || e < -126 || e > 127) return a / b;
+    uint qv = uint(float(ma) / float(mb) * 16777216.0);
+    int r = int((ma << 24) - qv * mb);
+    for (int i = 0; i < 16 && r < 0; i++) { qv--; r += int(mb); }
+    for (int i = 0; i < 16 && r >= int(mb); i++) { qv++; r -= int(mb); }
+    if (r < 0 || r >= int(mb)) {
+        qv = 0u;
+        for (int i = 0; i < 25; i++) { qv <<= 1; if (ma >= mb) { ma -= mb; qv |= 1u; } ma <<= 1; }
+        r = int(ma);
+    }
+    uint m = qv >> 1;
+    if ((qv & 1u) != 0u && (r != 0 || (m & 1u) != 0u)) m++;
+    if (m > 0xFFFFFFu) { m >>= 1; e++; }
+    if (e > 127) return a / b;
+    return uintBitsToFloat((uint(e + 127) << 23) | (m & 0x7FFFFFu));
 }
+float bsi_id(float amax) { return amax > 0.0 ? bsi_div(127.0, amax) : 0.0; }
 bool bsi_has(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42; }
 int bsi_dot(uint w, uint xi) { return dotPacked4x8EXT(int(w), BSI_X(xi)); }
 // 0xFF in each byte whose bit (of the low four) is set: those bytes are negated
