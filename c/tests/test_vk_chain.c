@@ -1638,7 +1638,7 @@ static void test_moe(const char *what, int D, int I, int E, int S, int K, int fg
     VkcBuf *ib = vkc_buf((size_t)S * irow * 4, VKC_DEV), *wb = vkc_buf((size_t)S * wrow * 4, VKC_DEV);
     VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * yrow * 4, VKC_DEV);
     VkcRoute rp = {S, E, K, 0, 0, lrow, 0, 0, 0, irow, 1, wrow, 1, 1, 1, 1.f, 1.f, 0.f};
-    VkcMoe mp = {S, K, D, I, act, limit, a, b, t_off, 2, xrow, 0, irow, 1, wrow, 1, yrow, 0, 0};
+    VkcMoe mp = {S, K, D, I, act, limit, a, b, t_off, 2, xrow, 0, irow, 1, wrow, 1, yrow, 0, 0, 0};
     /* the route and the experts in frames of their own, timed: a frame past the fence
      * wait's 20 s loses the device, and the line says which of the two took the time */
     struct timespec ts0, ts1, ts2;
@@ -2768,9 +2768,12 @@ static void bench_dn(void) {
 
 /* COLI_VK_CHAIN_BENCH=moe: the routed experts in the frame (vkc_route + vkc_moe) at
  * Qwen3.8-Flash-Next's shapes, a GGUF's experts (IQ2_S gate/up, Q2_0 down; COLI_VK_BENCH_FMTS
- * "122 142" sets them), random blocks, S rows of K = 10 experts of 64. */
+ * "122 142" sets them), random blocks, S rows of K = 10 experts of 256, each layer of the
+ * frame its own route: a forward's experts come from memory, not from the cache a route
+ * used again would leave them in (that measured gate and up at 550 GB/s on a card that
+ * reads 415). rpw 0: the engine's own shape (vkc_moe). */
 static void bench_moe(void) {
-    int D = 2560, I = 640, E = 64, K = 10, fg = 122, fd = 142, rpw = 32;
+    int D = 2560, I = 640, E = 256, K = 10, fg = 122, fd = 142, rpw = 0;
     const char *fe = getenv("COLI_VK_BENCH_FMTS"), *sh = getenv("COLI_VK_BENCH_MOE");   /* "D I K rpw" */
     if (fe && *fe) sscanf(fe, "%d %d", &fg, &fd);
     if (sh && *sh) sscanf(sh, "%d %d %d %d", &D, &I, &K, &rpw);
@@ -2791,19 +2794,20 @@ static void bench_moe(void) {
     VkcBuf *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
     vkc_begin(); vkc_write(tb, 0, tab, (size_t)E * COLI_VK_XB_ENTRY * 4); vkc_submit(1);
     for (int S = 1; S <= 3; S++) {
-        float *lg = fvec((size_t)S * E, 3.f), *x = fvec((size_t)S * D, 1.f);
-        VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D);
-        VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DEV), *wb = vkc_buf((size_t)S * K * 4, VKC_DEV);
+        int nl = 48;   /* a forward's layers in one frame, each its own route */
+        float *lg = fvec((size_t)S * E * nl, 3.f), *x = fvec((size_t)S * D, 1.f);
+        VkcBuf *lb = up(lg, (size_t)S * E * nl), *xb = up(x, (size_t)S * D);
+        VkcBuf *ib = vkc_buf((size_t)S * K * 4 * nl, VKC_DEV), *wb = vkc_buf((size_t)S * K * 4 * nl, VKC_DEV);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * D * 4, VKC_DEV);
-        VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 1, K, 1, 1, 1, 1.f, 1.f, 0.f};
-        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, rpw, 1};   /* block-format experts */
+        VkcRoute rp = {S * nl, E, K, 0, 0, E, 0, 0, 0, K, 1, K, 1, 1, 1, 1.f, 1.f, 0.f};
+        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, rpw, 1, fg};   /* block-format experts */
         vkc_begin(); ok = vkc_route(lb, NULL, ib, wb, &rp) && vkc_submit(1);
-        double best = 1e9; int nl = 48;   /* a forward's layers in one frame */
-        for (int r = 0; r < 4 && ok; r++) {
+        double best = 1e9;
+        for (int r = -1; r < 4 && ok; r++) {   /* r -1 untimed: a driver may finish the pipeline on its first frames */
             vkc_begin();
-            for (int l = 0; l < nl && ok; l++) ok = vkc_moe(xb, ib, wb, tb, hb, yb, &mp);
+            for (int l = 0; l < nl && ok; l++) { mp.i_off = mp.w_off = l * S * K; ok = vkc_moe(xb, ib, wb, tb, hb, yb, &mp); }
             double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
-            if (dt < best) best = dt;
+            if (r >= 0 && dt < best) best = dt;
         }
         double bytes = (double)S * K * (2.0 * rg * I + (double)rd * D);   /* every pair's weights once */
         if (ok) printf("bench moe fmt %d/%d S %d K %d [D %d I %d]: %.1f us per layer, %.1f GB/s of pair weights\n",

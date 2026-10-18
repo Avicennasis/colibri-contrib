@@ -1468,11 +1468,26 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
         hid == x || hid == y || y == x) return 0;
     if ((size_t)p->S * p->K * ((size_t)p->I + p->D) * sizeof(float) > hid->bytes) return 0;
     struct { int mode, S, K, D, I, act; float limit, a, b;
-             int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row, rpw; } pc =
+             int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row, rpw, spl; } pc =
         {0, p->S, p->K, p->D, p->I, p->act, p->limit, p->a, p->b,
          p->t_off, p->x_off, p->x_row, p->i_off, p->i_row, p->w_off, p->w_row, p->y_off, p->y_row,
-         p->rpw > 0 && p->rpw <= 256 ? p->rpw : 64};
-    const int rpw = pc.rpw;
+         p->rpw > 0 && p->rpw <= 256 ? p->rpw : 64, 8};
+    /* The block formats' rows a workgroup and 32-weight steps a lane, pass by pass (an RTX
+     * PRO 4000, 256 experts, a route of their own each layer; Qwen3.6's Q4_K/Q5_K at D 2048,
+     * I 512, K 8 and Qwen3.8's IQ2_S/Q2_0 at D 2560, I 640, K 10):
+     *   gate and up of the K-quants and Q8_0: 64 rows at 16 steps (Q4_K one row 38.8 ->
+     *   37.4 us against 64 at 8); of the grid types and Q2_0, 32 rows at 8 steps while 64
+     *   would leave fewer than 128 workgroups (IQ2_S one row 84.8 -> 74.7 us), 64 at 16
+     *   past that (three rows 323.5 -> 305.0 us a layer);
+     *   down: 128 rows at 8 steps, every lane of the workgroup on a row (Q5_K 36.5 -> 25.3
+     *   us, Q2_0 35.2 -> 31.5).
+     * Qwen3.6's layer, one row: 82.8 -> 70 us. A rpw of the caller's keeps both passes. */
+    int rg = pc.rpw, sg = 8, rd = pc.rpw, sd = 8;
+    if (p->blocks && p->rpw <= 0 && p->gfmt >= 100) {
+        int t = p->gfmt - 100, kq = t == 8 || t == 12 || t == 13 || t == 14;
+        int wide = kq || (long long)p->S * p->K * ((p->I + 63) / 64) >= 128;
+        rg = wide ? 64 : 32; sg = wide ? 16 : 8; rd = 128; sd = 8;
+    }
     /* gate and up, then down, each (pair, rpw outputs) a workgroup; then the rank-order sum.
      * Binding 6: the block formats' table (a GGUF's experts), a dummy without one. */
     VkPipeline mp = p->blocks ? KC.moe_bd : KC.moe;
@@ -1480,10 +1495,11 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
     VkcBind bt = tabbuf ? (VkcBind){tabbuf, 0, 0, 0} : B(NULL, 0);
     VkcBind bd[7] = {B(x, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 1), B(NULL, 0), bt};
     uint32_t gx, gy;
-    grid((uint64_t)p->S * p->K * ((p->I + rpw - 1) / rpw), &gx, &gy);
+    pc.rpw = rg; pc.spl = sg;
+    grid((uint64_t)p->S * p->K * ((p->I + rg - 1) / rg), &gx, &gy);
     if (!record(mp, bd, 7, &pc, sizeof pc, gx, gy, 1)) return 0;
-    pc.mode = 1;
-    grid((uint64_t)p->S * p->K * ((p->D + rpw - 1) / rpw), &gx, &gy);
+    pc.mode = 1; pc.rpw = rd; pc.spl = sd;
+    grid((uint64_t)p->S * p->K * ((p->D + rd - 1) / rd), &gx, &gy);
     if (!record(mp, bd, 7, &pc, sizeof pc, gx, gy, 1)) return 0;
     pc.mode = 2;
     VkcBind bd2[7] = {B(NULL, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 0), B(y, 1), bt};
