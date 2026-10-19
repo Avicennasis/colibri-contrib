@@ -308,6 +308,24 @@ int main(void) {
         ck(T->reserve(&r, 64, CC_DEV) && T->bytes(r) >= 64 && T->reserve(&r, 32, CC_DEV) && T->bytes(r) >= 64 && T->reserve(&r, 4096, CC_DEV) && T->bytes(r) >= 4096, "reserve grows, never shrinks");
         T->free(d); T->free(u); T->free(dn); T->free(d2); T->free(r);
     }
+    {   /* a prompt chunk's K rows into a head-major cache: a region per row and head, one kernel for
+         * the grid (64 regions or more); off the grid, the copies as before */
+        const int S = 100, H = 4, hd = 32, DR = 256, pb = 7;
+        for (int shuffle = 0; shuffle < 2; shuffle++) {
+            std::vector<float> src = rnd((size_t)S * H * hd, 61 + shuffle), dst = rnd((size_t)H * DR * hd, 63);
+            std::vector<CcRegion> rg((size_t)S * H);
+            for (int s = 0; s < S; s++) for (int h = 0; h < H; h++)
+                rg[(size_t)s * H + h] = {((size_t)h * DR + pb + s) * hd, (size_t)s * H * hd + (size_t)h * hd, (size_t)hd};
+            if (shuffle) std::swap(rg[0], rg[(size_t)S * H - 1]);
+            std::vector<float> want = dst;
+            for (auto &x : rg) memcpy(want.data() + x.dst, src.data() + x.src, x.n * 4);
+            CcBuf *sb = up(src), *db = up(dst);
+            ck(T->begin() && T->copy_regions(db, sb, rg.data(), (int)rg.size()) && T->submit(1) &&
+               maxdiff(down(db, dst.size()).data(), want.data(), dst.size()) == 0,
+               shuffle ? "400 regions off the grid: a copy each" : "400 regions on a grid: one kernel");
+            T->free(sb); T->free(db);
+        }
+    }
     printf("matmul\n");
     {
         const int I = 96, O = 40, S = 3; unsigned s = 5;
@@ -400,6 +418,28 @@ int main(void) {
         CcBuf *sb = T->buf(sel.size() * 4, CC_DEV);
         ck(T->begin() && T->write(sb, 0, sel.data(), sel.size() * 4) && T->attn(qb, kb, vb, ob, NULL, sb, &ps) && T->submit(1) && maxdiff(down(ob, o.size()).data(), ref.data(), o.size()) < 1e-4, "a selection list, one row causal, no gate");
         T->free(qb); T->free(kb); T->free(vb); T->free(ob); T->free(sb);
+    }
+    {   /* a prompt chunk's rows (COLI_CUDA_CHAIN_FLASH, 16 rows): the tensor cores where the device has them
+         * (f16 Q, K and V: within 4e-3 of the reference), cc_attn_k elsewhere */
+        struct { int H, KV, hd, S, pos_base, gate; } cs[] = {{4, 2, 64, 40, 0, 1}, {16, 2, 256, 70, 33, 1}, {8, 8, 128, 17, 200, 0},
+                                                              {16, 4, 128, 64, 0, 0}};
+        for (auto &k : cs) {
+            const int qdim = 2 * k.hd, cap = k.pos_base + k.S + 9, k_off = 32;
+            std::vector<float> q = rnd((size_t)k.S * k.H * qdim, 51), kc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 52),
+                               vc = rnd((size_t)k_off + (size_t)k.KV * cap * k.hd, 53);
+            std::vector<float> o((size_t)k.S * k.H * k.hd), ref = o;
+            CcAttn p = {k.S, k.H, k.KV, k.hd, k.pos_base, cap, 0, k.H * qdim, qdim, k.hd, k.H * qdim, qdim, k.gate, 0, k.H * k.hd, 0, 0,
+                        1.f / sqrtf((float)k.hd), k_off, k_off};
+            ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), NULL, &p);
+            CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(o.size() * 4, CC_DEV);
+            char what[128];
+            snprintf(what, sizeof what, "prompt rows: H %d KV %d hd %d, %d rows after %d%s", k.H, k.KV, k.hd, k.S, k.pos_base, k.gate ? ", the gate" : "");
+            float d = 1e30f;
+            if (T->begin() && T->attn(qb, kb, vb, ob, qb, NULL, &p) && T->submit(1)) d = maxdiff(down(ob, o.size()).data(), ref.data(), o.size());
+            ck(d < 4e-3f, what);
+            printf("  %s: max |diff| %.2e\n", what, d);
+            T->free(qb); T->free(kb); T->free(vb); T->free(ob);
+        }
     }
     printf("dnconv\n");
     {
