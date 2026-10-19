@@ -173,24 +173,28 @@ from the float probability sum.
 With the Vulkan chain the head runs on the device: its layer, its routing and its
 routed experts through the chain's device MoE, one frame a draft. `Q36_MTP_GPU=0`
 keeps the head on the CPU, and so does `Q36_MTP_DMOE=0` or a device without the
-chain's MoE. Under the CUDA tier `Q36_MTP=1` leaves the head off and says so: with
-part of the experts there are no speculative steps, and under the CUDA chain the head
-has no CUDA path yet (on the CPU beside the card a draft row cost 5.1 ms, decode fell
-from 98 to 85-88 tok/s); prompt lookup drafts there.
+chain's MoE. With the CUDA chain and every routed expert on the card the head runs on
+its device the same way (`qwen36_mtp_cuda.h`: the chain's ops, the head's experts
+uploaded once as the tier's int8 or int4-g64 and read from an expert table of their
+addresses). There a head that cannot go on the device stays off: beside the card the
+CPU's head cost 5.1 ms a draft row and decode fell from 98 to 85-88 tok/s. Under a
+CUDA tier holding part of the experts there are no speculative steps, and `Q36_MTP=1`
+leaves the head off and says so.
 
-Measured on an RTX PRO 4000 (Vulkan chain, Qwen3.6-35B-A3B int4-g64, `coli serve`,
-answers of 128 tokens, two alternated rounds of three):
+Measured on an RTX PRO 4000 (Qwen3.6-35B-A3B int4-g64, `coli serve`, answers of 128
+tokens, two alternated rounds of three):
 
-| `Q36_MTP_DRAFTS` | decode | drafts accepted |
-|---|---|---|
-| no head | 84.2-86.0 tok/s | |
-| 1 (the default) | 93.9-97.4 tok/s | 84% |
-| 2 | 82.0-83.7 tok/s | 62% |
-| 3 | 67.6-70.7 tok/s | 42% (a 300-token answer) |
+| `Q36_MTP_DRAFTS` | Vulkan chain | CUDA chain | drafts accepted |
+|---|---|---|---|
+| no head | 84.2-86.0 tok/s | 97.9-98.2 tok/s | |
+| 1 (the default) | 93.9-97.4 tok/s | 106.8-108.5 tok/s | 84-87% |
+| 2 | 82.0-83.7 tok/s | 90.6-91.3 tok/s | 62% |
+| 3 | 67.6-70.7 tok/s | | 42% (a 300-token answer) |
 
 A verify of more rows reads more routed experts: from the runs' forward counts, a
 verify of two rows costs about 1.5 decode steps and one of three about 2. With a
-draft row at 1.7 ms, one draft is the depth that pays. On that machine's CPU alone
+draft row at 1.5 to 1.7 ms, one draft is the depth that pays. The greedy story of 232
+words is the same text on both chains, with and without the head. On that machine's CPU alone
 (Core i5-13500, answers of 96 tokens) one draft takes decode from 13.7-13.9 to
 14.7-14.9 tok/s, 74% of the drafts accepted. Greedy answers with and without the head are byte-identical.
 `tests/vulkan_engines.sh qwen-spec` runs the harness below in the chain on Lavapipe.

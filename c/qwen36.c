@@ -5372,6 +5372,9 @@ static int q36_cuda_tier_drafts(Model *m) {
     return 0;
 #endif
 }
+#ifdef COLI_CUDA
+#include "qwen36_mtp_cuda.h"   /* Q36_MTP: the head on the CUDA chain's device */
+#endif
 
 /* The forward: ids[0..S) at pos_base through every layer, the final norm and
  * lm_head on the last `nlogits` rows (one for a step, every row of a speculative

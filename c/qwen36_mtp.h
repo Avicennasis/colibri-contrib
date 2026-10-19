@@ -498,6 +498,14 @@ static int q36_mg_row(Model *m, int tok, const float *hid, int pos, float *logit
 }
 #endif
 
+#ifdef COLI_CUDA
+/* the head on the CUDA chain's device (qwen36_mtp_cuda.h, included after the chain) */
+static int q36_mc_init(Model *m);
+static int q36_mc_kv_rows(Model *m, const int *tok, const float *hid, int R, int pos0);
+static int q36_mc_row(Model *m, int tok, const float *hid, int pos, float *logits);
+static int q36_mc_on(void);
+#endif
+
 /* R head rows at positions pos0 .. pos0+R-1: token tok[r] with the model's row hid[r]
  * (its output at pos0+r-1, after the final norm); the last row's logits when logits,
  * and with hid_out that row's output after mtp.norm (a deeper draft's input).
@@ -510,6 +518,17 @@ static void q36_mtp_rows(Model *m, const int *tok, const float *hid, int R, int 
     if (q36_mg_init(m)) {   /* the head on the device; hid NULL: its own state of the row before */
         if (!logits ? q36_mg_kv_rows(m, tok, hid, R, pos0) : R == 1 && q36_mg_row(m, tok[0], hid, pos0, logits)) return;
         fprintf(stderr, "[mtp] the head's device frames failed: it stays off\n");
+        p->on = 0; return;
+    }
+#endif
+#ifdef COLI_CUDA
+    if (q36_mc_init(m)) {   /* the head on the CUDA chain's device; hid NULL: its own state of the row before */
+        if (!logits ? q36_mc_kv_rows(m, tok, hid, R, pos0) : R == 1 && q36_mc_row(m, tok[0], hid, pos0, logits)) return;
+        fprintf(stderr, "[mtp] the head's CUDA frames failed: it stays off\n");
+        p->on = 0; return;
+    }
+    if (q36_cuda_tier_drafts(m)) {   /* beside the CUDA chain the CPU's head costs about half a decode step a draft */
+        fprintf(stderr, "[mtp] the head is not on the CUDA chain's device (Q36_MTP_GPU=0 or it did not fit): it stays off\n");
         p->on = 0; return;
     }
 #endif
@@ -646,6 +665,10 @@ static int q36_mtp_draft_more(Model *m, float *hidden, int tok, int pos) {
     if (g_q36_mg.on) q36_mtp_rows(m, &tok, NULL, 1, pos, lg, NULL);   /* the state before stays on the device */
     else
 #endif
+#ifdef COLI_CUDA
+    if (q36_mc_on()) q36_mtp_rows(m, &tok, NULL, 1, pos, lg, NULL);
+    else
+#endif
     q36_mtp_rows(m, &tok, h, 1, pos, lg, hidden);
     p->drafts++;
     int best = 0;
@@ -667,14 +690,16 @@ static void q36_mtp_attach(Model *m) {
     if (!path || strcmp(path, "1") || g_q36_mtp.on) return;
     /* where a verify would not reproduce plain decoding there are no drafts (q36_spec_begin):
      * a head there would only be fed, every row brought back from the chain for nothing.
-     * Under the CUDA chain with the whole tier there are, but the head has no CUDA path
-     * yet: on the CPU beside the device a draft row costs about half a decode step. */
-    if (qt_ready() || m->dn_dev || g_cache_route || qq_active()) {
-        fprintf(stderr, "[mtp] Q36_MTP=1: the head stays off under %s\n",
-                q36_cuda_tier_drafts(m) ? "the CUDA chain (no CUDA path for the head yet; prompt lookup still drafts)"
-                : qt_ready() || m->dn_dev ? "a CUDA tier holding part of the experts, where there are no speculative steps"
-                : g_cache_route ? "CACHE_ROUTE, where there are no speculative steps"
-                : "a qpack container, where there are no speculative steps");
+     * Under the CUDA chain with the whole tier there are, and the head runs on its device
+     * (qwen36_mtp_cuda.h). */
+    if ((qt_ready() || m->dn_dev) && !q36_cuda_tier_drafts(m)) {
+        fprintf(stderr, "[mtp] Q36_MTP=1: the head stays off under a CUDA tier holding part of the experts, "
+                        "where there are no speculative steps\n");
+        return;
+    }
+    if (g_cache_route || qq_active()) {
+        fprintf(stderr, "[mtp] Q36_MTP=1: the head stays off under %s, where there are no speculative steps\n",
+                g_cache_route ? "CACHE_ROUTE" : "a qpack container");
         return;
     }
     if (!q36_mtp_load(m)) { fprintf(stderr, "[mtp] Q36_MTP=%s: the head stays off\n", path); return; }
