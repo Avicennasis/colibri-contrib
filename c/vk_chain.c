@@ -1101,15 +1101,15 @@ static int codes_of(int I) {
  * on first use; NULL for a type it does not decode (Q4_K and Q5_K also want rows of whole
  * 16-byte steps) */
 static VkPipeline bdv_pipe(int t, int nr, int rowWords, int I) {
-    static const int types[] = {8, 12, 13, 14, 16, 17, 20, 21, 22, 23, 42};
+    static const int types[] = {8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 42};
     int on = 0;
     for (size_t k = 0; k < sizeof types / sizeof *types; k++) on |= types[k] == t;
     if (!on || !KC.mod_bdv || nr < 1 || nr > 4 || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
-    /* the smallest staging only for one row of IQ2_XXS, IQ2_XS or IQ2_S, whose decoders wait on
+    /* the smallest staging only for one row of IQ2_XXS, IQ2_XS, IQ3_XXS or IQ2_S, whose decoders wait on
      * their grid reads: twice the workgroups an SM hide them, 10240 x 2560 at 61.2 -> 48.4
      * and 66.4 -> 52.0 us. The others read at the memory's rate, and more workgroups cost
      * them: IQ4_XS and IQ4_NL 3-4% for one row, Q8_0 40% for two. */
-    int i4 = nr * (I / 4), b = nr == 1 && (t == 16 || t == 17 || t == 22) ? stage_of(i4 + i4 / 8, KC.bdv_xs) : KC_STAGES;
+    int i4 = nr * (I / 4), b = nr == 1 && (t == 16 || t == 17 || t == 18 || t == 22) ? stage_of(i4 + i4 / 8, KC.bdv_xs) : KC_STAGES;
     if (!KC.bdv_tried[nr - 1][t][b]) {
         KC.bdv_tried[nr - 1][t][b] = 1;
         int32_t v[3] = {stage_vec4(b, KC.bdv_xs), t, nr};
@@ -1149,8 +1149,8 @@ static VkPipeline bdv8_pipe(int t, int nr, int rowWords, int I) {
 int vkc_gemm_bd_ready(void) { return vkc_ready() && KC.mod_bdg != VK_NULL_HANDLE; }
 /* qmatmul_gemm_bd.comp's pipeline for ggml type t, made on first use */
 static VkPipeline bdg_pipe(int t, int rowWords) {
-    if (t < 0 || t >= 64 || !(t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 20 || t == 21 ||
-        t == 22 || t == 23 || t == 42) || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
+    if (t < 0 || t >= 64 || !(t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 ||
+        t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42) || ((t == 12 || t == 13) && rowWords % 4)) return VK_NULL_HANDLE;
     /* on the matrix units where the device has them (qmatmul_gemm_bdc.comp; COLI_VK_CHAIN_GEMM=0 off) */
     if (!KC.bdgc_tried[t]) {
         KC.bdgc_tried[t] = 1;
@@ -1787,7 +1787,8 @@ static VkPipeline moe_gv_pipe(int fmt, int n) {
  * default where the device's packed 4 x 8 dot is accelerated. */
 static int moe_i8_type(int fmt) {
     int t = fmt - 100;
-    return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42;
+    return t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 || t == 20 || t == 21 ||
+           t == 22 || t == 23 || t == 29 || t == 42;
 }
 static VkPipeline moe_i8_pipe(int n) {
     if (!(KC.idot_set >= 0 ? KC.idot_set && KC.idot : KC.idot == 2) || !KC.moe_xs_bd) return VK_NULL_HANDLE;
@@ -1995,7 +1996,7 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
      * Qwen3.6's layer, one row: 82.8 -> 70 us. A rpw of the caller's keeps both passes. */
     int rg = pc.rpw, sg = 8, rd = pc.rpw, sd = 8;
     if (p->blocks && p->rpw <= 0 && p->gfmt >= 100) {
-        int t = p->gfmt - 100, kq = t == 8 || t == 12 || t == 13 || t == 14;
+        int t = p->gfmt - 100, kq = t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14;
         int wide = kq || (long long)p->S * p->K * ((p->I + 63) / 64) >= 128;
         rg = wide ? 64 : 32; sg = wide ? 16 : 8; rd = 128; sd = 8;
     }
@@ -2037,7 +2038,8 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
 }
 /* ---- a prompt chunk's routed experts (chain_moe_rows.comp, qmatmul_grp*_bd.comp) ------ */
 /* the ggml types bdstep.glsl decodes */
-static int bd_type(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42; }
+static int bd_type(int t) { return t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 ||
+                                                    t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42; }
 /* the grouped GEMM's pipeline for pass v (1 gate+up, 0 down) and ggml type t: on the matrix
  * units (coop, qmatmul_grp*_bdc.comp, where the device has cooperative matrices at subgroups
  * of 64 or 32, unless COLI_VK_GRP_COOP=0) or in floats (qmatmul_grp*_bd.comp) */

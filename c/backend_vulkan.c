@@ -4200,7 +4200,8 @@ static int xb_coop_slot(XbCtx *X, const ColiVkTensor *t, int rows, int gemm) {
 static VkPipeline xb_bdg_pipe(XbCtx *X, const ColiVkTensor *t) {
     int ty = t->fmt - 100;
     if (!X->sh_mm_bd || !bd_fmt(t->fmt) || ty < 0 || ty >= 64 || t->I % 64 ||
-        !(ty == 8 || ty == 12 || ty == 13 || ty == 14 || ty == 16 || ty == 17 || ty == 20 || ty == 21 || ty == 22 || ty == 23 || ty == 42) ||
+        !(ty == 8 || ty == 10 || ty == 11 || ty == 12 || ty == 13 || ty == 14 || ty == 16 || ty == 17 || ty == 18 || ty == 19 || ty == 20 ||
+          ty == 21 || ty == 22 || ty == 23 || ty == 29 || ty == 42) ||
         ((ty == 12 || ty == 13) && t->rowWords % 4)) return VK_NULL_HANDLE;
     if (!X->mm_bd_tried[ty]) {
         X->mm_bd_tried[ty] = 1;
@@ -4387,8 +4388,8 @@ static void xb_grp_bd_init(XbCtx *X) {
 }
 /* its pipeline for v (0 down, 1 gate+up) and ggml type t, made on first use */
 static VkPipeline xb_grp_bd_pipe(XbCtx *X, int v, int t) {
-    if (!X->grp_bd || t < 0 || t >= 64 || !(t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 20 || t == 21 ||
-        t == 22 || t == 23 || t == 42)) return VK_NULL_HANDLE;
+    if (!X->grp_bd || t < 0 || t >= 64 || !(t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 ||
+        t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42)) return VK_NULL_HANDLE;
     if (!X->grp_bd_tried[v][t]) {
         X->grp_bd_tried[v][t] = 1;
         int32_t sv = t;
