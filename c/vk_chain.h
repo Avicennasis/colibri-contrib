@@ -828,6 +828,7 @@ typedef struct {
     unsigned long long copy_grids;     /* region lists copied by one dispatch (chain_copy2d, vkc_copy_regions) */
     unsigned long long grp_coop;       /* grouped expert GEMMs on the matrix units (qmatmul_grp_qc, qmatmul_grp*_bdc) */
     unsigned long long gemv_xg;        /* decode GEMVs whose row is past the staging: x from its buffer (chain_gemv.comp XG) */
+    unsigned long long moe_gv;         /* routed-expert decode steps in our formats on chain_moe_gv.comp */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

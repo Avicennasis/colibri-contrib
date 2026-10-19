@@ -744,7 +744,7 @@ VK_SPV   += shaders/chain_ares.spv
 # the router's pick on the device, every MoE engine's kind (vk_chain.h: vkc_route)
 VK_SPV   += shaders/chain_route.spv
 # the routed experts on the device, their weights by address (vk_chain.h: vkc_moe)
-VK_SPV   += shaders/chain_moe.spv
+VK_SPV   += shaders/chain_moe.spv shaders/chain_moe_gv.spv
 # the same in the CPU's integer form (packed 4 x 8 dot products), where the device has them
 VK_SPV   += shaders/chain_moe_i8.spv
 VK_SPV   += shaders/chain_moe_rows.spv
