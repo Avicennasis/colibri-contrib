@@ -445,6 +445,25 @@ int main(void) {
         ck(T->begin() && T->write(sb, 0, sel.data(), sel.size() * 4) && T->attn(qb, kb, vb, ob, NULL, sb, &ps) && T->submit(1) && maxdiff(down(ob, o.size()).data(), ref.data(), o.size()) < 1e-4, "a selection list, one row causal, no gate");
         T->free(qb); T->free(kb); T->free(vb); T->free(ob); T->free(sb);
     }
+    {   /* a decode's or a verify's rows over many positions: in blocks of positions (cc_attn_dec_k) */
+        struct { int H, KV, hd, S, pos_base, cap, gate; } cs[] = {{16, 2, 256, 3, 2500, 3000, 1}, {4, 2, 32, 1, 140, 300, 1},
+                                                                   {8, 8, 128, 4, 700, 800, 0}};
+        for (auto &k : cs) {
+            const int qdim = 2 * k.hd, k_off = 32;
+            std::vector<float> q = rnd((size_t)k.S * k.H * qdim, 51), kc = rnd((size_t)k_off + (size_t)k.KV * k.cap * k.hd, 52),
+                               vc = rnd((size_t)k_off + (size_t)k.KV * k.cap * k.hd, 53);
+            std::vector<float> o((size_t)k.S * k.H * k.hd), ref = o;
+            CcAttn p = {k.S, k.H, k.KV, k.hd, k.pos_base, k.cap, 0, k.H * qdim, qdim, k.hd, k.H * qdim, qdim, k.gate, 0, k.H * k.hd, 0, 0,
+                        1.f / sqrtf((float)k.hd), k_off, k_off};
+            ref_attn(q.data(), kc.data(), vc.data(), ref.data(), k.gate ? q.data() : NULL, NULL, &p);
+            CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(o.size() * 4, CC_DEV);
+            char what[96];
+            snprintf(what, sizeof what, "H %d/%d hd %d: %d rows after %d positions, in blocks", k.H, k.KV, k.hd, k.S, k.pos_base);
+            ck(T->begin() && T->attn(qb, kb, vb, ob, k.gate ? qb : NULL, NULL, &p) && T->submit(1) &&
+               maxdiff(down(ob, o.size()).data(), ref.data(), o.size()) < 1e-4, what);
+            T->free(qb); T->free(kb); T->free(vb); T->free(ob);
+        }
+    }
     {   /* a prompt chunk's rows (COLI_CUDA_CHAIN_FLASH, 16 rows): the tensor cores where the device has them
          * (f16 Q, K and V: within 4e-3 of the reference), cc_attn_k elsewhere */
         struct { int H, KV, hd, S, pos_base, gate; } cs[] = {{4, 2, 64, 40, 0, 1}, {16, 2, 256, 70, 33, 1}, {8, 8, 128, 17, 200, 0},
