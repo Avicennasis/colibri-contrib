@@ -2832,7 +2832,8 @@ static void test_kvs_cold(void) {
 }
 
 /* COLI_VK_CHAIN_BENCH=1: decode-shaped GEMVs back to back in one frame (the chain's
- * situation: no host gap between matrices), per weight format, in GB/s of weights. */
+ * situation: no host gap between matrices), per weight format, in GB/s of weights.
+ * COLI_VK_BENCH_S: rows of x (a speculative verify's: the decode GEMV, vkc_gemm_rows 0). */
 #include <time.h>
 static double bnow(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void bench_gemv(void) {
@@ -2850,26 +2851,63 @@ static void bench_gemv(void) {
         for (size_t i = 0; i < rb * O; i++) w[i] = (uint8_t)rnd();
         for (size_t i = 0; i < (size_t)O * (I / 64 + 1); i++) sc[i] = 0.01f;
         for (int j = 0; j < nm; j++) coli_vk_tensor_ensure(&t[j], w, sc, fmt, I, O, gs);
-        float *x = fvec(I, 1.f);
-        VkcBuf *xb = up(x, I), *yb = vkc_buf((size_t)O * 4 * nm, VKC_DEV);
+        const char *se = getenv("COLI_VK_BENCH_S"); int S = se && *se ? atoi(se) : 1;
+        if (S < 1 || S > 4) S = 1;
+        vkc_gemm_rows(S > 1 ? 0 : -1);
+        float *x = fvec((size_t)I * S, 1.f);
+        VkcBuf *xb = up(x, (size_t)I * S), *yb = vkc_buf((size_t)O * 4 * nm * S, VKC_DEV);
         /* COLI_VK_BENCH_CHAIN=1: each GEMV waits for the one before, as a decode's do (its x
          * the previous output's first I values, a barrier between them) */
-        const char *ce = getenv("COLI_VK_BENCH_CHAIN"); int chain = ce && *ce == '1' && O >= I;
+        const char *ce = getenv("COLI_VK_BENCH_CHAIN"); int chain = ce && *ce == '1' && O >= I && S == 1;
         double best = 1e9;
         for (int r = 0; r < 4; r++) {
             vkc_begin();
             for (int j = 0; j < nm; j++) {
                 if (chain && j) vkc_matmul(t[j], yb, (size_t)(j - 1) * O, yb, (size_t)j * O, 1);
-                else vkc_matmul(t[j], xb, 0, yb, (size_t)j * O, 1);
+                else vkc_matmul(t[j], xb, 0, yb, (size_t)j * O * S, S);
             }
             double t0 = bnow(); vkc_submit(1); double dt = bnow() - t0;
             if (dt < best) best = dt;
         }
-        printf("bench fmt %2d [%5d x %5d] x %d%s: %.3f ms per matrix, %.1f GB/s of weights\n", fmt, O, I, nm, chain ? " chained" : "",
+        vkc_gemm_rows(-1);
+        printf("bench fmt %2d [%5d x %5d] S %d x %d%s: %.3f ms per matrix, %.1f GB/s of weights\n", fmt, O, I, S, nm, chain ? " chained" : "",
                best * 1e3 / nm, (double)rb * O * nm / best / 1e9);
         for (int j = 0; j < nm; j++) coli_vk_tensor_free(t[j]);
         vkc_free(xb); vkc_free(yb); free(t); free(w); free(sc); free(x);
     }
+}
+
+/* A speculative verify's rows (vkc_gemm_rows 0: the decode GEMV, never the tiled GEMM): each
+ * row of S = 2..4 gets the bits of the same row through the GEMV alone (S 1), which is what
+ * makes a verify reproduce plain decoding. chain_gemv.comp shares each weight load among
+ * them; the formats it reads (int8, int4 per 64, f32, bf16, f16), a staged row, a row past
+ * the staging (x from its buffer) and a matrix of few long rows (a row a workgroup). */
+static void test_verify_rows(int fmt, int I, int O) {
+    size_t rb = fmt == 1 ? (size_t)I : fmt == 4 ? (size_t)I / 2 : fmt == 10 ? (size_t)I * 4 : (size_t)I * 2;
+    uint8_t *w = malloc(rb * O); float *sc = malloc((size_t)O * (I / 64 + 1) * sizeof(float));
+    for (size_t i = 0; i < rb * O; i++) w[i] = (uint8_t)rnd();
+    if (fmt == 10) for (size_t i = 0; i < (size_t)I * O; i++) ((float *)w)[i] = frnd() * 0.05f;
+    if (fmt == 11) for (size_t i = 0; i < (size_t)I * O; i++) ((uint16_t *)w)[i] = f2bf(frnd() * 0.05f);
+    if (fmt == 14) for (size_t i = 0; i < (size_t)I * O; i++) ((uint16_t *)w)[i] = (uint16_t)(0x2000 + rnd() % 0x1000 + (rnd() & 1) * 0x8000);
+    for (size_t i = 0; i < (size_t)O * (I / 64 + 1); i++) sc[i] = 0.005f + (rnd() % 100) / 10000.f;
+    ColiVkTensor *t = NULL;
+    if (!coli_vk_tensor_ensure(&t, w, sc, fmt, I, O, fmt == 4 ? 64 : 0)) { CHECK(0, "verify rows fmt %d: upload", fmt); free(w); free(sc); return; }
+    float *x = fvec((size_t)4 * I, 1.f), *one = malloc((size_t)4 * O * 4);
+    VkcBuf *xb = up(x, (size_t)4 * I), *yb = vkc_buf((size_t)4 * O * 4, VKC_DOWN);
+    vkc_gemm_rows(0);
+    int ok = 1;
+    for (int s = 0; s < 4 && ok; s++) {   /* each row alone: a decode step's */
+        ok = vkc_begin() && vkc_matmul(t, xb, (size_t)s * I, yb, (size_t)s * O, 1) && vkc_submit(1);
+        memcpy(one + (size_t)s * O, (float *)vkc_ptr(yb) + (size_t)s * O, (size_t)O * 4);
+    }
+    for (int S = 2; S <= 4 && ok; S++) {
+        ok = vkc_begin() && vkc_matmul(t, xb, 0, yb, 0, S) && vkc_submit(1);
+        int same = ok && !memcmp(vkc_ptr(yb), one, (size_t)S * O * 4) && !bad(one, (size_t)S * O);
+        CHECK(same, "verify rows fmt %d I %d O %d: the %d rows have a decode step's bits", fmt, I, O, S);
+    }
+    vkc_gemm_rows(-1);
+    if (!ok) CHECK(0, "verify rows fmt %d I %d O %d: a frame failed", fmt, I, O);
+    coli_vk_tensor_free(t); vkc_free(xb); vkc_free(yb); free(w); free(sc); free(x); free(one);
 }
 
 /* ---- a GGUF's block formats (matmul_bd: chain_gemv_bd.comp, qmatmul_bd.comp) -----------
@@ -3738,6 +3776,14 @@ int main(int argc, char **argv) {
         test_matmul(fmts[k], 2, 3072, 40, 0, 0);         /* a long row (chain_gemv's staging) */
         test_matmul(fmts[k], 2, 20480, 40, 0, 0);        /* a row past the staging: x from its buffer, a row a workgroup */
         test_matmul(fmts[k], 1, 20480, 1100, 0, 0);      /* the same with rows to spread over the workgroups */
+    }
+    {
+        int vf[5] = {1, 4, 10, 11, 14};
+        for (int k = 0; k < 5; k++) {
+            test_verify_rows(vf[k], 2048, 300);   /* staged, a verify's rows in one workgroup */
+            test_verify_rows(vf[k], 20480, 40);   /* x from its buffer */
+            test_verify_rows(vf[k], 4096, 24);    /* few long rows: a row a workgroup */
+        }
     }
     {
         VkcStats sv1; vkc_stats(&sv1);
