@@ -41,7 +41,7 @@ float bsi_div(float a, float b) {
     return uintBitsToFloat((uint(e + 127) << 23) | (m & 0x7FFFFFu));
 }
 float bsi_id(float amax) { return amax > 0.0 ? bsi_div(127.0, amax) : 0.0; }
-bool bsi_has(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42; }
+bool bsi_has(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42; }
 int bsi_dot(uint w, uint r, uint xi) { return dotPacked4x8EXT(int(w), BSI_X(r, xi)); }
 // 0xFF in each byte whose bit (of the low four) is set: those bytes are negated
 uint bsi_smask(uint b4) { return ((b4 * 0x00204081u) & 0x01010101u) * 0xFFu; }
@@ -157,6 +157,25 @@ void bsi_step(int t, uint rb, uint q) {
         [[unroll]] for (int l = 0; l < 4; l++) {
             uint idx = ((ix >> (8u * uint(l))) & 255u) | (((hb >> (2u * uint(l))) & 3u) << 8);
             uint s8 = sg >> (8u * uint(l));
+            w[2 * l] = bsi_neg(bs_grid[2u * idx], s8); w[2 * l + 1] = bsi_neg(bs_grid[2u * idx + 1u], s8 >> 4);
+        }
+        BSI_ROWS {
+            int s0 = 0, s1 = 0;
+            [[unroll]] for (int l = 0; l < 4; l++) {
+                int v = bsi_dot(w[2 * l], r, q * 8u + 2u * uint(l)) + bsi_dot(w[2 * l + 1], r, q * 8u + 2u * uint(l) + 1u);
+                if (l < 2) s0 += v; else s1 += v;
+            }
+            BSI_ACC(r, BSI_DX(r, q) * (d * (0.5 + float(scb & 15u)) * 0.25 * float(s0) + d * (0.5 + float(scb >> 4)) * 0.25 * float(s1)));
+        }
+        return;
+    }
+    if (t == 17) {   // IQ2_XS: 4 entries of a 9-bit grid index and a 7-bit sign index (ksigns); a scale per 16
+        uint b = q >> 3, ib = q & 7u, base = rb + b * 74u;
+        uint i0 = bs_ldu(base + 2u + 8u * ib), i1 = bs_ldu(base + 6u + 8u * ib), scb = bs_u8at(base + 66u + ib);
+        float d = bs_f16at(base);
+        uint w[8];
+        [[unroll]] for (int l = 0; l < 4; l++) {
+            uint e = ((l < 2 ? i0 : i1) >> (16u * uint(l & 1))) & 0xFFFFu, idx = e & 511u, s8 = bs_ks[e >> 9];
             w[2 * l] = bsi_neg(bs_grid[2u * idx], s8); w[2 * l + 1] = bsi_neg(bs_grid[2u * idx + 1u], s8 >> 4);
         }
         BSI_ROWS {

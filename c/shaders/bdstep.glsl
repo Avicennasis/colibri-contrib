@@ -1,8 +1,8 @@
 // bdstep.glsl: 32 weights of a GGUF block row (100 + ggml type t, the file's layout) dotted
 // with x, one decoder per type, for the GEMVs that take a row over several lanes
 // (chain_gemv_bd.comp, a pipeline per type; chain_moe.comp, a GGUF's routed experts). The
-// types: 8 Q8_0, 12 Q4_K, 13 Q5_K, 14 Q6_K, 16 IQ2_XXS, 20 IQ4_NL, 21 IQ3_S, 22 IQ2_S,
-// 23 IQ4_XS, 42 Q2_0 (bs_has). Q4_K and Q5_K read 16-byte steps (their blocks, 144 and 176
+// types: 8 Q8_0, 12 Q4_K, 13 Q5_K, 14 Q6_K, 16 IQ2_XXS, 17 IQ2_XS, 20 IQ4_NL, 21 IQ3_S,
+// 22 IQ2_S, 23 IQ4_XS, 42 Q2_0 (bs_has). Q4_K and Q5_K read 16-byte steps (their blocks, 144 and 176
 // bytes, keep a row's 16-byte alignment); the others words, two for one where a block of 34,
 // 210, 18, 110, 82 or 66 bytes leaves a field at an even byte (bs_ldu). A step q is weights
 // 32q..32q+31 of the row at byte rb. The sums are the CPU's float decoders' in another
@@ -13,21 +13,22 @@
 //   BS_ACC(w, i)  w (vec4, the decoded weights) against x elements 4i..4i+3
 //   BS_G(i)   word i of blockdec_table.h's table
 // and keeps `shared float bs_kvt[16]` (kvalues_iq4nl), `shared uint bs_grid[2048]` (the type's
-// grid: IQ2_S's 1024 rows of 8 bytes, IQ3_S's 512 of 4, IQ2_XXS's 256 of 8) and `shared uint
+// grid: IQ2_S's 1024 rows of 8 bytes, IQ2_XS's 512 of 8, IQ3_S's 512 of 4, IQ2_XXS's 256 of
+// 8) and `shared uint
 // bs_ks[128]` (ksigns_iq2xs), filled by bs_tables_fill before a barrier: a grid row comes
 // from shared memory, not the table buffer, at every 8 or 4 weights.
 #ifndef BDSTEP_GLSL
 #define BDSTEP_GLSL
 #include "blockdec_table.h"
 
-bool bs_has(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42; }
+bool bs_has(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42; }
 // type t's tables into shared memory (a workgroup of 256)
 void bs_tables_fill(int t, int tid) {
     if ((t == 20 || t == 23) && tid < 16) bs_kvt[tid] = float(int(BS_G(BDT_IQ4NL + uint(tid))));
-    uint base = t == 22 ? uint(BDT_IQ2S) : t == 21 ? uint(BDT_IQ3S) : uint(BDT_IQ2XXS);
-    uint n = t == 22 ? 2048u : t == 21 || t == 16 ? 512u : 0u;
+    uint base = t == 22 ? uint(BDT_IQ2S) : t == 21 ? uint(BDT_IQ3S) : t == 17 ? uint(BDT_IQ2XS) : uint(BDT_IQ2XXS);
+    uint n = t == 22 ? 2048u : t == 17 ? 1024u : t == 21 || t == 16 ? 512u : 0u;
     for (uint i = uint(tid); i < n; i += 256u) bs_grid[i] = BS_G(base + i);
-    if (t == 16 && tid < 128) bs_ks[tid] = BS_G(BDT_KSIGNS + uint(tid));
+    if ((t == 16 || t == 17) && tid < 128) bs_ks[tid] = BS_G(BDT_KSIGNS + uint(tid));
 }
 
 // four bytes from an even byte offset: one word when aligned, two otherwise; the second
@@ -175,6 +176,18 @@ void bs_step(int t, uint rb, uint q) {
             uint idx = (i0 >> (8u * uint(l))) & 255u, s8 = bs_ks[(i1 >> (7u * uint(l))) & 127u];
             BS_ACC(bs_sgn4(bs_grid[2u * idx], s8) * d, q * 8u + 2u * uint(l));
             BS_ACC(bs_sgn4(bs_grid[2u * idx + 1u], s8 >> 4) * d, q * 8u + 2u * uint(l) + 1u);
+        }
+        return;
+    }
+    if (t == 17) {   // IQ2_XS: 8 steps a block (74 bytes); 4 16-bit entries, a 9-bit grid index and a 7-bit sign index each; a scale per 16
+        uint b = q >> 3, ib = q & 7u, base = rb + b * 74u;
+        uint i0 = bs_ldu(base + 2u + 8u * ib), i1 = bs_ldu(base + 6u + 8u * ib), scb = bs_u8at(base + 66u + ib);
+        float d = bs_f16at(base) * 0.25, d0 = d * (0.5 + float(scb & 15u)), d1 = d * (0.5 + float(scb >> 4));
+        [[unroll]] for (int l = 0; l < 4; l++) {
+            uint e = ((l < 2 ? i0 : i1) >> (16u * uint(l & 1))) & 0xFFFFu, idx = e & 511u, s8 = bs_ks[e >> 9];
+            float dl = l < 2 ? d0 : d1;
+            BS_ACC(bs_sgn4(bs_grid[2u * idx], s8) * dl, q * 8u + 2u * uint(l));
+            BS_ACC(bs_sgn4(bs_grid[2u * idx + 1u], s8 >> 4) * dl, q * 8u + 2u * uint(l) + 1u);
         }
         return;
     }

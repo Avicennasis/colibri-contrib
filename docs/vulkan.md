@@ -2091,8 +2091,8 @@ integer dot products (`VK_KHR_shader_integer_dot_product`,
   integer inner sums (`dotPacked4x8EXT`).
 
 Against the CPU's integer form, `tests/test_vk_chain`'s `moe i8` cases agree to about
-2e-7 for every type it decodes (Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, IQ3_S, IQ4_NL,
-IQ4_XS, Q2_0), where the float form differs by about 1e-2: on the device the experts now
+2e-7 for every type it decodes (Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_S,
+IQ4_NL, IQ4_XS, Q2_0), where the float form differs by about 1e-2: on the device the experts now
 give what the CPU gives. Both of a layer's formats must have the form (else the float
 pipeline runs that layer); a prompt chunk's grouped GEMMs keep their float sums.
 `COLI_VK_IDOT=0` leaves the extension off; a device that supports it without
