@@ -712,9 +712,10 @@ def engine_path(directory, family):
 
 #: CUDA engines built with Vulkan too, which run on it in a build with both where their CUDA
 #: path lacks the work: a GGUF (qwen36.c, qwen38.c, colibri.c: the CUDA backend takes no ggml
-#: block types), Kimi K3 (its CUDA experts upload every routed expert at every call) and
-#: Inkling (its CUDA backend leaves the routed experts on the CPU)
-CUDA_WITH_VULKAN = ("qwen36", "qwen38", "glm", "kimi", "inkling")
+#: block types; deepseek_v4: its CUDA tier mirrors native FP4 experts only), Kimi K3 (its
+#: CUDA experts upload every routed expert at every call) and Inkling (its CUDA backend
+#: leaves the routed experts on the CPU)
+CUDA_WITH_VULKAN = ("qwen36", "qwen38", "glm", "kimi", "inkling", "deepseek_v4")
 
 
 def make_command(family, backend, tc, make_args=()):

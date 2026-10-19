@@ -542,7 +542,7 @@ class CudaBackendChoice(unittest.TestCase):
             cmd, _cwd, _env = setup_flow.make_command(family_by_id("deepseek_v4"), "cuda", TC_ALL,
                                                       ["NO_TC=1"])
             self.assertEqual(cmd[cmd.index("deepseek-v4"):],
-                             ["deepseek-v4", "ARCH=native", "CUDA=1", "CUDA_ARCH=native", "NO_TC=1"])
+                             ["deepseek-v4", "ARCH=native", "CUDA=1", "VK=1", "CUDA_ARCH=native", "NO_TC=1"])
             cmd, _cwd, _env = setup_flow.make_command(family_by_id("qwen36"), "cuda", TC_ALL,
                                                       ["CUDA_ARCH=sm_70"])
             self.assertEqual(cmd[cmd.index("qwen36"):], ["qwen36", "ARCH=native", "CUDA=1", "VK=1", "CUDA_ARCH=sm_70"])
