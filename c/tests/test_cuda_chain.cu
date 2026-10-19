@@ -249,6 +249,31 @@ static float e4m3(int b) {
     return sg ? -v : v;
 }
 /* one expert matrix [O][I] in a tier format, its values for the reference (dq) and the tensor */
+/* moe_mat's int4-per-gs matrix (the same seed, the same codes and scales) in expert_ffn.h's
+ * planar blocks (byte k of a 64-weight block: weight k low, k + 32 high, both v + 8), in
+ * page-locked host memory the device reads over the bus: its device address in *dev, its scales
+ * likewise. The host pointers to free with cudaFreeHost. */
+static int moe_planar(int gs, int I, int O, unsigned seed, uint8_t **hw, float **hs, const void **dw, const float **ds) {
+    unsigned s = seed; int ng = I / gs;
+    std::vector<float> sc((size_t)O * ng);
+    for (auto &v : sc) v = 0.05f + 0.02f * frand(&s);
+    if (cudaHostAlloc((void **)hw, (size_t)O * I / 2, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostAlloc((void **)hs, sc.size() * 4, cudaHostAllocMapped) != cudaSuccess) return 0;
+    memset(*hw, 0, (size_t)O * I / 2);
+    for (int o = 0; o < O; o++) for (int i = 0; i < I; i += 2) {
+        int a = (int)(frand(&s) * 7.9f), b = (int)(frand(&s) * 7.9f);
+        for (int t = 0; t < 2; t++) {
+            int e = i + t, v = (t ? b : a) + 8, blk = e / 64, k = e % 64;
+            uint8_t &byte = (*hw)[(size_t)o * I / 2 + (size_t)blk * 32 + (k & 31)];
+            byte = (uint8_t)(k < 32 ? (byte & 0xF0) | v : (byte & 0x0F) | (v << 4));
+        }
+    }
+    memcpy(*hs, sc.data(), sc.size() * 4);
+    void *a = NULL, *b = NULL;
+    if (cudaHostGetDevicePointer(&a, *hw, 0) != cudaSuccess || cudaHostGetDevicePointer(&b, *hs, 0) != cudaSuccess) return 0;
+    *dw = a; *ds = (const float *)b;
+    return 1;
+}
 static ColiCudaTensor *moe_mat(int fmt, int gs, int I, int O, unsigned seed, std::vector<float> &dq) {
     unsigned s = seed; dq.assign((size_t)O * I, 0.f);
     ColiCudaTensor *t = NULL; int ok = 0;
@@ -604,6 +629,28 @@ int main(void) {
                 if (ef >= 2e-3 || ep >= 2e-3) printf("  (prompt rows fmt %d: relative errors %.3g, %.3g)\n", fmt, ef, ep);
                 ck(ok2 && ef < 2e-3, "forty rows: the slots sorted by expert, their GEMMs, the sum in rank order");
                 ck(okp && ep < 2e-3, "forty rows, two experts the host's: its rows plus the device's slots");
+                if (fmt == 4) {   /* experts 1 and 5 in planar blocks in host memory (the tier's RAM cache), read over the bus */
+                    std::vector<CcExpert> tp = tab;
+                    std::vector<void *> hosts;
+                    int okh = 1;
+                    for (int e : {1, 5}) {
+                        CcExpert &xp = tp[2 + e];
+                        unsigned s0 = 300 + 3 * (unsigned)e + (fmt == 4 ? 3u * E * 2u : 0u);   /* moe_mat's seeds for this expert and format */
+                        uint8_t *hw[3]; float *hs[3];
+                        okh &= moe_planar(gs, D, I, s0, &hw[0], &hs[0], &xp.g, &xp.gs) && moe_planar(gs, D, I, s0 + 1, &hw[1], &hs[1], &xp.u, &xp.us) &&
+                               moe_planar(gs, I, D, s0 + 2, &hw[2], &hs[2], &xp.d, &xp.ds);
+                        xp.planar = 1;
+                        for (int j = 0; j < 3; j++) { hosts.push_back(hw[j]); hosts.push_back(hs[j]); }
+                    }
+                    CcBuf *tpb = T->buf(tp.size() * sizeof(CcExpert), CC_DEV);
+                    int okq = okh && tpb && T->begin() && T->write(tpb, 0, tp.data(), tp.size() * sizeof(CcExpert)) &&
+                              T->moe(tpb, x2b, i2b, w2b, h2b, y2b, NULL, &m2) && T->submit(1);
+                    double eq = okq ? maxdiff(down(y2b, (size_t)S2 * D).data(), rf.data(), (size_t)S2 * D) / sc2 : 1;
+                    if (eq >= 2e-3) printf("  (prompt rows, planar experts in host memory: relative error %.3g)\n", eq);
+                    ck(okq && eq < 2e-3, "forty rows, two experts in planar blocks in host memory, read over the bus");
+                    for (void *h : hosts) cudaFreeHost(h);
+                    T->free(tpb);
+                }
                 T->free(x2b); T->free(i2b); T->free(w2b); T->free(h2b); T->free(y2b); T->free(hy2b);
             }
             for (int e = 0; e < E; e++) { coli_cuda_tensor_free(tg[e]); coli_cuda_tensor_free(tu[e]); coli_cuda_tensor_free(td[e]); }

@@ -3029,23 +3029,33 @@ __device__ __forceinline__ void tcg_tile(float *__restrict__ Y, int yld, const i
 #if HCG_BODY
 /* a thread's share of a step: row t >> 2 of the 64, inputs k0 + 16 (t & 3) .. + 15 */
 template<int WF> struct HcgW { int4 q; float sv; };
+/* planar: the row in expert_ffn.h's planar blocks (CcExpert.planar; int4 per 64 only): the
+ * thread's 16 weights are 16 bytes of block k0 / 64, their low nibbles (kq < 32) or high */
 template<int WF>
 __device__ __forceinline__ void hcg_fetch_w(HcgW<WF> &r, const uint8_t *__restrict__ W, const float *__restrict__ sc,
-                                            int gs, int ng, int n, int N, int k0, int K) {
+                                            int gs, int ng, int n, int N, int k0, int K, int planar) {
     int kq = (threadIdx.x & 3) * 16;
     if (n >= N) { r.q = make_int4(0, 0, 0, 0); r.sv = 0.f; return; }
     if (WF == 1) { r.q = *reinterpret_cast<const int4 *>(W + (size_t)n * K + k0 + kq); r.sv = 1.f; }
-    else {
+    else if (WF == 4 && planar) {
+        r.q = *reinterpret_cast<const int4 *>(W + ((size_t)n * K + k0) / 2 + (kq & 31));
+        r.sv = sc[(size_t)n * ng + (k0 + kq) / gs];
+    } else {
         uint2 v = *reinterpret_cast<const uint2 *>(W + ((size_t)n * K + k0 + kq) / 2);
         r.q = make_int4((int)v.x, (int)v.y, 0, 0);
         r.sv = WF == 4 ? sc[(size_t)n * ng + (k0 + kq) / gs] : 1.f;
     }
 }
 template<int WF>
-__device__ __forceinline__ void hcg_store_w(__half (*Ws)[HCG_LDH], const HcgW<WF> &r) {
+__device__ __forceinline__ void hcg_store_w(__half (*Ws)[HCG_LDH], const HcgW<WF> &r, int planar) {
     int t = threadIdx.x, row = t >> 2, kq = (t & 3) * 16;
     __align__(16) __half v[16];
-    if (WF == 1) {
+    if (WF == 4 && planar) {   /* 16 bytes, a nibble each: v + 8 */
+        const uint8_t *b = reinterpret_cast<const uint8_t *>(&r.q);
+        int sh = kq < 32 ? 0 : 4;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) v[j] = __float2half_rn((float)((int)((b[j] >> sh) & 15u) - 8) * r.sv);
+    } else if (WF == 1) {
         const int8_t *b = reinterpret_cast<const int8_t *>(&r.q);
         #pragma unroll
         for (int j = 0; j < 16; j++) v[j] = __int2half_rn((int)b[j]);
@@ -3085,7 +3095,8 @@ __device__ __forceinline__ void hcg_store_x(__half (*Xs)[HCG_LDH], const float4 
 #endif
 template<int WF, int NW>
 __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const int *yr, const float *__restrict__ X, int xld, const int *xr,
-                                         int M, const uint8_t *const *W, const float *const *sc, int gs, int N, int K, int n0) {
+                                         int M, const uint8_t *const *W, const float *const *sc, int gs, int N, int K, int n0,
+                                         int planar = 0) {
 #if HCG_BODY
     using namespace nvcuda;
     constexpr int STG = (1 + NW) * TCG_BM * HCG_LDH * 2, EPI = NW * TCG_BM * (TCG_BN + 4) * 4;   /* bytes */
@@ -3100,17 +3111,17 @@ __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const i
     HcgW<WF> rw[NW]; float4 rx[4];
     hcg_fetch_x(rx, X, xld, xr, M, 0);
     #pragma unroll
-    for (int w = 0; w < NW; w++) hcg_fetch_w<WF>(rw[w], W[w], sc[w], gs, ng, n, N, 0, K);
+    for (int w = 0; w < NW; w++) hcg_fetch_w<WF>(rw[w], W[w], sc[w], gs, ng, n, N, 0, K, planar);
     hcg_store_x(Xs, rx);
     #pragma unroll
-    for (int w = 0; w < NW; w++) hcg_store_w<WF>(Ws[w], rw[w]);
+    for (int w = 0; w < NW; w++) hcg_store_w<WF>(Ws[w], rw[w], planar);
     __syncthreads();
     for (int k0 = 0; k0 < K; k0 += HCG_BK) {
         bool next = k0 + HCG_BK < K;   /* block-uniform */
         if (next) {   /* in flight while the tensor cores work on this step */
             hcg_fetch_x(rx, X, xld, xr, M, k0 + HCG_BK);
             #pragma unroll
-            for (int w = 0; w < NW; w++) hcg_fetch_w<WF>(rw[w], W[w], sc[w], gs, ng, n, N, k0 + HCG_BK, K);
+            for (int w = 0; w < NW; w++) hcg_fetch_w<WF>(rw[w], W[w], sc[w], gs, ng, n, N, k0 + HCG_BK, K, planar);
         }
         #pragma unroll
         for (int kk = 0; kk < HCG_BK / 16; kk++) {
@@ -3129,7 +3140,7 @@ __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const i
         if (next) {
             hcg_store_x(Xs, rx);
             #pragma unroll
-            for (int w = 0; w < NW; w++) hcg_store_w<WF>(Ws[w], rw[w]);
+            for (int w = 0; w < NW; w++) hcg_store_w<WF>(Ws[w], rw[w], planar);
             __syncthreads();
         }
     }
@@ -3153,7 +3164,7 @@ __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const i
         Y[(size_t)yr[r] * yld + nn] = g;
     }
 #else
-    (void)Y; (void)yld; (void)yr; (void)X; (void)xld; (void)xr; (void)M; (void)W; (void)sc; (void)gs; (void)N; (void)K; (void)n0;
+    (void)Y; (void)yld; (void)yr; (void)X; (void)xld; (void)xr; (void)M; (void)W; (void)sc; (void)gs; (void)N; (void)K; (void)n0; (void)planar;
 #endif
 }
 template<int WF>
@@ -3504,7 +3515,7 @@ __global__ static void __launch_bounds__(256) hcg_moe_gu_k(const CcExpert *__res
     __syncthreads();
     CcExpert ex = tab[p.t_off + e];
     const uint8_t *W[2] = {(const uint8_t *)ex.g, (const uint8_t *)ex.u}; const float *Sc[2] = {ex.gs, ex.us};
-    hcg_tile<WF, 2>(hid, p.I, pr, x + p.x_off, p.x_row, xr, M, W, Sc, p.gs, p.I, p.D, blockIdx.x * TCG_BN);
+    hcg_tile<WF, 2>(hid, p.I, pr, x + p.x_off, p.x_row, xr, M, W, Sc, p.gs, p.I, p.D, blockIdx.x * TCG_BN, WF == 4 && ex.planar);
 }
 template<int WF>
 __global__ static void __launch_bounds__(256) hcg_moe_dn_k(const CcExpert *__restrict__ tab, float *__restrict__ hid, MoeSort m, CcMoe p) {
@@ -3515,7 +3526,7 @@ __global__ static void __launch_bounds__(256) hcg_moe_dn_k(const CcExpert *__res
     CcExpert ex = tab[p.t_off + e];
     const uint8_t *W[1] = {(const uint8_t *)ex.d}; const float *Sc[1] = {ex.ds};
     size_t A = (size_t)p.S * p.K;
-    hcg_tile<WF, 1>(hid + A * p.I, p.D, pr, hid, p.I, xr, M, W, Sc, p.gs, p.D, p.I, blockIdx.x * TCG_BN);
+    hcg_tile<WF, 1>(hid + A * p.I, p.D, pr, hid, p.I, xr, M, W, Sc, p.gs, p.D, p.I, blockIdx.x * TCG_BN, WF == 4 && ex.planar);
 }
 template<int WF>
 static int moe_rows_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, MoeSort m, const CcMoe *p, cudaStream_t st, int f16) {

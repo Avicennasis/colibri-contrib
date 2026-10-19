@@ -106,8 +106,12 @@ typedef struct {
     float temp, scale, norm_eps;
 } CcRoute;
 /* A routed expert as a device holds it (the CUDA tier's resident tensors: their weights
- * and scales, coli_cuda_tensor_dev); g NULL: not on the device (the host computes it). */
-typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; } CcExpert;
+ * and scales, coli_cuda_tensor_dev); g NULL: not on the device (the host computes it).
+ * planar 1: int4 per 64 as the engine keeps it in RAM (expert_ffn.h's planar blocks: in each
+ * 64 weights' 32 bytes, byte k holds weight k in its low nibble and k + 32 in its high one,
+ * both v + 8), read over the bus from host memory the tier registered (a prompt chunk's
+ * GEMMs only); 0: the backend's own layout (signed nibbles, weight 2j low and 2j + 1 high). */
+typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; int planar, pad_; } CcExpert;
 /* A layer's routed experts on the device for S rows (cc_moe): x (x_off + s*x_row, D
  * floats) routed to ids and w as cc_route writes them (i_off + s*i_row, w_off + s*w_row,
  * K each); expert e is entry t_off + e of the table (E of them), its matrices of format fmt (1 int8
