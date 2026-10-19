@@ -120,6 +120,11 @@ int  qt_dn_gpu_step(int layer, const float *x, float *out, const float *egh, con
  * qt_place_of(name, layer) after it, then hand the quantized bytes here.
  * Returns the handle (>= 0) or -1 (stays on the CPU). */
 int  qt_dense_init(const int8_t *q, const float *sc, int I, int O, int device);
+/* The same three with the tensor's format: 1 int8 rows (scales sc), 100 + ggml type a GGUF's
+ * blocks as the file has them (sc NULL: the backend's block formats, coli_cuda_block_elems). */
+int  qt_dense_init_fmt(const void *w, const float *sc, int fmt, int I, int O, int device);
+int  qt_lmhead_init_fmt(const void *w, const float *sc, int fmt, int I, int O);
+int  qt_dnproj_init_fmt(int layer, const void *w, const float *sc, int fmt, int I, int O, int device);
 int  qt_dense_matmul(int handle, float *y, const float *x, int I, int O);
 /* Row-major x[S,I] -> y[S,O], using the same resident int8 tensor. */
 int  qt_dense_matmul_batch(int handle, float *y, const float *x, int S, int I, int O);
@@ -142,6 +147,14 @@ int  qt_init_fp8(int n_layers, int n_experts, int hidden, int inter,
 int  qt_init(int n_layers, int n_experts, int hidden, int inter,
              int cap_experts_per_layer, int topk, int expert_gs,
              int expert_is_int4);
+/* A GGUF's experts as the file has them (fmt 100 + ggml type: the backend's block formats,
+ * coli_cuda_block_elems): gate and up of type tg[l], down of td[l] in layer l, one gate (or
+ * up) matrix gu_bytes[l] bytes and one down d_bytes[l]; qt_note hands over the file's rows
+ * (g4, u4, d4; no scales). The residents compute in the dense chain's frame only
+ * (qt_chain_layer_format): the expert group takes no block format. */
+int  qt_init_gguf(int n_layers, int n_experts, int hidden, int inter,
+                  int cap_experts_per_layer, int topk, const int *tg, const int *td,
+                  const size_t *gu_bytes, const size_t *d_bytes);
 int  qt_ready(void);
 int  qt_streaming(void);   /* copy mode: no pointer into the engine's slots is kept */
 int  qt_experts_on(void);  /* some device has room for experts (not trunk-only) */
@@ -214,13 +227,15 @@ void qt_stats(void);
  *   qt_chain_count     the books qt_issue keeps for K routed ids of one row (-1 skipped):
  *                      the heat of the residents, hits and misses, the LFRU tick at layer 0
  *   qt_chain_format    the residents' format as the backend holds them (1 int8, 2 int4,
- *                      4 int4 per gs inputs, 8 fp8-e4m3) and gs
+ *                      4 int4 per gs inputs, 8 fp8-e4m3, 100 a GGUF's types by layer) and gs
+ *   qt_chain_layer_format  layer's gate/up and down formats (100 + ggml type for a GGUF)
  *   qt_chain_devices   the tier's device count */
 unsigned qt_chain_epoch(void);
 int  qt_chain_resident(int layer, int eid, int device, struct ColiCudaTensor **g, struct ColiCudaTensor **u, struct ColiCudaTensor **d);
 void qt_chain_hold(int on);
 void qt_chain_count(int layer, const int *eids, int K);
 int  qt_chain_format(int *fmt, int *gs);
+int  qt_chain_layer_format(int layer, int *fmt, int *fmt_d);
 int  qt_chain_devices(void);
 /* The host pool (qwen36_tier.c): qt_note_host page-locks a non-resident expert's RAM copy (its
  * planar blocks and scales, as the engine's slot holds them) for the device to copy a prompt
@@ -235,6 +250,7 @@ int  qt_chain_host_count(void);
 
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_init_fp8(int a,int b,int c,int d,int e,int f,const float*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
+static inline int  qt_init_gguf(int a,int b,int c,int d,int e,int f,const int*g,const int*h,const size_t*i,const size_t*j){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;return 0;}
 static inline int  qt_lmhead_init(const int8_t*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 #define QT_PLACE_CPU (-1)
@@ -254,6 +270,9 @@ static inline int  qt_dn_gpu_set_state(int a,const float*b,const float*c){(void)
 static inline int  qt_dn_gpu_get_state(int a,float*b,float*c){(void)a;(void)b;(void)c;return 0;}
 static inline int  qt_dn_gpu_step(int a,const float*b,float*c,const float*d,const float*e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_init(const int8_t*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
+static inline int  qt_dense_init_fmt(const void*a,const float*b,int c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return -1;}
+static inline int  qt_lmhead_init_fmt(const void*a,const float*b,int c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
+static inline int  qt_dnproj_init_fmt(int a,const void*b,const float*c,int d,int e,int f,int g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_dense_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dense_matmul_batch(int a,float*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dense_count(void){return 0;}
@@ -267,6 +286,7 @@ static inline int  qt_chain_resident(int a,int b,int c,struct ColiCudaTensor**g,
 static inline void qt_chain_hold(int a){(void)a;}
 static inline void qt_chain_count(int a,const int*b,int c){(void)a;(void)b;(void)c;}
 static inline int  qt_chain_format(int*a,int*b){(void)a;(void)b;return 0;}
+static inline int  qt_chain_layer_format(int a,int*b,int*c){(void)a;(void)b;(void)c;return 0;}
 static inline int  qt_chain_devices(void){return 0;}
 static inline void qt_note_host(int l,int e,const uint8_t*g,const uint8_t*u,const uint8_t*d,const float*a,const float*b,const float*c){(void)l;(void)e;(void)g;(void)u;(void)d;(void)a;(void)b;(void)c;}
 static inline int  qt_chain_host(int l,int e,const void**w,size_t*wb,const float**sc,size_t*sb){(void)l;(void)e;(void)w;(void)wb;(void)sc;(void)sb;return 0;}

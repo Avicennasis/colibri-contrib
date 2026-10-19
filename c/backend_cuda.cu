@@ -1510,11 +1510,12 @@ static size_t bd_file_row_bytes(int fmt, int I) {
     if (!bd_fmt_ok(fmt) || I < 32 || I % 32 || I % BD_BLK[fmt - 100]) return 0;
     return (size_t)I / BD_BLK[fmt - 100] * BD_BYTES[fmt - 100];
 }
-/* O rows of rb bytes from the host into rows of row_words words (zero padding) */
-static int bd_rows_copy(ColiCudaTensor *t, const void *weights) {
+/* O rows of rb bytes from the host into rows of row_words words; zero_pad: the padding zeroed
+ * first (a new tensor's; a refill keeps what the upload wrote there) */
+static int bd_rows_copy(ColiCudaTensor *t, const void *weights, int zero_pad) {
     size_t rb = bd_file_row_bytes(t->fmt, t->I), pitch = (size_t)t->row_words * 4;
     if (pitch == rb) return cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "block tensor upload");
-    return cuda_ok(cudaMemset(t->weights, 0, t->weight_bytes), "block tensor padding") &&
+    return (!zero_pad || cuda_ok(cudaMemset(t->weights, 0, t->weight_bytes), "block tensor padding")) &&
            cuda_ok(cudaMemcpy2D(t->weights, pitch, weights, rb, rb, (size_t)t->O, cudaMemcpyHostToDevice), "block tensor upload");
 }
 static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device) {
@@ -1528,7 +1529,7 @@ static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fm
     t->weight_bytes = (size_t)t->row_words * 4 * (size_t)O;
     if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) { coli_cuda_tensor_free(t); return 0; }
     t->weights_owned = 1;
-    if (!bd_rows_copy(t, weights)) { coli_cuda_tensor_free(t); return 0; }
+    if (!bd_rows_copy(t, weights, 1)) { coli_cuda_tensor_free(t); return 0; }
     t->tracked = 1;
     ctx->tensor_count++;
     ctx->tensor_bytes += t->weight_bytes;
@@ -1633,7 +1634,7 @@ extern "C" int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *weights
 #ifdef COLI_ANS
     if (t->compressed) return 0;            /* archive bytes, not a weight buffer of this size */
 #endif
-    if (t->fmt >= 100) { DeviceContext *c = find_ctx(t->device); return select_ctx(c) && bd_rows_copy(t, weights); }
+    if (t->fmt >= 100) { DeviceContext *c = find_ctx(t->device); return select_ctx(c) && bd_rows_copy(t, weights, 0); }
     if (t->fmt && t->fmt != 6 && (!scales || !t->scales)) return 0;
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
@@ -1809,7 +1810,7 @@ extern "C" int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tensor,
 extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                                           const void *weights,
                                           const float *scales) {
-    if (tensor && weights && tensor->fmt >= 100) { DeviceContext *c = find_ctx(tensor->device); return select_ctx(c) && bd_rows_copy(tensor, weights); }
+    if (tensor && weights && tensor->fmt >= 100) { DeviceContext *c = find_ctx(tensor->device); return select_ctx(c) && bd_rows_copy(tensor, weights, 0); }
     if (!tensor || !weights || (tensor->fmt && tensor->fmt != 6 && !scales)) return 0;
 #ifdef COLI_ANS
     if(tensor->compressed) return 0;

@@ -4,7 +4,7 @@
  *   - the integer form's types against the CPU's integer form (the same codes, scales and
  *     integer sums, in double), the float form's against the CPU's dequantized rows;
  *   - a verify's 2, 3 and 4 rows, sharing every weight load, each with the bits of the
- *     same row alone (a decode step's).
+ *     same row alone (a decode step's);
  *   - the routed experts of the dense chain (coli_cuda_moe_async, CcMoe.fmt >= 100) against
  *     the CPU's integer form, a row and a verify's;
  *   - the backend's path: coli_cuda_tensor_upload of the file's rows (padded to words on the
