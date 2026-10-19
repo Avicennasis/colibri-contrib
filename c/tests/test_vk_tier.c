@@ -264,6 +264,7 @@ static void formats(void) {
         CHECK(on, "%s: the tier did not start", cs[c].name);
         if (!on) { model_free(); continue; }
         Books bk = {0, 0}; double worst = 0;
+        ColiVkXbStats x0, x1; coli_vk_xb_stats(&x0);
         static const int Ss[] = {1, 3, 20, 1, 2, 24};
         for (int t = 0; t < 6; t++)
             for (int l = 0; l < L; l++) {
@@ -272,7 +273,9 @@ static void formats(void) {
                 double r = step(l, Ss[t], idx, w, &bk);
                 if (r > worst) worst = r;
             }
-        printf("  %-34s device %3llu of %3llu assignments, worst relative error %.2e\n", cs[c].name, bk.dev, bk.routed, worst);
+        coli_vk_xb_stats(&x1);   /* the steps of a few rows: the chain's kernels where the device has them */
+        printf("  %-34s device %3llu of %3llu assignments, worst relative error %.2e, %llu batches on the chain's kernels\n",
+               cs[c].name, bk.dev, bk.routed, worst, x1.chain_gemv_batches - x0.chain_gemv_batches);
         CHECK(bk.dev > 0, "%s: nothing ran on the device", cs[c].name);
         CHECK(worst < 2e-3, "%s: device rows off the reference (%.3g)", cs[c].name, worst);
         vkt_shutdown(); model_free();
@@ -391,6 +394,7 @@ static void blocks(void) {
         CHECK(on, "%s: the tier did not start", cs[c].name);
         if (!on) { model_free(); continue; }
         Books bk = {0, 0}; double worst = 0;
+        ColiVkXbStats x0, x1; coli_vk_xb_stats(&x0);
         static const int Ss[] = {1, 3, 20, 1, 2, 24};
         for (int t = 0; t < 6; t++)
             for (int l = 0; l < L; l++) {
@@ -399,7 +403,9 @@ static void blocks(void) {
                 double r = step(l, Ss[t], idx, w, &bk);
                 if (r > worst) worst = r;
             }
-        printf("  %-34s device %3llu of %3llu assignments, worst relative error %.2e\n", cs[c].name, bk.dev, bk.routed, worst);
+        coli_vk_xb_stats(&x1);   /* the steps of a few rows: the chain's kernels where the device has them */
+        printf("  %-34s device %3llu of %3llu assignments, worst relative error %.2e, %llu batches on the chain's kernels\n",
+               cs[c].name, bk.dev, bk.routed, worst, x1.chain_gemv_batches - x0.chain_gemv_batches);
         CHECK(bk.dev > 0, "%s: nothing ran on the device", cs[c].name);
         CHECK(worst < 2e-3, "%s: device rows off the reference (%.3g)", cs[c].name, worst);
         vkt_shutdown(); model_free();
@@ -1172,13 +1178,14 @@ static void grouped(void) {
                     if (r > worst) worst = r;
                 }
             coli_vk_xb_stats(&b);
-            unsigned long long gb = b.grouped_batches - a.grouped_batches, gv = b.gemv_batches - a.gemv_batches;
+            unsigned long long gb = b.grouped_batches - a.grouped_batches, gv = b.gemv_batches - a.gemv_batches,
+                               cg = b.chain_gemv_batches - a.chain_gemv_batches;   /* subgroups of 32: the chain's decode kernel */
             static const char *mn[4] = {"single", "whole", "mixed", "decode"};
             printf("  %-30s %-6s device %3llu of %3llu, %3llu grouped GEMM / %3llu GEMV batches, %d summed on the device, worst %.2e\n",
                    cs[c].name, mn[mode], bk.dev, bk.routed, gb, gv, summed, worst);
             CHECK(bk.dev > 0, "grouped %s %s: nothing ran on the device", cs[c].name, mn[mode]);
             CHECK(worst < (gb ? 1e-2 : 2e-3), "grouped %s %s: off the reference (%.3g)", cs[c].name, mn[mode], worst);
-            any_gemv |= gv > 0;
+            any_gemv |= gv > 0 || cg > 0;
             any_grouped |= gb > 0; any_summed |= summed > 0;
             vkt_shutdown(); model_free();
             unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");
@@ -1188,7 +1195,7 @@ static void grouped(void) {
            any_summed ? "taken" : "not on this device");
     CHECK(!any_grouped || any_summed, "grouped: the device took the grouped route but never summed a whole step");
     const char *gve = getenv("COLI_VK_XB_GEMV");
-    CHECK(!any_grouped || any_gemv || (gve && *gve == '0'), "grouped: the device took the grouped GEMM but never the grouped GEMV");
+    CHECK(!any_grouped || any_gemv || (gve && *gve == '0'), "grouped: the device took the grouped GEMM but never a grouped GEMV (its own or the chain's)");
     H = h0;
 }
 

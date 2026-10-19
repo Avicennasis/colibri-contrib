@@ -2,8 +2,9 @@
 // A decode step's routed experts in our own formats (vk_chain.c, vkc_moe; vk_chain.h): the
 // gate and up pass and the down pass of chain_moe.comp, laid out as chain_gemv.comp lays a
 // dense GEMV. FMT, a specialization constant, is the layer's format: 1 int8 with a scale per
-// row, 2 int4 with a scale per row, 4 int4 with a scale per gs inputs (the tier's layout:
-// signed bytes, or nibbles v + 8 with the low one the even input). chain_moe.comp spread a
+// row, 2 int4 with a scale per row, 4 int4 with a scale per gs inputs, 7 MXFP4 with a scale
+// per gs inputs, gs a multiple of 32 (the tier's layout: signed bytes, nibbles v + 8 with the
+// low one the even input, or e2m1 nibbles in int4's order). chain_moe.comp spread a
 // row of Qwen3.6's 2048 inputs over 32 lanes, two 16-byte steps each, and a workgroup over
 // 64 outputs: its gate and up pass took 72-80 us a layer on an RTX PRO 4000, where
 // chain_gemv.comp reads a dense 8192 x 2048 int4 matrix, the same bytes, in 28.
@@ -12,7 +13,10 @@
 //           o of expert ids[s][k], both against the same x loads; hid[s*K + k][o] =
 //           act(gate . x, up . x)
 //   mode 1, down: workgroup (pair j, tile) stages pair j's hidden row (I floats) and takes
-//           rows o of the tile, a row lpr lanes: yk[j][o] = down_e[o] . hid[j]
+//           rows o of the tile, a row lpr lanes: yk[j][o] = down_e[o] . hid[j], into binding
+//           5 at y_off + j * y_row (the chain: hid itself, past the S * K hidden rows)
+// The expert tier's small experts (backend_vulkan.c, xb_cgv_record) run this shader too, a
+// row a pair (K 1), so a row has the same bits there as in the chain's decode.
 // chain_moe.comp's mode 2 adds the pairs in rank order. A slot whose id is -1 or whose
 // expert the table does not hold (a zero entry: the host computes it) is skipped: its lanes
 // run no step and write nothing, so every lane reaches the shuffles. The host takes this
@@ -33,6 +37,7 @@ layout(std430, binding = 0) readonly buffer X { float x[]; };
 layout(std430, binding = 1) readonly buffer ID { int ids[]; };
 layout(std430, binding = 3) readonly buffer T { uint tab[]; };
 layout(std430, binding = 4) buffer H { float hid[]; };
+layout(std430, binding = 5) writeonly buffer YO { float yo[]; };
 
 layout(push_constant) uniform P {
     int mode, S, K, D, I, act;
@@ -40,6 +45,7 @@ layout(push_constant) uniform P {
     int t_off, x_off, x_row, i_off, i_row;
     int lpr;     // lanes a unit (a row of down), a power of two up to the subgroup
     int tiles;   // mode 1: the workgroups a pair's D rows take
+    int y_off, y_row;   // mode 1: where pair j's output row starts in binding 5
 } p;
 
 #define ENT 32u
@@ -79,6 +85,27 @@ float dot4(uvec4 w, int xb) {
            dot(xs[xi(xb + 6)], vec4(nb(w.w, 0), nb(w.w, 4), nb(w.w, 8), nb(w.w, 12))) +
            dot(xs[xi(xb + 7)], vec4(nb(w.w, 16), nb(w.w, 20), nb(w.w, 24), nb(w.w, 28)));
 }
+// MXFP4: e2m1 code n (bit 3 the sign) is (0, 0.5, 1, 1.5, 2, 3, 4, 6)[n & 7], twice those
+// packed as nibbles in one constant
+float e2(uint w, int off) {
+    uint n = bitfieldExtract(w, off, 4);
+    float v = float((0xC8643210u >> ((n & 7u) * 4u)) & 15u) * 0.5;
+    return (n & 8u) != 0u ? -v : v;
+}
+float dotmx(uvec4 w, int xb) {
+    return dot(xs[xi(xb)], vec4(e2(w.x, 0), e2(w.x, 4), e2(w.x, 8), e2(w.x, 12))) +
+           dot(xs[xi(xb + 1)], vec4(e2(w.x, 16), e2(w.x, 20), e2(w.x, 24), e2(w.x, 28))) +
+           dot(xs[xi(xb + 2)], vec4(e2(w.y, 0), e2(w.y, 4), e2(w.y, 8), e2(w.y, 12))) +
+           dot(xs[xi(xb + 3)], vec4(e2(w.y, 16), e2(w.y, 20), e2(w.y, 24), e2(w.y, 28))) +
+           dot(xs[xi(xb + 4)], vec4(e2(w.z, 0), e2(w.z, 4), e2(w.z, 8), e2(w.z, 12))) +
+           dot(xs[xi(xb + 5)], vec4(e2(w.z, 16), e2(w.z, 20), e2(w.z, 24), e2(w.z, 28))) +
+           dot(xs[xi(xb + 6)], vec4(e2(w.w, 0), e2(w.w, 4), e2(w.w, 8), e2(w.w, 12))) +
+           dot(xs[xi(xb + 7)], vec4(e2(w.w, 16), e2(w.w, 20), e2(w.w, 24), e2(w.w, 28)));
+}
+// a step of FMT 7 at q of row `row`: its group's scale (gs a multiple of 32)
+float stepmx(uvec4 v, int q, SRef sc, uint row, uint ng, uint gs) {
+    return dotmx(v, q * 8) * sc.v[row * ng + uint(q * 32) / gs];
+}
 // FMT 4 with groups that split a step (gs not a multiple of 32, a multiple of 8): each word's
 // 8 weights times their group's scale
 float dot4w(uint w, int xb, SRef sc, uint sb, uint i, uint gs) {
@@ -99,6 +126,7 @@ float rowpart(WRef4 w, SRef sc, uint row, uint rw4, uint ng, uint gs, int nq, in
         uvec4 v = w.v[row * rw4 + uint(q)];
         if (FMT == 1) acc += dot8(v, q * 4);
         else if (FMT == 2) acc += dot4(v, q * 8);
+        else if (FMT == 7) acc += stepmx(v, q, sc, row, ng, gs);
         else acc += step4(v, q, sc, row, ng, gs);
     }
     return acc;
@@ -142,12 +170,13 @@ void main() {
                     uvec4 vg = wg.v[at], vu = wu.v[at];
                     if (FMT == 1) { g += dot8(vg, q * 4); uu += dot8(vu, q * 4); }
                     else if (FMT == 2) { g += dot4(vg, q * 8); uu += dot4(vu, q * 8); }
+                    else if (FMT == 7) { g += stepmx(vg, q, sg_, uint(o), ng, gs); uu += stepmx(vu, q, su, uint(o), ng, gs); }
                     else { g += step4(vg, q, sg_, uint(o), ng, gs); uu += step4(vu, q, su, uint(o), ng, gs); }
                 }
             }
             g = lanes_sum(g, lpr); uu = lanes_sum(uu, lpr);
             if (lane == 0 && live) {
-                if (FMT != 4) { g *= sg_.v[o]; uu *= su.v[o]; }
+                if (FMT != 4 && FMT != 7) { g *= sg_.v[o]; uu *= su.v[o]; }
                 hid[(s * p.K + k) * p.I + o] = act(g, uu);
             }
         }
@@ -161,7 +190,7 @@ void main() {
     int e = ids[p.i_off + s * p.i_row + k];
     uint eb = uint(p.t_off + max(e, 0)) * ENT;
     if (e < 0 || tab[eb + 18u] == 0u) return;   // uniform
-    int n = p.I, nq = n / per, yko = p.S * p.K * p.I;
+    int n = p.I, nq = n / per;
     for (int i = tid; i < n / 4; i += 256) {
         int b = j * p.I + 4 * i;
         xs[xi(i)] = vec4(hid[b], hid[b + 1], hid[b + 2], hid[b + 3]);
@@ -176,6 +205,6 @@ void main() {
         int oc = min(o, p.D - 1);
         float d = live ? rowpart(wd, sd, uint(oc), rws / 4u, ng, gs, nq, lane, lpr) : 0.0;
         d = lanes_sum(d, lpr);
-        if (lane == 0 && live) hid[yko + j * p.D + o] = FMT != 4 ? d * sd.v[oc] : d;
+        if (lane == 0 && live) yo[p.y_off + j * p.y_row + o] = FMT != 4 && FMT != 7 ? d * sd.v[oc] : d;
     }
 }

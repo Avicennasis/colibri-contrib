@@ -1801,12 +1801,40 @@ static void test_moe(const char *what, int D, int I, int E, int S, int K, int fg
     if (getenv("VKC_TEST_VERBOSE")) printf("moe %s: %.2e\n", what, e);
     {   /* the layer's formats named: each pass on its format's own pipeline (1, 2, 4), the rest as before */
         mp.gfmt = fg; mp.dfmt = fd;
+        VkcStats n0, n1; vkc_stats(&n0);
         int rec2 = vkc_begin() && vkc_moe(xb, ib, wb, tb, hb, yb, &mp) && vkc_submit(1);
+        vkc_stats(&n1);
         float *got2 = down(yb, 0, (size_t)S * yrow);
         double e2 = 0;
         for (int s = 0; s < S; s++) { double r = relerr(got2 + (size_t)s * yrow + 1, ref + (size_t)s * yrow + 1, (size_t)D, 1e-3); if (r > e2) e2 = r; }
         CHECK(rec2 && e2 < 2e-4 && !bad(got2, (size_t)S * yrow), "moe %s (fmt %d/%d named): rel err %.2e", what, fg, fd, e2);
         free(got2);
+        /* chain_moe_gv.comp took the run: the tier's small experts run the same kernel
+         * (backend_vulkan.c, xb_cgv_record), so each pair's down row, an expert and a row a
+         * batch of the tier, is the chain's bit for bit (a prompt chunk's experts in the
+         * tier and the next tokens' in the chain give a resumed prefix the cold numbers) */
+        if (rec2 && n1.moe_gv > n0.moe_gv && coli_vk_xb_init(D, I, act, limit, a, b)) {
+            ColiVkXbStats t0, t1; coli_vk_xb_stats(&t0);
+            float *hy = down(hb, 0, (size_t)S * K * (I + D)), *dv = down(ib, 0, (size_t)S * irow);
+            int same = 1, cmp = 0;
+            for (int s = 0; s < S && same; s++)
+                for (int k = 0; k < K && same; k++) {
+                    int e; memcpy(&e, dv + (size_t)s * irow + k, 4);
+                    if (e < 0 || e >= E || e == gone) continue;
+                    ColiVkExpert *one = ex[e]; int r1 = 1; const float *xr = x + (size_t)s * xrow + 2, *yr = NULL;
+                    if (!coli_vk_xb_issue(&one, &r1, 1, &xr) || !coli_vk_xb_join(&yr, NULL)) { same = 0; break; }
+                    same = !memcmp(yr, hy + (size_t)S * K * I + (size_t)(s * K + k) * D, (size_t)D * 4);
+                    cmp++;
+                }
+            coli_vk_xb_stats(&t1);
+            if (t1.chain_gemv_batches > t0.chain_gemv_batches) {   /* not where a grouped route took them */
+                CHECK(same && cmp > 0, "moe %s (fmt %d/%d): the tier's small experts give the chain's bits (%d pairs)", what, fg, fd, cmp);
+                if (same && cmp > 0) printf("  moe %s: the tier's small experts give the chain's bits (%d pairs)\n", what, cmp);
+            }
+            else printf("  moe %s: the tier's small experts on a grouped route here, not chain_moe_gv\n", what);
+            coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0, 0, 0);
+            free(hy); free(dv);
+        }
     }
     vkc_free(lb); vkc_free(xb); vkc_free(tb); vkc_free(ib); vkc_free(wb); vkc_free(hb); vkc_free(yb);
     for (int k = 0; k < E; k++) {
@@ -3367,6 +3395,66 @@ static void bench_moe(void) {
     free(tg); free(tu); free(td); free(ex); free(tab); free(wg); free(wd);
 }
 
+/* COLI_VK_CHAIN_BENCH=xb: the expert tier's batch (coli_vk_xb_issue_w and _join), the route
+ * of the engines whose routed experts the chain does not compute (GLM, Kimi K3, DeepSeek,
+ * MiMo, Inkling), at a decode step's shape: one row through K experts of E, each layer its
+ * own experts so the weights come from memory. COLI_VK_BENCH_MOE "D I K E",
+ * COLI_VK_BENCH_FMTS "fg fd", COLI_VK_BENCH_GS; the device time from the batch's
+ * timestamps, the wall time with the submit and the wait. */
+static void bench_xb(void) {
+    int D = 6144, I = 2048, K = 8, E = 64, fg = 4, fd = 4, gs = 64, act = COLI_VK_ACT_SWIGLU;
+    const char *fe = getenv("COLI_VK_BENCH_FMTS"), *sh = getenv("COLI_VK_BENCH_MOE"), *ge = getenv("COLI_VK_BENCH_GS");
+    if (fe && *fe) sscanf(fe, "%d %d", &fg, &fd);
+    if (sh && *sh) sscanf(sh, "%d %d %d %d", &D, &I, &K, &E);
+    if (ge && *ge) gs = atoi(ge);
+    if (getenv("COLI_VK_BENCH_ACT")) act = atoi(getenv("COLI_VK_BENCH_ACT"));   /* 1 SiTU (Kimi K3) */
+    if (E < K) E = K;
+    if (!coli_vk_xb_init(D, I, act, 0, 4.f, 25.f)) { printf("bench xb: no expert batch here\n"); return; }
+    coli_vk_tier_pool_limit((size_t)1 << 40);
+    ColiVkTensor **t = calloc((size_t)E * 3, sizeof *t);
+    ColiVkExpert **ex = calloc(E, sizeof *ex);
+    int ok = 1;
+    for (int e = 0; e < E && ok; e++)
+        for (int m = 0; m < 3 && ok; m++) {
+            int f = m < 2 ? fg : fd, in = m < 2 ? D : I, out = m < 2 ? I : D, g = f == 4 || f == 7 || f == 12 || f == 13 ? gs : 0;
+            uint8_t *rows; size_t stride; float *sc;
+            if (!(ok = coli_vk_tier_tensor(&t[e * 3 + m], f, in, out, g, &rows, &stride, &sc))) break;
+            size_t rb = coli_vk_tensor_row_bytes(f, in), ns = coli_vk_tensor_scale_count(f, in, out, g);
+            for (int o = 0; o < out; o++)
+                for (size_t b = 0; b < rb; b++) rows[(size_t)o * stride + b] = f == 12 ? (uint8_t)(rnd() % 0x70) : (uint8_t)rnd();
+            for (size_t i = 0; i < ns; i++) sc[i] = f == 10 || f == 11 ? 1.f : 0.002f;
+            ok = coli_vk_tensor_commit(&t[e * 3 + m], 1);
+        }
+    for (int e = 0; e < E && ok; e++) ok = (ex[e] = coli_vk_xb_expert(t[e * 3], t[e * 3 + 1], t[e * 3 + 2])) != NULL;
+    if (!ok) { printf("bench xb: the experts did not go up (fmt %d/%d)\n", fg, fd); return; }
+    float *x = fvec((size_t)K * D, 1.f);
+    const float **xr = malloc((size_t)K * sizeof *xr), **yr = malloc((size_t)K * sizeof *yr);
+    int *ones = malloc((size_t)K * sizeof *ones);
+    ColiVkExpert **sel = malloc((size_t)K * sizeof *sel);
+    for (int k = 0; k < K; k++) { xr[k] = x; ones[k] = 1; }
+    int nl = 48;
+    double best_dev = 1e9, best_wall = 1e9;
+    for (int r = -1; r < 5 && ok; r++) {
+        double dev = 0, t0 = bnow();
+        for (int l = 0; l < nl && ok; l++) {
+            for (int k = 0; k < K; k++) sel[k] = ex[((l * K) + k) % E];
+            double dms = 0;
+            ok = coli_vk_xb_issue_w(sel, ones, K, xr, NULL) && coli_vk_xb_join(yr, &dms);
+            dev += dms;
+        }
+        double wall = bnow() - t0;
+        if (r >= 0 && dev < best_dev) best_dev = dev;
+        if (r >= 0 && wall < best_wall) best_wall = wall;
+    }
+    size_t rg = coli_vk_tensor_row_bytes(fg, D), rd = coli_vk_tensor_row_bytes(fd, I);
+    double bytes = (double)K * (2.0 * rg * I + (double)rd * D);
+    if (ok) printf("bench xb fmt %d/%d gs %d act %d K %d [D %d I %d]: device %.1f us per layer (%.1f GB/s), wall %.1f us\n",
+                   fg, fd, gs, act, K, D, I, best_dev * 1e3 / nl, bytes * nl / (best_dev * 1e-3) / 1e9, best_wall * 1e6 / nl);
+    else printf("bench xb: the batch failed\n");
+    for (int e = 0; e < E; e++) if (ex[e]) coli_vk_xb_expert_free(ex[e]);
+    free(t); free(ex); free(x); free(xr); free(yr); free(ones); free(sel);
+}
+
 /* COLI_VK_CHAIN_BENCH=rows: a prompt chunk's routed experts (vkc_route + vkc_moe_rows) at
  * Qwen3.6's shapes in our int4-g64 (D 2048, I 512, 256 experts, top 8), S rows
  * (COLI_VK_BENCH_ROWS, 467), L layers of experts of their own (COLI_VK_BENCH_L, 4) each
@@ -3629,6 +3717,7 @@ int main(int argc, char **argv) {
     if (getenv("COLI_VK_CHAIN_BENCH")) {
         if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "bd")) bench_bd();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "moe")) bench_moe();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "xb")) bench_xb();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dn")) bench_dn();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dsa")) bench_dsa();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "mla")) bench_mla();
