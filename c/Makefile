@@ -753,6 +753,8 @@ VK_SPV   += shaders/chain_gemv_bd.spv shaders/qmatmul_gemm_bd.spv
 VK_SPV   += shaders/chain_gemv_bd_i8.spv
 # the expert batch's grouped GEMM for a GGUF's experts, down and gate+up (backend_vulkan.c)
 VK_SPV   += shaders/qmatmul_grp_bd.spv shaders/qmatmul_grp_gate_up_bd.spv
+# and both on the matrix units (cooperative matrices at subgroups of 64 or 32)
+VK_SPV   += shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_grp_bdc.spv shaders/qmatmul_grp_gate_up_bdc.spv
 # and for our own formats' experts on the chain's prompt chunks (vk_chain.c: vkc_moe_rows)
 VK_SPV   += shaders/qmatmul_grp_q.spv shaders/qmatmul_grp_gate_up_q.spv
 # and on the matrix units (cooperative matrices at subgroups of 64 or 32)
@@ -934,7 +936,7 @@ vk_chain.o: vk_chain.c .build-config
 # routed experts; the chain's block GEMV reads the same table
 shaders/qmatmul_bd.spv shaders/qmatmul_gate_up_bd.spv shaders/chain_moe.spv: shaders/blockdec.glsl shaders/blockdec_table.h
 # the per-type decoders of the chain's block GEMV and of its routed experts
-shaders/chain_gemv_bd.spv shaders/chain_moe.spv shaders/qmatmul_gemm_bd.spv shaders/qmatmul_grp_bd.spv: shaders/bdstep.glsl shaders/blockdec_table.h
+shaders/chain_gemv_bd.spv shaders/chain_moe.spv shaders/qmatmul_gemm_bd.spv shaders/qmatmul_grp_bd.spv shaders/qmatmul_gemm_bdc.spv shaders/qmatmul_grp_bdc.spv: shaders/bdstep.glsl shaders/blockdec_table.h
 shaders/chain_gemv_bd_i8.spv: shaders/chain_gemv_bd.comp shaders/bdstep.glsl shaders/bdstep_i8.glsl shaders/blockdec_table.h
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DIDOT $< -o $@ || { [ -f $@ ] && touch $@ && \
@@ -944,6 +946,9 @@ shaders/chain_moe_i8.spv: shaders/chain_moe.comp shaders/bdstep.glsl shaders/bds
 	$(GLSLC) --target-env=vulkan1.2 -DIDOT $< -o $@ || { [ -f $@ ] && touch $@ && \
 	  echo "warning: $(GLSLC) cannot compile $<, keeping the committed $@" >&2; }
 shaders/qmatmul_grp_gate_up_bd.spv: shaders/qmatmul_grp_bd.comp shaders/bdstep.glsl shaders/blockdec_table.h
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+shaders/qmatmul_grp_gate_up_bdc.spv: shaders/qmatmul_grp_bdc.comp shaders/bdstep.glsl shaders/blockdec_table.h
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
 shaders/qmatmul_grp_gate_up_q.spv: shaders/qmatmul_grp_q.comp

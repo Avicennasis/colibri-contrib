@@ -1688,6 +1688,8 @@ static void host_init(long long all) {
             T.engine, T.dmax[2], human((double)lim, hb, sizeof hb), left, fit < left ? ", not all of them" : "");
 }
 
+int vkt_host_pool_on(void) { return T.on && T.dmax[2] > 0; }
+
 int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.on || !cfg) return 0;
     if (!vkt_wanted()) return 0;

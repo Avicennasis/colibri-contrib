@@ -1958,7 +1958,17 @@ the host's step. Where the device has cooperative matrices at subgroups of 64 or
 formats' tiles run on the matrix units (`qmatmul_grp_qc.comp` and its `GATE_UP` build: the
 same items and table, weights times their scales and the inputs rounded to f16, sums in
 f32, the item's eight 16 x 16 accumulators shared out among the subgroups;
-`COLI_VK_GRP_COOP=0` keeps the floats). No row leaves
+`COLI_VK_GRP_COOP=0` keeps the floats). A GGUF's experts take the same way
+(`qmatmul_grp_bdc.comp` and its `GATE_UP` build: the block decoders write f16 into the
+tiles), and so do its dense matrices for a prompt's rows (`qmatmul_gemm_bdc.comp`, 64
+outputs x 64 rows a workgroup, `COLI_VK_CHAIN_GEMM=0` keeps the floats). On an RTX PRO
+4000, Qwen3.6-35B-A3B, a 467-token prompt, two starts each: UD-Q4_K_M 694-726 -> 1300-1373
+tok/s, UD-IQ2_XXS 733-757 -> 1403-1505 tok/s, the decode unchanged (66-68, 86-88); the
+teacher-forced loss after a 600-token prompt 3.2141 -> 3.2211. With the tier's host pool on
+(experts in system RAM the device reads over PCIe) a chunk's grouped GEMMs keep the floats,
+whose reads over PCIe went faster: Qwen3.8 Next IQ2_XS with 19 GiB of experts in the pool, a
+507-token prompt, 93-94 tok/s on the matrix units against 115-116 in floats; without the pool
+the two were even. No row leaves
 the device. A layer whose types have no grouped GEMM (a GGUF's IQ1_M layers) keeps the
 host's step for that chunk; the rest of the forward stays in the frame. It needs the
 grouped GEMMs' 34.8 KiB of shared memory (not Lavapipe's 32 KiB, where every layer keeps

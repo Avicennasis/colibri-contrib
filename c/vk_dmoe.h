@@ -357,6 +357,11 @@ static int vkc_dmoe_layer(VkcDmoe *d, int layer, int n, VkcBuf *lg, VkcBuf *bias
     if (!m.dfmt && d->tabh) m.dfmt = vkc_dmoe_fmt(d, i, 15);   /* and down's (the integer form wants both) */
     if (n > VKC_DMOE_ROWS) {   /* a prompt chunk: the grouped GEMMs (vkc_dmoe_prepare checked the layer's formats) */
         m.E = d->E;
+        /* With a host pool the GEMMs read some experts over PCIe, and the floats' were faster
+         * there: Qwen3.8 Next IQ2_XS on an RTX PRO 4000 (19 GiB of experts in the host pool), a
+         * 507-token prompt, 115-116 tok/s against 93-94 on the matrix units; without the pool the
+         * two were even (104-114 against 109-120). */
+        m.floats = vkt_host_pool_on();
         if (!vkc_route(lg, bias, d->rid, d->rwt, &r) || !vkc_moe_rows(x, d->rid, d->rwt, d->tab, &d->rows, d->y, &m)) return 0;
         d->steps++; d->big_steps++;
         return 1;
