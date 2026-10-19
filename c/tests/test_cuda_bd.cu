@@ -133,6 +133,31 @@ static void check(int t, int I, int O, int bench) {
         okb = okb && cudaDeviceSynchronize() == cudaSuccess;
         cudaMemcpy(got, yd, (size_t)SM * O * 4, cudaMemcpyDeviceToHost);
         if (!okb || memcmp(got, one, (size_t)SM * O * 4)) { printf("FAIL %s [%d x %d]: the backend's upload and matmul differ from the kernel's\n", ref_name(t), O, I); fails++; }
+        /* a prompt chunk's rows (40: past the GEMV's 8) through the f16 tiles where the device has
+         * them, against the dequantized rows in double: f16 operands, to 1e-2 of the terms' magnitude */
+        if (okb && I % 64 == 0) {
+            const int SG = 40;
+            float *xg = (float *)malloc((size_t)SG * I * 4), *yg = (float *)malloc((size_t)SG * O * 4), *deq = (float *)malloc((size_t)I * 4);
+            float *dxg, *dyg;
+            for (int i = 0; i < SG * I; i++) xg[i] = ((int)(rnd() % 20001) - 10000) * 1e-4f;
+            cudaMalloc(&dxg, (size_t)SG * I * 4); cudaMalloc(&dyg, (size_t)SG * O * 4);
+            cudaMemcpy(dxg, xg, (size_t)SG * I * 4, cudaMemcpyHostToDevice);
+            int okg = coli_cuda_tensor_gemm_async(ct, dyg, dxg, SG, NULL) && cudaDeviceSynchronize() == cudaSuccess;
+            cudaMemcpy(yg, dyg, (size_t)SG * O * 4, cudaMemcpyDeviceToHost);
+            double worst = 0;
+            for (int o = 0; o < O && okg; o++) {
+                if (ref_dequant(t, w + (size_t)o * rw * 4, deq, I)) { okg = 0; break; }
+                for (int r = 0; r < SG; r += 13) {
+                    double ref = 0, mag = 0;
+                    for (int i = 0; i < I; i++) { ref += (double)deq[i] * xg[(size_t)r * I + i]; mag += fabs((double)deq[i] * xg[(size_t)r * I + i]); }
+                    double e = fabs(yg[(size_t)r * O + o] - ref) / (mag + 1e-6);
+                    if (!(e <= worst)) worst = e;
+                }
+            }
+            if (!okg || !(worst <= 1e-2)) { printf("FAIL %s [%d x %d]: %d rows off by %.3g\n", ref_name(t), O, I, SG, worst); fails++; }
+            else if (I == 2048 && O == 300) printf("%-8s [%6d x %5d] %d rows (tiles): within %.2g of the dequantized rows\n", ref_name(t), O, I, SG, worst);
+            cudaFree(dxg); cudaFree(dyg); free(xg); free(yg); free(deq);
+        }
         if (ct) coli_cuda_tensor_free(ct);
         free(packed);
     }
@@ -175,9 +200,18 @@ static double ref_dot(int t, const uint8_t *r, int n, const int8_t *xq, const fl
     }
     return acc;
 }
+/* the dequantized row r (type t, n inputs) against x, in double */
+static double ref_fdot(int t, const uint8_t *r, int n, const float *x) {
+    static float deq[16384];
+    if (ref_dequant(t, r, deq, n)) return NAN;
+    double acc = 0;
+    for (int i = 0; i < n; i++) acc += (double)deq[i] * x[i];
+    return acc;
+}
 /* The chain's routed experts (coli_cuda_moe_async) of a GGUF: E experts of gate/up type tg
- * and down type td, S rows routed to K of them, against the CPU's integer form (each row
- * quantized, then the hidden row quantized for down). */
+ * and down type td, S rows routed to K of them: up to 8 rows (the GEMV kernels) against the
+ * CPU's integer form (each row quantized, then the hidden row quantized for down), more (a prompt
+ * chunk's, the sorted f16 tiles) against the dequantized rows. */
 static void check_moe(int tg, int td, int S, int K, int E, int D, int I) {
     long rg = ref_row_bytes(tg, D), rd = ref_row_bytes(td, I);
     if (rg <= 0 || rd <= 0) return;
@@ -203,7 +237,9 @@ static void check_moe(int tg, int td, int S, int K, int E, int D, int I) {
     }
     float *x = (float *)malloc((size_t)S * D * 4), *w = (float *)malloc((size_t)S * K * 4), *y = (float *)malloc((size_t)S * D * 4);
     int *ids = (int *)malloc((size_t)S * K * 4);
-    for (int i = 0; i < S * D; i++) x[i] = ((int)(rnd() % 20001) - 10000) * 1e-4f;
+    /* random K-quant blocks: the hidden rows of an x of 1e-4 run past f16's range in the tiles
+     * (an operand held to 65504), a tenth keeps them in it, as test_vk_chain's moe rows do */
+    for (int i = 0; i < S * D; i++) x[i] = ((int)(rnd() % 20001) - 10000) * (S > 8 ? 1e-5f : 1e-4f);
     for (int s = 0; s < S; s++)
         for (int k = 0; k < K; k++) {
             int e;
@@ -231,15 +267,26 @@ static void check_moe(int tg, int td, int S, int K, int E, int D, int I) {
             for (int k = 0; k < K; k++) {
                 int e = ids[s * K + k];
                 if (e < 0) continue;
-                ref_quant(x + (size_t)s * D, D, xq, dxs, xss);
-                for (int o = 0; o < I; o++) {
-                    double g = ref_dot(tg, G + e * gb + o * rg, D, xq, dxs, xss), u = ref_dot(tg, U + e * gb + o * rg, D, xq, dxs, xss);
-                    h[o] = (float)(g / (1 + exp(-g)) * u);
-                }
-                ref_quant(h, I, xq, dxs, xss);
-                for (int o = 0; o < D; o++) {
-                    double v = ref_dot(td, Dn + e * db + o * rd, I, xq, dxs, xss);
-                    ref[o] += w[s * K + k] * v; mag[o] += fabs(w[s * K + k] * v);
+                if (S <= 8) {   /* the GEMV kernels: the CPU's integer form, row and hidden row quantized */
+                    ref_quant(x + (size_t)s * D, D, xq, dxs, xss);
+                    for (int o = 0; o < I; o++) {
+                        double g = ref_dot(tg, G + e * gb + o * rg, D, xq, dxs, xss), u = ref_dot(tg, U + e * gb + o * rg, D, xq, dxs, xss);
+                        h[o] = (float)(g / (1 + exp(-g)) * u);
+                    }
+                    ref_quant(h, I, xq, dxs, xss);
+                    for (int o = 0; o < D; o++) {
+                        double v = ref_dot(td, Dn + e * db + o * rd, I, xq, dxs, xss);
+                        ref[o] += w[s * K + k] * v; mag[o] += fabs(w[s * K + k] * v);
+                    }
+                } else {        /* the f16 tiles: the dequantized rows in double, nothing quantized */
+                    for (int o = 0; o < I; o++) {
+                        double g = ref_fdot(tg, G + e * gb + o * rg, D, x + (size_t)s * D), u = ref_fdot(tg, U + e * gb + o * rg, D, x + (size_t)s * D);
+                        h[o] = (float)(g / (1 + exp(-g)) * u);
+                    }
+                    for (int o = 0; o < D; o++) {
+                        double v = ref_fdot(td, Dn + e * db + o * rd, I, h);
+                        ref[o] += w[s * K + k] * v; mag[o] += fabs(w[s * K + k] * v);
+                    }
                 }
             }
             for (int o = 0; o < D; o++) { double e = fabs(y[(size_t)s * D + o] - ref[o]) / (mag[o] + 1e-3); if (!(e <= worst)) worst = e; }
@@ -247,8 +294,10 @@ static void check_moe(int tg, int td, int S, int K, int E, int D, int I) {
         }
         free(xq); free(dxs); free(xss); free(h);
     }
-    if (!ok || !(worst <= 2e-3)) { printf("FAIL moe %s/%s S %d K %d E %d [%d x %d]: %s %.3g\n", ref_name(tg), ref_name(td), S, K, E, D, I, ok ? "off by" : "the call failed", worst); fails++; }
-    else printf("moe %-7s/%-7s S %d K %d E %d [%d x %d]: within %.2g of the CPU's integer form\n", ref_name(tg), ref_name(td), S, K, E, D, I, worst);
+    double tol = S > 8 ? 1e-2 : 2e-3;   /* past 8 rows the f16 tiles */
+    if (!ok || !(worst <= tol)) { printf("FAIL moe %s/%s S %d K %d E %d [%d x %d]: %s %.3g\n", ref_name(tg), ref_name(td), S, K, E, D, I, ok ? "off by" : "the call failed", worst); fails++; }
+    else printf("moe %-7s/%-7s S %d K %d E %d [%d x %d]: within %.2g of the %s\n", ref_name(tg), ref_name(td), S, K, E, D, I, worst,
+                S > 8 ? "dequantized rows (f16 tiles)" : "CPU's integer form");
     cudaFree(dtab); cudaFree(dx_); cudaFree(dw); cudaFree(dy); cudaFree(dh); cudaFree(di);
     for (int i = 0; i < 3 * E; i++) if (tt[i]) coli_cuda_tensor_free(tt[i]);
     free(tt); free(tab); free(G); free(U); free(Dn); free(x); free(w); free(y); free(ids);
@@ -275,6 +324,7 @@ int main(void) {
     for (size_t i = 0; i < sizeof pairs / sizeof *pairs; i++) {
         check_moe(pairs[i][0], pairs[i][1], 1, 8, 16, 2048, 512);
         check_moe(pairs[i][0], pairs[i][1], 3, 8, 16, 1024, 768);
+        check_moe(pairs[i][0], pairs[i][1], 40, 8, 16, 1024, 768);
     }
     if (bench) {
         printf("BENCH (rows of x: 1 2 3 4)\n");

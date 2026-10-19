@@ -1536,10 +1536,15 @@ static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fm
     *tensor = t;
     return 1;
 }
-/* y[S, O] = x[S, I] W^T for a block-format tensor, on stream st (device pointers) */
+/* y[S, O] = x[S, I] W^T for a block-format tensor, on stream st (device pointers): up to
+ * BD_GEMV_MAX_S rows (a decode step, a verify's) on the GEMV, each row a decode step's bits;
+ * more (a prompt chunk) through the tensor cores' tiles where the device has them (bd_tensor_gemm) */
+#define BD_GEMV_MAX_S 8
+static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st);
 static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st) {
     const bd_u32 *tab = bd_table(ctx);
     if (!tab || ((uintptr_t)x & 15)) return 0;
+    if (S > BD_GEMV_MAX_S && bd_tensor_gemm(ctx, t, y, x, S, st)) return 1;
     const char *e = std::getenv("COLI_CUDA_BD_FLOAT");   /* 1: the float form for every type (tests) */
     if (!bd_gemv_launch(y, x, (const bd_u32 *)t->weights, tab, t->fmt, t->I, t->O, t->row_words, S, ctx->smem_optin, e && *e == '1', st)) return 0;
     return cuda_ok(cudaGetLastError(), "block gemv launch");
@@ -3224,6 +3229,45 @@ __device__ __forceinline__ void hcg_store_x(__half (*Xs)[HCG_LDH], const float4 
     uint4 *dst = reinterpret_cast<uint4 *>(&Xs[row][kq]);
     dst[0] = *reinterpret_cast<const uint4 *>(&v[0]); dst[1] = *reinterpret_cast<const uint4 *>(&v[8]);
 }
+/* WF 100: a GGUF's blocks (cuda_bd.cuh's float form, bdf_decode), the format in gs, the
+ * decoders' table in sc: the thread's 16 weights are half of a 32-weight unit, decoded with
+ * its scales and mins (weight = s * w - m) and rounded to f16, the scales in the weights */
+template<> struct HcgW<100> { float f[16]; };
+template<>
+__device__ __forceinline__ void hcg_fetch_w<100>(HcgW<100> &r, const uint8_t *__restrict__ W, const float *__restrict__ sc,
+                                                 int gs, int ng, int n, int N, int k0, int K, int planar) {
+    (void)ng; (void)planar;
+    int kq = (threadIdx.x & 3) * 16;
+    if (n >= N) {
+        #pragma unroll
+        for (int j = 0; j < 16; j++) r.f[j] = 0.f;
+        return;
+    }
+    const bd_u32 *tab = reinterpret_cast<const bd_u32 *>(sc);
+    int t = gs - 100;
+    bd_u32 B = __ldg(tab + BDT_BLK + t), T = __ldg(tab + BDT_BYTES + t);
+    size_t rw = ((size_t)K / B * T + 3) / 4;
+    const bd_u32 *Wr = reinterpret_cast<const bd_u32 *>(W) + (size_t)n * rw;
+    int wv[32]; float sA, mA, sB, mB;
+    bdf_decode(gs, Wr, (bd_u32)((k0 + kq) >> 5), tab, wv, sA, mA, sB, mB);
+    if ((kq >> 4) & 1) {
+        #pragma unroll
+        for (int j = 0; j < 16; j++) r.f[j] = sB * (float)wv[16 + j] - mB;
+    } else {
+        #pragma unroll
+        for (int j = 0; j < 16; j++) r.f[j] = sA * (float)wv[j] - mA;
+    }
+}
+template<>
+__device__ __forceinline__ void hcg_store_w<100>(__half (*Ws)[HCG_LDH], const HcgW<100> &r, int planar) {
+    (void)planar;
+    int t = threadIdx.x, row = t >> 2, kq = (t & 3) * 16;
+    __align__(16) __half v[16];
+    #pragma unroll
+    for (int j = 0; j < 16; j++) v[j] = hcg_h(r.f[j]);
+    uint4 *dst = reinterpret_cast<uint4 *>(&Ws[row][kq]);
+    dst[0] = *reinterpret_cast<const uint4 *>(&v[0]); dst[1] = *reinterpret_cast<const uint4 *>(&v[8]);
+}
 #endif
 template<int WF, int NW>
 __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const int *yr, const float *__restrict__ X, int xld, const int *xr,
@@ -3287,10 +3331,10 @@ __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const i
         int r = e / TCG_BN, c = e - r * TCG_BN, nn = n0 + c;
         if (r >= M || nn >= N) continue;
         float g = Cs[r * CL + c];
-        if (WF != 4) g *= sc[0][nn];   /* int8 and int4 rows: the codes went in exact, the row's scale here */
+        if (WF != 4 && WF != 100) g *= sc[0][nn];   /* int8 and int4 rows: the codes went in exact, the row's scale here */
         if (NW == 2) {
             float u = Cs[TCG_BM * CL + r * CL + c];
-            if (WF != 4) u *= sc[NW - 1][nn];
+            if (WF != 4 && WF != 100) u *= sc[NW - 1][nn];
             g = (g / (1.f + expf(-g))) * u;
         }
         Y[(size_t)yr[r] * yld + nn] = g;
@@ -3308,6 +3352,18 @@ __global__ static void __launch_bounds__(256) hcg_dense_k(float *__restrict__ y,
     __syncthreads();
     const uint8_t *W[1] = {w}; const float *Sc[1] = {sc};
     hcg_tile<WF, 1>(y, O, rows, x, I, rows, M, W, Sc, gs, O, I, blockIdx.x * TCG_BN);
+}
+static int hcg_ok(const DeviceContext *ctx);
+/* a prompt chunk's rows of a block-format tensor: the f16 tiles (hcg_tile WF 100), I a
+ * multiple of 64; 0 where the device has no f16 fragments (the GEMV takes them) */
+static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st) {
+    const bd_u32 *tab = bd_table(ctx);
+    static int tiles = -1;
+    if (tiles < 0) { const char *e = getenv("COLI_CUDA_BD_TILES"); tiles = !(e && *e == '0'); }   /* 0: a prompt's rows on the GEMV too */
+    if (!tiles || !tab || !hcg_ok(ctx) || t->I % HCG_BK || ((uintptr_t)x & 15)) return 0;
+    dim3 g((unsigned)((t->O + TCG_BN - 1) / TCG_BN), (unsigned)((S + TCG_BM - 1) / TCG_BM));
+    hcg_dense_k<100><<<g, 256, 0, st>>>(y, x, (const uint8_t *)t->weights, reinterpret_cast<const float *>(tab), t->fmt, S, t->I, t->O);
+    return cuda_ok(cudaGetLastError(), "block gemm launch");
 }
 extern "C" int coli_cuda_host_register(void *p, size_t bytes) {
     if (!p || !bytes) return 0;
@@ -3729,6 +3785,43 @@ __global__ static void __launch_bounds__(256) hcg_moe_dn_k(const CcExpert *__res
     size_t A = (size_t)p.S * p.K;
     hcg_tile<WF, 1>(hid + A * p.I, p.D, pr, hid, p.I, xr, M, W, Sc, p.gs, p.D, p.I, blockIdx.x * TCG_BN, WF == 4 && ex.planar);
 }
+/* a GGUF's experts (WF 100): gate and up of type fmt, down of fmt_d, the decoders' table btab */
+__global__ static void __launch_bounds__(256) hcg_moe_gu_bd_k(const CcExpert *__restrict__ tab, const float *__restrict__ x, float *__restrict__ hid,
+                                                              MoeSort m, CcMoe p, const bd_u32 *__restrict__ btab) {
+    __shared__ int xr[64], pr[64];
+    if ((int)blockIdx.y >= *m.ntile) return;
+    int e, M = moe_tile_rows(m, p, blockIdx.y, xr, pr, &e, 0);
+    __syncthreads();
+    CcExpert ex = tab[p.t_off + e];
+    const uint8_t *W[2] = {(const uint8_t *)ex.g, (const uint8_t *)ex.u};
+    const float *Sc[2] = {reinterpret_cast<const float *>(btab), reinterpret_cast<const float *>(btab)};
+    hcg_tile<100, 2>(hid, p.I, pr, x + p.x_off, p.x_row, xr, M, W, Sc, p.fmt, p.I, p.D, blockIdx.x * TCG_BN);
+}
+__global__ static void __launch_bounds__(256) hcg_moe_dn_bd_k(const CcExpert *__restrict__ tab, float *__restrict__ hid, MoeSort m, CcMoe p,
+                                                              const bd_u32 *__restrict__ btab) {
+    __shared__ int xr[64], pr[64];
+    if ((int)blockIdx.y >= *m.ntile) return;
+    int e, M = moe_tile_rows(m, p, blockIdx.y, xr, pr, &e, 1);
+    __syncthreads();
+    CcExpert ex = tab[p.t_off + e];
+    const uint8_t *W[1] = {(const uint8_t *)ex.d};
+    const float *Sc[1] = {reinterpret_cast<const float *>(btab)};
+    size_t A = (size_t)p.S * p.K;
+    hcg_tile<100, 1>(hid + A * p.I, p.D, pr, hid, p.I, xr, M, W, Sc, p.fmt_d ? p.fmt_d : p.fmt, p.D, p.I, blockIdx.x * TCG_BN);
+}
+static int moe_rows_bd_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, MoeSort m, const CcMoe *p, const bd_u32 *btab,
+                              cudaStream_t st) {
+    size_t A = (size_t)p->S * p->K;
+    unsigned ga = (unsigned)((A + 255) / 256);
+    if (!cuda_ok(cudaMemsetAsync(m.cnt, 0, (size_t)p->E * sizeof(int), st), "chain moe sort")) return 0;
+    moe_sort_count_k<<<ga, 256, 0, st>>>(tab, ids, m, *p);
+    moe_sort_scan_k<<<1, 32, 0, st>>>(m, *p);
+    moe_sort_place_k<<<ga, 256, 0, st>>>(tab, ids, m, *p);
+    dim3 gg((unsigned)((p->I + TCG_BN - 1) / TCG_BN), (unsigned)m.T), gd((unsigned)((p->D + TCG_BN - 1) / TCG_BN), (unsigned)m.T);
+    hcg_moe_gu_bd_k<<<gg, 256, 0, st>>>(tab, x, hid, m, *p, btab);
+    hcg_moe_dn_bd_k<<<gd, 256, 0, st>>>(tab, hid, m, *p, btab);
+    return cuda_ok(cudaGetLastError(), "chain moe block rows launch");
+}
 template<int WF>
 static int moe_rows_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, MoeSort m, const CcMoe *p, cudaStream_t st, int f16) {
     size_t A = (size_t)p->S * p->K;
@@ -4031,15 +4124,24 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream) {
     if (fault_injected()) return 0;
     if (!tab || !ids || !hid || !p || p->S < 1 || p->K < 1 || p->D < 32 || p->I < 32 || p->D % 32 || p->I % 32 || p->act) return 0;
-    if (p->fmt >= 100) {   /* a GGUF's experts: every row as a decode step's (a prompt chunk's rows too) */
+    if (p->fmt >= 100) {   /* a GGUF's experts: a decode step's rows on the GEMV kernels, a prompt chunk's sorted through the f16 tiles */
         if (!moe_bd_ok(p) || p->D > MOE_DIM_MAX || p->I > MOE_DIM_MAX) return 0;
         DeviceContext *bc = find_ctx(device);
         if (!select_ctx(bc)) return 0;
         cudaStream_t bst = (cudaStream_t)stream;
-        if ((p->parts & 1) && (!x || !moe_bd_launch(bc, tab, x, ids, hid, p, bst))) return 0;
+        const bd_u32 *btab = bd_table(bc);
+        static int tiles = -1;
+        if (tiles < 0) { const char *e = getenv("COLI_CUDA_BD_TILES"); tiles = !(e && *e == '0'); }   /* 0: every row on the GEMV kernels */
+        int brows = tiles && btab && p->S > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && hcg_ok(bc) && p->D % HCG_BK == 0 && p->I % HCG_BK == 0 &&
+                    (!x || ((uintptr_t)(x + p->x_off) & 15) == 0) && p->x_row % 4 == 0;
+        MoeSort bm = moe_sort_of(hid, p);
+        if ((p->parts & 1) && (!x || !(brows ? moe_rows_bd_launch(tab, x, ids, hid, bm, p, btab, bst) : moe_bd_launch(bc, tab, x, ids, hid, p, bst))))
+            return 0;
         if (p->parts & 2) {
             if (!w || !y || (p->h_off >= 0 && !hy)) return 0;
-            moe_sum_k<<<dim3((unsigned)((p->D + 255) / 256), (unsigned)p->S), 256, 0, bst>>>(tab, ids, w, hid, hy, y, *p);
+            dim3 g((unsigned)((p->D + 255) / 256), (unsigned)p->S);
+            if (brows) moe_rows_sum_k<<<g, 256, 0, bst>>>(w, hid, hy, y, bm, *p);
+            else moe_sum_k<<<g, 256, 0, bst>>>(tab, ids, w, hid, hy, y, *p);
             if (!cuda_ok(cudaGetLastError(), "chain moe sum launch")) return 0;
         }
         return 1;
