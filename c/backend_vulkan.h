@@ -284,6 +284,15 @@ void coli_vk_xb_expert_free(ColiVkExpert *e);
  * them by address: bufferDeviceAddress off, the second device, a tensor outside a pool. */
 #define COLI_VK_XB_ENTRY 32
 int coli_vk_xb_expert_entry(const ColiVkExpert *e, uint32_t *entry);
+/* The lanes chain_moe_gv.comp gives a row of n inputs in format fmt (1 int8, else 4-bit): a
+ * power of two near n's 16-byte steps / 8, 1 to 32. The chain's decode experts (vk_chain.c)
+ * and the tier's small experts (the expert batch) both take it from here: a row's partial
+ * sums, and so its bits, depend on it. */
+static inline int coli_vk_gv_lanes(int fmt, int n) {
+    int steps = n / (fmt == 1 ? 16 : 32), l = 1;
+    while (l < 32 && l * 2 * 8 <= steps) l *= 2;
+    return l;
+}
 /* Submit and return: count experts, rows[c] activation rows each, the rows given as
  * sum(rows) pointers to D floats, expert by expert. 0 = nothing was submitted (the
  * caller computes those experts itself). One batch in flight at a time. */
@@ -300,6 +309,7 @@ typedef struct {
     unsigned long long batches, experts, rows, gemm_experts;
     unsigned long long grouped_batches;   /* batches that took the grouped GEMM (qmatmul_grp.comp) */
     unsigned long long gemv_batches;      /* batches that took the grouped GEMV (qmatmul_grp_gemv.comp) */
+    unsigned long long chain_gemv_batches;   /* batches whose small experts took chain_moe_gv.comp */
     double device_ms;                 /* summed batch device time (timestamps) */
     int timestamps, queue_shared, gemm_rows;
     size_t scratch_bytes;

@@ -2017,12 +2017,6 @@ static VkPipeline moe_pipe_f(int bd, int n, int fmt, int tg, int td) {
     return *pp;
 }
 static VkPipeline moe_pipe(int bd, int n) { return moe_pipe_f(bd, n, 0, 0, 0); }
-/* lanes a row of n inputs in format fmt: a power of two near n's 16-byte steps / 8, 1 to 32 */
-static int gv_lanes(int fmt, int n) {
-    int steps = n / (fmt == 1 ? 16 : 32), l = 1;
-    while (l < 32 && l * 2 * 8 <= steps) l *= 2;
-    return l;
-}
 /* chain_moe_gv.comp for format fmt (1, 2, 4) and input rows of n floats (a multiple of 32):
  * NULL where the row does not fit the staging or COLI_VK_MOE_GV=0 */
 static VkPipeline moe_gv_pipe(int fmt, int n) {
@@ -2294,16 +2288,19 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
     if (gvg && gvd) {
         /* lanes a row: about eight 16-byte steps each (Qwen3.6's 2048 inputs 8, its 512 2:
          * an RTX PRO 4000's layer 47-50 us, against 51 at 4 and 4, 53 at 32) */
-        int l0 = gv_lanes(p->gfmt, p->D), l1 = gv_lanes(p->dfmt, p->I);
-        struct { int mode, S, K, D, I, act; float limit, a, b; int t_off, x_off, x_row, i_off, i_row, lpr, tiles; } gp =
-            {0, p->S, p->K, p->D, p->I, p->act, p->limit, p->a, p->b, p->t_off, p->x_off, p->x_row, p->i_off, p->i_row, l0, 1};
+        int l0 = coli_vk_gv_lanes(p->gfmt, p->D), l1 = coli_vk_gv_lanes(p->dfmt, p->I);
+        /* down's rows into hid past the S * K hidden rows (binding 5) */
+        struct { int mode, S, K, D, I, act; float limit, a, b; int t_off, x_off, x_row, i_off, i_row, lpr, tiles, y_off, y_row; } gp =
+            {0, p->S, p->K, p->D, p->I, p->act, p->limit, p->a, p->b, p->t_off, p->x_off, p->x_row, p->i_off, p->i_row, l0, 1,
+             p->S * p->K * p->I, p->D};
+        VkcBind bg[7] = {B(x, 0), B(ids, 0), B(w, 0), B(table, 0), B(hid, 1), B(hid, 1), bt};
         int upw = 256 / l0, nwg = (p->K * p->I + upw - 1) / upw;   /* units a workgroup, at subgroups of 64 */
         if (nwg > 1024) nwg = 1024;
-        if (!record(gvg, bd, 7, &gp, sizeof gp, (uint32_t)nwg, (uint32_t)p->S, 1)) return 0;
+        if (!record(gvg, bg, 7, &gp, sizeof gp, (uint32_t)nwg, (uint32_t)p->S, 1)) return 0;
         int rpp = 256 / l1;   /* a down tile: the rows one pass of the workgroup takes */
         gp.mode = 1; gp.lpr = l1; gp.tiles = (p->D + rpp - 1) / rpp;
         grid((uint64_t)p->S * p->K * gp.tiles, &gx, &gy);
-        if (!record(gvd, bd, 7, &gp, sizeof gp, gx, gy, 1)) return 0;
+        if (!record(gvd, bg, 7, &gp, sizeof gp, gx, gy, 1)) return 0;
         KC.st.moe_gv++;
     } else {
     pc.rpw = rg; pc.spl = sg;
