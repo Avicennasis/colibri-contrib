@@ -1108,10 +1108,10 @@ static int cc_copy_stream(CcCtx *c) {
     if (c->cs_ok) return 1;
     if (!cc_ok(c, cudaStreamCreateWithFlags(&c->cs, cudaStreamNonBlocking), "copy stream")) return 0;
     if (cudaEventCreateWithFlags(&c->ev_fetched, cudaEventDisableTiming) != cudaSuccess) {
-        cudaStreamDestroy(c->cs); return cc_ok(c, cudaErrorMemoryAllocation, "copy event");
+        (void)cudaStreamDestroy(c->cs); return cc_ok(c, cudaErrorMemoryAllocation, "copy event");
     }
     if (cudaEventCreateWithFlags(&c->ev_free, cudaEventDisableTiming) != cudaSuccess) {
-        cudaEventDestroy(c->ev_fetched); cudaStreamDestroy(c->cs); return cc_ok(c, cudaErrorMemoryAllocation, "copy event");
+        (void)cudaEventDestroy(c->ev_fetched); (void)cudaStreamDestroy(c->cs); return cc_ok(c, cudaErrorMemoryAllocation, "copy event");
     }
     c->cs_ok = 1;
     return 1;
