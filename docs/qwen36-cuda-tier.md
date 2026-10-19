@@ -463,6 +463,15 @@ in fp32. Against an fp64 reference the outputs are within 2e-4 to 4e-4 (relative
 largest); the CPU's own experts quantize their inputs to int8. `COLI_CUDA_TC_GEMM=0`
 keeps the block kernel.
 
+A prompt chunk's attention (16 rows or more, `COLI_CUDA_CHAIN_FLASH`; no selection list)
+runs on the tensor cores too (`cc_attn_fk`, sm_70 and later, head dim 64, 128 or 256): a
+block takes 16 query rows, the query heads of one kv head times 16 / GQ tokens, so each
+block of 64 keys is staged once for all of them as f16; two passes (each row's max and
+sum, then exp(s - m) * V into the fragments, divided by the sum at the end). The kernel
+it replaces gave each (head, row) a block that read every K and V row again. On the
+35B, a 1024-token prompt: 226 ms of attention -> 23 ms; a 467-token prompt 819-837 ->
+890-903 tok/s; the loss above 3.2223 -> 3.2271.
+
 It is off with cache routing or the agreement meter (their state crosses tokens on the
 host), a gate bias, more groups than the kernel keeps, or a tier on more than one card.
 `COLI_CUDA_CHAIN_MOE=0` keeps the host's step. A decode step's text is the same either

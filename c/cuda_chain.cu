@@ -39,6 +39,7 @@ struct CcBuf { int kind, dev; size_t bytes; float *d; void *h; };
 namespace {
 struct CcCtx {
     int device, up, lost, in_frame;
+    int major;   /* the device's compute capability: cc_attn_fk's tensor cores from 7 */
     cudaStream_t stream;
     cudaEvent_t ev; int ev_ok, ev_pending;
 };
@@ -182,6 +183,138 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
         if (p.has_gate) v *= 1.f / (1.f + expf(-gt[gb + d]));
         o[ob + d] = v;
     }
+}
+/* A prompt chunk's plain causal attention on the tensor cores (cc_attn with no selection
+ * list, from COLI_CUDA_CHAIN_FLASH rows): chain_attn_flash.comp's way, WMMA f16 x f16 ->
+ * f32. A block of 128 (four warps) takes 16 query rows: TPW = 16 / GQ tokens x the GQ query
+ * heads of one kv head, so each K and V block is staged once for all of them. Two passes
+ * over the keys in blocks of 64: the first finds each row's max m and sum l, the second adds
+ * exp(s - m) * V into the accumulators, divided by l at the end (no rescaling: the output
+ * stays in the fragments). Q is scaled before its f16 rounding and kept in registers; K and
+ * V are rounded to f16 as they are staged, row-major with a stride of HD + 8. Key t is
+ * valid for row r iff t <= pos_base + token(r). Not bit-identical to cc_attn_k (f16 operands).
+ * Grid: x = ceil(S / TPW) token groups, y = kv heads. */
+#define CC_FA_BC 64
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+#define CC_FA_BODY 1
+#else
+#define CC_FA_BODY 0
+#endif
+template<int HD>
+__global__ static void __launch_bounds__(128) cc_attn_fk(const float *__restrict__ q, const float *__restrict__ kc,
+        const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, CcAttn p, int GQ) {
+#if CC_FA_BODY
+    using namespace nvcuda;
+    constexpr int LD = HD + 8, NDT = HD / 16, NDS = NDT / 4, LS = CC_FA_BC + 4, LP = CC_FA_BC + 8;
+    __shared__ __align__(32) __half skv[CC_FA_BC * LD];     /* K, then V, of a key block; Q first; the output last */
+    __shared__ __align__(32) float ss[16 * LS];              /* the block's scores, row r key c at r * LS + c */
+    __shared__ __align__(32) __half sp[16 * LP];             /* exp(s - m) */
+    __shared__ float sm[16], sl[16];
+    int tid = threadIdx.x, warp = tid >> 5;
+    int TPW = 16 / GQ, g = blockIdx.y, t0 = blockIdx.x * TPW, S = p.S;
+    int tlast = min(t0 + TPW, S) - 1, nt = p.pos_base + S;
+    int nkb = (p.pos_base + tlast) / CC_FA_BC + 1;
+    /* Q, scaled, into the fragments (staged through skv) */
+    for (int e = tid; e < 16 * HD; e += 128) {
+        int r = e / HD, d = e - r * HD, tk = t0 + r / GQ, h = g * GQ + r % GQ;
+        float v = tk < S ? q[p.q_off + tk * p.q_row + h * p.q_seg + d] * p.scale : 0.f;
+        skv[r * LD + d] = __float2half(v);
+    }
+    __syncthreads();
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> A[NDT];
+    #pragma unroll
+    for (int j = 0; j < NDT; j++) wmma::load_matrix_sync(A[j], skv + j * 16, LD);
+    __syncthreads();
+    /* the softmax's layout: row r = tid / 8, keys c = (tid % 8) * 8 .. + 7 */
+    int row = tid >> 3, cl = (tid & 7) * 8;
+    int qpos = p.pos_base + min(t0 + row / GQ, S - 1);
+    float m = -3.0e38f, l = 0.f;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> Bk;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> Sc;
+    for (int pass = 0; pass < 2; pass++) {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> Oa[NDS > 0 ? NDS : 1];
+        #pragma unroll
+        for (int u = 0; u < NDS; u++) wmma::fill_fragment(Oa[u], 0.f);
+        if (pass == 1) {
+            if ((tid & 7) == 0) { sm[row] = m; sl[row] = l; }
+            __syncthreads();
+            m = sm[row];
+        }
+        for (int kb = 0; kb < nkb; kb++) {
+            int k0 = kb * CC_FA_BC;
+            for (int e = tid; e < CC_FA_BC * HD; e += 128) {   /* K of keys k0 .. k0 + 63, zero past nt */
+                int kl = e / HD, d = e - kl * HD, key = k0 + kl;
+                float v = key < nt ? kc[p.k_off + (g * p.cap + key) * HD + d] : 0.f;
+                skv[kl * LD + d] = __float2half(v);
+            }
+            __syncthreads();
+            wmma::fill_fragment(Sc, 0.f);
+            #pragma unroll
+            for (int j = 0; j < NDT; j++) {   /* warp w: keys k0 + 16w .. + 15 */
+                wmma::load_matrix_sync(Bk, skv + (warp * 16) * LD + j * 16, LD);
+                wmma::mma_sync(Sc, A[j], Bk, Sc);
+            }
+            wmma::store_matrix_sync(ss + warp * 16, Sc, LS, wmma::mem_row_major);
+            __syncthreads();
+            if (pass == 0) {
+                float sv[8], bm = -3.0e38f;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    int key = k0 + cl + i;
+                    sv[i] = key <= qpos ? ss[row * LS + cl + i] : -3.0e38f;
+                    bm = fmaxf(bm, sv[i]);
+                }
+                for (int off = 4; off > 0; off >>= 1) bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, off, 8));
+                float mn = fmaxf(m, bm), part = 0.f;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) part += sv[i] > -1e38f ? __expf(sv[i] - mn) : 0.f;
+                for (int off = 4; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off, 8);
+                l = l * __expf(m - mn) + part;
+                m = mn;
+                __syncthreads();   /* skv and ss are rewritten next block */
+                continue;
+            }
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                int key = k0 + cl + i;
+                float sv = ss[row * LS + cl + i];
+                sp[row * LP + cl + i] = __float2half(key <= qpos ? __expf(sv - m) : 0.f);
+            }
+            __syncthreads();   /* P complete, K consumed */
+            for (int e = tid; e < CC_FA_BC * HD; e += 128) {   /* V of the same keys */
+                int kl = e / HD, d = e - kl * HD, key = k0 + kl;
+                float v = key < nt ? vc[p.v_off + (g * p.cap + key) * HD + d] : 0.f;
+                skv[kl * LD + d] = __float2half(v);
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int kt = 0; kt < 4; kt++) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> Pa;
+                wmma::load_matrix_sync(Pa, sp + kt * 16, LP);
+                #pragma unroll
+                for (int u = 0; u < NDS; u++) {   /* warp w: dims (w * NDS + u) * 16 .. + 15 */
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> Bv;
+                    wmma::load_matrix_sync(Bv, skv + (kt * 16) * LD + (warp * NDS + u) * 16, LD);
+                    wmma::mma_sync(Oa[u], Pa, Bv, Oa[u]);
+                }
+            }
+            __syncthreads();
+        }
+        if (pass == 0) continue;
+        /* out: rows map to (token, head); through skv as floats, divided by l, the gate */
+        float *so = reinterpret_cast<float *>(skv);
+        #pragma unroll
+        for (int u = 0; u < NDS; u++) wmma::store_matrix_sync(so + (warp * NDS + u) * 16, Oa[u], HD + 4, wmma::mem_row_major);
+        __syncthreads();
+        for (int e = tid; e < 16 * HD; e += 128) {
+            int r = e / HD, d = e - r * HD, tk = t0 + r / GQ, h = g * GQ + r % GQ;
+            if (tk >= S) continue;
+            float lv = sl[r], v = lv > 0.f ? so[r * (HD + 4) + d] / lv : 0.f;
+            if (p.has_gate) v *= 1.f / (1.f + __expf(-gt[p.g_off + tk * p.g_row + h * p.g_seg + d]));
+            o[p.o_off + tk * p.o_row + h * HD + d] = v;
+        }
+    }
+#endif
 }
 /* one thread per channel, the rows in order, the channel's ring in registers */
 __global__ static void cc_dnconv_k(const float *__restrict__ xin, const float *__restrict__ w, float *__restrict__ ring,
@@ -611,6 +744,7 @@ static int cc_init(int device) {
     if (!cc_ok(nullptr, cudaStreamCreateWithFlags(&c->stream, cudaStreamNonBlocking), "stream")) return 0;
     if (!cc_ok(nullptr, cudaEventCreateWithFlags(&c->ev, cudaEventDisableTiming), "event")) { cudaStreamDestroy(c->stream); return 0; }
     c->ev_ok = 1; c->up = 1; c->lost = 0; c->in_frame = 0; c->ev_pending = 0;
+    if (cudaDeviceGetAttribute(&c->major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) { c->major = 0; (void)cudaGetLastError(); }
     if (c == &g_cc[g_ncc]) g_ncc++;
     g_cur = (int)(c - g_cc);
     return 1;
@@ -808,6 +942,22 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
     if (!c || !q || !kc || !vc || !o || !p || p->S < 1 || p->H < 1 || p->KVH < 1 || p->H % p->KVH || p->hd < 1 || p->hd > 256) return 0;
     if (p->has_gate && !gate) return 0;
     if (p->sel_row > 0 && !sel) return 0;
+    /* a prompt chunk's plain causal attention on the tensor cores (cc_attn_fk), from
+     * COLI_CUDA_CHAIN_FLASH rows (16; 0 = never): sm_70 and later, head dim 64, 128 or 256,
+     * the query heads of a kv head dividing 16, no selection list */
+    static int fl = -1;
+    if (fl < 0) { const char *e = getenv("COLI_CUDA_CHAIN_FLASH"); fl = e && *e ? atoi(e) : 16; if (fl < 0) fl = 0; }
+    int G = p->H / p->KVH;
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    if (fl > 0 && p->S >= fl && c->major >= 7 && p->sel_row <= 0 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256)) {
+        dim3 fg((unsigned)((p->S + 16 / G - 1) / (16 / G)), (unsigned)p->KVH);
+        if (p->hd == 64) cc_attn_fk<64><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G);
+        else if (p->hd == 128) cc_attn_fk<128><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G);
+        else cc_attn_fk<256><<<fg, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), *p, G);
+        return launched(c, "attn (tensor cores)");
+    }
+#endif
+    (void)fl; (void)G;
     dim3 grid((unsigned)p->H, (unsigned)p->S);
     cc_attn_k<<<grid, 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), sel ? (const int *)sel->d : nullptr, *p);
     return launched(c, "attn");
