@@ -3323,6 +3323,32 @@ static void bench_rows(void) {
     free(t); free(ex); free(tab); free(wg); free(wd); free(sg); free(sd);
 }
 
+/* COLI_VK_CHAIN_BENCH=mla: the MLA attention core (vkc_mla_core: GLM-5.2/5.3's, Kimi K3's,
+ * DeepSeek V4.1's) for a decode row: H heads (COLI_VK_BENCH_VH, 64), latent K 512 and rope
+ * R 64, over T positions (COLI_VK_BENCH_ROWS, 2000), L layers of caches of their own */
+static void bench_mla(void) {
+    int H = 64, K = 512, R = 64, T = 2000, L = 4;
+    const char *he = getenv("COLI_VK_BENCH_VH"), *te = getenv("COLI_VK_BENCH_ROWS");
+    if (he && atoi(he) > 0) H = atoi(he);
+    if (te && atoi(te) > 0) T = atoi(te);
+    float *qa = fvec((size_t)H * K, 1.f), *qr = fvec((size_t)H * R, 1.f), *lat = fvec((size_t)L * T * K, 1.f), *rope = fvec((size_t)L * T * R, 1.f);
+    VkcBuf *qab = up(qa, (size_t)H * K), *qrb = up(qr, (size_t)H * R), *lb = up(lat, (size_t)L * T * K), *rb = up(rope, (size_t)L * T * R);
+    VkcBuf *ob = vkc_buf((size_t)L * H * K * 4, VKC_DEV);
+    double best = 1e9; int ok = 1;
+    for (int r = 0; r < 4 && ok; r++) {
+        ok = vkc_begin();
+        for (int l = 0; l < L && ok; l++) {
+            VkcMlaCore cp = {1, H, K, R, T - 1, 0, 0, H * K, K, 0, H * R, R, l * T * K, K, l * T * R, R, 0, 0, l * H * K, H * K, K, 0.04f};
+            ok = vkc_mla_core(qab, qrb, lb, rb, NULL, ob, &cp);
+        }
+        double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+        if (r && dt < best) best = dt;
+    }
+    if (ok) printf("bench mla H %d K %d R %d, one row over %d positions: %.0f us a layer\n", H, K, R, T, best * 1e6 / L);
+    vkc_free(qab); vkc_free(qrb); vkc_free(lb); vkc_free(rb); vkc_free(ob);
+    free(qa); free(qr); free(lat); free(rope);
+}
+
 /* COLI_VK_CHAIN_BENCH=route: the router's pick (vkc_route), 48 one-row routes in a frame
  * as a forward's layers run them: E experts (COLI_VK_BENCH_E, 512 by default), top 10,
  * softmax, the ids in host-readable memory as vk_dmoe.h keeps them. */
@@ -3500,6 +3526,7 @@ int main(int argc, char **argv) {
         if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "bd")) bench_bd();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "moe")) bench_moe();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dn")) bench_dn();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "mla")) bench_mla();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "rows")) bench_rows();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "route")) bench_route();
         else bench_gemv();
@@ -3649,6 +3676,20 @@ int main(int argc, char **argv) {
             {1, 16, 8, 16, 1024, 32, 64, 1, 20, 0, 1, 0, 0, 1, 10, 5, 10},     /* the largest latent, int3-g64 */
         };
         for (size_t k = 0; k < sizeof cases / sizeof *cases; k++) test_mla(cases[k]);
+        {   /* a decode's or a verify's rows over many positions: chain_mla_dec.comp's blocks (the
+             * random stream as before them, for the tests after) */
+            unsigned rng_was = rng;
+            VkcStats d0; vkc_stats(&d0);
+            MlaCase dec[] = {
+                {4, 24, 8, 32, 32, 64, 128, 1, 400, 0, 1, 0, 1, 0, 10, 10, 10},     /* a selection list over 400 */
+                {2, 192, 64, 256, 512, 128, 256, 3, 600, 7, 1, 0, 0, 0, 4, 4, 4},   /* GLM-5.2's heads, three rows after 600 */
+                {1, 16, 8, 16, 1024, 32, 64, 2, 300, 0, 1, 0, 0, 1, 10, 5, 10},     /* the largest latent */
+            };
+            for (size_t k = 0; k < sizeof dec / sizeof *dec; k++) test_mla(dec[k]);
+            VkcStats d1; vkc_stats(&d1);
+            printf("  mla cores in blocks of positions: %llu\n", d1.attn_dec - d0.attn_dec);
+            rng = rng_was;
+        }
         {   /* the core over a long chunk in slices of rows (COLI_VK_ATTN_SLICE) */
             VkcStats s0; vkc_stats(&s0);
             setenv("COLI_VK_ATTN_SLICE", "200000", 1);

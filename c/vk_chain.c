@@ -141,6 +141,7 @@ typedef struct {
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
     VkPipeline gemv4x;                /* chain_gemv.comp with x read from its buffer (a row past the staging) */
     VkShaderModule mod_adec; VkPipeline adec; int adec_tried; VkcBuf *adec_x;   /* chain_attn_dec.comp and its scratch */
+    VkShaderModule mod_mdec; VkPipeline mdec; int mdec_tried;   /* chain_mla_dec.comp (the same scratch) */
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
     VkShaderModule mod_tg; VkPipeline tg;
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
@@ -1732,6 +1733,39 @@ int vkc_ple(VkcBuf *keys, VkcBuf *hyp, VkcBuf *val, VkcBuf *prm, VkcBuf *gated, 
 /* ---- multi-head latent attention ------------------------------------------------- */
 int vkc_mla_ready(void) { return vkc_ready() && KC.mla_ok; }
 
+/* ---- a decode's MLA core split over its positions (chain_mla_dec.comp) -------------
+ * chain_mla.comp's core gives a (head, row) one workgroup that walks every position (64
+ * heads of a 512-float latent: 1.75 ms a layer at 2000 positions on an RTX PRO 4000, the
+ * same with 128 heads). From VKC_MLA_DEC_MIN positions a call of up to 4 rows runs in
+ * blocks of positions, as chain_attn_dec.comp does (selection lists too: blocks of the
+ * list's entries). COLI_VK_MLA_DEC=0 keeps chain_mla.comp's. */
+#define VKC_MLA_DEC_MIN 128
+static VkPipeline mdec_pipe(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_MLA_DEC"); on = !(e && *e == '0'); }
+    if (!on || KC.mdec || KC.mdec_tried) return KC.mdec;
+    KC.mdec_tried = 1;
+    if ((KC.mod_mdec = load_module(KC.core.spv_path, "chain_mla_dec.spv"))) KC.mdec = make_pipe(KC.mod_mdec, NULL);
+    return KC.mdec;
+}
+static int mla_dec(VkcBuf *qabs, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *sel, VkcBuf *clat, const VkcMlaCore *b) {
+    int S = b->S, n = b->pos_base + S - b->kv_start;
+    if (b->sel_row > 0 && b->sel_row - 1 > n) n = b->sel_row - 1;   /* a list holds at most its row's room */
+    if (S > 4 || n < VKC_MLA_DEC_MIN || !mdec_pipe()) return 0;
+    int L = 64, nb = (n + L - 1) / L;
+    while (L < 256 && (int64_t)b->H * nb > 4096) { L *= 2; nb = (n + L - 1) / L; }
+    VkcBuf *xs = adec_scratch((size_t)S * b->H * nb * (b->K + 2) * 4);
+    if (!xs) return 0;
+    struct { int mode; VkcMlaCore b; int dmode, L, nb; } pc = {0, *b, 0, L, nb};
+    VkcBind bd[8] = {B(qabs, 0), B(qr, 0), B(lat, 0), B(b->R > 0 ? rope : NULL, 0), B(b->sel_row > 0 ? sel : NULL, 0),
+                     B(clat, 1), B(NULL, 0), B(xs, 1)};
+    int ok = record(KC.mdec, bd, 8, &pc, sizeof pc, (uint32_t)b->H, (uint32_t)nb, (uint32_t)S);
+    pc.dmode = 1;
+    bd[7].written = 0;
+    ok = ok && record(KC.mdec, bd, 8, &pc, sizeof pc, (uint32_t)b->H, (uint32_t)S, 1);
+    KC.st.attn_dec += ok;
+    return ok;
+}
 int vkc_mla_core(VkcBuf *qabs, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *sel, VkcBuf *clat, const VkcMlaCore *p) {
     KC.kind = PK_MLA;
     if (!KC.mla_ok || p->S < 1 || p->H < 1 || p->K < 1 || p->K > 1024 || p->R < 0 || p->R > 128 ||
@@ -1739,6 +1773,7 @@ int vkc_mla_core(VkcBuf *qabs, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *se
     typedef struct { int mode; VkcMlaCore b; } CorePC;
     CorePC pc = {0, *p};
     if (!sel) pc.b.sel_row = 0;
+    if (mla_dec(qabs, qr, lat, rope, sel, clat, &pc.b)) return 1;   /* a decode's rows: in blocks of positions */
     VkcBind bd[6] = {B(qabs, 0), B(qr, 0), B(lat, 0), B(p->R > 0 ? rope : NULL, 0), B(pc.b.sel_row > 0 ? sel : NULL, 0),
                      B(clat, 1)};
     /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows) */
@@ -3021,6 +3056,8 @@ void vkc_shutdown(void) {
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
     if (KC.gemv4x) vkDestroyPipeline(KC.dev, KC.gemv4x, NULL);
     if (KC.adec) vkDestroyPipeline(KC.dev, KC.adec, NULL);
+    if (KC.mdec) vkDestroyPipeline(KC.dev, KC.mdec, NULL);
+    if (KC.mod_mdec) vkDestroyShaderModule(KC.dev, KC.mod_mdec, NULL);
     if (KC.mod_adec) vkDestroyShaderModule(KC.dev, KC.mod_adec, NULL);
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);
     if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
