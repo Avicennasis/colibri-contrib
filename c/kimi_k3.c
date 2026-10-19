@@ -1029,6 +1029,22 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
         snprintf(m->pfx,sizeof(m->pfx),"language_model.");
     if((c->n_layers+c->res_bs-1)/c->res_bs+1>16){ fprintf(stderr,"attn_res: too many blocks\n"); exit(1); }
     g_bits_env = getenv("K3_BITS")!=NULL;
+#if defined(COLI_CUDA) && defined(COLI_VULKAN)
+    {   /* K3_CUDA's experts upload each routed expert's weights at every call: a decode step's
+         * MXFP4 expert of 7168 x 2048 took 2.46 ms on an RTX PRO 4000 (23.4 MB at 9.5 GB/s),
+         * where the Vulkan tier's resident ones take 72 us, and the dense matrices stay on the
+         * CPU there while Vulkan's chain runs them on the card. A build with both backends runs
+         * on Vulkan, the same card, when CUDA was asked for (K3_CUDA=1, which coli sets for
+         * COLI_CUDA=1) and neither COLI_VULKAN nor K3_VK was set (qwen38.c's way for a GGUF);
+         * COLI_VULKAN=0 keeps the CUDA path. */
+        const char *kc=getenv("K3_CUDA"), *vk=getenv("COLI_VULKAN"), *kv=getenv("K3_VK");
+        if(kc&&atoi(kc)&&!(vk&&*vk)&&!(kv&&*kv)){
+            setenv("COLI_VULKAN","1",1); setenv("K3_CUDA","0",1); setenv("COLI_CUDA","0",1);
+            fprintf(stderr,"[K3-CUDA] the CUDA path uploads every routed expert at every call: this run uses Vulkan, the same card "
+                           "(its expert tier and dense chain; COLI_VULKAN=0 keeps CUDA)\n");
+        }
+    }
+#endif
     g_k3_mmap = getenv("K3_MMAP")?atoi(getenv("K3_MMAP")):0;
     if(g_k3_mmap){
         int vk_requested=0, cuda_requested=0;

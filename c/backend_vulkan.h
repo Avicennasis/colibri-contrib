@@ -284,6 +284,9 @@ void coli_vk_xb_expert_free(ColiVkExpert *e);
  * them by address: bufferDeviceAddress off, the second device, a tensor outside a pool. */
 #define COLI_VK_XB_ENTRY 32
 int coli_vk_xb_expert_entry(const ColiVkExpert *e, uint32_t *entry);
+/* The same entry for three tensors outside the tier (an MTP head's expert, say): 0 when the
+ * device cannot read one of them by address. Valid while the tensors are. */
+int coli_vk_tensor_xb_entry(const ColiVkTensor *gate, const ColiVkTensor *up, const ColiVkTensor *down, uint32_t *entry);
 /* The lanes chain_moe_gv.comp gives a row of n inputs in format fmt (1 int8, else 4-bit): a
  * power of two near n's 16-byte steps / 8, 1 to 32. The chain's decode experts (vk_chain.c)
  * and the tier's small experts (the expert batch) both take it from here: a row's partial

@@ -710,8 +710,12 @@ def engine_path(directory, family):
 # ---------------------------------------------------------------- building
 
 
-#: CUDA engines that hand a GGUF to Vulkan in a build with both (qwen36.c, qwen38.c)
-GGUF_ON_VULKAN = ("qwen36", "qwen38")
+#: CUDA engines built with Vulkan too, which run on it in a build with both where their CUDA
+#: path lacks the work: a GGUF (qwen36.c, qwen38.c, colibri.c: the CUDA backend takes no ggml
+#: block types; deepseek_v4: its CUDA tier mirrors native FP4 experts only), Kimi K3 (its
+#: CUDA experts upload every routed expert at every call) and Inkling (its CUDA backend
+#: leaves the routed experts on the CPU)
+CUDA_WITH_VULKAN = ("qwen36", "qwen38", "glm", "kimi", "inkling", "deepseek_v4")
 
 
 def make_command(family, backend, tc, make_args=()):
@@ -725,10 +729,10 @@ def make_command(family, backend, tc, make_args=()):
         args.append("VK=1")
     elif backend == "cuda":
         args.append("CUDA=1")
-        # Vulkan too where it builds, for the engines that run a GGUF on it when CUDA
-        # cannot (their CUDA tier takes no ggml block types; the Windows CUDA package
-        # has both already): a GGUF on an NVIDIA card stays on the card
-        if family.id in GGUF_ON_VULKAN and tc.get("can_build_vulkan") and host_os() != "win32":
+        # Vulkan too where it builds, for the engines that run on it when their CUDA path
+        # lacks the work (CUDA_WITH_VULKAN; the Windows CUDA package has both already): a
+        # GGUF, Kimi K3's or Inkling's routed experts stay on the NVIDIA card
+        if family.id in CUDA_WITH_VULKAN and tc.get("can_build_vulkan") and host_os() != "win32":
             args.append("VK=1")
         if not any(arg.startswith("CUDA_ARCH=") for arg in make_args):
             args.append(f"CUDA_ARCH={os.environ.get('CUDA_ARCH') or 'native'}")

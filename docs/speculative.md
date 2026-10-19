@@ -59,9 +59,14 @@ pass its row. More copies split the convolution and the recurrence into one disp
 per copy, each ending on its row. The state crosses between them through memory in f32,
 so the rows get the bits of the single dispatch.
 
-Drafting stays off where a row's result depends on what is resident: qwen36 under the
-CUDA expert tier, `CACHE_ROUTE` or a qpack container (with `COLI_LOOKUP=1` asked for, a
-`[qwen36] COLI_LOOKUP=1: no drafts under ...` line says so; the default stays quiet). One case stays inside the gate but changes the last bits: with the
+Drafting stays off where a row's result depends on what is resident: qwen36 under a
+CUDA expert tier holding part of the experts, `CACHE_ROUTE` or a qpack container (with
+`COLI_LOOKUP=1` asked for, a `[qwen36] COLI_LOOKUP=1: no drafts under ...` line says so;
+the default stays quiet). A tier holding every routed expert, run by the CUDA chain, drafts:
+nothing there depends on residency, and the chain's verify rows get a decode step's bits.
+On an RTX PRO 4000 (Qwen3.6-35B-A3B int4-g64) a code edit of 400 tokens took 3.25 s
+against 4.40 s without lookup, 2.91 tokens per forward, the same text; on a chat answer
+the gate declined almost every proposal (98.2-98.8 against 97.8-98.3 tok/s). One case stays inside the gate but changes the last bits: with the
 Vulkan expert tier on, a verify's rows, the rejected drafts' included, feed the tier's
 history, so which experts are on the device follows what was drafted. An expert on the
 device sums in a different order than on the CPU, so the logits of a run with drafts and
@@ -110,6 +115,27 @@ standing rows' streams, each with the token that followed it.
 `Q38_MTP_DRAFTS` sets the drafts per verify: `1`, `2` or `3` drafts every time, or `0` /
 `auto` to let the gate pick 0 to 3 per verify. The default is 2, the depth measured
 fastest (below). `Q38_MTP_DRAFTS=1` is the one-draft verify that came before.
+
+## The MTP head's drafts (qwen36)
+
+`Q36_MTP=1` reads the release's `mtp.*` block from the converted container
+([conversion and settings](qwen36.md#the-mtp-head-q36_mtp)). Its input pairs
+the backbone's output **after its final norm** with the next token's embedding.
+The head has its own causal KV cache; every completed pair contributes its K/V,
+and only a draft row runs the full attention/MoE/output computation.
+
+`Q36_MTP_DRAFTS=1..7` bounds the depth, `auto` lets the measured gate choose,
+`Q36_MTP_PMIN` stops uncertain deeper drafts, and `Q36_MTP_VOCAB_IDS` limits
+only the draft's output scoring. When lookup also proposes tokens the gate
+chooses a source by its measured value. Both sources share verification and
+rollback; `[qwen36 mtp]` reports the head's acceptance separately. A rejected
+row or an unconsumed tail never commits to the backbone state. Pins preserve
+the pending residual as well as the backbone recurrence.
+
+`make -C c qwen36-tiny-mtp-check` checks reference logits, exact output and final
+logits at every depth, forced rejection/acceptance/mixed rows, and multi-turn
+serve including prefix reuse, pin restore and sampling. The reference uses
+Qwen's Transformers decoder with the converted int8 or int4-g64 weights.
 
 ## Prompt lookup
 

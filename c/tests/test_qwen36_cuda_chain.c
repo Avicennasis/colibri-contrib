@@ -18,7 +18,9 @@
  *   - a frame that fails loses the device: the state is rebuilt on the CPU from the
  *     prefix record, the step and every later one run there, and the logits still
  *     equal the CPU path's;
- *   - a backend without the chain (an older DLL) leaves the engine on the per-matrix path.
+ *   - a backend without the chain (an older DLL) leaves the engine on the per-matrix path;
+ *   - speculative steps (prompt lookup, the MTP head) run under the tier only when it holds
+ *     every routed expert and the chain runs them (q36_cuda_tier_drafts).
  * Include order as in test_qwen36_tier_int8_engine.c. */
 #define main qwen36_main_unused
 #include "../qwen36.c"
@@ -251,6 +253,19 @@ int main(void) {
       fake_chain_absent = 0;
       ck(q36cc_setup(&m2, 2) == NULL, "KV_SLOTS > 1 keeps the chain off");
       (void)m2; }
+
+    printf(" F. speculative steps under the tier\n");
+    g_cuda_chain = 1;
+    ck(!q36_cuda_tier_drafts(&m), "routed experts off the device: no speculative steps (residency would follow the drafts)");
+    for (int i = 0; i < NL; i++)
+        for (int e = 0; e < E; e++) {
+            const Slot *sl = &m.cache[i].slots[e];
+            qt_note_block(i, e, (const uint8_t *)sl->g, (const uint8_t *)sl->u, (const uint8_t *)sl->d, sl->gs, sl->us, sl->ds);
+        }
+    qt_fill_wait();
+    ck(q36_cuda_tier_drafts(&m), "every routed expert on the device, the chain on: speculative steps");
+    g_cuda_chain = 0;
+    ck(!q36_cuda_tier_drafts(&m), "the chain off: none");
 
     qt_shutdown();
     if (fails) { printf("test_qwen36_cuda_chain: %d failure(s)\n", fails); return 1; }
