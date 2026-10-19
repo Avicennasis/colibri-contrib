@@ -1972,6 +1972,13 @@ family_qwen_spec() {
     $h --engine ./qwen36 --kind qwen36 --fixture ./qwen36_tiny_v128_c --ref ./qwen36_tiny_v128/ref_full.json \
       --cap 8 --n-new 64 --quick --env COLI_DENSE_I8=0 $e
   done
+  # Qwen3.6's checkpoint MTP head in the chain: its layer, routing and routed experts on the
+  # device (one frame a draft), every depth's tokens and last logits those of plain decoding
+  # in the same chain, serve with prefix reuse and pins. Its draft logits against the
+  # reference within the device's roundings (make qwen36-tiny-mtp-check holds the CPU's to 1e-6).
+  make qwen36-tiny-mtp-generate
+  $PY tests/qwen36_mtp_harness.py --engine ./qwen36 --source ./qwen36_tiny_mtp --model ./qwen36_tiny_mtp_i8 \
+    --model ./qwen36_tiny_mtp_i4 --quick --device --head-tol 2e-2 $chain
   # A six-row verify crosses several one-row KV chunks. Rollback must lower both
   # the mirror and split-cache validity, including rejected rows already uploaded.
   # Keep the same attention kernel in plain/speculative arms for byte comparisons.
