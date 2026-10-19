@@ -2342,6 +2342,23 @@ int main(int argc, char **argv) {
             g_q38_gguf = 1; g_q38_a_direct = 1; g_q38_dn_tiled = 1;
             fprintf(stderr, "[gguf] %s: %d file(s), %d tensors, read in place (native ggml types, no conversion)\n",
                     gp, g_q38gg.n_files, g_q38gg.n_tensors);
+            /* The CUDA tier takes no ggml block types (qwen36.c's note): a CUDA run of a GGUF
+             * computed every routed expert on the CPU (Qwen3.8 IQ2_S/Q2_0, RTX PRO 4000: 28
+             * tok/s of prompt, 9 of decode; 114-116 and 46-49 on Vulkan, the same card). A
+             * build with both backends runs a GGUF on Vulkan when CUDA was asked for and
+             * COLI_VULKAN was not set; COLI_VULKAN=0 keeps CUDA. */
+            {   const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
+                if (cu && *cu == '1' && !(vk && *vk)) {
+#if defined(COLI_CUDA) && defined(COLI_VULKAN)
+                    setenv("COLI_VULKAN", "1", 1); setenv("COLI_CUDA", "0", 1);
+                    fprintf(stderr, "[gguf] the CUDA backend has no ggml block types: this GGUF runs on Vulkan, the same card "
+                                    "(COLI_VULKAN=0 keeps CUDA, the routed experts then on the CPU)\n");
+#else
+                    fprintf(stderr, "[gguf] the CUDA backend has no ggml block types: this GGUF's routed experts run on the CPU "
+                                    "(a VK=1 build runs them on the card through Vulkan)\n");
+#endif
+                }
+            }
         }
     }
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
