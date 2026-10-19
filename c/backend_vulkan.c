@@ -3985,6 +3985,7 @@ typedef struct XbCtx {
     VkShaderModule sh_gv[2]; VkPipeline p_gv[2];   /* qmatmul_grp_gemv.comp: the same batches below grp_rows */
     XbBuf grp_it[3][2], grp_et[3][2], grp_map[3];
     int grp_rows;
+    int grp_q;   /* the grouped GEMM is qmatmul_grp_qc.comp (subgroups of 32): its tiles */
     unsigned long long grp_batches, gv_batches;
     /* chain_moe_gv.comp, the dense chain's decode experts, for the experts of a batch below
      * gemm_rows rows the grouped routes leave (xb_cgv_init, xb_cgv_record): a pipeline per
@@ -4303,10 +4304,18 @@ static int xb_gemm_slot(const XbCtx *X, int S) {
 #define GRP_GATE_UP_SHARED 36864u
 static void xb_grp_init(XbCtx *X) {
     const char *e = getenv("COLI_VK_XB_GROUPED");
-    if (X->d || !G.has_bda || !G.has_coop || G.coop_sg != 64 || (e && *e == '0')) return;
+    if (X->d || !G.has_bda || !G.has_coop || (G.coop_sg != 64 && G.coop_sg != 32) || (e && *e == '0')) return;
     VkPhysicalDeviceProperties lp; vkGetPhysicalDeviceProperties(X->phys, &lp);
     if (lp.limits.maxComputeSharedMemorySize < GRP_GATE_UP_SHARED) return;
+    /* matrix units at subgroups of 32 (NVIDIA): the dense chain's grouped GEMM of a prompt
+     * chunk (qmatmul_grp_qc.comp, vk_chain.c's vkc_moe_rows), whose items, expert table,
+     * bindings and push constants are qmatmul_grp.comp's, its tiles 32 rows of 32 outputs
+     * (gate+up) or 64 (down): a prompt chunk's experts had a GEMM each there, three dispatches
+     * an expert (Qwen3.6's 467 rows of 8 of 256 int4-g64 experts, 8.3 ms a layer on an RTX PRO
+     * 4000), and the streaming step's sums (coli_vk_xb_step_*) need it */
+    X->grp_q = G.coop_sg == 32;
     const char *nm[2] = {"qmatmul_grp.spv", "qmatmul_grp_gate_up.spv"};
+    if (X->grp_q) { nm[0] = "qmatmul_grp_qc.spv"; nm[1] = "qmatmul_grp_gate_up_qc.spv"; }
     for (int v = 0; v < 2; v++) {
         char path[1100];
         derive_dir_file(X->spv, nm[v], path, sizeof path);
@@ -4318,19 +4327,21 @@ static void xb_grp_init(XbCtx *X) {
     VkSpecializationInfo si = {1, &me, sizeof tt, &tt};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT rss = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
-        .requiredSubgroupSize = 64};
+        .requiredSubgroupSize = (uint32_t)G.coop_sg};
     for (int v = 0; v < 2; v++) {
         VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .pNext = &rss,
                       .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT,
                       .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = X->sh_grp[v], .pName = "main",
-                      .pSpecializationInfo = &si}, .layout = X->pl_grp};
+                      .pSpecializationInfo = X->grp_q ? NULL : &si}, .layout = X->pl_grp};
         if (vkCreateComputePipelines(X->dev, VK_NULL_HANDLE, 1, &ci, NULL, &X->p_grp[v]) != VK_SUCCESS) {
             X->p_grp[v] = VK_NULL_HANDLE; return;
         }
     }
-    /* the grouped GEMV for the small batches (COLI_VK_XB_GEMV=0: per-expert GEMVs) */
+    /* the grouped GEMV for the small batches (COLI_VK_XB_GEMV=0: per-expert GEMVs); at
+     * subgroups of 32 the small experts take the dense chain's decode kernel (xb_cgv_record) */
     const char *ge = getenv("COLI_VK_XB_GEMV");
+    if (X->grp_q) ge = "0";
     const char *gnm[2] = {"qmatmul_grp_gemv.spv", "qmatmul_grp_gemv_gate_up.spv"};
     for (int v = 0; v < 2 && !(ge && *ge == '0'); v++) {
         char path[1100];
@@ -4952,8 +4963,9 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
      * of one (expert, block) adjacent, so workgroups in flight share weights */
     /* the GEMV's items: (expert, row, XB_GV_RPW outputs) */
     /* mode 3 (the block formats'): 32 rows, 64 outputs of the down and 32 of gate+up */
-    const int tm = mode == 1 ? 16 * XB_GRP_TT : mode == 3 ? 32 : 1;
-    const int bov[2] = {mode == 1 ? 128 : mode == 3 ? 64 : XB_GV_RPW, mode == 1 ? 128 : mode == 3 ? 32 : XB_GV_RPW};
+    const int tm = mode == 1 ? (X->grp_q ? 32 : 16 * XB_GRP_TT) : mode == 3 ? 32 : 1;
+    const int bov[2] = {mode == 1 ? (X->grp_q ? 64 : 128) : mode == 3 ? 64 : XB_GV_RPW,
+                        mode == 1 ? (X->grp_q ? 32 : 128) : mode == 3 ? 32 : XB_GV_RPW};
     int nit[2] = {0, 0};
     for (int c = 0; c < count; c++) {
         int nt = (rows[c] + tm - 1) / tm;
