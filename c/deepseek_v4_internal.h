@@ -1010,6 +1010,7 @@ int coli_v4_gpu_sparse_attention_batch_cached_idx(
 int coli_v4_gpu_moe_batch_wanted(void);
 void coli_v4_gpu_moe_batch_release(void);
 void coli_v4_gpu_moe_batch_hint(int total_fresh_tokens);
+void coli_v4_gpu_moe_batch_prefill(int prefill);
 int coli_v4_gpu_moe_batch_union(float *outputs,
                                 const ColiDeepSeekV4LayerWeights *weights,
                                 const ColiDeepSeekV4Config *config,
