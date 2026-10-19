@@ -729,7 +729,7 @@ VK_SPV    = shaders/qmatmul.spv shaders/qmatmul_gate_up.spv shaders/qmatmul_bd.s
 VK_OBJ   += vk_chain.o
 VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv shaders/chain_dnconv.spv \
             shaders/chain_dnrec.spv shaders/chain_dnrec_rows.spv shaders/chain_ew.spv shaders/chain_qsa.spv shaders/chain_ple.spv \
-            shaders/chain_gemv.spv shaders/chain_attn_dec.spv
+            shaders/chain_gemv.spv shaders/chain_attn_dec.spv shaders/chain_mla_dec.spv
 # the MLA ops (vk_chain.h): attention core, RoPE and LayerNorm rows, per-head weight
 # blocks, the DSA indexer's selection
 VK_SPV   += shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv

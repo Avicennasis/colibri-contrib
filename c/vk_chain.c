@@ -141,6 +141,7 @@ typedef struct {
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
     VkPipeline gemv4x;                /* chain_gemv.comp with x read from its buffer (a row past the staging) */
     VkShaderModule mod_adec; VkPipeline adec; int adec_tried; VkcBuf *adec_x;   /* chain_attn_dec.comp and its scratch */
+    VkShaderModule mod_mdec; VkPipeline mdec; int mdec_tried;   /* chain_mla_dec.comp (the same scratch) */
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
     VkShaderModule mod_tg; VkPipeline tg;
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
@@ -1734,6 +1735,39 @@ int vkc_ple(VkcBuf *keys, VkcBuf *hyp, VkcBuf *val, VkcBuf *prm, VkcBuf *gated, 
 /* ---- multi-head latent attention ------------------------------------------------- */
 int vkc_mla_ready(void) { return vkc_ready() && KC.mla_ok; }
 
+/* ---- a decode's MLA core split over its positions (chain_mla_dec.comp) -------------
+ * chain_mla.comp's core gives a (head, row) one workgroup that walks every position (64
+ * heads of a 512-float latent: 1.75 ms a layer at 2000 positions on an RTX PRO 4000, the
+ * same with 128 heads). From VKC_MLA_DEC_MIN positions a call of up to 4 rows runs in
+ * blocks of positions, as chain_attn_dec.comp does (selection lists too: blocks of the
+ * list's entries). COLI_VK_MLA_DEC=0 keeps chain_mla.comp's. */
+#define VKC_MLA_DEC_MIN 128
+static VkPipeline mdec_pipe(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_MLA_DEC"); on = !(e && *e == '0'); }
+    if (!on || KC.mdec || KC.mdec_tried) return KC.mdec;
+    KC.mdec_tried = 1;
+    if ((KC.mod_mdec = load_module(KC.core.spv_path, "chain_mla_dec.spv"))) KC.mdec = make_pipe(KC.mod_mdec, NULL);
+    return KC.mdec;
+}
+static int mla_dec(VkcBuf *qabs, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *sel, VkcBuf *clat, const VkcMlaCore *b) {
+    int S = b->S, n = b->pos_base + S - b->kv_start;
+    if (b->sel_row > 0 && b->sel_row - 1 > n) n = b->sel_row - 1;   /* a list holds at most its row's room */
+    if (S > 4 || n < VKC_MLA_DEC_MIN || !mdec_pipe()) return 0;
+    int L = 64, nb = (n + L - 1) / L;
+    while (L < 256 && (int64_t)b->H * nb > 4096) { L *= 2; nb = (n + L - 1) / L; }
+    VkcBuf *xs = adec_scratch((size_t)S * b->H * nb * (b->K + 2) * 4);
+    if (!xs) return 0;
+    struct { int mode; VkcMlaCore b; int dmode, L, nb; } pc = {0, *b, 0, L, nb};
+    VkcBind bd[8] = {B(qabs, 0), B(qr, 0), B(lat, 0), B(b->R > 0 ? rope : NULL, 0), B(b->sel_row > 0 ? sel : NULL, 0),
+                     B(clat, 1), B(NULL, 0), B(xs, 1)};
+    int ok = record(KC.mdec, bd, 8, &pc, sizeof pc, (uint32_t)b->H, (uint32_t)nb, (uint32_t)S);
+    pc.dmode = 1;
+    bd[7].written = 0;
+    ok = ok && record(KC.mdec, bd, 8, &pc, sizeof pc, (uint32_t)b->H, (uint32_t)S, 1);
+    KC.st.attn_dec += ok;
+    return ok;
+}
 int vkc_mla_core(VkcBuf *qabs, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *sel, VkcBuf *clat, const VkcMlaCore *p) {
     KC.kind = PK_MLA;
     if (!KC.mla_ok || p->S < 1 || p->H < 1 || p->K < 1 || p->K > 1024 || p->R < 0 || p->R > 128 ||
@@ -1741,6 +1775,7 @@ int vkc_mla_core(VkcBuf *qabs, VkcBuf *qr, VkcBuf *lat, VkcBuf *rope, VkcBuf *se
     typedef struct { int mode; VkcMlaCore b; } CorePC;
     CorePC pc = {0, *p};
     if (!sel) pc.b.sel_row = 0;
+    if (mla_dec(qabs, qr, lat, rope, sel, clat, &pc.b)) return 1;   /* a decode's rows: in blocks of positions */
     VkcBind bd[6] = {B(qabs, 0), B(qr, 0), B(lat, 0), B(p->R > 0 ? rope : NULL, 0), B(pc.b.sel_row > 0 ? sel : NULL, 0),
                      B(clat, 1)};
     /* a long prompt chunk in slices of rows, a submission each (attn_slice_rows) */
@@ -1788,13 +1823,28 @@ int vkc_mla_hgemv(ColiVkTensor *t, VkcBuf *x, VkcBuf *y, VkcBuf *gate, const Vkc
     return record(KC.mpipe[PM_HGEMV], bd, 5, &pc, sizeof pc, (uint32_t)wg, (uint32_t)p->S, 1);
 }
 
+#define VKC_DSA_GRID 32   /* positions (pools, columns) from which the indexers score on a grid */
+static int dsa_grid_on(void) {   /* COLI_VK_DSA_GRID=0: every row's scores in its own workgroup, as before */
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_DSA_GRID"); on = !(e && *e == '0'); }
+    return on;
+}
 int vkc_dsa_select(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *sc, VkcBuf *sel, const VkcDsa *p) {
     KC.kind = PK_DSA;
     if (!KC.mla_ok || p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 64 || p->ID < 1 || p->IH * p->ID > 4096 ||
         p->topk < 1 || p->pos_base < 0 || p->sc_row < p->pos_base + p->S ||
         p->sel_row < 1 + (p->topk < p->pos_base + p->S ? p->topk : p->pos_base + p->S)) return 0;
-    struct { int mode; VkcDsa b; } pc = {0, *p};
+    struct { int mode; VkcDsa b; int scored; } pc = {0, *p, 0};
     VkcBind bd[5] = {B(iq, 0), B(hw, 0), B(keys, 0), B(sc, 1), B(sel, 1)};
+    /* past VKC_DSA_GRID positions the scores on a grid of 256 positions a workgroup first
+     * (mode 3, the same bits), then each row's selection from them */
+    int nk = p->pos_base + p->S;
+    if (dsa_grid_on() && nk > p->topk && nk >= VKC_DSA_GRID) {
+        pc.mode = 3;
+        int P = 256 / p->IH > 0 ? 256 / p->IH : 1;   /* positions a workgroup: a thread a (position, head) */
+        if (!record(KC.mpipe[PM_DSA], bd, 5, &pc, sizeof pc, (uint32_t)((nk + P - 1) / P), (uint32_t)p->S, 1)) return 0;
+        pc.mode = 0; pc.scored = 1;
+    }
     return record(KC.mpipe[PM_DSA], bd, 5, &pc, sizeof pc, (uint32_t)p->S, 1, 1);
 }
 
@@ -1812,8 +1862,16 @@ int vkc_dsa_pool_select(VkcBuf *iq, VkcBuf *hw, VkcBuf *pk, VkcBuf *sc, VkcBuf *
     if (!KC.mla_ok || p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 64 || p->ID < 1 || p->IH * p->ID > 4096 ||
         p->pool < 1 || p->topk < p->pool || p->topk % p->pool || p->topk / p->pool > 1024 || p->pos_base < 0 ||
         p->sc_row < (p->pos_base + p->S) / p->pool || p->sel_row < 1 + p->topk + (p->tail ? p->pool - 1 : 0)) return 0;
-    struct { int mode; VkcDsaPick b; } pc = {2, *p};
+    struct { int mode; VkcDsaPick b; int scored; } pc = {2, *p, 0};
     VkcBind bd[6] = {B(iq, 0), B(hw, 0), B(NULL, 0), B(sc, 1), B(sel, 1), B(pk, 0)};
+    /* past VKC_DSA_GRID pools their scores on a grid first (mode 4, the same bits) */
+    int np = (p->pos_base + p->S) / p->pool;
+    if (dsa_grid_on() && np >= VKC_DSA_GRID) {
+        pc.mode = 4;
+        int P = 256 / p->IH > 0 ? 256 / p->IH : 1;   /* pools a workgroup: a thread a (pool, head) */
+        if (!record(KC.mpipe[PM_DSA], bd, 6, &pc, sizeof pc, (uint32_t)((np + P - 1) / P), (uint32_t)p->S, 1)) return 0;
+        pc.mode = 2; pc.scored = 1;
+    }
     return record(KC.mpipe[PM_DSA], bd, 6, &pc, sizeof pc, (uint32_t)p->S, 1, 1);
 }
 
@@ -3051,6 +3109,8 @@ void vkc_shutdown(void) {
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
     if (KC.gemv4x) vkDestroyPipeline(KC.dev, KC.gemv4x, NULL);
     if (KC.adec) vkDestroyPipeline(KC.dev, KC.adec, NULL);
+    if (KC.mdec) vkDestroyPipeline(KC.dev, KC.mdec, NULL);
+    if (KC.mod_mdec) vkDestroyShaderModule(KC.dev, KC.mod_mdec, NULL);
     if (KC.mod_adec) vkDestroyShaderModule(KC.dev, KC.mod_adec, NULL);
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);
     if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
@@ -3162,6 +3222,11 @@ int vkc_dsv4_score(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *mask, VkcBuf *s
         p->width < 0 || p->sc_row < p->width || (p->mask_row > 0 && !mask)) return 0;
     if (p->width == 0) return open_frame() && !KC.lost;
     VkcBind bd[6] = {B(iq, 0), B(hw, 0), B(keys, 0), B(p->mask_row > 0 ? mask : NULL, 0), B(NULL, 0), B(sc, 1)};
+    /* many columns: on a grid of 256 / IH columns a workgroup (mode 10, the same bits) */
+    if (dsa_grid_on() && p->IH <= 256 && p->width >= VKC_DSA_GRID) {
+        int P = 256 / p->IH;
+        return dsv4_rec(PK_DSA, 10, p, sizeof *p, bd, 6, (uint32_t)((p->width + P - 1) / P), (uint32_t)p->S);
+    }
     return dsv4_rec(PK_DSA, wide ? 9 : 3, p, sizeof *p, bd, 6, (uint32_t)p->S, 1);
 }
 int vkc_dsv4_cand(VkcBuf *sc, VkcBuf *mask, const VkcDsCand *p) {
