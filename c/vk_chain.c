@@ -13,6 +13,7 @@
  * it on the queue) and closes with one to the host. Weights are never written, so they
  * never cause one. */
 #include "vk_chain.h"
+#include "vk_tier.h"
 #include "vk_alloc.h"
 #include "vk_load.h"
 #include "shaders/chain_qsa.h"
@@ -108,6 +109,7 @@ typedef struct {
     VkShaderModule mod_bdv; VkPipeline bdv[4][64][10]; uint8_t bdv_tried[4][64][10]; int bdv_xs;   /* chain_gemv_bd.comp: a pipeline per (rows, ggml type, staging size), made on first use */
     VkShaderModule mod_bdv8; VkPipeline bdv8[4][64][10]; uint8_t bdv8_tried[4][64][10];   /* chain_gemv_bd_i8.spv: the same in the CPU's integer form, by its codes' size */
     VkShaderModule mod_bdg; VkPipeline bdg[64]; uint8_t bdg_tried[64];   /* qmatmul_gemm_bd.comp: a prompt's rows, a pipeline per ggml type */
+    VkShaderModule mod_fetch; VkPipeline fetch; uint8_t fetch_tried;      /* chain_fetch.comp (vkc_fetch) */
     VkShaderModule mod_moe; VkPipeline moe[2][10];            /* chain_moe.comp: the routed experts, by address (bufferDeviceAddress),
                                                                  [1] with the block formats' paths (BD = 1), by staging size */
     int moe_xs, moe_xs_bd; uint8_t moe_tried[2][10];          /* their largest staging floats (0: the device cannot); made once asked for */
@@ -277,6 +279,10 @@ VkcBuf *vkc_buf(size_t bytes, int kind) {
 
 static void buf_release(VkcBuf *b) {
     if (b->kind == VKC_HOST) { coli_vk_host_buffer_free((void *)b->buf, (void *)b->mem, b->bytes); free(b); return; }
+    if (b->kind == VKC_ADDR) {
+        vkDestroyBuffer(KC.dev, b->buf, NULL); vkFreeMemory(KC.dev, b->mem, NULL);
+        KC.st.dev_bytes -= b->bytes; free(b); return;
+    }
     VkcPool *P = &KC.pool[b->kind];
     vkDestroyBuffer(KC.dev, b->buf, NULL);
     if (vka_free(&P->p, b->r)) {
@@ -319,6 +325,36 @@ int vkc_reserve(VkcBuf **b, size_t bytes, int kind) {
 }
 void *vkc_ptr(const VkcBuf *b) { return b ? b->ptr : NULL; }
 size_t vkc_bytes(const VkcBuf *b) { return b ? b->bytes : 0; }
+VkcBuf *vkc_buf_addr(size_t bytes, uint64_t *addr) {
+    if (!vkc_ready() || g_kd || !KC.core.bda || !addr) return NULL;
+    bytes = (bytes + 15) & ~(size_t)15;
+    if (!bytes) bytes = 16;
+    if (KC.core.ssbo_range && bytes > KC.core.ssbo_range) return NULL;   /* bound as one too */
+    VkcBuf *b = calloc(1, sizeof *b);
+    if (!b) return NULL;
+    b->kind = VKC_ADDR; b->bytes = bytes; b->d = g_kd;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = bytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    if (vkCreateBuffer(KC.dev, &bi, NULL, &b->buf) != VK_SUCCESS) { free(b); return NULL; }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(KC.dev, b->buf, &req);
+    VkMemoryAllocateFlagsInfo fl = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &fl,
+        .allocationSize = req.size, .memoryTypeIndex = KC.core.memtype_dev};
+    if (!(req.memoryTypeBits & (1u << KC.core.memtype_dev)) || vkAllocateMemory(KC.dev, &ai, NULL, &b->mem) != VK_SUCCESS) {
+        vkDestroyBuffer(KC.dev, b->buf, NULL); free(b); return NULL;
+    }
+    if (vkBindBufferMemory(KC.dev, b->buf, b->mem, 0) != VK_SUCCESS) {
+        vkFreeMemory(KC.dev, b->mem, NULL); vkDestroyBuffer(KC.dev, b->buf, NULL); free(b); return NULL;
+    }
+    VkBufferDeviceAddressInfo da = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b->buf};
+    *addr = (uint64_t)vkGetBufferDeviceAddress(KC.dev, &da);
+    KC.st.dev_bytes += bytes;
+    return b;
+}
 VkcBuf *vkc_host(const void *ptr, size_t bytes, size_t *off) {
     /* the primary device's import: on the second device's chain the host's part of a
      * split stays on the CPU (vkc_kv_shadow says so) */
@@ -931,6 +967,30 @@ static int copy_bytes(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t
     prof_mark(f, PK_COPY);
     src->last_frame = dst->last_frame = KC.serial;
     return 1;
+}
+int vkc_barrier(void) {
+    VkcFrame *f = open_frame();
+    if (!f || KC.lost) return 0;
+    barrier_now(f->cmd, ALL_STAGES, ALL_RW);
+    track_reset();
+    return 1;
+}
+/* chain_fetch.comp: a workgroup per slice of a region, the regions along y */
+#define VKC_FETCH_SLICE 65536   /* words a workgroup: 256 KiB */
+int vkc_fetch(VkcBuf *reg, int first, int n, uint32_t max_words, VkcBuf *dst) {
+    if (!vkc_ready() || !KC.core.bda || !reg || !dst || first < 0 || n < 0) return 0;
+    if (!n) return 1;
+    if ((size_t)(first + n) * 16 > reg->bytes) return 0;
+    if (!KC.fetch_tried) {
+        KC.fetch_tried = 1;
+        if ((KC.mod_fetch = load_module(KC.core.spv_path, "chain_fetch.spv"))) KC.fetch = make_pipe(KC.mod_fetch, NULL);
+    }
+    if (!KC.fetch) return 0;
+    KC.kind = PK_COPY;
+    VkcBind bd[2] = {B(reg, 0), B(dst, 1)};
+    struct { int first, n, slice; } pc = {first, n, VKC_FETCH_SLICE};
+    uint32_t gx = (max_words + VKC_FETCH_SLICE - 1) / VKC_FETCH_SLICE;
+    return record(KC.fetch, bd, 2, &pc, sizeof pc, gx ? gx : 1, (uint32_t)n, 1);
 }
 int vkc_copy(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t n) {
     return copy_bytes(dst, doff * 4, src, soff * 4, n * 4);
@@ -2624,6 +2684,9 @@ int vkc_chunk_rows(const char *engine, size_t row_bytes) {
      * discrete device. Bound both memories, including Windows commit headroom. */
     double avail = compat_mem_available_gb() * 1e9;
     if (avail > 0 && avail < free_b) free_b = avail;
+    /* the room the tier's budget left for a chunk's host pool experts (vk_dmoe.h), not
+     * for rows: Qwen3.8's chunks took it and every prompt after the first read the pool */
+    if (g_kd == 0) free_b -= (double)vkt_stage_room();
     if (free_b < 0) free_b = 0;
     double fit = row_bytes ? free_b / 2 / (double)row_bytes : cap;
     int rows = fit >= cap ? cap : (int)fit;
@@ -2859,6 +2922,8 @@ void vkc_shutdown(void) {
         if (KC.bdv[r][t][b]) vkDestroyPipeline(KC.dev, KC.bdv[r][t][b], NULL);
     for (int t = 0; t < 64; t++) if (KC.bdg[t]) vkDestroyPipeline(KC.dev, KC.bdg[t], NULL);
     if (KC.mod_bdg) vkDestroyShaderModule(KC.dev, KC.mod_bdg, NULL);
+    if (KC.fetch) vkDestroyPipeline(KC.dev, KC.fetch, NULL);
+    if (KC.mod_fetch) vkDestroyShaderModule(KC.dev, KC.mod_fetch, NULL);
     for (int t = 0; t < 64; t++) if (KC.bdgc[t]) vkDestroyPipeline(KC.dev, KC.bdgc[t], NULL);
     if (KC.mod_bdgc) vkDestroyShaderModule(KC.dev, KC.mod_bdgc, NULL);
     for (int v = 0; v < 2; v++) {

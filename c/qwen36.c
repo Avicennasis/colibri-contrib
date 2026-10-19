@@ -7483,7 +7483,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
                     .gate_up = gu, .down = dn, .act = VKT_ACT_SWIGLU,
                     .max_rows = QWEN_VK_ROWS * c->topk,
                     .ram_reserve = slot * (size_t)cap * (size_t)c->n_layers,
-                    .dense_bytes = vk_dense_bytes(m),
+                    .dense_bytes = vk_dense_bytes(m), .stage = g_vk_chain,
                     .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_release, .load_ctx = m,
                     .layer_gate_up = lgu, .layer_down = ldn};

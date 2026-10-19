@@ -2079,6 +2079,37 @@ OpenMP's 14 threads, 44 to 45 with the regions' rows in chunks; the same greedy 
 (160 of them) on and off. The CPU spends about 155 us a pair (IQ2_S gate and up 86 us,
 Q2_0 down 28 us): the device's own experts take less, so a step waits for the CPU.
 
+**A prompt chunk's host pool experts in VRAM.** A prompt chunk routes nearly every expert
+of a layer, and the grouped GEMMs of a GGUF's block types read the host pool in place at
+about 4 GB/s. Before a chunk's layer runs, its host pool experts of block types are now
+copied into a staging buffer in VRAM (`chain_fetch.comp`: regions read by address, 16-byte
+loads, several in flight a lane), and the layer's GEMMs read them there:
+- the room comes out of the tier's budget when the host pool will hold experts (a layer's
+  share of them and a quarter more; the tier's line says how much), and the prompt chunks'
+  rows are sized without it. Allocated beside a full budget, the buffer took the card to
+  its last memory, and the driver moved other allocations out: decode after a prompt lost
+  4 to 15%;
+- between prompt chunks the buffer holds the host pool's hottest experts of block types
+  (the tier's own order), as more of the device's: the decode's tables point there and the
+  CPU's hybrid share leaves them, so the decode gets the room back;
+- colibri's formats keep reading the pool in place: their GEMMs read it near the bus's
+  rate, and a copy before them only added its time (Qwen3.6 int4 with 9 GiB in the pool,
+  a 507-token prompt: 513 against 394 tok/s).
+
+Measured on the RTX PRO 4000 (PCIe 4.0 x8), a 507-token prompt, servers started one after
+the other:
+
+| model | host pool | prefill, staging off | prefill, staging on |
+|---|---|---|---|
+| Qwen3.8 IQ2_S/Q2_0, the default budget | 19 GiB | 114 to 119 tok/s | 143 to 150 tok/s |
+| Qwen3.6 Q4_K_M, `COLI_VK_TIER_GB=8` | 12 GiB | 279 to 282 tok/s | 333 to 338 tok/s |
+
+The decode's tok/s in such a bench moves with the text: the prompt on the matrix units
+continues differently from the floats' it took over PCIe, and the continuation routes to
+other experts. With the same tokens (Qwen3.8, a 2000-token prompt then 200 single steps,
+teacher-forced): 31.4 s against 24.0 s, the CPU's host pool pairs 31920 against 23642, the
+loss 1.4458 against 1.4274. `COLI_VK_STAGE=0` turns it off (the tier keeps its room too).
+
 **The integer form.** A GGUF's experts run, where the device accelerates packed 4 x 8
 integer dot products (`VK_KHR_shader_integer_dot_product`,
 `integerDotProduct4x8BitPackedSignedAccelerated`), in the CPU's integer form

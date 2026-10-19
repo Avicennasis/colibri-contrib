@@ -1202,7 +1202,8 @@ static void olmoe_vk_tier_start(Model *m) {
                     .act = VKT_ACT_SWIGLU, .max_rows = OLMOE_VK_ROWS * c->topk,
                     .ram_reserve = slotb * (size_t)m->cache[0].cap * (size_t)c->n_layers,
                     .dense_bytes = dense, .in_ram = olmoe_vk_in_ram, .ram_ctx = m,
-                    .load = olmoe_vk_load, .release = olmoe_vk_release, .load_ctx = m};
+                    .load = olmoe_vk_load, .release = olmoe_vk_release, .load_ctx = m,
+                    .stage = 1};   /* the chain (decided after the tier) stages a prompt chunk's host pool experts */
     atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
     const int tier_on = vkt_init(&vc, m->freq);
     free(lgu); free(ldn);   /* read during vkt_init only */

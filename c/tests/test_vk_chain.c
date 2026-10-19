@@ -2966,6 +2966,39 @@ done:
  * the CPU's own: each input row quantized as gq_quant_act_ref does it, each expert row
  * through gq_unpack_row and gq_dot_i8, SwiGLU, down the same way, the rank-order sum; and
  * the float form's distance from it, which the integer one must beat. */
+/* vkc_fetch (chain_fetch.comp): regions read by address into a bound buffer, as vk_dmoe.h
+ * stages a prompt chunk's host pool experts: 16-byte steps, a source off 16 bytes (the
+ * word path), slices past one workgroup's and a dispatch from a region past the first */
+static void test_fetch(void) {
+    const size_t sw = 300000, dw = 300000;
+    uint64_t sa = 0, da = 0;
+    VkcBuf *src = vkc_buf_addr(sw * 4, &sa), *dst = vkc_buf_addr(dw * 4, &da);
+    if (!src || !dst) { printf("fetch: no buffers by address on this device\n"); vkc_free(src); vkc_free(dst); return; }
+    /* (source word, destination word, words) */
+    static const uint32_t rg[5][3] = {{0, 0, 4096}, {4097, 4100, 1003}, {6, 9000, 7}, {10000, 20000, 140000}, {170001, 170003, 65545}};
+    uint32_t *sv = malloc(sw * 4), *want = calloc(dw, 4), *zero = calloc(dw, 4), reg[5 * 4];
+    VkcBuf *rb = vkc_buf(sizeof reg, VKC_DEV), *out = vkc_buf(dw * 4, VKC_DOWN);
+    int ok = sv && want && zero && rb && out;
+    if (ok) {
+        for (size_t i = 0; i < sw; i++) sv[i] = rnd() ^ (uint32_t)i << 20;
+        uint32_t most = 0;
+        for (int k = 0; k < 5; k++) {
+            uint64_t a = sa + 4ull * rg[k][0];
+            reg[4 * k] = (uint32_t)a; reg[4 * k + 1] = (uint32_t)(a >> 32); reg[4 * k + 2] = rg[k][1]; reg[4 * k + 3] = rg[k][2];
+            memcpy(want + rg[k][1], sv + rg[k][0], (size_t)rg[k][2] * 4);
+            if (k && rg[k][2] > most) most = rg[k][2];
+        }
+        ok = vkc_begin() && vkc_write(src, 0, sv, sw * 4) && vkc_write(dst, 0, zero, dw * 4) && vkc_write(rb, 0, reg, sizeof reg) &&
+             vkc_barrier() &&
+             vkc_fetch(rb, 0, 1, rg[0][2], dst) && vkc_fetch(rb, 1, 4, most, dst) && vkc_barrier() &&
+             vkc_copy(out, 0, dst, 0, dw) && vkc_submit(1);
+    }
+    size_t bad = 0;
+    if (ok) { const uint32_t *got = vkc_ptr(out); for (size_t i = 0; i < dw; i++) bad += got[i] != want[i]; }
+    CHECK(ok && !bad, "fetch: %zu of %zu words wrong (frame %d)", bad, dw, ok);
+    if (ok && !bad) printf("fetch: 5 regions by address, %zu words, as the source has them\n", dw);
+    free(sv); free(want); free(zero); vkc_free(rb); vkc_free(out); vkc_free(src); vkc_free(dst);
+}
 static void test_moe_i8(int tg, int td, int S, int K, int E, int D, int I) {
     int fg = 100 + tg, fd = 100 + td;
     if (!vkc_moe_idot()) { printf("moe i8 %s/%s: no integer dot product on this device\n", gq_type_name(tg), gq_type_name(td)); return; }
@@ -3655,6 +3688,7 @@ int main(int argc, char **argv) {
         test_moe_i8(GQ_IQ1_S, GQ_Q2_K, 2, 3, 8, 512, 256);
         test_moe_i8(GQ_IQ1_M, GQ_Q2_K, 2, 3, 8, 512, 256);
         printf("moe done\n");
+        test_fetch();
     }
     rng = rng_routed;
     if (vkc_sconv_ready() && vkc_relattn_ready()) {

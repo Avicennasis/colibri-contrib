@@ -104,6 +104,18 @@ typedef struct VkcDmoe_ {
     int *hx_n;                     /* per layer: its experts the CPU computes (0: the full table's step) */
     int D, I;
     unsigned long long hyb_steps;
+    /* a prompt chunk's staging of the host pool (vkc_dmoe_stage_read): the table with its
+     * host pool entries pointing into stg (tabs; tabsh the host's copy), the copies a layer
+     * makes (fr: uvec4s, fro / frn / frmax a layer's first, count and widest), whether a
+     * layer's host pool experts all moved (full), stg_off: none from here on */
+    int stg_off, stg_on, stg_big, stg_said; VkcBuf *stg, *tabs, *fr; uint64_t stg_addr; size_t stg_cap, stg_peak;
+    uint32_t *tabsh, *frh; int *fro, *frn; uint32_t *frmax; uint8_t *full, *hostm; int nfr;
+    unsigned long long stg_steps; double stg_bytes;
+    /* between prompt chunks: stg holds the host pool's hottest experts of block types
+     * (vkc_dmoe_keep): koff [L][E] their places in it (-1 none), frk the copies, nkr of
+     * them, kmax the widest, keep_valid whether stg has them, keep_fetch: copy them */
+    int64_t *koff; uint32_t *frk; int nkr, nkeep, keep_valid, keep_fetch; uint32_t kmax;
+    unsigned long long keep_fills;
 } VkcDmoe;
 
 static int vkc_dmoe_wanted(void) {
@@ -244,6 +256,8 @@ static int vkc_hyb_post(const VkcHybJob *j) {
 }
 
 /* The tier's table for layers lo..lo+L-1, read again when its residents changed since. */
+static int vkc_dmoe_stage_read(VkcDmoe *d);   /* below: the prompt chunks' staging of the host pool */
+static void vkc_dmoe_keep(VkcDmoe *d);         /* and what stg holds between them */
 static int vkc_dmoe_read(VkcDmoe *d) {
     if (d->read && d->epoch == vkt_epoch()) return 1;
     int L = d->L, E = d->E;
@@ -267,6 +281,9 @@ static int vkc_dmoe_read(VkcDmoe *d) {
             for (int e = 0; e < E; e++) d->hx_n[i] += d->hx[(size_t)i * E + e].g != NULL;
         }
     }
+    d->stg_on = d->big && d->big_step && vkc_dmoe_stage_read(d);
+    if (!d->big_step) vkc_dmoe_keep(d);
+    d->stg_big = d->big_step;
     d->epoch = vkt_epoch(); d->read = 1; d->dirty = 1;
     return 1;
 }
@@ -278,6 +295,208 @@ static int vkc_dmoe_fmt(const VkcDmoe *d, int i, int w) {
     for (int e = 0; e < d->E; e++, t += COLI_VK_XB_ENTRY) if (t[18]) return (int)t[w];
     return 0;
 }
+/* A prompt chunk routes nearly every expert of a layer, and the grouped GEMMs of the block
+ * types drew about 4 GB/s from the bus reading the host pool in place: a chunk of more
+ * than VKC_DMOE_ROWS rows copies a layer's host pool experts of block types into stg first
+ * (vkc_fetch, at the bus's rate), the table it runs on pointing there (tabs), and its
+ * GEMMs read VRAM (Qwen3.8 IQ2_S/Q2_0 on an RTX PRO 4000, 19 GiB in the host pool: a
+ * 507-token prompt 116-119 -> 139-149 tok/s). Our formats' GEMMs read the pool near the
+ * bus's rate already, and the copy before them only cost (Qwen3.6 int4, 9 GiB in the pool:
+ * 513 -> 394 tok/s): they keep reading it. stg holds the most a layer has, within the room
+ * the tier's budget left (vkt_stage_room; past it an entry reads the pool): a barrier
+ * before each copy, the layer before done with it. COLI_VK_STAGE=0 off. */
+static int vkc_stage_wanted(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_STAGE"); on = !(e && *e == '0'); }
+    return on;
+}
+/* the bytes of a matrix's rows for an entry's format word fmt (row words rw) at `rows`
+ * rows: the block types' (their scales are in the blocks, their tables shared); 0 for
+ * the others, which keep reading the pool */
+static int vkc_stage_sizes(uint32_t fmt, uint32_t rw, uint32_t gs, int rows, int n, size_t *wb, size_t *sb) {
+    (void)gs; (void)n;
+    *wb = (size_t)rows * rw * 4; *sb = 0;
+    return fmt >= 100 && fmt < 164;
+}
+static size_t vkc_stage_up(size_t b) { return (b + 255) & ~(size_t)255; }
+static int vkc_dmoe_stage_read(VkcDmoe *d) {
+    int L = d->L, E = d->E, D = d->D, I = d->I;
+    const size_t ent = COLI_VK_XB_ENTRY;
+    size_t room = vkt_stage_room();   /* what the tier's budget left for it */
+    if (d->stg_off || !vkc_stage_wanted() || !vkt_host_pool_on() || !room || D < 1 || I < 1) return 0;
+    if (!d->hostm && !(d->hostm = malloc((size_t)L * E))) return 0;
+    if (!d->tabsh) d->tabsh = malloc((size_t)L * E * ent * sizeof(uint32_t));
+    if (!d->fro) { d->fro = calloc((size_t)L, sizeof(int)); d->frn = calloc((size_t)L, sizeof(int));
+                   d->frmax = calloc((size_t)L, sizeof(uint32_t)); d->full = calloc((size_t)L, 1); }
+    if (!d->tabsh || !d->fro || !d->frn || !d->frmax || !d->full) return 0;
+    /* pass 1: each layer's bytes and regions */
+    size_t need = 0; int regions = 0;
+    for (int i = 0; i < L; i++) {
+        if (vkt_dev_host(d->lo + i, d->hostm + (size_t)i * E) < 0) return 0;
+        size_t lb = 0;
+        for (int e = 0; e < E; e++) {
+            const uint32_t *o = d->tabh + ((size_t)i * E + e) * ent;
+            size_t w[3], s[3];
+            if (!d->hostm[(size_t)i * E + e] || !o[18]) continue;
+            if (!vkc_stage_sizes(o[12], o[13], o[14], I, D, &w[0], &s[0]) || !vkc_stage_sizes(o[15], o[16], o[17], D, I, &w[2], &s[2])) continue;
+            w[1] = w[0]; s[1] = s[0];
+            size_t eb = 0;
+            for (int k = 0; k < 3; k++) eb += vkc_stage_up(w[k]) + (s[k] ? vkc_stage_up(s[k]) : 0);
+            if (lb + eb > room) continue;   /* past the room: this one reads the pool */
+            lb += eb;
+            for (int k = 0; k < 3; k++) regions += 1 + (s[k] != 0);
+        }
+        if (lb > need) need = lb;
+    }
+    if (!need) return 0;
+    if (need > d->stg_cap) {
+        vkc_free(d->stg); d->stg = NULL; d->stg_cap = 0;
+        /* not into the device's last memory (the driver moves the rest out then) */
+        double used = 0, bud = 0;
+        if (coli_vk_mem_budget(&used, &bud) && (bud - used) * 1e9 < (double)need + 67108864.0) {
+            if (!d->stg_said) fprintf(stderr, "[VK] chain: %.0f MiB free on the device, short of the host pool experts' staging "
+                                              "(%.0f MiB); a prompt chunk reads them over PCIe\n", (bud - used) * 1e9 / 1048576.0, need / 1048576.0);
+            d->stg_said = 1;
+            return 0;
+        }
+        if (room > need) need = room;   /* the whole room: between chunks it holds the hottest (vkc_dmoe_keep) */
+        if (!(d->stg = vkc_buf_addr(need, &d->stg_addr))) {
+            fprintf(stderr, "[VK] chain: no VRAM to stage the host pool's experts in (%.0f MiB); a prompt chunk reads them over PCIe\n",
+                    need / 1048576.0);
+            d->stg_off = 1;
+            return 0;
+        }
+        d->stg_cap = need;
+        if (need > d->stg_peak) d->stg_peak = need;
+    }
+    uint32_t *fr = realloc(d->frh, (size_t)regions * 4 * sizeof(uint32_t));
+    if (!fr) return 0;
+    d->frh = fr;
+    /* pass 2: the entries pointing into stg, the copies */
+    int k = 0;
+    for (int i = 0; i < L; i++) {
+        size_t off = 0; int full = 1;
+        d->fro[i] = k; d->frmax[i] = 0;
+        for (int e = 0; e < E; e++) {
+            size_t j = ((size_t)i * E + e) * ent;
+            const uint32_t *o = d->tabh + j;
+            uint32_t *t = d->tabsh + j;
+            memcpy(t, o, ent * sizeof(uint32_t));
+            if (!d->hostm[(size_t)i * E + e] || !o[18]) continue;
+            size_t w[3], s[3];
+            if (!vkc_stage_sizes(o[12], o[13], o[14], I, D, &w[0], &s[0]) || !vkc_stage_sizes(o[15], o[16], o[17], D, I, &w[2], &s[2])) {
+                full = 0; continue;
+            }
+            w[1] = w[0]; s[1] = s[0];
+            size_t eb = 0;
+            for (int m = 0; m < 3; m++) eb += vkc_stage_up(w[m]) + (s[m] ? vkc_stage_up(s[m]) : 0);
+            if (off + eb > d->stg_cap) { full = 0; continue; }
+            for (int m = 0; m < 3; m++) {   /* rows at words 4m, 4m + 1; scales at 4m + 2, 4m + 3 */
+                for (int sc = 0; sc < 2; sc++) {
+                    size_t bytes = sc ? s[m] : w[m];
+                    if (!bytes) continue;
+                    uint64_t src = (uint64_t)o[4 * m + 2 * sc] | (uint64_t)o[4 * m + 2 * sc + 1] << 32, dst = d->stg_addr + off;
+                    fr[4 * k] = (uint32_t)src; fr[4 * k + 1] = (uint32_t)(src >> 32);
+                    fr[4 * k + 2] = (uint32_t)(off / 4); fr[4 * k + 3] = (uint32_t)(bytes / 4);
+                    if (bytes / 4 > d->frmax[i]) d->frmax[i] = (uint32_t)(bytes / 4);
+                    t[4 * m + 2 * sc] = (uint32_t)dst; t[4 * m + 2 * sc + 1] = (uint32_t)(dst >> 32);
+                    off += vkc_stage_up(bytes); k++;
+                }
+            }
+        }
+        d->frn[i] = k - d->fro[i]; d->full[i] = full;
+    }
+    d->nfr = k;
+    if (!vkc_reserve(&d->tabs, (size_t)L * E * ent * sizeof(uint32_t), VKC_DEV) ||
+        !vkc_reserve(&d->fr, (size_t)L * E * 6 * 4 * sizeof(uint32_t), VKC_DEV)) { d->stg_off = 1; return 0; }   /* the most regions: never grown in a frame */
+    return 1;
+}
+/* Between prompt chunks stg would sit idle: it holds the host pool's hottest experts of
+ * block types (the tier's order, vkt_score) as more of the device's, the decode's tables
+ * pointing there and the CPU's hybrid share leaving them. So the room the tier's budget
+ * gave up for the staging comes back to the decode (Qwen3.8 IQ2_S/Q2_0 on an RTX PRO 4000,
+ * a 2000-token prompt and 200 teacher-forced steps: the CPU's host pool pairs 31920 ->
+ * 23642). Chosen and copied at the first table read after a chunk staged into stg (or the
+ * first ever), applied again at every read until the next chunk. */
+static int vkc_keep_cmp(const void *a, const void *b) {
+    uint64_t x = ((const uint64_t *)a)[0], y = ((const uint64_t *)b)[0];
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+static void vkc_dmoe_keep(VkcDmoe *d) {
+    int L = d->L, E = d->E, D = d->D, I = d->I;
+    const size_t ent = COLI_VK_XB_ENTRY;
+    size_t room = vkt_stage_room();
+    if (d->stg_off || !vkc_stage_wanted() || !room || D < 1 || I < 1) return;
+    if (!d->hostm && !(d->hostm = malloc((size_t)L * E))) return;
+    if (!d->stg) {   /* stg before any prompt chunk: the room's size, as a chunk would make it */
+        if (!(d->stg = vkc_buf_addr(room, &d->stg_addr))) { d->stg_off = 1; return; }
+        d->stg_cap = room;
+        if (room > d->stg_peak) d->stg_peak = room;
+    }
+    if (!vkc_reserve(&d->fr, (size_t)L * E * 6 * 4 * sizeof(uint32_t), VKC_DEV)) { d->stg_off = 1; return; }
+    for (int i = 0; i < L; i++) if (vkt_dev_host(d->lo + i, d->hostm + (size_t)i * E) < 0) return;
+    if (!d->keep_valid) {
+        /* the choice: the host pool's experts of block types, hottest first, while stg holds them */
+        uint64_t (*c)[2] = malloc((size_t)L * E * sizeof *c), *sc = malloc((size_t)E * sizeof *sc);
+        if (!d->koff) d->koff = malloc((size_t)L * E * sizeof *d->koff);
+        if (!d->frk) d->frk = malloc((size_t)L * E * 3 * 4 * sizeof *d->frk);
+        if (!c || !sc || !d->koff || !d->frk) { free(c); free(sc); return; }
+        size_t n = 0;
+        for (int i = 0; i < L; i++) {
+            if (vkt_score(d->lo + i, sc) < 0) { free(c); free(sc); return; }
+            for (int e = 0; e < E; e++) {
+                const uint32_t *o = d->tabh + ((size_t)i * E + e) * ent;
+                if (d->hostm[(size_t)i * E + e] && o[18] && o[12] >= 100 && o[12] < 164 && o[15] >= 100 && o[15] < 164) {
+                    c[n][0] = sc[e]; c[n][1] = (uint64_t)i * E + e; n++;
+                }
+            }
+        }
+        qsort(c, n, sizeof *c, vkc_keep_cmp);
+        for (size_t k = 0; k < (size_t)L * E; k++) d->koff[k] = -1;
+        size_t off = 0; int r = 0; d->kmax = 0; d->nkeep = 0;
+        for (size_t k = 0; k < n; k++) {
+            size_t j = (size_t)c[k][1];
+            const uint32_t *o = d->tabh + j * ent;
+            size_t w[3], s0;
+            vkc_stage_sizes(o[12], o[13], o[14], I, D, &w[0], &s0);
+            vkc_stage_sizes(o[15], o[16], o[17], D, I, &w[2], &s0);
+            w[1] = w[0];
+            size_t eb = vkc_stage_up(w[0]) + vkc_stage_up(w[1]) + vkc_stage_up(w[2]);
+            if (off + eb > d->stg_cap) continue;
+            d->koff[j] = (int64_t)off;
+            for (int m = 0; m < 3; m++) {
+                uint64_t src = (uint64_t)o[4 * m] | (uint64_t)o[4 * m + 1] << 32;
+                d->frk[4 * r] = (uint32_t)src; d->frk[4 * r + 1] = (uint32_t)(src >> 32);
+                d->frk[4 * r + 2] = (uint32_t)(off / 4); d->frk[4 * r + 3] = (uint32_t)(w[m] / 4);
+                if (w[m] / 4 > d->kmax) d->kmax = (uint32_t)(w[m] / 4);
+                off += vkc_stage_up(w[m]); r++;
+            }
+            d->nkeep++;
+        }
+        free(c); free(sc);
+        d->nkr = r; d->keep_valid = 1; d->keep_fetch = 1;
+    }
+    /* the tables: a kept expert still in the host pool reads stg (one the tier moved
+     * onto the device keeps its own entry) */
+    for (size_t j = 0; j < (size_t)L * E; j++) {
+        if (d->koff[j] < 0 || !d->hostm[j]) continue;
+        uint32_t *o = d->tabh + j * ent;
+        if (!o[18]) continue;
+        size_t w[3], s0, off = (size_t)d->koff[j];
+        vkc_stage_sizes(o[12], o[13], o[14], I, D, &w[0], &s0);
+        vkc_stage_sizes(o[15], o[16], o[17], D, I, &w[2], &s0);
+        w[1] = w[0];
+        for (int m = 0; m < 3; m++) {
+            uint64_t dst = d->stg_addr + off;
+            o[4 * m] = (uint32_t)dst; o[4 * m + 1] = (uint32_t)(dst >> 32);
+            off += vkc_stage_up(w[m]);
+        }
+        if (d->hybrid && d->tabhh && d->hx) {   /* the device's in the hybrid steps, not the CPU's */
+            memcpy(d->tabhh + j * ent, o, ent * sizeof(uint32_t));
+            if (d->hx[j].g) { d->hx_n[j / E]--; memset(&d->hx[j], 0, sizeof d->hx[j]); }
+        }
+    }
+}
 /* For a step of `rows` rows on the primary device: whether any of layers lo..lo+L-1 takes
  * it; reads the tier's table again when its residents changed. 0 for good when the
  * device cannot read the tier's experts by address. */
@@ -287,6 +506,11 @@ static int vkc_dmoe_prepare(VkcDmoe *d, int lo, int L, int E, int K, int D, int 
         !vkc_moe_ready() || !vkc_route_ready() || K < 1 || K > VKC_ROUTE_KMAX || E < K || E > VKC_ROUTE_EMAX) return 0;
     if (d->on && (d->lo != lo || d->L != L || d->E != E || d->K != K)) { d->off = 1; return 0; }
     d->lo = lo; d->L = L; d->E = E; d->K = K;
+    if (d->D != D || d->I != I) d->read = 0;   /* the staging's sizes follow D and I */
+    d->D = D; d->I = I;
+    /* the staging's table is a prompt's: read again when the steps change kind */
+    d->big_step = big;
+    if (d->stg_big != big) d->read = 0;
     if (!vkc_dmoe_read(d)) return 0;
     int any = 0;
     for (int i = 0; i < L; i++) any |= d->on[i];
@@ -331,7 +555,16 @@ static int vkc_dmoe_upload(VkcDmoe *d) {
     if (!vkc_dmoe_read(d)) return 1;   /* d->off: every layer takes the host's step from here */
     if (!d->dirty) return 1;
     if (!vkc_write(d->tab, 0, d->tabh, (size_t)d->L * d->E * COLI_VK_XB_ENTRY * sizeof(uint32_t))) return 0;
+    if (d->stg_on && (!vkc_write(d->tabs, 0, d->tabsh, (size_t)d->L * d->E * COLI_VK_XB_ENTRY * sizeof(uint32_t)) ||
+                      !vkc_write(d->fr, 0, d->frh, (size_t)d->nfr * 4 * sizeof(uint32_t)))) return 0;
     if (d->hybrid && !vkc_write(d->tabhyb, 0, d->tabhh, (size_t)d->L * d->E * COLI_VK_XB_ENTRY * sizeof(uint32_t))) return 0;
+    /* the kept experts into stg, before any step reads it (by address: the barriers are ours) */
+    if (d->keep_fetch && d->nkr) {
+        if (!vkc_write(d->fr, 0, d->frk, (size_t)d->nkr * 4 * sizeof(uint32_t)) || !vkc_barrier() ||
+            !vkc_fetch(d->fr, 0, d->nkr, d->kmax, d->stg) || !vkc_barrier()) return 0;
+        d->keep_fills++;
+    }
+    d->keep_fetch = 0;
     d->dirty = 0;
     return 1;
 }
@@ -361,8 +594,14 @@ static int vkc_dmoe_layer(VkcDmoe *d, int layer, int n, VkcBuf *lg, VkcBuf *bias
          * there: Qwen3.8 Next IQ2_XS on an RTX PRO 4000 (19 GiB of experts in the host pool), a
          * 507-token prompt, 115-116 tok/s against 93-94 on the matrix units; without the pool the
          * two were even (104-114 against 109-120). */
-        m.floats = vkt_host_pool_on();
-        if (!vkc_route(lg, bias, d->rid, d->rwt, &r) || !vkc_moe_rows(x, d->rid, d->rwt, d->tab, &d->rows, d->y, &m)) return 0;
+        int stg = d->stg_on && d->frn[i] > 0;
+        m.floats = vkt_host_pool_on() && !(d->stg_on && d->full[i]);   /* staged: VRAM, the matrix units' GEMMs */
+        if (!vkc_route(lg, bias, d->rid, d->rwt, &r)) return 0;
+        /* the layer's host pool experts into stg: after the layer before is done reading it,
+         * before this one's GEMMs read it (both by address, so the barriers are ours) */
+        if (stg && !(vkc_barrier() && vkc_fetch(d->fr, d->fro[i], d->frn[i], d->frmax[i], d->stg) && vkc_barrier())) return 0;
+        if (!vkc_moe_rows(x, d->rid, d->rwt, d->stg_on ? d->tabs : d->tab, &d->rows, d->y, &m)) return 0;
+        if (stg) { d->keep_valid = 0; d->stg_steps++; for (int k = 0; k < d->frn[i]; k++) d->stg_bytes += 4.0 * d->frh[4 * (d->fro[i] + k) + 3]; }
         d->steps++; d->big_steps++;
         return 1;
     }
@@ -392,13 +631,22 @@ static void vkc_dmoe_free(VkcDmoe *d) {
     vkc_hyb_drain();   /* the worker reads its buffers */
     vkc_free(d->tab); vkc_free(d->rid); vkc_free(d->rwt); vkc_free(d->hid); vkc_free(d->y);
     vkc_free(d->tabhyb); vkc_free(d->hxx); vkc_free(d->cy);
+    vkc_free(d->stg); vkc_free(d->tabs); vkc_free(d->fr); free(d->koff); free(d->frk);
     vkc_moe_rows_free(&d->rows);
     free(d->on); free(d->tabh); free(d->rows_off); free(d->tabhh); free(d->hx); free(d->hx_n);
+    free(d->tabsh); free(d->frh); free(d->fro); free(d->frn); free(d->frmax); free(d->full); free(d->hostm);
     memset(d, 0, sizeof *d);
 }
 /* the hybrid steps' line: steps, pairs the CPU computed, its time */
 static void vkc_dmoe_hyb_report(const char *engine, const VkcDmoe *d) {
     const VkcHyb *w = &g_vkc_hyb;
+    if (d->stg_steps)
+        fprintf(stderr, "[VK] %s chain: %llu prompt layer steps staged the host pool's experts (%.2f GiB copied over PCIe, "
+                        "%.0f MiB of staging, the tier's room %.0f MiB)\n",
+                engine, d->stg_steps, d->stg_bytes / 1073741824.0, d->stg_peak / 1048576.0, vkt_stage_room() / 1048576.0);
+    if (d->keep_fills)
+        fprintf(stderr, "[VK] %s chain: between prompt chunks the staging held the host pool's hottest %d experts (%llu fills)\n",
+                engine, d->nkeep, d->keep_fills);
     if (!d->hyb_steps) return;
     fprintf(stderr, "[VK] %s chain: %llu hybrid layer steps, %llu host pool pairs on the CPU in %.1f ms (%.1f us a step)%s\n",
             engine, d->hyb_steps, w->pairs, w->cpu_ms, w->steps ? w->cpu_ms * 1e3 / (double)w->steps : 0.0,
