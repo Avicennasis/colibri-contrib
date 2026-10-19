@@ -3167,6 +3167,83 @@ static void test_bd(void) {
     printf("matmul_bd: %zu block types\n", sizeof types / sizeof *types);
 }
 
+/* COLI_VK_CHAIN_BENCH=mla: the MLA attention core (vkc_mla_core: GLM-5.2/5.3's, Kimi K3's,
+ * DeepSeek V4.1's) for a decode row: H heads (COLI_VK_BENCH_VH, 64), latent K 512 and rope
+ * R 64, over T positions (COLI_VK_BENCH_ROWS, 2000), L layers of caches of their own */
+static void bench_mla(void) {
+    int H = 64, K = 512, R = 64, T = 2000, L = 4;
+    const char *he = getenv("COLI_VK_BENCH_VH"), *te = getenv("COLI_VK_BENCH_ROWS");
+    if (he && atoi(he) > 0) H = atoi(he);
+    if (te && atoi(te) > 0) T = atoi(te);
+    float *qa = fvec((size_t)H * K, 1.f), *qr = fvec((size_t)H * R, 1.f), *lat = fvec((size_t)L * T * K, 1.f), *rope = fvec((size_t)L * T * R, 1.f);
+    VkcBuf *qab = up(qa, (size_t)H * K), *qrb = up(qr, (size_t)H * R), *lb = up(lat, (size_t)L * T * K), *rb = up(rope, (size_t)L * T * R);
+    VkcBuf *ob = vkc_buf((size_t)L * H * K * 4, VKC_DEV);
+    double best = 1e9; int ok = 1;
+    for (int r = 0; r < 4 && ok; r++) {
+        ok = vkc_begin();
+        for (int l = 0; l < L && ok; l++) {
+            VkcMlaCore cp = {1, H, K, R, T - 1, 0, 0, H * K, K, 0, H * R, R, l * T * K, K, l * T * R, R, 0, 0, l * H * K, H * K, K, 0.04f};
+            ok = vkc_mla_core(qab, qrb, lb, rb, NULL, ob, &cp);
+        }
+        double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+        if (r && dt < best) best = dt;
+    }
+    if (ok) printf("bench mla H %d K %d R %d, one row over %d positions: %.0f us a layer\n", H, K, R, T, best * 1e6 / L);
+    vkc_free(qab); vkc_free(qrb); vkc_free(lb); vkc_free(rb); vkc_free(ob);
+    free(qa); free(qr); free(lat); free(rope);
+}
+
+/* COLI_VK_CHAIN_BENCH=dsa: a DSA indexer's selection (vkc_dsa_select: GLM-5.2's) for a decode
+ * row: IH index heads (COLI_VK_BENCH_VH, 32) of ID 128 over T positions (COLI_VK_BENCH_ROWS,
+ * 8000), top 2048 */
+static void bench_dsa(void) {
+    int IH = 32, ID = 128, T = 8000, topk = 2048;
+    const char *he = getenv("COLI_VK_BENCH_VH"), *te = getenv("COLI_VK_BENCH_ROWS");
+    if (he && atoi(he) > 0) IH = atoi(he);
+    if (te && atoi(te) > 0) T = atoi(te);
+    float *q = fvec((size_t)IH * ID, 1.f), *w = fvec((size_t)IH, 1.f), *k = fvec((size_t)T * ID, 1.f);
+    VkcBuf *qb = up(q, (size_t)IH * ID), *wb = up(w, (size_t)IH), *kb = up(k, (size_t)T * ID);
+    VkcBuf *scb = vkc_buf((size_t)T * 4, VKC_DEV), *sb = vkc_buf((size_t)(topk + 1) * 4, VKC_DEV);
+    VkcDsa p = {1, T - 1, IH, ID, topk, 0, 0, IH * ID, 0, IH, 0, ID, T, topk + 1, 0.1f, 0.5f};
+    /* COLI_VK_BENCH_POOL=n: GLM-5.3's pooled form instead, T / n pooled keys (the same rows) */
+    const char *pe = getenv("COLI_VK_BENCH_POOL");
+    int pool = pe && atoi(pe) > 0 ? atoi(pe) : 0;
+    VkcDsaPick pp = {1, T - 1, IH, ID, topk, pool, 0, IH * ID, 0, IH, 0, 0, T, topk + pool + 1, 1.f, 0.1f};
+    VkcBuf *sb2 = pool ? vkc_buf((size_t)(topk + pool + 1) * 4, VKC_DEV) : NULL;
+    double best = 1e9; int ok = 1;
+    for (int r = 0; r < 4 && ok; r++) {
+        ok = vkc_begin() && (pool ? vkc_dsa_pool_select(qb, wb, kb, scb, sb2, &pp) : vkc_dsa_select(qb, wb, kb, scb, sb, &p));
+        double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+        if (r && dt < best) best = dt;
+    }
+    if (ok) printf("bench dsa IH %d ID %d, one row over %d positions%s, top %d: %.0f us\n", IH, ID, T, pool ? " in pools" : "", topk, best * 1e6);
+    /* COLI_VK_BENCH_V4=ratio: DeepSeek V4's indexer scores (vkc_dsv4_score) over T / ratio compressed columns */
+    const char *ve = getenv("COLI_VK_BENCH_V4");
+    if (ve && atoi(ve) > 0) {
+        int ratio = atoi(ve), W = T / ratio;
+        VkcDsScore sp = {1, T - 1, ratio, IH, ID, W, 0, IH * ID, 0, IH, 0, ID, 0, W, 0.5f, 0, 0};
+        double b4 = 1e9; int ok4 = 1;
+        for (int r = 0; r < 4 && ok4; r++) {
+            ok4 = vkc_begin() && vkc_dsv4_score(qb, wb, kb, NULL, scb, &sp);
+            double t0 = bnow(); ok4 = vkc_submit(1) && ok4; double dt = bnow() - t0;
+            if (r && dt < b4) b4 = dt;
+        }
+        if (ok4) printf("bench dsv4 score IH %d ID %d, one row over %d columns: %.0f us\n", IH, ID, W, b4 * 1e6);
+        VkcBuf *lb4 = vkc_buf((size_t)(topk + 1) * 4, VKC_DEV);
+        VkcDsTopk tp = {1, W, topk, W, 0, topk, 0, 0};   /* S, width, topk, sc_row, l_off, l_row, base, order */
+        double bt = 1e9;
+        for (int r = 0; r < 4 && ok4 && lb4; r++) {
+            ok4 = vkc_begin() && vkc_dsv4_score(qb, wb, kb, NULL, scb, &sp) && vkc_dsv4_topk(scb, lb4, &tp);
+            double t0 = bnow(); ok4 = vkc_submit(1) && ok4; double dt = bnow() - t0;
+            if (r && dt < bt) bt = dt;
+        }
+        if (ok4) printf("bench dsv4 score and top %d over %d columns: %.0f us\n", topk, W, bt * 1e6);
+        vkc_free(lb4);
+    }
+    vkc_free(sb2);
+    vkc_free(qb); vkc_free(wb); vkc_free(kb); vkc_free(scb); vkc_free(sb); free(q); free(w); free(k);
+}
+
 /* COLI_VK_CHAIN_BENCH=dn: the DeltaNet recurrence at Qwen3.6's decode shape (32 value heads,
  * 16 key heads, KD = VD = 128, one row), 30 layers' worth in one frame, each its own state */
 static void bench_dn(void) {
@@ -3321,83 +3398,6 @@ static void bench_rows(void) {
         else for (int k = 0; k < 3; k++) if (t[3 * e + k]) coli_vk_tensor_free(t[3 * e + k]);
     }
     free(t); free(ex); free(tab); free(wg); free(wd); free(sg); free(sd);
-}
-
-/* COLI_VK_CHAIN_BENCH=mla: the MLA attention core (vkc_mla_core: GLM-5.2/5.3's, Kimi K3's,
- * DeepSeek V4.1's) for a decode row: H heads (COLI_VK_BENCH_VH, 64), latent K 512 and rope
- * R 64, over T positions (COLI_VK_BENCH_ROWS, 2000), L layers of caches of their own */
-static void bench_mla(void) {
-    int H = 64, K = 512, R = 64, T = 2000, L = 4;
-    const char *he = getenv("COLI_VK_BENCH_VH"), *te = getenv("COLI_VK_BENCH_ROWS");
-    if (he && atoi(he) > 0) H = atoi(he);
-    if (te && atoi(te) > 0) T = atoi(te);
-    float *qa = fvec((size_t)H * K, 1.f), *qr = fvec((size_t)H * R, 1.f), *lat = fvec((size_t)L * T * K, 1.f), *rope = fvec((size_t)L * T * R, 1.f);
-    VkcBuf *qab = up(qa, (size_t)H * K), *qrb = up(qr, (size_t)H * R), *lb = up(lat, (size_t)L * T * K), *rb = up(rope, (size_t)L * T * R);
-    VkcBuf *ob = vkc_buf((size_t)L * H * K * 4, VKC_DEV);
-    double best = 1e9; int ok = 1;
-    for (int r = 0; r < 4 && ok; r++) {
-        ok = vkc_begin();
-        for (int l = 0; l < L && ok; l++) {
-            VkcMlaCore cp = {1, H, K, R, T - 1, 0, 0, H * K, K, 0, H * R, R, l * T * K, K, l * T * R, R, 0, 0, l * H * K, H * K, K, 0.04f};
-            ok = vkc_mla_core(qab, qrb, lb, rb, NULL, ob, &cp);
-        }
-        double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
-        if (r && dt < best) best = dt;
-    }
-    if (ok) printf("bench mla H %d K %d R %d, one row over %d positions: %.0f us a layer\n", H, K, R, T, best * 1e6 / L);
-    vkc_free(qab); vkc_free(qrb); vkc_free(lb); vkc_free(rb); vkc_free(ob);
-    free(qa); free(qr); free(lat); free(rope);
-}
-
-/* COLI_VK_CHAIN_BENCH=dsa: a DSA indexer's selection (vkc_dsa_select: GLM-5.2's) for a decode
- * row: IH index heads (COLI_VK_BENCH_VH, 32) of ID 128 over T positions (COLI_VK_BENCH_ROWS,
- * 8000), top 2048 */
-static void bench_dsa(void) {
-    int IH = 32, ID = 128, T = 8000, topk = 2048;
-    const char *he = getenv("COLI_VK_BENCH_VH"), *te = getenv("COLI_VK_BENCH_ROWS");
-    if (he && atoi(he) > 0) IH = atoi(he);
-    if (te && atoi(te) > 0) T = atoi(te);
-    float *q = fvec((size_t)IH * ID, 1.f), *w = fvec((size_t)IH, 1.f), *k = fvec((size_t)T * ID, 1.f);
-    VkcBuf *qb = up(q, (size_t)IH * ID), *wb = up(w, (size_t)IH), *kb = up(k, (size_t)T * ID);
-    VkcBuf *scb = vkc_buf((size_t)T * 4, VKC_DEV), *sb = vkc_buf((size_t)(topk + 1) * 4, VKC_DEV);
-    VkcDsa p = {1, T - 1, IH, ID, topk, 0, 0, IH * ID, 0, IH, 0, ID, T, topk + 1, 0.1f, 0.5f};
-    /* COLI_VK_BENCH_POOL=n: GLM-5.3's pooled form instead, T / n pooled keys (the same rows) */
-    const char *pe = getenv("COLI_VK_BENCH_POOL");
-    int pool = pe && atoi(pe) > 0 ? atoi(pe) : 0;
-    VkcDsaPick pp = {1, T - 1, IH, ID, topk, pool, 0, IH * ID, 0, IH, 0, 0, T, topk + pool + 1, 1.f, 0.1f};
-    VkcBuf *sb2 = pool ? vkc_buf((size_t)(topk + pool + 1) * 4, VKC_DEV) : NULL;
-    double best = 1e9; int ok = 1;
-    for (int r = 0; r < 4 && ok; r++) {
-        ok = vkc_begin() && (pool ? vkc_dsa_pool_select(qb, wb, kb, scb, sb2, &pp) : vkc_dsa_select(qb, wb, kb, scb, sb, &p));
-        double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
-        if (r && dt < best) best = dt;
-    }
-    if (ok) printf("bench dsa IH %d ID %d, one row over %d positions%s, top %d: %.0f us\n", IH, ID, T, pool ? " in pools" : "", topk, best * 1e6);
-    /* COLI_VK_BENCH_V4=ratio: DeepSeek V4's indexer scores (vkc_dsv4_score) over T / ratio compressed columns */
-    const char *ve = getenv("COLI_VK_BENCH_V4");
-    if (ve && atoi(ve) > 0) {
-        int ratio = atoi(ve), W = T / ratio;
-        VkcDsScore sp = {1, T - 1, ratio, IH, ID, W, 0, IH * ID, 0, IH, 0, ID, 0, W, 0.5f, 0, 0};
-        double b4 = 1e9; int ok4 = 1;
-        for (int r = 0; r < 4 && ok4; r++) {
-            ok4 = vkc_begin() && vkc_dsv4_score(qb, wb, kb, NULL, scb, &sp);
-            double t0 = bnow(); ok4 = vkc_submit(1) && ok4; double dt = bnow() - t0;
-            if (r && dt < b4) b4 = dt;
-        }
-        if (ok4) printf("bench dsv4 score IH %d ID %d, one row over %d columns: %.0f us\n", IH, ID, W, b4 * 1e6);
-        VkcBuf *lb4 = vkc_buf((size_t)(topk + 1) * 4, VKC_DEV);
-        VkcDsTopk tp = {1, W, topk, W, 0, topk, 0, 0};   /* S, width, topk, sc_row, l_off, l_row, base, order */
-        double bt = 1e9;
-        for (int r = 0; r < 4 && ok4 && lb4; r++) {
-            ok4 = vkc_begin() && vkc_dsv4_score(qb, wb, kb, NULL, scb, &sp) && vkc_dsv4_topk(scb, lb4, &tp);
-            double t0 = bnow(); ok4 = vkc_submit(1) && ok4; double dt = bnow() - t0;
-            if (r && dt < bt) bt = dt;
-        }
-        if (ok4) printf("bench dsv4 score and top %d over %d columns: %.0f us\n", topk, W, bt * 1e6);
-        vkc_free(lb4);
-    }
-    vkc_free(sb2);
-    vkc_free(qb); vkc_free(wb); vkc_free(kb); vkc_free(scb); vkc_free(sb); free(q); free(w); free(k);
 }
 
 /* COLI_VK_CHAIN_BENCH=route: the router's pick (vkc_route), 48 one-row routes in a frame
