@@ -3230,6 +3230,66 @@ static void bench_moe(void) {
     free(tg); free(tu); free(td); free(ex); free(tab); free(wg); free(wd);
 }
 
+/* COLI_VK_CHAIN_BENCH=rows: a prompt chunk's routed experts (vkc_route + vkc_moe_rows) at
+ * Qwen3.6's shapes in our int4-g64 (D 2048, I 512, 256 experts, top 8), S rows
+ * (COLI_VK_BENCH_ROWS, 467), L layers of experts of their own (COLI_VK_BENCH_L, 4) each
+ * its own route, so the weights come from memory; COLI_VK_BENCH_FMTS "fmt gs" sets the format */
+static void bench_rows(void) {
+    int D = 2048, I = 512, E = 256, K = 8, S = 467, L = 4, fmt = 4, gs = 64;
+    const char *re = getenv("COLI_VK_BENCH_ROWS"), *le = getenv("COLI_VK_BENCH_L"), *fe = getenv("COLI_VK_BENCH_FMTS");
+    if (re && atoi(re) > 0) S = atoi(re);
+    if (le && atoi(le) > 0) L = atoi(le);
+    if (fe && *fe) sscanf(fe, "%d %d", &fmt, &gs);
+    if (!vkc_moe_rows_ready(fmt, fmt) || !coli_vk_xb_init(D, I, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { printf("bench rows: not on this device\n"); return; }
+    size_t rg = fmt == 1 ? (size_t)D : (size_t)D / 2, rd = fmt == 1 ? (size_t)I : (size_t)I / 2;
+    size_t ng = fmt == 4 ? (size_t)D / gs : 1, nd = fmt == 4 ? (size_t)I / gs : 1;
+    uint8_t *wg = malloc(rg * I), *wd = malloc(rd * D);
+    float *sg = malloc((size_t)I * ng * 4), *sd = malloc((size_t)D * nd * 4);
+    int n = L * E;
+    ColiVkTensor **t = calloc((size_t)3 * n, sizeof *t);
+    ColiVkExpert **ex = calloc((size_t)n, sizeof *ex);
+    uint32_t *tab = calloc((size_t)n * COLI_VK_XB_ENTRY, 4);
+    int ok = wg && wd && sg && sd && t && ex && tab;
+    for (size_t i = 0; ok && i < rg * I; i++) wg[i] = (uint8_t)rnd();
+    for (size_t i = 0; ok && i < rd * D; i++) wd[i] = (uint8_t)rnd();
+    for (size_t i = 0; ok && i < (size_t)I * ng; i++) sg[i] = 0.002f;
+    for (size_t i = 0; ok && i < (size_t)D * nd; i++) sd[i] = 0.002f;
+    int g = fmt == 4 ? gs : 0;
+    for (int e = 0; e < n && ok; e++)
+        ok = coli_vk_tensor_ensure(&t[3 * e], wg, sg, fmt, D, I, g) && coli_vk_tensor_ensure(&t[3 * e + 1], wg, sg, fmt, D, I, g) &&
+             coli_vk_tensor_ensure(&t[3 * e + 2], wd, sd, fmt, I, D, g) && (ex[e] = coli_vk_xb_expert(t[3 * e], t[3 * e + 1], t[3 * e + 2])) &&
+             coli_vk_xb_expert_entry(ex[e], tab + (size_t)e * COLI_VK_XB_ENTRY);
+    if (ok) {
+        float *lg = fvec((size_t)L * S * E, 2.f), *x = fvec((size_t)S * D, 1.f);
+        VkcBuf *lb = up(lg, (size_t)L * S * E), *xb = up(x, (size_t)S * D), *tb = vkc_buf((size_t)n * COLI_VK_XB_ENTRY * 4, VKC_DEV);
+        VkcBuf *ib = vkc_buf((size_t)L * S * K * 4, VKC_DEV), *wb = vkc_buf((size_t)S * K * 4, VKC_DEV), *yb = vkc_buf((size_t)S * D * 4, VKC_DEV);
+        VkcMoeRows rr = {0};
+        double best = 1e9;
+        ok = vkc_begin() && vkc_write(tb, 0, tab, (size_t)n * COLI_VK_XB_ENTRY * 4) && vkc_submit(1);
+        for (int r = 0; r < 4 && ok; r++) {
+            ok = vkc_begin();
+            for (int l = 0; l < L && ok; l++) {
+                VkcRoute rp = {S, E, K, 0, l * S * E, E, 0, 0, l * S * K, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
+                VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, l * E, 0, D, l * S * K, K, 0, K, 0, D, 0, 0, fmt, fmt, E, 0, 0};
+                ok = vkc_route(lb, NULL, ib, wb, &rp) && vkc_moe_rows(xb, ib, wb, tb, &rr, yb, &mp);
+            }
+            double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+            if (r && dt < best) best = dt;
+        }
+        double bytes = (double)E * ((double)2 * (rg * I + I * ng * 4) + rd * D + D * nd * 4);
+        if (ok) printf("bench rows fmt %d gs %d, S %d K %d E %d D %d I %d: %.0f us a layer (its experts %.0f MB: %.0f GB/s)\n",
+                       fmt, gs, S, K, E, D, I, best * 1e6 / L, bytes / 1e6, bytes * L / best / 1e9);
+        else printf("bench rows: the frame failed\n");
+        vkc_moe_rows_free(&rr);
+        vkc_free(lb); vkc_free(xb); vkc_free(tb); vkc_free(ib); vkc_free(wb); vkc_free(yb); free(lg); free(x);
+    }
+    for (int e = 0; e < n && t && ex; e++) {
+        if (ex[e]) coli_vk_xb_expert_free(ex[e]);
+        else for (int k = 0; k < 3; k++) if (t[3 * e + k]) coli_vk_tensor_free(t[3 * e + k]);
+    }
+    free(t); free(ex); free(tab); free(wg); free(wd); free(sg); free(sd);
+}
+
 /* COLI_VK_CHAIN_BENCH=route: the router's pick (vkc_route), 48 one-row routes in a frame
  * as a forward's layers run them: E experts (COLI_VK_BENCH_E, 512 by default), top 10,
  * softmax, the ids in host-readable memory as vk_dmoe.h keeps them. */
@@ -3407,6 +3467,7 @@ int main(int argc, char **argv) {
         if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "bd")) bench_bd();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "moe")) bench_moe();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dn")) bench_dn();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "rows")) bench_rows();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "route")) bench_route();
         else bench_gemv();
         vkc_shutdown(); coli_vk_shutdown(); return 0;
