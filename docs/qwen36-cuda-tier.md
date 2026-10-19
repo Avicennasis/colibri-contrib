@@ -478,6 +478,16 @@ it replaces gave each (head, row) a block that read every K and V row again. On 
 35B, a 1024-token prompt: 226 ms of attention -> 23 ms; a 467-token prompt 819-837 ->
 890-903 tok/s; the loss above 3.2223 -> 3.2271.
 
+On sm_70 and later the same GEMMs run in f16 (`hcg_tile`: `hcg_dense_k`, `hcg_moe_gu_k`,
+`hcg_moe_dn_k`), at twice the TF32 fragments' rate and with a tile that keeps more of the
+card busy: 256 threads (eight warps) for 64 rows x 64 outputs, K in steps of 64, the next
+step's words and inputs fetched into registers while the tensor cores work. int8 and int4
+codes are exact in f16 (the row's scale after the sum), int4 per group goes in times its
+scale, x is rounded to f16 and held to +-65504 (a NaN stays one), sums in fp32. On the 35B,
+a 1024-token prompt: the experts' GEMMs 513 -> 236 ms, the dense ones 234 -> 97 ms; a
+467-token prompt 889-910 -> 1561-1609 tok/s; the loss above 3.2271 (TF32) -> 3.2262.
+`COLI_CUDA_TC_F16=0` keeps TF32 where it runs.
+
 It is off with cache routing or the agreement meter (their state crosses tokens on the
 host), a gate bias, more groups than the kernel keeps, or a tier on more than one card.
 `COLI_CUDA_CHAIN_MOE=0` keeps the host's step. A decode step's text is the same either
@@ -504,6 +514,52 @@ With every expert in VRAM a decode token is the device's 10 ms, and a 467-token 
 prompt keeps the host's step for its experts),
 the CPU computes two thirds of the slots (about 10 ms a token) and the layer after waits
 for them: the hybrid step overlaps the device's experts with the host's, not the layers.
+The host pool below takes a prompt's share off the CPU.
+
+### A prompt's experts past VRAM: the host pool (`COLI_CUDA_HOST_POOL`, on by default)
+
+A prompt chunk routes nearly every expert of a layer (467 rows, 8 slots each, over 256
+experts: 15 rows an expert), and the CPU's step costs per row where a copy over the bus
+costs per expert: 1.65 MB of int4-g64 per expert of the 35B is 0.13 ms at the 12.8 GB/s of
+a PCIe 4.0 x8 link, the CPU's 15 rows about 0.7 ms. So a chunk of more than 32 rows copies
+a layer's non-resident experts into VRAM and runs them with the residents:
+
+- The source is the engine's RAM cache as it is, page-locked at the warm start
+  (`qt_note_host`, `coli_cuda_host_register`): expert_ffn.h's planar int4 blocks, which the
+  f16 GEMMs read directly (`CcExpert.planar`: in each 64 weights' 32 bytes, byte k holds
+  weight k low and k + 32 high, both v + 8). No second copy in RAM, no conversion. On when
+  the RAM holds every expert (no slot is ever recycled), one card, int4-g64 and the f16
+  GEMMs (`coli_cuda_planar_rows`).
+- The staging (`cc_fetch`, `cc_fetch_wait`, `cc_fetch_done`): one layer's worth of VRAM,
+  the most non-resident experts any layer has, filled on a copy stream of its own. The copy
+  of the next such layer starts once the layer before has run its experts' GEMMs, so it
+  overlaps that layer's sum and the next layer's attention; one buffer, because the copy
+  is the longer of the two and a second one would buy little.
+- The prompt chunk's table points each staged expert at its place in the staging; a
+  decode step keeps the table of the residents and the CPU's share (a row at a time,
+  the CPU's kernel is faster than a copy).
+
+The chunk's rows matter as much: every chunk copies the layer's experts again, so the chain
+now sizes a chunk from the card's free memory (`COLI_CUDA_CHAIN_ROWS`, unset: the most of
+256, 512, ... 4096 rows whose scratch takes half the free memory less the staging; the
+line `rows per prompt chunk` says which). With every expert in VRAM larger chunks help
+too: fewer, fuller tiles per expert.
+
+**Measured** (the same box, two runs each, `bench_stream.py`):
+
+| | 467-token prompt | 1727-token prompt | decode after each |
+|---|---|---|---|
+| `CUDA_EXPERT_GB=8`, the host's step, 256 rows (before) | 127-128 tok/s | 122-125 | 52 / 43 |
+| `CUDA_EXPERT_GB=8`, the host pool, 4096 rows | 365-385 | 997-1037 | 52-54 / 45-46 |
+| every expert in VRAM, 256 rows (before) | 1626-1686 | 1705-1732 | 86 / 65 |
+| every expert in VRAM, 4096 rows | 1922-2137 | 2321-2516 | 86 / 65 |
+
+At `CUDA_EXPERT_GB=8` the 1727-token prompt copies 11 GB once (6714 experts staged in 27
+layers) in about 0.9 s; the host pool at 256 rows copied them seven times (215-225 tok/s). The teacher-forced loss
+after a 2000-token prompt (200 tokens scored): 1.7567 nats every expert in VRAM, 1.7590 the
+host pool, 1.7555 the host's step. The staging takes about 450 MB of VRAM here;
+without room for it the chain says so once and the chunk keeps the host's step.
+`COLI_CUDA_HOST_POOL=0` keeps the host's step for a prompt's non-resident experts.
 
 ## The residents follow the prompt (`QT_PREFILL_REPLAN=1`)
 

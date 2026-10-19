@@ -42,6 +42,8 @@ struct CcCtx {
     int major;   /* the device's compute capability: cc_attn_fk's tensor cores from 7 */
     cudaStream_t stream;
     cudaEvent_t ev; int ev_ok, ev_pending;
+    /* staging (cc_fetch): the copy stream, its copies' event and the buffer's last reader's */
+    cudaStream_t cs; cudaEvent_t ev_fetched, ev_free; int cs_ok;
 };
 CcCtx g_cc[COLI_CUDA_MAX_DEVICES];
 int g_ncc, g_cur = -1;   /* g_cur: index into g_cc of the current context */
@@ -763,9 +765,13 @@ static void cc_shutdown(void) {
             if (!c->lost) cudaStreamSynchronize(c->stream);
             if (c->ev_ok) cudaEventDestroy(c->ev);
             cudaStreamDestroy(c->stream);
+            if (c->cs_ok) {
+                if (!c->lost) cudaStreamSynchronize(c->cs);
+                cudaEventDestroy(c->ev_fetched); cudaEventDestroy(c->ev_free); cudaStreamDestroy(c->cs);
+            }
         }
         (void)cudaGetLastError();
-        c->up = 0; c->ev_ok = 0;
+        c->up = 0; c->ev_ok = 0; c->cs_ok = 0;
     }
     g_ncc = 0; g_cur = -1;
 }
@@ -814,6 +820,7 @@ static void cc_free(CcBuf *b) {
     CcCtx *c = ctx_of(b->dev);
     if (c && c->up && cudaSetDevice(c->device) == cudaSuccess) {
         if (!c->lost) cudaStreamSynchronize(c->stream);   /* the frames that may read it */
+        if (!c->lost && c->cs_ok) cudaStreamSynchronize(c->cs);   /* and the copies that may write it */
         if (b->kind == CC_DEV) { cudaFree(b->d); g_st.dev_bytes -= b->bytes; }
         else cudaFreeHost(b->h);
     }
@@ -857,6 +864,7 @@ static int cc_finish(void) {
     if (!c) return 0;
     double t0 = cc_now_ms();
     int ok = cc_ok(c, cudaStreamSynchronize(c->stream), "finish");
+    if (ok && c->cs_ok) ok = cc_ok(c, cudaStreamSynchronize(c->cs), "finish copies");
     g_st.waits++; g_st.wait_ms += cc_now_ms() - t0;
     c->ev_pending = 0;
     return ok;
@@ -1099,6 +1107,47 @@ static int cc_wait_host(CcBuf *flag, size_t word, unsigned v) {
 }
 static void cc_stats(CcStats *st) { if (st) *st = g_st; }
 
+/* ---- staging: copies from page-locked host memory beside the frame ---------------- */
+static int cc_copy_stream(CcCtx *c) {
+    if (c->cs_ok) return 1;
+    if (!cc_ok(c, cudaStreamCreateWithFlags(&c->cs, cudaStreamNonBlocking), "copy stream")) return 0;
+    if (cudaEventCreateWithFlags(&c->ev_fetched, cudaEventDisableTiming) != cudaSuccess) {
+        (void)cudaStreamDestroy(c->cs); return cc_ok(c, cudaErrorMemoryAllocation, "copy event");
+    }
+    if (cudaEventCreateWithFlags(&c->ev_free, cudaEventDisableTiming) != cudaSuccess) {
+        (void)cudaEventDestroy(c->ev_fetched); (void)cudaStreamDestroy(c->cs); return cc_ok(c, cudaErrorMemoryAllocation, "copy event");
+    }
+    c->cs_ok = 1;
+    return 1;
+}
+static int cc_fetch(CcBuf *dst, const CcFetch *r, int n) {
+    CcCtx *c = live();
+    if (!c || !dst || dst->kind != CC_DEV || n < 0 || (n && !r)) return 0;
+    for (int i = 0; i < n; i++) if (!r[i].src || r[i].dst > dst->bytes || r[i].bytes > dst->bytes - r[i].dst) return 0;
+    if (!cc_copy_stream(c)) return 0;
+    /* an event never recorded is no wait: the first fetch starts at once */
+    if (!cc_ok(c, cudaStreamWaitEvent(c->cs, c->ev_free, 0), "fetch's reader")) return 0;
+    for (int i = 0; i < n; i++) {
+        if (!r[i].bytes) continue;
+        if (!cc_ok(c, cudaMemcpyAsync((char *)dst->d + r[i].dst, r[i].src, r[i].bytes, cudaMemcpyHostToDevice, c->cs), "fetch")) return 0;
+        g_st.bytes_up += r[i].bytes;
+    }
+    g_st.ops++;
+    return cc_ok(c, cudaEventRecord(c->ev_fetched, c->cs), "fetch event");
+}
+static int cc_fetch_wait(void) {
+    CcCtx *c = live();
+    if (!c || !c->cs_ok) return 0;
+    g_st.ops++;
+    return cc_ok(c, cudaStreamWaitEvent(c->stream, c->ev_fetched, 0), "fetch wait");
+}
+static int cc_fetch_done(void) {
+    CcCtx *c = live();
+    if (!c || !c->cs_ok) return 0;
+    return cc_ok(c, cudaEventRecord(c->ev_free, c->stream), "fetch done");
+}
+static const void *cc_dev_addr(const CcBuf *b) { return b && b->kind == CC_DEV ? (const void *)b->d : nullptr; }
+
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -1109,5 +1158,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_stats,
     cc_qsa, cc_ple,
     cc_route, cc_moe, cc_signal, cc_wait_host, coli_cuda_tensor_dev,
+    cc_fetch, cc_fetch_wait, cc_fetch_done, cc_dev_addr,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

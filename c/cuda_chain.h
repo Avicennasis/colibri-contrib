@@ -106,8 +106,12 @@ typedef struct {
     float temp, scale, norm_eps;
 } CcRoute;
 /* A routed expert as a device holds it (the CUDA tier's resident tensors: their weights
- * and scales, coli_cuda_tensor_dev); g NULL: not on the device (the host computes it). */
-typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; } CcExpert;
+ * and scales, coli_cuda_tensor_dev); g NULL: not on the device (the host computes it).
+ * planar 1: int4 per 64 as the engine keeps it in RAM (expert_ffn.h's planar blocks: in each
+ * 64 weights' 32 bytes, byte k holds weight k in its low nibble and k + 32 in its high one,
+ * both v + 8), as a prompt chunk stages it from the tier's RAM cache (cc_fetch; its GEMMs
+ * only); 0: the backend's own layout (signed nibbles, weight 2j low and 2j + 1 high). */
+typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; int planar, pad_; } CcExpert;
 /* A layer's routed experts on the device for S rows (cc_moe): x (x_off + s*x_row, D
  * floats) routed to ids and w as cc_route writes them (i_off + s*i_row, w_off + s*w_row,
  * K each); expert e is entry t_off + e of the table (E of them), its matrices of format fmt (1 int8
@@ -124,6 +128,7 @@ typedef struct {
     int S, K, D, I, fmt, gs, act, parts;
     int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row, h_off;
     int E;   /* the layer's experts: a step of more than CC_MOE_FRAME_ROWS rows sorts its slots by expert */
+    int planar;   /* the table may hold CcExpert.planar entries: refused where the GEMMs cannot read them */
 } CcMoe;
 /* More rows than this (a prompt chunk): the slots sorted by expert and each expert's rows
  * through the tensor cores' GEMM where the device has it (gate and up, then down); hid
@@ -136,6 +141,8 @@ static inline size_t cc_moe_hid_floats(int S, int K, int D, int I, int E) {
 }
 /* one copy over n regions (a KV row per head, say); offsets and counts in floats */
 typedef struct { size_t dst, src, n; } CcRegion;
+/* a fetch's region: bytes of page-locked host memory at src into a DEV buffer at byte dst */
+typedef struct { const void *src; size_t dst, bytes; } CcFetch;
 /* counters, for the engines' [chain] lines */
 typedef struct {
     unsigned long long frames, waits, ops, matmuls, bytes_up, bytes_down;
@@ -195,6 +202,16 @@ typedef struct ColiCudaChainOps {
     /* a resident tensor's device copy, for a CcExpert: its weights, scales and the scales'
      * group size (fmt 4); 0 for none */
     int  (*tensor_dev)(const ColiCudaTensor *t, const void **w, const float **sc, int *gs);
+    /* Staging (optional): a DEV buffer filled from page-locked host memory on the device's
+     * copy stream, beside the frame's ops (a prompt chunk's experts from the tier's RAM
+     * cache). fetch: n regions into dst, once the frame's ops recorded before the last
+     * fetch_done are done (the buffer's last reader); fetch_wait: the frame's later ops wait
+     * for the last fetch's copies; fetch_done: the buffer is free again once the frame's
+     * earlier ops are done. dev_addr: a DEV buffer's device address, for a CcExpert. */
+    int  (*fetch)(CcBuf *dst, const CcFetch *r, int n);
+    int  (*fetch_wait)(void);
+    int  (*fetch_done)(void);
+    const void *(*dev_addr)(const CcBuf *b);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -247,6 +264,11 @@ static inline int cc_moe(CcBuf *tab, CcBuf *x, CcBuf *ids, CcBuf *w, CcBuf *hid,
 static inline int cc_signal(CcBuf *flag, size_t word, unsigned v) { return cc_moe_ready() ? cc_ops()->signal(flag, word, v) : 0; }
 static inline int cc_wait_host(CcBuf *flag, size_t word, unsigned v) { return cc_moe_ready() ? cc_ops()->wait_host(flag, word, v) : 0; }
 static inline int cc_tensor_dev(const ColiCudaTensor *w, const void **p, const float **sc, int *gs) { return cc_moe_ready() ? cc_ops()->tensor_dev(w, p, sc, gs) : 0; }
+static inline int cc_fetch_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, dev_addr) + sizeof t->dev_addr; }
+static inline int cc_fetch(CcBuf *dst, const CcFetch *r, int n) { return cc_fetch_ready() ? cc_ops()->fetch(dst, r, n) : 0; }
+static inline int cc_fetch_wait(void) { return cc_fetch_ready() ? cc_ops()->fetch_wait() : 0; }
+static inline int cc_fetch_done(void) { return cc_fetch_ready() ? cc_ops()->fetch_done() : 0; }
+static inline const void *cc_dev_addr(const CcBuf *b) { return cc_fetch_ready() ? cc_ops()->dev_addr(b) : NULL; }
 #endif
 
 #ifdef __cplusplus

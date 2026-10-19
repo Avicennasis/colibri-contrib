@@ -77,6 +77,12 @@ typedef struct {
     int dm_on, dm_fmt, dm_gs, dm_read, dm_held;
     unsigned dm_epoch, dm_seq;
     CcExpert *dm_host; uint8_t *dm_res; int *dm_part; uint8_t *dm_ran;   /* dm_ran: the step's layers that ran so */
+    /* a prompt chunk's table (more than Q36CC_STAGE_ROWS rows): the residents, and the tier's host
+     * pool staged a layer at a time into dm_stage (planar; dm_fr the copies, dm_fro and dm_frn each
+     * layer's), the layers with some expert in neither; dm_stage_off: no staging from here on */
+    CcExpert *dm_hostb; int *dm_partb, *dm_fro, *dm_frn; CcFetch *dm_fr; CcBuf *dm_tabb, *dm_stage;
+    int dm_stage_off; unsigned long long dm_staged, dm_stage_bytes;
+    int rows_max;   /* a prompt chunk's rows (q36cc_rows_max) */
     CcBuf *dm_tab, *dm_ids, *dm_w, *dm_idsd, *dm_wd, *dm_hid, *dm_y, *dm_hy, *dm_dfl, *dm_hfl;
     float *dm_g, *dm_u, *dm_hh;
     unsigned long long dm_steps, dm_hyb, dm_pairs;   /* layer steps in the frame, the hybrid ones, slots the host computed */
@@ -94,8 +100,8 @@ static int q36cc_dm_able(Q36CChain *ch, Model *m);
 static int q36cc_env_on(void) { const char *e = getenv("COLI_CUDA_CHAIN"); return !(e && *e == '0'); }
 static int q36cc_rows_env(void) {
     const char *e = getenv("COLI_CUDA_CHAIN_ROWS");
-    int r = e && *e ? atoi(e) : 256;
-    return r < 1 ? 1 : r > 8192 ? 8192 : r;
+    int r = e && *e ? atoi(e) : 0;
+    return r < 0 ? 0 : r > 8192 ? 8192 : r;
 }
 static void q36cc_fatal(const char *what) {
     fprintf(stderr, "[chain] qwen36: %s -- stopping (COLI_CUDA_CHAIN=0 keeps the state on the CPU)\n", what);
@@ -574,6 +580,67 @@ static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
         memcpy(m->V[i] + dst, kv + (size_t)ch->rows * kvo + src, c->k_head_dim * sizeof(float));
     }
 }
+/* A prompt chunk routes nearly every expert of a layer, and the host's step costs per row
+ * where a copy over the bus costs per expert: more than Q36CC_STAGE_ROWS rows copy a layer's
+ * experts in the tier's host pool (its RAM cache, page-locked) into dm_stage and run them
+ * with the residents, the copy of the next such layer on the copy stream while the device
+ * works through the layers before it. dm_stage holds the most experts any layer has there
+ * (one layer's: the copy is the longer of the two, a second buffer would buy little); the
+ * table points each such expert at its place there (planar, as the RAM holds it). 0: no
+ * VRAM for it. */
+#define Q36CC_STAGE_ROWS 32
+static int q36cc_stage_table(Q36CChain *ch, Model *m) {
+    Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, D = c->hidden, I = c->inter;
+    size_t ne = (size_t)L * E, mb = (size_t)D * I / 2, nsc = (size_t)I * (D / ch->dm_gs), wb = 3 * mb, sb = 3 * nsc * sizeof(float);
+    size_t wa = (wb + 255) / 256 * 256, stride = wa + (sb + 255) / 256 * 256;
+    int hmax = 0, tot = 0;
+    for (int i = 0; i < L; i++) {
+        int h = 0;
+        for (int e = 0; e < E; e++) {
+            const void *w; const float *sc; size_t a, b;
+            if (ch->dm_res[(size_t)i * E + e] || !qt_chain_host(i, e, &w, &a, &sc, &b)) continue;
+            if (a != wb || b != sb) return 0;   /* not the layout the table describes */
+            h++;
+        }
+        if (h > hmax) hmax = h;
+        tot += h;
+    }
+    if (!ch->dm_hostb) {
+        ch->dm_hostb = malloc(ne * sizeof(CcExpert));
+        ch->dm_partb = calloc(L, sizeof(int)); ch->dm_fro = calloc(L, sizeof(int)); ch->dm_frn = calloc(L, sizeof(int));
+        if (!ch->dm_hostb || !ch->dm_partb || !ch->dm_fro || !ch->dm_frn) return 0;
+    }
+    CcFetch *fr = realloc(ch->dm_fr, (size_t)(2 * tot + 1) * sizeof(CcFetch));
+    if (!fr) return 0;
+    ch->dm_fr = fr;
+    if (!cc_reserve(&ch->dm_stage, (size_t)(hmax ? hmax : 1) * stride, CC_DEV) || !cc_reserve(&ch->dm_tabb, ne * sizeof(CcExpert), CC_DEV))
+        return 0;
+    const char *base = (const char *)cc_dev_addr(ch->dm_stage);
+    if (!base) return 0;
+    int k = 0;
+    for (int i = 0; i < L; i++) {
+        int h = 0, miss = 0;
+        ch->dm_fro[i] = k;
+        for (int e = 0; e < E; e++) {
+            size_t j = (size_t)i * E + e;
+            CcExpert *x = &ch->dm_hostb[j];
+            const void *w; const float *sc; size_t a, b;
+            *x = ch->dm_host[j];
+            if (ch->dm_res[j]) continue;
+            memset(x, 0, sizeof *x);
+            if (h >= hmax || k + 2 > 2 * tot || !qt_chain_host(i, e, &w, &a, &sc, &b) || a != wb || b != sb) { miss = 1; continue; }
+            const char *g = base + (size_t)h * stride;
+            x->g = g; x->u = g + mb; x->d = g + 2 * mb;
+            x->gs = (const float *)(g + wa); x->us = x->gs + nsc; x->ds = x->gs + 2 * nsc;
+            x->planar = 1;
+            fr[k++] = (CcFetch){w, (size_t)h * stride, wb};
+            fr[k++] = (CcFetch){sc, (size_t)h * stride + wa, sb};
+            h++;
+        }
+        ch->dm_frn[i] = k - ch->dm_fro[i]; ch->dm_partb[i] = miss;
+    }
+    return cc_begin() && cc_write(ch->dm_tabb, 0, ch->dm_hostb, ne * sizeof(CcExpert)) && cc_submit(1);
+}
 /* the step's buffers, and the table when the tier's residents moved (the tier held) */
 static int q36cc_dm_begin(Q36CChain *ch, Model *m) {
     Cfg *c = &m->c; int L = c->n_layers, E = c->n_experts, K = c->topk, D = c->hidden, I = c->inter;
@@ -606,7 +673,31 @@ static int q36cc_dm_begin(Q36CChain *ch, Model *m) {
         ch->dm_part[i] = miss;
     }
     if (!cc_begin() || !cc_write(ch->dm_tab, 0, ch->dm_host, ne * sizeof(CcExpert)) || !cc_submit(1)) return 0;
+    if (qt_chain_host_count() > 0 && !ch->dm_stage_off && cc_fetch_ready() && !q36cc_stage_table(ch, m)) {
+        if (cc_lost()) return 0;
+        fprintf(stderr, "[chain] qwen36: no VRAM to stage the host pool's experts in; a prompt chunk's go to the host's step\n");
+        ch->dm_stage_off = 1;
+        cc_free(ch->dm_stage); ch->dm_stage = NULL;
+    }
     ch->dm_epoch = ep; ch->dm_read = 1;
+    return 1;
+}
+/* layer i's table and whether some of its experts are elsewhere (the host's), for a step of n rows */
+static CcBuf *q36cc_dm_tab(Q36CChain *ch, int i, int n, int *part) {
+    if (n > Q36CC_STAGE_ROWS && !ch->dm_stage_off && ch->dm_stage && ch->dm_tabb) { *part = ch->dm_partb[i]; return ch->dm_tabb; }
+    *part = ch->dm_part[i];
+    return ch->dm_tab;
+}
+/* whether layer i of a step on table tab stages its experts, and the copy of the first such layer
+ * from layer i on into the staging (none: nothing to copy) */
+static int q36cc_stages(Q36CChain *ch, CcBuf *tab, int i) { return tab == ch->dm_tabb && ch->dm_frn[i] > 0 && !ch->dm_partb[i]; }
+static int q36cc_stage_from(Q36CChain *ch, Model *m, int i) {
+    for (; i < m->c.n_layers; i++) {
+        if (!q36cc_stages(ch, ch->dm_tabb, i)) continue;
+        ch->dm_staged++;
+        for (int k = 0; k < ch->dm_frn[i]; k++) ch->dm_stage_bytes += ch->dm_fr[ch->dm_fro[i] + k].bytes;
+        return cc_fetch(ch->dm_stage, ch->dm_fr + ch->dm_fro[i], ch->dm_frn[i]);
+    }
     return 1;
 }
 static void q36cc_dm_end(Q36CChain *ch) { if (ch->dm_held) { qt_chain_hold(0); ch->dm_held = 0; } }
@@ -616,15 +707,20 @@ static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsig
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
     int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1, io = i * ch->rows * K;
     CcRoute rp = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, ng, ng > 1 ? c->topk_group : 1, 1, 1.f, 1.f, 0.f};
-    CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1, E};
+    int part;
+    CcBuf *tab = q36cc_dm_tab(ch, i, n, &part);
+    CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1, E, tab == ch->dm_tabb};
+    int stg = q36cc_stages(ch, tab, i);
     int ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp) &&
              cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K);
     *v = 0;
-    if (ok && ch->dm_part[i]) { *v = ++ch->dm_seq; ok = cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D) && cc_signal(ch->dm_dfl, 0, *v); }
-    ok = ok && q36cc_shared(ch, m, l, i, n) && cc_moe(ch->dm_tab, ch->h2, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
+    if (ok && part) { *v = ++ch->dm_seq; ok = cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D) && cc_signal(ch->dm_dfl, 0, *v); }
+    ok = ok && q36cc_shared(ch, m, l, i, n) && (!stg || cc_fetch_wait()) &&
+         cc_moe(tab, ch->h2, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, NULL, &mp);
+    if (ok && stg) ok = cc_fetch_done() && q36cc_stage_from(ch, m, i + 1);   /* the sum below reads no weights */
     if (ok && *v) ok = cc_wait_host(ch->dm_hfl, 0, *v);
     CcMoe ms = mp; ms.parts = 2; ms.h_off = *v ? 0 : -1;
-    ok = ok && cc_moe(ch->dm_tab, NULL, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, ch->dm_hy, &ms);
+    ok = ok && cc_moe(tab, NULL, ch->dm_ids, ch->dm_w, ch->dm_hid, ch->dm_y, ch->dm_hy, &ms);
     ch->dm_steps++;
     return ok;
 }
@@ -673,6 +769,34 @@ static void q36cc_dm_books(Q36CChain *ch, Model *m, int n, int pb) {
     }
 }
 
+/* Rows per prompt chunk: COLI_CUDA_CHAIN_ROWS, else the most (a power of two from 256 to 4096)
+ * whose scratch takes at most half the device's free memory once the tier filled it, less the
+ * host pool's staging (the other half for the KV mirrors as the context grows). A chunk reads
+ * every routed expert's weights once, the host pool's over the bus: the more rows, the fewer
+ * reads (q36c on an RTX PRO 4000, 1727 tokens: 256 rows 1704 tok/s, 1024 2270; the experts
+ * past 8 GB in the host pool: 215 against 1036 at 2048). */
+static int q36cc_rows_max(Q36CChain *ch, Model *m) {
+    if (ch->rows_max) return ch->rows_max;
+    int env = q36cc_rows_env();
+    if (env) return ch->rows_max = env;
+    Cfg *c = &m->c; int D = c->hidden, I = c->inter, L = c->n_layers, K = c->topk > 0 ? c->topk : 1;
+    int E = c->n_experts > 0 ? c->n_experts : 1, SI = c->shared_inter > 0 ? c->shared_inter : 1;
+    int qo = c->q_heads * c->q_head_dim, kvo = c->kv_heads * c->k_head_dim, vd = c->dn_vheads * c->dn_vdim;
+    /* q36cc_bufs' device rows and the routed experts' (q36cc_dm_begin), per row */
+    size_t row = ((size_t)6 * D + qo + 2 * kvo + (size_t)c->q_heads * c->head_dim + 2 * (size_t)c->dn_conv_dim + 2 * vd +
+                  2 * c->dn_vheads + E + 3 * SI + 1 + (size_t)K * (I + D) + 2 * (size_t)L * K + 4 * K) * sizeof(float);
+    size_t fr = 0, tot = 0, stage = 0;
+    if (c->n_experts > 0 && qt_chain_host_count() > 0 && ch->dm_gs > 0)
+        stage = (size_t)c->n_experts * (3 * ((size_t)D * I / 2) + 3 * ((size_t)D * I / ch->dm_gs) * sizeof(float) + 512);
+    coli_cuda_mem_info(ch->dev, &fr, &tot);
+    size_t room = fr > stage ? (fr - stage) / 2 : 0;
+    int r = 4096;
+    while (r > 256 && (size_t)r * row > room) r /= 2;
+    fprintf(stderr, "[chain] qwen36: %d rows per prompt chunk (%.0f KiB a row, %.1f GB free on the device; COLI_CUDA_CHAIN_ROWS sets it)\n",
+            r, row / 1024.0, fr / 1073741824.0);
+    return ch->rows_max = r;
+}
+
 /* Every layer for S rows from host rows xh, the last nlogits rows' logits into `logit`;
  * xh gets the final rows back when want_x. 0 = not taken (nothing on the device
  * changed, or the device was lost and the state rebuilt: the CPU runs the step).
@@ -684,7 +808,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
     Q36CChain *ch = q36cc_of(m);
     if (!ch || !ch->ok || ch->failed) return 0;
     Cfg *c = &m->c; int D = c->hidden, L = c->n_layers, E = c->n_experts;
-    int CH = q36cc_rows_env(), rows = S < CH ? S : CH;
+    int CH = q36cc_rows_max(ch, m), rows = S < CH ? S : CH;
     int kvo = c->kv_heads * c->k_head_dim, half = c->rotary_dim / 2;
     if (m->snap_rows > 0 && !q36cc_spec_slots(ch, m, m->snap_rows)) {
         fprintf(stderr, "[chain] qwen36: device memory for a verify's %d copies refused; this verify on the CPU\n", m->snap_rows);
@@ -730,6 +854,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         if (dm) memset(ch->dm_ran, 0, (size_t)L);
         if (!q36cc_frame_begin(ch) || !cc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
             !q36cc_push_state(ch, m, pb)) goto lost;
+        if (dm && q36cc_dm_tab(ch, 0, n, &(int){0}) == ch->dm_tabb && !q36cc_stage_from(ch, m, 0)) goto lost;   /* the first staged layer's copy */
         int ok = 1, pending = 0, pend_i = -1;   /* pend_i: the hybrid layer the host serves after recording the next */
         unsigned pend_v = 0;
         CcBuf *routed = ch->routed;              /* where the layer before left its routed sum */
@@ -746,8 +871,10 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             ok = ok && cc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
             if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)i * 3 + 1) * D, ch->x, (size_t)(n - 1) * D, D);
             ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps);
-            if (ok && dm && (n <= Q36CC_DM_ROWS || !ch->dm_part[i])) {   /* routed in the frame, the residents here; a hybrid
-                                                                         * layer's host share once the next is recorded */
+            int dpart = 0;
+            if (dm) (void)q36cc_dm_tab(ch, i, n, &dpart);
+            if (ok && dm && (n <= Q36CC_DM_ROWS || !dpart)) {   /* routed in the frame, the residents (and a prompt chunk's
+                                                              * host pool) here; a hybrid layer's host share once the next is recorded */
                 unsigned v = 0;
                 ch->dm_ran[i] = 1;
                 ok = q36cc_dm_layer(ch, m, l, i, n, &v);
@@ -843,4 +970,7 @@ static void q36cc_report(Model *m) {
         fprintf(stderr, "[chain] qwen36: %llu layer steps with the routed experts in the frame, %llu of them hybrid "
                         "(%llu slots on the host in %.1f ms, %.1f ms waiting for the device's routes)\n",
                 ch->dm_steps, ch->dm_hyb, ch->dm_pairs, ch->dm_host_ms, ch->dm_spin_ms);
+    if (ch->dm_staged)
+        fprintf(stderr, "[chain] qwen36: %llu prompt layer steps staged the host pool's experts (%.2f GB copied over the bus)\n",
+                ch->dm_staged, ch->dm_stage_bytes / 1073741824.0);
 }

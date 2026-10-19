@@ -85,6 +85,10 @@ void coli_cuda_tensor_free(ColiCudaTensor *t) {
     if (t && fake_dense_compute && t->fmt == 1) { free((void *)t->w); free((void *)t->sc); }
     free(t);
 }
+/* no bus to copy host memory over: the tier keeps the host's step for those experts */
+int coli_cuda_host_register(void *p, size_t bytes) { (void)p; (void)bytes; return 0; }
+void coli_cuda_host_unregister(void *p) { (void)p; }
+int coli_cuda_planar_rows(int device, int D, int I) { (void)device; (void)D; (void)I; return 0; }
 int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *w, const float *sc) {
     if (!t || !w || fake_overwrite_fail) return 0;
     if (fake_upload_hook) fake_upload_hook(t->fmt);

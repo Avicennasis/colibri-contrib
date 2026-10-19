@@ -14,6 +14,7 @@
  *   lost      a failed launch (COLI_GPU_FAIL_AFTER) marks the device lost to the chain
  * Needs a device: run by hand (make cuda-chain-check CUDA=1); gpu-compile builds it. */
 #include "../backend_cuda.h"
+#include "../backend_gpu_compat.h"   /* the runtime's names under HIP too (the planar blocks' host memory) */
 #define COLI_CUDA_CHAIN_NO_WRAPPERS
 #include "../cuda_chain.h"
 #include <cstdio>
@@ -249,6 +250,31 @@ static float e4m3(int b) {
     return sg ? -v : v;
 }
 /* one expert matrix [O][I] in a tier format, its values for the reference (dq) and the tensor */
+/* moe_mat's int4-per-gs matrix (the same seed, the same codes and scales) in expert_ffn.h's
+ * planar blocks (byte k of a 64-weight block: weight k low, k + 32 high, both v + 8), in
+ * page-locked host memory the device reads over the bus: its device address in *dev, its scales
+ * likewise. The host pointers to free with cudaFreeHost. */
+static int moe_planar(int gs, int I, int O, unsigned seed, uint8_t **hw, float **hs, const void **dw, const float **ds) {
+    unsigned s = seed; int ng = I / gs;
+    std::vector<float> sc((size_t)O * ng);
+    for (auto &v : sc) v = 0.05f + 0.02f * frand(&s);
+    if (cudaHostAlloc((void **)hw, (size_t)O * I / 2, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostAlloc((void **)hs, sc.size() * 4, cudaHostAllocMapped) != cudaSuccess) return 0;
+    memset(*hw, 0, (size_t)O * I / 2);
+    for (int o = 0; o < O; o++) for (int i = 0; i < I; i += 2) {
+        int a = (int)(frand(&s) * 7.9f), b = (int)(frand(&s) * 7.9f);
+        for (int t = 0; t < 2; t++) {
+            int e = i + t, v = (t ? b : a) + 8, blk = e / 64, k = e % 64;
+            uint8_t &byte = (*hw)[(size_t)o * I / 2 + (size_t)blk * 32 + (k & 31)];
+            byte = (uint8_t)(k < 32 ? (byte & 0xF0) | v : (byte & 0x0F) | (v << 4));
+        }
+    }
+    memcpy(*hs, sc.data(), sc.size() * 4);
+    void *a = NULL, *b = NULL;
+    if (cudaHostGetDevicePointer(&a, *hw, 0) != cudaSuccess || cudaHostGetDevicePointer(&b, *hs, 0) != cudaSuccess) return 0;
+    *dw = a; *ds = (const float *)b;
+    return 1;
+}
 static ColiCudaTensor *moe_mat(int fmt, int gs, int I, int O, unsigned seed, std::vector<float> &dq) {
     unsigned s = seed; dq.assign((size_t)O * I, 0.f);
     ColiCudaTensor *t = NULL; int ok = 0;
@@ -609,7 +635,7 @@ int main(void) {
             CcBuf *yb = T->buf(((size_t)S * D + 8) * 4, CC_DEV), *hyb = up(hy, CC_UP);
             int ok = tb && pb && T->begin() && T->write(tb, 0, tab.data(), tab.size() * sizeof(CcExpert)) && T->write(pb, 0, part.data(), part.size() * sizeof(CcExpert)) &&
                      T->write(ib, 0, ids.data(), ids.size() * 4) && T->submit(1);
-            CcMoe m = {S, K, D, I, fmt, gs, 0, 3, 2, 4, D, 0, K, 0, K, 8, D, -1, E};
+            CcMoe m = {S, K, D, I, fmt, gs, 0, 3, 2, 4, D, 0, K, 0, K, 8, D, -1, E, 0};
             ok = ok && T->begin() && T->moe(tb, xb, ib, wb, hb, yb, NULL, &m) && T->submit(1);
             std::vector<float> y = down(yb, (size_t)S * D + 8);
             double scale = 0; for (float v : ref_full) scale = fmax(scale, fabs(v));
@@ -635,7 +661,7 @@ int main(void) {
                 double sc2 = 0; for (float v : rf) sc2 = fmax(sc2, fabs(v));
                 CcBuf *x2b = up(x2), *i2b = T->buf(ids2.size() * 4, CC_DEV), *w2b = up(w2), *h2b = T->buf(cc_moe_hid_floats(S2, K, D, I, E) * 4, CC_DEV);
                 CcBuf *y2b = T->buf((size_t)S2 * D * 4, CC_DEV), *hy2b = up(hy2, CC_UP);
-                CcMoe m2 = {S2, K, D, I, fmt, gs, 0, 3, 2, 0, D, 0, K, 0, K, 0, D, -1, E};
+                CcMoe m2 = {S2, K, D, I, fmt, gs, 0, 3, 2, 0, D, 0, K, 0, K, 0, D, -1, E, 0};
                 int ok2 = T->begin() && T->write(i2b, 0, ids2.data(), ids2.size() * 4) && T->moe(tb, x2b, i2b, w2b, h2b, y2b, NULL, &m2) && T->submit(1);
                 double ef = ok2 ? maxdiff(down(y2b, (size_t)S2 * D).data(), rf.data(), (size_t)S2 * D) / sc2 : 1;
                 CcMoe a2 = m2, b2 = m2; a2.parts = 1; b2.parts = 2; b2.h_off = 0;
@@ -644,6 +670,69 @@ int main(void) {
                 if (ef >= 2e-3 || ep >= 2e-3) printf("  (prompt rows fmt %d: relative errors %.3g, %.3g)\n", fmt, ef, ep);
                 ck(ok2 && ef < 2e-3, "forty rows: the slots sorted by expert, their GEMMs, the sum in rank order");
                 ck(okp && ep < 2e-3, "forty rows, two experts the host's: its rows plus the device's slots");
+                if (fmt == 4) {   /* experts 1 and 5 in planar blocks in host memory (the tier's RAM cache), read over the bus */
+                    std::vector<CcExpert> tp = tab;
+                    std::vector<void *> hosts;
+                    uint8_t *hwv[2][3] = {}; float *hsv[2][3] = {};
+                    int okh = 1;
+                    for (int k = 0; k < 2; k++) {
+                        int e = k ? 5 : 1;
+                        CcExpert &xp = tp[2 + e];
+                        unsigned s0 = 300 + 3 * (unsigned)e + (fmt == 4 ? 3u * E * 2u : 0u);   /* moe_mat's seeds for this expert and format */
+                        uint8_t **hw = hwv[k]; float **hs = hsv[k];
+                        okh &= moe_planar(gs, D, I, s0, &hw[0], &hs[0], &xp.g, &xp.gs) && moe_planar(gs, D, I, s0 + 1, &hw[1], &hs[1], &xp.u, &xp.us) &&
+                               moe_planar(gs, I, D, s0 + 2, &hw[2], &hs[2], &xp.d, &xp.ds);
+                        xp.planar = 1;
+                        for (int j = 0; j < 3; j++) { hosts.push_back(hw[j]); hosts.push_back(hs[j]); }
+                    }
+                    CcBuf *tpb = T->buf(tp.size() * sizeof(CcExpert), CC_DEV);
+                    CcMoe m3 = m2; m3.planar = 1;   /* the table holds planar entries: the f16 GEMMs */
+                    int okq = okh && tpb && T->begin() && T->write(tpb, 0, tp.data(), tp.size() * sizeof(CcExpert)) &&
+                              T->moe(tpb, x2b, i2b, w2b, h2b, y2b, NULL, &m3) && T->submit(1);
+                    double eq = okq ? maxdiff(down(y2b, (size_t)S2 * D).data(), rf.data(), (size_t)S2 * D) / sc2 : 1;
+                    if (eq >= 2e-3) printf("  (prompt rows, planar experts in host memory: relative error %.3g)\n", eq);
+                    ck(okq && eq < 2e-3, "forty rows, two experts in planar blocks in host memory, read over the bus");
+                    /* the same two staged into VRAM from those blocks (fetch: the tier's host pool for a prompt
+                     * chunk), twice in one frame in swapped places: the second copy waits for the first
+                     * table's GEMMs (fetch_done), or the first one reads half-copied weights */
+                    if (okh && T->size >= offsetof(ColiCudaChainOps, dev_addr) + sizeof T->dev_addr) {
+                        size_t mb = (size_t)D * I / 2, nsc = (size_t)D * I / gs, wa = (3 * mb + 255) / 256 * 256;
+                        size_t st = wa + (3 * nsc * 4 + 255) / 256 * 256;
+                        CcBuf *sg = T->buf(2 * st, CC_DEV);
+                        const char *base = sg ? (const char *)T->dev_addr(sg) : NULL;
+                        std::vector<CcExpert> t1 = tab, t2 = tab;
+                        std::vector<CcFetch> f1, f2;
+                        for (int k = 0; k < 2 && base; k++) for (int r = 0; r < 2; r++) {
+                            int at = r ? 1 - k : k;   /* round r: expert k at place k, then at the other */
+                            CcExpert &xp = (r ? t2 : t1)[2 + (k ? 5 : 1)];
+                            std::vector<CcFetch> &f = r ? f2 : f1;
+                            const char *g = base + at * st;
+                            xp.g = g; xp.u = g + mb; xp.d = g + 2 * mb;
+                            xp.gs = (const float *)(g + wa); xp.us = xp.gs + nsc; xp.ds = xp.gs + 2 * nsc; xp.planar = 1;
+                            for (int j = 0; j < 3; j++) {
+                                f.push_back({hwv[k][j], at * st + j * mb, mb});
+                                f.push_back({hsv[k][j], at * st + wa + j * nsc * 4, nsc * 4});
+                            }
+                        }
+                        CcBuf *t1b = T->buf(t1.size() * sizeof(CcExpert), CC_DEV), *t2b = T->buf(t2.size() * sizeof(CcExpert), CC_DEV);
+                        CcBuf *y3b = T->buf((size_t)S2 * D * 4, CC_DEV);
+                        int oks = base && t1b && t2b && y3b && T->begin() && T->write(t1b, 0, t1.data(), t1.size() * sizeof(CcExpert)) &&
+                                  T->write(t2b, 0, t2.data(), t2.size() * sizeof(CcExpert)) && T->submit(1);
+                        oks = oks && T->begin() && T->fetch(sg, f1.data(), (int)f1.size()) && T->fetch_wait() &&
+                              T->moe(t1b, x2b, i2b, w2b, h2b, y2b, NULL, &m3) && T->fetch_done() &&
+                              T->fetch(sg, f2.data(), (int)f2.size()) && T->fetch_wait() &&
+                              T->moe(t2b, x2b, i2b, w2b, h2b, y3b, NULL, &m3) && T->fetch_done() && T->submit(1);
+                        double e1 = oks ? maxdiff(down(y2b, (size_t)S2 * D).data(), rf.data(), (size_t)S2 * D) / sc2 : 1;
+                        double e2 = oks ? maxdiff(down(y3b, (size_t)S2 * D).data(), rf.data(), (size_t)S2 * D) / sc2 : 1;
+                        if (e1 >= 2e-3 || e2 >= 2e-3) printf("  (prompt rows, staged experts: relative errors %.3g, %.3g)\n", e1, e2);
+                        ck(oks && e1 < 2e-3 && e2 < 2e-3, "forty rows, two experts staged into VRAM from host memory, twice in swapped places");
+                        CcFetch bad = {hwv[0][0], 2 * st - 8, 16};
+                        ck(!sg || !T->fetch(sg, &bad, 1), "a fetch past its buffer refused");
+                        T->free(sg); T->free(t1b); T->free(t2b); T->free(y3b);
+                    }
+                    for (void *h : hosts) cudaFreeHost(h);
+                    T->free(tpb);
+                }
                 T->free(x2b); T->free(i2b); T->free(w2b); T->free(h2b); T->free(y2b); T->free(hy2b);
             }
             for (int e = 0; e < E; e++) { coli_cuda_tensor_free(tg[e]); coli_cuda_tensor_free(tu[e]); coli_cuda_tensor_free(td[e]); }
