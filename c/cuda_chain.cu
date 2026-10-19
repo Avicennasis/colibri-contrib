@@ -427,6 +427,94 @@ __global__ static void __launch_bounds__(128) cc_dnrec_k(const float *__restrict
         for (int k = 0; k < KD; k++) st[sb + k * p.VD + v] = col[k];
     }
 }
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#define cc_shfl_xor(v, o) __shfl_xor((v), (o), 32)   /* 32-lane groups on a wave64 device too */
+#else
+#define cc_shfl_xor(v, o) __shfl_xor_sync(0xffffffffu, (v), (o), 32)
+#endif
+#define CC_DNREC_ROWS 8   /* rows from which cc_dnrec takes cc_dnrec_rows_k (COLI_CUDA_DNREC_ROWS=0 never) */
+/* A prompt chunk's rows (cc_dnrec from CC_DNREC_ROWS rows): cc_dnrec_k's arithmetic, R
+ * rows at a time. cc_dnrec_k takes about eighteen barriers a row (the tree sums of the q, k
+ * and output norms); here, per block: the q and k norms, beta, decay and v in parallel (a
+ * warp a vector), the rows in order with no barrier (each thread's column in registers,
+ * its dots over the block's shared q and k), then each row's gated RMSNorm (a warp a row):
+ * three barriers a block. The norms' sums run in a warp's order, the state's as before. */
+template <int KD, int R>
+__global__ static void __launch_bounds__(128) cc_dnrec_rows_k(const float *__restrict__ cv, const float *__restrict__ ab,
+        const float *__restrict__ z, float *__restrict__ st, const float *__restrict__ prm, float *__restrict__ y,
+        float *__restrict__ snap, CcDnRec p) {
+    __shared__ float qs[R][KD];
+    __shared__ float ks[R][KD];
+    __shared__ float vs[R][128];
+    __shared__ float os[R][128];
+    __shared__ float bs[R], ds[R];
+    int h = blockIdx.x, v = threadIdx.x, wp = v >> 5, lane = v & 31;
+    bool own = v < p.VD;
+    int kh = h / (p.VH / p.KH);
+    float col[KD];
+    int sb = p.st_off + h * KD * p.VD, nb = p.snap_off + h * KD * p.VD;
+    #pragma unroll
+    for (int k = 0; k < KD; k++) col[k] = own ? st[sb + k * p.VD + v] : 0.f;
+    float alog = prm[p.prm_off + h], dtb = prm[p.prm_off + p.VH + h];
+    for (int s0 = 0; s0 < p.S; s0 += R) {
+        int nr = min(R, p.S - s0);
+        for (int w = wp; w < 2 * nr; w += 4) {
+            int r = w >> 1, isk = w & 1, cb = p.cv_off + (s0 + r) * p.cv_row + isk * p.Ktot + kh * KD;
+            float a = 0.f;
+            for (int k = lane; k < KD; k += 32) { float x = cv[cb + k]; a += x * x; }
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) a += cc_shfl_xor(a, m);
+            float sc = 1.f / sqrtf(a + 1e-6f) * (isk ? 1.f : p.qscale);
+            for (int k = lane; k < KD; k += 32) { float x = cv[cb + k] * sc; if (isk) ks[r][k] = x; else qs[r][k] = x; }
+        }
+        for (int i = v; i < nr * p.VD; i += 128) {
+            int r = i / p.VD, c = i - r * p.VD;
+            vs[r][c] = cv[p.cv_off + (s0 + r) * p.cv_row + 2 * p.Ktot + h * p.VD + c];
+        }
+        if (v < nr) {
+            int s = s0 + v;
+            float bv = ab[p.b_off + s * p.b_row + h], av = ab[p.a_off + s * p.a_row + h];
+            bs[v] = 1.f / (1.f + expf(-bv));
+            ds[v] = expf(-expf(alog) * cc_softplus(av + dtb));
+        }
+        __syncthreads();
+        if (own)
+            for (int r = 0; r < nr; r++) {
+                float decay = ds[r], kvs = 0.f, o = 0.f;
+                #pragma unroll
+                for (int k = 0; k < KD; k++) { col[k] *= decay; kvs += ks[r][k] * col[k]; }
+                float delta = (vs[r][v] - kvs) * bs[r];
+                #pragma unroll
+                for (int k = 0; k < KD; k++) col[k] += ks[r][k] * delta;
+                #pragma unroll
+                for (int k = 0; k < KD; k++) o += qs[r][k] * col[k];
+                os[r][v] = o;
+                if (s0 + r == p.snap_row) {
+                    #pragma unroll
+                    for (int k = 0; k < KD; k++) snap[nb + k * p.VD + v] = col[k];
+                }
+            }
+        __syncthreads();
+        for (int r = wp; r < nr; r += 4) {
+            int s = s0 + r;
+            float oo = 0.f;
+            for (int c = lane; c < p.VD; c += 32) oo += os[r][c] * os[r][c];
+            #pragma unroll
+            for (int m = 16; m > 0; m >>= 1) oo += cc_shfl_xor(oo, m);
+            float rr = 1.f / sqrtf(oo / (float)p.VD + p.eps);
+            for (int c = lane; c < p.VD; c += 32) {
+                float zv = z[p.z_off + s * p.z_row + h * p.VD + c];
+                float g = (p.flags & 1) ? 1.f / (1.f + expf(-zv)) : zv / (1.f + expf(-zv));
+                y[p.y_off + s * p.y_row + h * p.VD + c] = os[r][c] * rr * prm[p.prm_off + 2 * p.VH + c] * g;
+            }
+        }
+        __syncthreads();
+    }
+    if (own) {
+        #pragma unroll
+        for (int k = 0; k < KD; k++) st[sb + k * p.VD + v] = col[k];
+    }
+}
 __device__ static float cc_sig(float x) { return 1.f / (1.f + expf(-x)); }
 /* chain_qsa.comp: mode 0 one block of 128 per block key; mode 1 one block per query row */
 __global__ static void __launch_bounds__(128) cc_qsa_k(const float *__restrict__ src, const float *__restrict__ w,
@@ -619,11 +707,6 @@ __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ 
 
 /* chain_route.comp: one block per row, its 8 warps the shader's subgroups (the row's max
  * and sum: each warp's, then theirs in warp order) */
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
-#define cc_shfl_xor(v, o) __shfl_xor((v), (o), 32)   /* 32-lane groups on a wave64 device too */
-#else
-#define cc_shfl_xor(v, o) __shfl_xor_sync(0xffffffffu, (v), (o), 32)
-#endif
 __device__ __forceinline__ float cc_wmax(float v) { for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, cc_shfl_xor(v, o)); return v; }
 __device__ __forceinline__ float cc_wsum(float v) { for (int o = 16; o > 0; o >>= 1) v += cc_shfl_xor(v, o); return v; }
 __device__ __forceinline__ int cc_wmin(int v) { for (int o = 16; o > 0; o >>= 1) v = min(v, cc_shfl_xor(v, o)); return v; }
@@ -1021,6 +1104,20 @@ static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *pr
     if (p->snap_row >= 0 && !snap) return 0;
     const float *a = fp(cv), *b = fp(ab), *zz = fp(z), *pr = fp(prm);
     float *s = fpw(st), *yy = fpw(y), *sn = fpw(snap);
+    static int rows_on = -1;
+    if (rows_on < 0) { const char *e = getenv("COLI_CUDA_DNREC_ROWS"); rows_on = !(e && *e == '0'); }
+    if (rows_on && p->S >= CC_DNREC_ROWS) {   /* a prompt chunk's rows, a block at a time */
+        switch (KD) {
+        case 4:   cc_dnrec_rows_k<4, 16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        case 8:   cc_dnrec_rows_k<8, 16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        case 16:  cc_dnrec_rows_k<16, 16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        case 32:  cc_dnrec_rows_k<32, 16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        case 64:  cc_dnrec_rows_k<64, 16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        case 128: cc_dnrec_rows_k<128, 16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        case 256: cc_dnrec_rows_k<256, 8><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); return launched(c, "dnrec rows");
+        default: return 0;
+        }
+    }
     switch (KD) {
     case 4:   cc_dnrec_k<4><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); break;
     case 8:   cc_dnrec_k<8><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); break;

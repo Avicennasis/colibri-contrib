@@ -483,18 +483,21 @@ int main(void) {
         T->free(ib); T->free(wb); T->free(rb); T->free(ob); T->free(sb);
     }
     printf("dnrec\n");
-    for (int KD = 8; KD <= 128; KD += 120) {
-        const int VH = 4, KH = 2, VD = KD == 8 ? 16 : 128, S = 4, Ktot = KH * KD, CD = 2 * Ktot + VH * VD, vd = VH * VD;
+    /* four rows (cc_dnrec_k) and 37 (cc_dnrec_rows_k: blocks past the first, the last part
+     * full, the snapshot inside one) */
+    for (int it = 0; it < 4; it++) {
+        const int KD = it & 1 ? 128 : 8, S = it < 2 ? 4 : 37, snap_at = S == 4 ? 1 : 20;
+        const int VH = 4, KH = 2, VD = KD == 8 ? 16 : 128, Ktot = KH * KD, CD = 2 * Ktot + VH * VD, vd = VH * VD;
         std::vector<float> cv = rnd((size_t)S * CD, 61), ab = rnd((size_t)S * 2 * VH, 62), z = rnd((size_t)S * (CD + vd), 63), st = rnd((size_t)VH * KD * VD, 64, 0.1f);
         std::vector<float> prm(2 * VH + VD); unsigned s = 65; for (int h = 0; h < VH; h++) { prm[h] = -1.f + 0.5f * frand(&s); prm[VH + h] = 0.2f * frand(&s); } for (int v = 0; v < VD; v++) prm[2 * VH + v] = 1.f + 0.2f * frand(&s);
         std::vector<float> y((size_t)S * vd), snap((size_t)VH * KD * VD), rst = st, ry = y, rs = snap;
-        CcDnRec p = {S, VH, KH, VD, Ktot, 0, CD, 0, 2 * VH, VH, 2 * VH, CD, CD + vd, 0, vd, 1, 0, 1e-6f, 1.f / sqrtf((float)KD), 0, 0, 0};
+        CcDnRec p = {S, VH, KH, VD, Ktot, 0, CD, 0, 2 * VH, VH, 2 * VH, CD, CD + vd, 0, vd, snap_at, 0, 1e-6f, 1.f / sqrtf((float)KD), 0, 0, 0};
         ref_dnrec(KD, cv.data(), ab.data(), z.data(), rst.data(), prm.data(), ry.data(), rs.data(), &p);
         CcBuf *cb = up(cv), *bb = up(ab), *zb = up(z), *sb = up(st), *pb = up(prm), *yb = T->buf(y.size() * 4, CC_DEV), *nb = T->buf(snap.size() * 4, CC_DEV);
         char what[96];
-        snprintf(what, sizeof what, "KD %d: four rows, the silu gate, z inside a wider row", KD);
+        snprintf(what, sizeof what, "KD %d: %d rows, the silu gate, z inside a wider row", KD, S);
         ck(T->begin() && T->dnrec(KD, cb, bb, zb, sb, pb, yb, nb, &p) && T->submit(1) && maxdiff(down(yb, y.size()).data(), ry.data(), y.size()) < 1e-4, what);
-        ck(maxdiff(down(sb, st.size()).data(), rst.data(), st.size()) < 1e-4 && maxdiff(down(nb, snap.size()).data(), rs.data(), snap.size()) < 1e-4, "the state carried, the snapshot after row 1");
+        ck(maxdiff(down(sb, st.size()).data(), rst.data(), st.size()) < 1e-4 && maxdiff(down(nb, snap.size()).data(), rs.data(), snap.size()) < 1e-4, "the state carried, the snapshot");
         CcDnRec p2 = p; p2.flags = 1; p2.snap_row = -1;
         ref_dnrec(KD, cv.data(), ab.data(), z.data(), rst.data(), prm.data(), ry.data(), rs.data(), &p2);
         ck(T->begin() && T->dnrec(KD, cb, bb, zb, sb, pb, yb, NULL, &p2) && T->submit(1) && maxdiff(down(yb, y.size()).data(), ry.data(), y.size()) < 1e-4 && maxdiff(down(sb, st.size()).data(), rst.data(), st.size()) < 1e-4, "the sigmoid gate, from the carried state");
