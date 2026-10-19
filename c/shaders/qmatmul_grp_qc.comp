@@ -44,6 +44,12 @@ shared uvec4 sw[4u * 4u * 32u];    // the weights: 4 output tiles (gate 0-1, up 
 shared float sacc[8u * 256u];      // the accumulators, tile by tile, for the epilogue
 
 uint pk(float a, float b) { return packFloat2x16(f16vec2(float16_t(a), float16_t(b))); }
+// an activation operand: held to +-65504 (a value past it would round to inf and the tile's
+// sums with it; the CUDA f16 GEMMs hold x the same way), a NaN kept a NaN. The weights, a
+// format's codes times its scales, stay well inside f16 and skip it (the hold on them cost
+// Qwen3.6's prompt 4%)
+float h16(float a) { return isnan(a) ? a : clamp(a, -65504.0, 65504.0); }
+uint pkx(float a, float b) { return pk(h16(a), h16(b)); }
 
 // row o's weights k..k+31 (fmt 1: eight words of int8, else four of int4) times their scales,
 // as f16 into output tile q's row r, k tiles kt0 and kt0 + 1
@@ -113,7 +119,7 @@ void main() {
                 vec4 a = vec4(0.0), b = vec4(0.0);
                 if (ok) { uint i4 = (xr * K + k0 + k) / 4u; a = x4[i4]; b = x4[i4 + 1u]; }
                 sx[((r >> 4u) * 4u + (k >> 4u)) * 32u + (r & 15u) * 2u + ((k & 15u) >> 3u)] =
-                    uvec4(pk(a.x, a.y), pk(a.z, a.w), pk(b.x, b.y), pk(b.z, b.w));
+                    uvec4(pkx(a.x, a.y), pkx(a.z, a.w), pkx(b.x, b.y), pkx(b.z, b.w));
             }
         }
         barrier();

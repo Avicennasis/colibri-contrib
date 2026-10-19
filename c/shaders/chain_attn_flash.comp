@@ -59,6 +59,12 @@ shared float16_t sp[4u * 256u];        // P as 4 A tiles (row, key)
 shared float sinvl[16];                // 1 / l per row
 
 uint pk(float a, float b) { return packFloat2x16(f16vec2(float16_t(a), float16_t(b))); }
+// an activation operand: held to +-65504 (a value past it would round to inf and the tile's
+// sums with it; the CUDA f16 GEMMs hold x the same way), a NaN kept a NaN. The weights, a
+// format's codes times its scales, stay well inside f16 and skip it (the hold on them cost
+// Qwen3.6's prompt 4%)
+float h16(float a) { return isnan(a) ? a : clamp(a, -65504.0, 65504.0); }
+uint pkx(float a, float b) { return pk(h16(a), h16(b)); }
 
 // stage keys k0 .. k0+63 of kv head g from f32 memory into skv (zero past nt)
 void stage(uint g, uint k0, uint nt, uint tid, bool isv) {
@@ -71,7 +77,7 @@ void stage(uint g, uint k0, uint nt, uint tid, bool isv) {
             if (isv) { base += uint(p.v_off); a = vec4(vc[base], vc[base+1u], vc[base+2u], vc[base+3u]); b = vec4(vc[base+4u], vc[base+5u], vc[base+6u], vc[base+7u]); }
             else     { base += uint(p.k_off); a = vec4(kc[base], kc[base+1u], kc[base+2u], kc[base+3u]); b = vec4(kc[base+4u], kc[base+5u], kc[base+6u], kc[base+7u]); }
         }
-        skv[((kl >> 4u) * NDT + (d8 >> 1u)) * 32u + (kl & 15u) * 2u + (d8 & 1u)] = uvec4(pk(a.x, a.y), pk(a.z, a.w), pk(b.x, b.y), pk(b.z, b.w));
+        skv[((kl >> 4u) * NDT + (d8 >> 1u)) * 32u + (kl & 15u) * 2u + (d8 & 1u)] = uvec4(pkx(a.x, a.y), pkx(a.z, a.w), pkx(b.x, b.y), pkx(b.z, b.w));
     }
 }
 
@@ -98,7 +104,7 @@ void main() {
             a = vec4(q[base], q[base+1u], q[base+2u], q[base+3u]) * p.scale;
             b = vec4(q[base+4u], q[base+5u], q[base+6u], q[base+7u]) * p.scale;
         }
-        skv[(d8 >> 1u) * 32u + r * 2u + (d8 & 1u)] = uvec4(pk(a.x, a.y), pk(a.z, a.w), pk(b.x, b.y), pk(b.z, b.w));
+        skv[(d8 >> 1u) * 32u + r * 2u + (d8 & 1u)] = uvec4(pkx(a.x, a.y), pkx(a.z, a.w), pkx(b.x, b.y), pkx(b.z, b.w));
     }
     barrier();
     bool mm = sgi < 4u;                              // subgroup-uniform: this subgroup's share of the matrix work

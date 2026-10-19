@@ -70,6 +70,12 @@ void fetch_raw(uint s0, uint o0, uint k0, uint tid) {
     }
 }
 uint pk(float a, float b) { return packFloat2x16(f16vec2(float16_t(a), float16_t(b))); }
+// an activation operand: held to +-65504 (a value past it would round to inf and the tile's
+// sums with it; the CUDA f16 GEMMs hold x the same way), a NaN kept a NaN. The weights, a
+// format's codes times its scales, stay well inside f16 and skip it (the hold on them cost
+// Qwen3.6's prompt 4%)
+float h16(float a) { return isnan(a) ? a : clamp(a, -65504.0, 65504.0); }
+uint pkx(float a, float b) { return pk(h16(a), h16(b)); }
 uint i8(uint w, uint k) { return uint(int(w << (24u - 8u * k)) >> 24); }
 void store_raw(uint tid) {
     {
@@ -77,7 +83,7 @@ void store_raw(uint tid) {
         [[unroll]] for (uint c = 0u; c < XPL / 8u; c++) {
             uint k = kk + 8u * c;
             uint base = ((r >> 4u) * 4u + (k >> 4u)) * 32u + (r & 15u) * 2u + ((k & 15u) >> 3u);
-            sx[base] = uvec4(pk(rx[8u*c], rx[8u*c+1u]), pk(rx[8u*c+2u], rx[8u*c+3u]), pk(rx[8u*c+4u], rx[8u*c+5u]), pk(rx[8u*c+6u], rx[8u*c+7u]));
+            sx[base] = uvec4(pkx(rx[8u*c], rx[8u*c+1u]), pkx(rx[8u*c+2u], rx[8u*c+3u]), pkx(rx[8u*c+4u], rx[8u*c+5u]), pkx(rx[8u*c+6u], rx[8u*c+7u]));
         }
     }
     uint n = tid >> 1u, hf = tid & 1u;

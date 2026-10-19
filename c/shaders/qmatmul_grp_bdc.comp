@@ -52,6 +52,12 @@ shared uint bs_grid[2048];
 shared uint bs_ks[128];
 
 uint pk(float a, float b) { return packFloat2x16(f16vec2(float16_t(a), float16_t(b))); }
+// an activation operand: held to +-65504 (a value past it would round to inf and the tile's
+// sums with it; the CUDA f16 GEMMs hold x the same way), a NaN kept a NaN. The weights, a
+// format's codes times its scales, stay well inside f16 and skip it (the hold on them cost
+// Qwen3.6's prompt 4%)
+float h16(float a) { return isnan(a) ? a : clamp(a, -65504.0, 65504.0); }
+uint pkx(float a, float b) { return pk(h16(a), h16(b)); }
 WRef g_bw; WRef4 g_bw4; bool g_b16; TRef g_tab;
 uint g_row, g_q, g_k0;   // the decoding thread's row in its tile, its output tile, the step's first vec4
 void bs_put(vec4 w, uint i) {
@@ -111,7 +117,7 @@ void main() {
                 vec4 a = vec4(0.0), b = vec4(0.0);
                 if (ok) { uint i4 = (xr * K + k0 + k) / 4u; a = x4[i4]; b = x4[i4 + 1u]; }
                 sx[((r >> 4u) * 4u + (k >> 4u)) * 32u + (r & 15u) * 2u + ((k & 15u) >> 3u)] =
-                    uvec4(pk(a.x, a.y), pk(a.z, a.w), pk(b.x, b.y), pk(b.z, b.w));
+                    uvec4(pkx(a.x, a.y), pkx(a.z, a.w), pkx(b.x, b.y), pkx(b.z, b.w));
             }
         }
         barrier();
