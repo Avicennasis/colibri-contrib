@@ -944,7 +944,7 @@ def _q38_chain_layout(info, env, vulkan):
     # streams' read-back and the final norm
     r, nb, rot = rows, 1, rotary if rotary > 0 else 2
     counts = [r * W, r * W, r * R, r * W, r * H, r * C, r * C, r * H, r * QH * 2 * D, r * kvo, r * kvo,
-              r * (IQ + 1) * ID, r * QH * D, r * 2 * nb, r * (budget + ratio), r * CD, r * VH * VD, r * 2 * VH,
+              r * (IQ + 1) * ID, r * QH * D, r * nb, r * (budget + ratio), r * CD, r * VH * VD, r * 2 * VH,
               r * CD, r * VH * VD, r * E, r * SI, r * SI, r * SI, r * H, r, r * H, r * W, r * H, r * W, r * W,
               r * H, r * E, r * (2 * kvo + ID), 2 * vocab, r * H, r * Ep, r * rot, nb * rot]
     fixed = sum(4 * (n if n else 1) for n in counts) + (rows + 1) * W * 4

@@ -2219,7 +2219,8 @@ class Qwen38PartialChainTest(unittest.TestCase):
 
     def test_qwen38_layout_is_the_engines(self):
         # The numbers qwen38 printed for these geometries on Lavapipe ("[VK] qwen38 chain
-        # fit: ... the engine's 1529872 B ..., tail 8960 B, layers 47664 92768 24112 92768 B"):
+        # fit: ... the engine's 1528848 B ..., tail 8960 B, layers 47664 92768 24112 92768 B";
+        # 1529872 before the QSA scores went to one float a block a row, #2116):
         # bf16 by default, the int8 trunk (Q38_TRUNK_MIN_KB=0), f32, the PLE at layer 2, and
         # the MTP head's matrices in the tail.
         from resource_plan import vk_chain_fit, vk_fit_pools
@@ -2236,7 +2237,7 @@ class Qwen38PartialChainTest(unittest.TestCase):
                 info = self.write_q38(ple)
                 fit = vk_chain_fit(info, "qwen38", dict(on, **env), device)
                 self.assertEqual(fit["layers"], layers)
-                self.assertEqual(fit["fixed"] - vk_fit_pools(0), 1529872)
+                self.assertEqual(fit["fixed"] - vk_fit_pools(0), 1528848)
                 self.assertEqual(fit["n"], 4)
                 self.assertTrue(fit["tail"])
         # the MTP head goes with the tail under Q38_MTP=1 (43008 B in bf16, 27392 B as int8 rows)
