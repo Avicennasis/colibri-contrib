@@ -2091,13 +2091,21 @@ integer dot products (`VK_KHR_shader_integer_dot_product`,
   integer inner sums (`dotPacked4x8EXT`).
 
 Against the CPU's integer form, `tests/test_vk_chain`'s `moe i8` cases agree to about
-2e-7 for every type it decodes (Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_S,
-IQ4_NL, IQ4_XS, Q2_0), where the float form differs by about 1e-2: on the device the experts now
+2e-7 for every type it decodes (Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS,
+IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, Q2_0), where the float form differs by about 1e-2: on the device the experts now
 give what the CPU gives. Both of a layer's formats must have the form (else the float
 pipeline runs that layer); a prompt chunk's grouped GEMMs keep their float sums.
 `COLI_VK_IDOT=0` leaves the extension off; a device that supports it without
 acceleration (Lavapipe) keeps the float form unless a test asks (`vkc_moe_set_idot`).
 The chain's line counts the layer steps that took it (`N in the integer form`).
+
+Both block formats' pipelines (the float form's and the integer form's) are made for a
+layer's pair of types (`chain_moe.comp`'s `BTG` and `BTD`), so each holds those two
+decoders alone: Qwen3.8's IQ2_S/Q2_0 decode 50.0-50.8 -> 51.1-51.9 tok/s on the RTX PRO
+4000, and a software device no longer builds every type's decoders at a layer's first
+launch (minutes on Lavapipe). The engines' prewarm makes one a pair of the file's gate/up
+and down types (every type's past 16 pairs); a step with no known types keeps the
+pipeline of every type.
 
 Measured on the RTX PRO 4000 (`COLI_VK_CHAIN_BENCH=moe`, the float form with
 `COLI_VK_IDOT=0`), a layer's experts in microseconds:

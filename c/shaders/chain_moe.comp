@@ -51,6 +51,12 @@ layout(constant_id = 2) const int XQ = 256;   // uvec4s of the quantized row's c
 // the gate and up pass of Qwen3.6's int4-g64 experts took 77 us a layer on an RTX PRO 4000,
 // with fmt 4's alone 42. 0: every format, by the table's word.
 layout(constant_id = 3) const int FMTC = 0;
+// a GGUF layer's block types plus one (gate and up; down), so the block formats' pipeline
+// holds those decoders alone: with every type's, a software device took minutes to build
+// it at its first launch (each entry of the layer has these types; the host keeps
+// vk_dmoe.h's tables so). 0: the table's word, every type.
+layout(constant_id = 4) const int BTG = 0;
+layout(constant_id = 5) const int BTD = 0;
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WRef4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer WRef { uint v[]; };
@@ -394,6 +400,8 @@ void main() {
     if (e < 0 || tab[eb + 18u] == 0u) return;
     uint fo = p.mode == 0 ? 12u : 15u;                  // the matrices' format words
     int fmt = int(tab[eb + fo]), rws = int(tab[eb + fo + 1u]), gs = int(tab[eb + fo + 2u]);
+    if (BD != 0 && BTG > 0 && BTD > 0) fmt = p.mode == 0 ? 99 + BTG : 99 + BTD;
+    int tg = BTG > 0 ? BTG - 1 : fmt - 100, td = BTD > 0 ? BTD - 1 : fmt - 100;   // each pass's type, constant when known
     bool wd = wide(fmt, rws, n);
 #ifdef IDOT
     /* uniform: the pair's format */
@@ -424,9 +432,9 @@ void main() {
             uint rb = oc * uint(rws) * 4u, nst = live ? steps : 0u;
             float g, u = 0.0;
             if (p.mode == 0) {
-                vec2 gu = bs_row2(fmt - 100, addr(eb), addr(eb + 4u), rb, jj, lpr, nst);
+                vec2 gu = bs_row2(tg, addr(eb), addr(eb + 4u), rb, jj, lpr, nst);
                 g = red(gu.x, lpr); u = red(gu.y, lpr);
-            } else { bs_mat(eb + 8u); g = red(bs_row(fmt - 100, rb, jj, lpr, nst), lpr); }
+            } else { bs_mat(eb + 8u); g = red(bs_row(td, rb, jj, lpr, nst), lpr); }
             if (jj != 0u || !live) continue;
             if (p.mode == 0) hid[j * p.I + int(o)] = act(g, u);
             else hid[yko + j * p.D + int(o)] = g;

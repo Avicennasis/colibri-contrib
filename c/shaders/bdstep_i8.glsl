@@ -41,7 +41,8 @@ float bsi_div(float a, float b) {
     return uintBitsToFloat((uint(e + 127) << 23) | (m & 0x7FFFFFu));
 }
 float bsi_id(float amax) { return amax > 0.0 ? bsi_div(127.0, amax) : 0.0; }
-bool bsi_has(int t) { return t == 8 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 20 || t == 21 || t == 22 || t == 23 || t == 42; }
+bool bsi_has(int t) { return t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 16 || t == 17 || t == 18 || t == 19 || t == 20 ||
+                             t == 21 || t == 22 || t == 23 || t == 29 || t == 42; }
 int bsi_dot(uint w, uint r, uint xi) { return dotPacked4x8EXT(int(w), BSI_X(r, xi)); }
 // 0xFF in each byte whose bit (of the low four) is set: those bytes are negated
 uint bsi_smask(uint b4) { return ((b4 * 0x00204081u) & 0x01010101u) * 0xFFu; }
@@ -185,6 +186,91 @@ void bsi_step(int t, uint rb, uint q) {
                 if (l < 2) s0 += v; else s1 += v;
             }
             BSI_ACC(r, BSI_DX(r, q) * (d * (0.5 + float(scb & 15u)) * 0.25 * float(s0) + d * (0.5 + float(scb >> 4)) * 0.25 * float(s1)));
+        }
+        return;
+    }
+    if (t == 18) {   // IQ3_XXS: 8 grid rows of 4, their signs (ksigns) and a 4-bit scale
+        uint b = q >> 3, ib = q & 7u, base = rb + b * 98u;
+        uint g0 = bs_ldu(base + 2u + 8u * ib), g1 = bs_ldu(base + 6u + 8u * ib), a = bs_ldu(base + 66u + 4u * ib);
+        uint w[8];
+        [[unroll]] for (int l = 0; l < 4; l++) {
+            uint gw = l < 2 ? g0 : g1, sh = 16u * uint(l & 1), s8 = bs_ks[(a >> (7u * uint(l))) & 127u];
+            w[2 * l] = bsi_neg(bs_grid[(gw >> sh) & 255u], s8); w[2 * l + 1] = bsi_neg(bs_grid[(gw >> (sh + 8u)) & 255u], s8 >> 4);
+        }
+        float d = bs_f16at(base);
+        BSI_ROWS {
+            int s = 0;
+            [[unroll]] for (int l = 0; l < 8; l++) s += bsi_dot(w[l], r, q * 8u + uint(l));
+            BSI_ACC(r, BSI_DX(r, q) * d * (0.5 + float(a >> 28)) * 0.5 * float(s));
+        }
+        return;
+    }
+    if (t == 10) {   // Q2_K: 2-bit codes, a scale and a min per 16
+        uint b = q >> 3, s = q & 7u, base = rb + b * 84u, sh = 2u * (s & 3u), qa = base + 16u + 32u * (s >> 2);
+        uint s0 = bs_u8at(base + 2u * s), s1 = bs_u8at(base + 2u * s + 1u);
+        vec2 dm = unpackHalf2x16(bs_ldu(base + 80u));
+        uint w[8];
+        [[unroll]] for (int k = 0; k < 8; k++) w[k] = (bs_ldu(qa + 4u * uint(k)) >> sh) & 0x03030303u;
+        BSI_ROWS {
+            int a0 = 0, a1 = 0;
+            [[unroll]] for (int k = 0; k < 8; k++) { int v = bsi_dot(w[k], r, q * 8u + uint(k)); if (k < 4) a0 += v; else a1 += v; }
+            BSI_ACC(r, BSI_DX(r, q) * (dm.x * float(s0 & 15u) * float(a0) - dm.y * float(s0 >> 4) * float(BSI_XS(r, 2u * q)) +
+                                       dm.x * float(s1 & 15u) * float(a1) - dm.y * float(s1 >> 4) * float(BSI_XS(r, 2u * q + 1u))));
+        }
+        return;
+    }
+    if (t == 11) {   // Q3_K: codes 0..7 (the 2 low bits, hmask's bit as 4), less 4 times the sum of x; a scale less 32 per 16
+        uint b = q >> 3, s = q & 7u, base = rb + b * 110u, sh = 2u * (s & 3u), qa = base + 32u + 32u * (s >> 2);
+        float d = bs_f16at(base + 108u), sw0, sw1;
+        [[unroll]] for (int h = 0; h < 2; h++) {
+            uint k = 2u * s + uint(h);
+            uint l = k < 8u ? (bs_u8at(base + 96u + k) & 15u) : (bs_u8at(base + 88u + k) >> 4);
+            uint hh = (bs_u8at(base + 104u + (k & 3u)) >> (2u * (k >> 2))) & 3u;
+            float v = d * float(int(l | (hh << 4)) - 32);
+            if (h == 0) sw0 = v; else sw1 = v;
+        }
+        uint w[8];
+        [[unroll]] for (int k = 0; k < 8; k++)
+            w[k] = ((bs_ldu(qa + 4u * uint(k)) >> sh) & 0x03030303u) | (((bs_ldu(base + 4u * uint(k)) >> s) & 0x01010101u) << 2);
+        BSI_ROWS {
+            int a0 = 0, a1 = 0;
+            [[unroll]] for (int k = 0; k < 8; k++) { int v = bsi_dot(w[k], r, q * 8u + uint(k)); if (k < 4) a0 += v; else a1 += v; }
+            a0 -= 4 * BSI_XS(r, 2u * q); a1 -= 4 * BSI_XS(r, 2u * q + 1u);
+            BSI_ACC(r, BSI_DX(r, q) * (sw0 * float(a0) + sw1 * float(a1)));
+        }
+        return;
+    }
+    if (t == 19 || t == 29) {   // IQ1_S / IQ1_M: 8 * (the grid rows' dot) + the delta's sign times the sum of x
+        uint b = q >> 3, ib = q & 7u, base = rb + b * (t == 19 ? 50u : 56u);
+        uint qs, qh; float sw0, sw1;
+        if (t == 19) {
+            qs = bs_ldu(base + 2u + 4u * ib); qh = bs_u16at(base + 34u + 2u * ib);
+            sw0 = sw1 = bs_f16at(base) * float(2u * ((qh >> 12) & 7u) + 1u) * 0.125;
+        } else {
+            qs = bs_ldu(base + 4u * ib); qh = bs_u16at(base + 32u + 2u * ib);
+            uint s01 = bs_ldu(base + 48u), s23 = bs_ldu(base + 52u);
+            float d = unpackHalf2x16(((s01 >> 12) & 0xFu) | ((s01 >> 24) & 0xF0u) | ((s23 >> 4) & 0xF00u) | ((s23 >> 16) & 0xF000u)).x;
+            uint scw = (ib >> 1) == 0u ? s01 : (ib >> 1) == 1u ? s01 >> 16 : (ib >> 1) == 2u ? s23 : s23 >> 16;
+            sw0 = d * float(2u * ((scw >> (3u * ((2u * ib) & 3u))) & 7u) + 1u) * 0.125;
+            sw1 = d * float(2u * ((scw >> (3u * ((2u * ib + 1u) & 3u))) & 7u) + 1u) * 0.125;
+        }
+        uint w[8]; int sg[4];
+        [[unroll]] for (int l = 0; l < 4; l++) {
+            uint idx, h;
+            if (t == 19) { idx = ((qs >> (8u * uint(l))) & 255u) | (((qh >> (3u * uint(l))) & 7u) << 8); sg[l] = (qh & 0x8000u) != 0u ? -1 : 1; }
+            else { h = (qh >> (4u * uint(l))) & 15u; idx = ((qs >> (8u * uint(l))) & 255u) | ((h & 7u) << 8); sg[l] = (h & 8u) != 0u ? -1 : 1; }
+            w[2 * l] = BS_G(BDT_IQ1S + 2u * idx); w[2 * l + 1] = BS_G(BDT_IQ1S + 2u * idx + 1u);
+        }
+        BSI_ROWS {
+            int a0 = 0, a1 = 0;
+            [[unroll]] for (int l = 0; l < 4; l++) {
+                uint xi = q * 8u + 2u * uint(l);
+                int g = bsi_dot(w[2 * l], r, xi) + bsi_dot(w[2 * l + 1], r, xi + 1u);
+                int xs8 = bsi_dot(0x01010101u, r, xi) + bsi_dot(0x01010101u, r, xi + 1u);   // the 8 codes' sum
+                int v = 8 * g + sg[l] * xs8;
+                if (l < 2) a0 += v; else a1 += v;
+            }
+            BSI_ACC(r, BSI_DX(r, q) * (sw0 * float(a0) + sw1 * float(a1)));
         }
         return;
     }
