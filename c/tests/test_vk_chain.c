@@ -2706,14 +2706,20 @@ static void bench_gemv(void) {
         for (int j = 0; j < nm; j++) coli_vk_tensor_ensure(&t[j], w, sc, fmt, I, O, gs);
         float *x = fvec(I, 1.f);
         VkcBuf *xb = up(x, I), *yb = vkc_buf((size_t)O * 4 * nm, VKC_DEV);
+        /* COLI_VK_BENCH_CHAIN=1: each GEMV waits for the one before, as a decode's do (its x
+         * the previous output's first I values, a barrier between them) */
+        const char *ce = getenv("COLI_VK_BENCH_CHAIN"); int chain = ce && *ce == '1' && O >= I;
         double best = 1e9;
         for (int r = 0; r < 4; r++) {
             vkc_begin();
-            for (int j = 0; j < nm; j++) vkc_matmul(t[j], xb, 0, yb, (size_t)j * O, 1);
+            for (int j = 0; j < nm; j++) {
+                if (chain && j) vkc_matmul(t[j], yb, (size_t)(j - 1) * O, yb, (size_t)j * O, 1);
+                else vkc_matmul(t[j], xb, 0, yb, (size_t)j * O, 1);
+            }
             double t0 = bnow(); vkc_submit(1); double dt = bnow() - t0;
             if (dt < best) best = dt;
         }
-        printf("bench fmt %2d [%5d x %5d] x %d: %.3f ms per matrix, %.1f GB/s of weights\n", fmt, O, I, nm,
+        printf("bench fmt %2d [%5d x %5d] x %d%s: %.3f ms per matrix, %.1f GB/s of weights\n", fmt, O, I, nm, chain ? " chained" : "",
                best * 1e3 / nm, (double)rb * O * nm / best / 1e9);
         for (int j = 0; j < nm; j++) coli_vk_tensor_free(t[j]);
         vkc_free(xb); vkc_free(yb); free(t); free(w); free(sc); free(x);
@@ -3308,6 +3314,7 @@ int main(int argc, char **argv) {
         vkc_shutdown(); coli_vk_shutdown(); return 0;
     }
     int fmts[4] = {1, 4, 10, 11};
+    VkcStats sv0; vkc_stats(&sv0);
     for (int k = 0; k < 4; k++) {
         test_matmul(fmts[k], 1, 192, 70, 0, 0);
         test_matmul(fmts[k], 3, 128, 96, 64, 128);       /* GEMV rows at bindable offsets */
@@ -3315,6 +3322,15 @@ int main(int argc, char **argv) {
         test_matmul(fmts[k], 2, 64, 33, 3, 5);           /* offsets the device cannot bind */
         test_matmul(fmts[k], 1, 100, 33, 0, 0);          /* rows that are not whole 16-byte steps */
         test_matmul(fmts[k], 2, 3072, 40, 0, 0);         /* a long row (chain_gemv's staging) */
+        test_matmul(fmts[k], 2, 20480, 40, 0, 0);        /* a row past the staging: x from its buffer, a row a workgroup */
+        test_matmul(fmts[k], 1, 20480, 1100, 0, 0);      /* the same with rows to spread over the workgroups */
+    }
+    {
+        VkcStats sv1; vkc_stats(&sv1);
+        const char *gv = getenv("COLI_VK_CHAIN_GEMV");
+        printf("  decode GEMVs with x from its buffer: %llu\n", sv1.gemv_xg - sv0.gemv_xg);
+        if (!(gv && *gv == '0'))
+            CHECK(sv1.gemv_xg > sv0.gemv_xg, "chain_gemv: the rows past the staging read x from its buffer");
     }
     { unsigned keep = rng; test_bd(); rng = keep; }   /* the later tests' data as before */
     /* int8 and int4 prompt GEMMs whose shapes chain_gemm.comp takes (I % 64, O % 128), on
