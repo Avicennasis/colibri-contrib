@@ -2191,8 +2191,7 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
 static int group_moe_ok(const GroupDesc *host, int count, int total, int D, int I) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_GROUP_MOE"); on = !(e && *e == '0'); }
-    if (!on || count < 1 || total > CC_MOE_FRAME_ROWS || D < 32 || I < 32 || D % 32 || I % 32 ||
-        D > CC_MOE_DIM_MAX || I > CC_MOE_DIM_MAX) return 0;
+    if (!on || count < 1 || D < 32 || I < 32 || D % 32 || I % 32 || D > CC_MOE_DIM_MAX || I > CC_MOE_DIM_MAX) return 0;
     int f = host[0].gf, gs = host[0].ggs;
     if (!(f == 1 || f == 2 || (f == 4 && gs >= 16 && gs % 16 == 0))) return 0;
     for (int c = 0; c < count; c++)
@@ -2203,29 +2202,33 @@ static int group_moe_ok(const GroupDesc *host, int count, int total, int D, int 
 static uint64_t g_group_moe_calls;   /* groups group_moe_launch took (tests/test_grouped_g4_cuda.cu) */
 /* the group's x already in ctx->x (its rows expert by expert); y into ctx->y the same way */
 static int group_moe_launch(DeviceContext *ctx, int device, const GroupDesc *host, int count, const int *rows,
-                            int total, int D, int I) {
-    size_t tb = (size_t)count * sizeof(CcExpert), nb = tb + (size_t)total * sizeof(int);
+                            int total, int D, int I, int pin) {
+    /* the table, then the rows' experts, then a weight of 1 a row: the chain's own sum of a
+     * row's slots in rank order (K 1) puts each row's down output in its place, a prompt
+     * chunk's from the tensor cores' sorted rows (more than CC_MOE_FRAME_ROWS rows) too */
+    size_t tb = (size_t)count * sizeof(CcExpert), nb = tb + (size_t)total * (sizeof(int) + sizeof(float));
     if (!reserve_bytes(&ctx->moe_tab, &ctx->moe_tab_cap, nb) || !reserve_pinned(&ctx->moe_host, &ctx->moe_host_cap, nb) ||
-        !reserve(&ctx->gate, &ctx->gate_cap, (size_t)total * (I + D) * sizeof(float))) return 0;
+        !reserve(&ctx->gate, &ctx->gate_cap, cc_moe_hid_floats(total, 1, D, I, pin ? 0 : count) * sizeof(float))) return 0;
     CcExpert *t = (CcExpert *)ctx->moe_host;
     int *ids = (int *)((char *)ctx->moe_host + tb);
+    float *w1 = (float *)(ids + total);
     for (int c = 0, r = 0; c < count; c++) {
         t[c].g = host[c].g; t[c].u = host[c].u; t[c].d = host[c].d;
         t[c].gs = host[c].gs; t[c].us = host[c].us; t[c].ds = host[c].ds; t[c].planar = 0; t[c].pad_ = 0;
-        for (int k = 0; k < rows[c]; k++) ids[r++] = c;
+        for (int k = 0; k < rows[c]; k++) { w1[r] = 1.f; ids[r++] = c; }
     }
     if (!cuda_ok(cudaMemcpyAsync(ctx->moe_tab, ctx->moe_host, nb, cudaMemcpyHostToDevice, ctx->stream), "expert group table")) return 0;
     CcMoe mp; std::memset(&mp, 0, sizeof mp);
     mp.S = total; mp.K = 1; mp.D = D; mp.I = I; mp.fmt = host[0].gf; mp.gs = host[0].gf == 4 ? host[0].ggs : 0;
-    mp.parts = 1; mp.x_row = D; mp.i_row = 1; mp.E = count;
-    if (!coli_cuda_moe_async(device, (const CcExpert *)ctx->moe_tab, ctx->x, (const int *)((char *)ctx->moe_tab + tb), nullptr,
-                             ctx->gate, nullptr, nullptr, &mp, (void *)ctx->stream)) return 0;
+    /* pin (a speculation's verify, coli_cuda_expert_group_pinned): the warp kernels at any rows
+     * (E 0), whose rows are a decode step's bits; else past CC_MOE_FRAME_ROWS the tensor cores */
+    mp.parts = 3; mp.x_row = D; mp.i_row = 1; mp.w_row = 1; mp.y_row = D; mp.h_off = -1; mp.E = pin ? 0 : count;
+    const int *dids = (const int *)((char *)ctx->moe_tab + tb);
+    if (!coli_cuda_moe_async(device, (const CcExpert *)ctx->moe_tab, ctx->x, dids, (const float *)(dids + total),
+                             ctx->gate, ctx->y, nullptr, &mp, (void *)ctx->stream)) return 0;
     g_group_moe_calls++;
-    /* hid: the S hidden rows, then the S output rows */
-    return cuda_ok(cudaMemcpyAsync(ctx->y, ctx->gate + (size_t)total * I, (size_t)total * D * sizeof(float),
-                                   cudaMemcpyDeviceToDevice, ctx->stream), "expert group rows");
+    return 1;
 }
-
 static int expert_group_impl(ColiCudaTensor *const *gates,
                              ColiCudaTensor *const *ups,
                              ColiCudaTensor *const *downs,
@@ -2365,7 +2368,7 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
             off16+=r;
         }
     }else if(group_moe_ok(host,count,total,D,I)){
-        if(!group_moe_launch(ctx,device,host,count,rows,total,D,I))return 0;
+        if(!group_moe_launch(ctx,device,host,count,rows,total,D,I,pin_small_batch))return 0;
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         int dual=!getenv("COLI_CUDA_DUAL_PROJ")||atoi(getenv("COLI_CUDA_DUAL_PROJ"));
@@ -2512,7 +2515,7 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
          * sync dispatch, silu fused in the dual epilogue. */
         f8_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,max_rows,count);
     }else if(group_moe_ok(host,count,total,D,I)){
-        if(!group_moe_launch(ctx,device,host,count,rows,total,D,I))return 0;
+        if(!group_moe_launch(ctx,device,host,count,rows,total,D,I,0))return 0;
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);

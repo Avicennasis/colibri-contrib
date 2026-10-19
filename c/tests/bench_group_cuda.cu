@@ -35,6 +35,37 @@ int main(void) {
     for (int e = 0; e < E; e++)
         if (!coli_cuda_tensor_upload_g(&tg[e], wg, sg, fmt, D, I, 0, gs) || !coli_cuda_tensor_upload_g(&tu[e], wg, sg, fmt, D, I, 0, gs) ||
             !coli_cuda_tensor_upload_g(&td[e], wd, sd, fmt, I, D, 0, gs)) { printf("upload failed\n"); return 1; }
+    /* BENCH_S > 1: a prompt chunk of S rows, each to K distinct experts at random, through the
+     * sync group (coli_cuda_expert_group), the rows expert by expert */
+    int S = getenv("BENCH_S") ? atoi(getenv("BENCH_S")) : 1;
+    if (S > 1) {
+        float *xs = (float *)malloc((size_t)S * D * 4), *xg = (float *)malloc((size_t)S * K * D * 4), *yg = (float *)malloc((size_t)S * K * D * 4);
+        for (size_t i = 0; i < (size_t)S * D; i++) xs[i] = (rand() / (float)RAND_MAX - .5f) * 2.f;
+        int *pick = (int *)malloc((size_t)S * K * sizeof(int)), *cnt = (int *)calloc(E, sizeof(int)), *rws = (int *)malloc(E * sizeof(int));
+        ColiCudaTensor **sg2 = (ColiCudaTensor **)malloc(E * sizeof *sg2), **su2 = (ColiCudaTensor **)malloc(E * sizeof *su2), **sd2 = (ColiCudaTensor **)malloc(E * sizeof *sd2);
+        double bestp = 1e9; int nlp = 4;
+        for (int r = -1; r < 3; r++) {
+            double t0 = now();
+            for (int l = 0; l < nlp; l++) {
+                memset(cnt, 0, E * sizeof(int));
+                for (int s2 = 0; s2 < S; s2++) for (int k = 0; k < K; k++) {
+                    int e, dup; do { e = rand() % E; dup = 0; for (int j = 0; j < k; j++) dup |= pick[s2 * K + j] == e; } while (dup);
+                    pick[s2 * K + k] = e; cnt[e]++;
+                }
+                int count = 0, at = 0;
+                for (int e = 0; e < E; e++) {
+                    if (!cnt[e]) continue;
+                    sg2[count] = tg[e]; su2[count] = tu[e]; sd2[count] = td[e]; rws[count++] = cnt[e];
+                    for (int i = 0; i < S * K; i++) if (pick[i] == e) memcpy(xg + (size_t)(at++) * D, xs + (size_t)(i / K) * D, (size_t)D * 4);
+                }
+                if (!coli_cuda_expert_group(sg2, su2, sd2, rws, count, yg, xg)) { printf("group failed\n"); return 1; }
+            }
+            double dt = now() - t0;
+            if (r >= 0 && dt < bestp) bestp = dt;
+        }
+        printf("cuda group prompt fmt %d gs %d S %d K %d E %d [D %d I %d]: %.0f us per layer (with the host's gather)\n", fmt, gs, S, K, E, D, I, bestp * 1e6 / nlp);
+        return 0;
+    }
     float *x = (float *)malloc((size_t)K * D * 4);
     for (size_t i = 0; i < (size_t)K * D; i++) x[i] = (rand() / (float)RAND_MAX - .5f) * 2.f;
     int *rows = (int *)malloc(K * sizeof(int));
