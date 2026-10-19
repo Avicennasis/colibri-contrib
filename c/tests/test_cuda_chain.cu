@@ -308,6 +308,24 @@ int main(void) {
         ck(T->reserve(&r, 64, CC_DEV) && T->bytes(r) >= 64 && T->reserve(&r, 32, CC_DEV) && T->bytes(r) >= 64 && T->reserve(&r, 4096, CC_DEV) && T->bytes(r) >= 4096, "reserve grows, never shrinks");
         T->free(d); T->free(u); T->free(dn); T->free(d2); T->free(r);
     }
+    {   /* a prompt chunk's K rows into a head-major cache: a region per row and head, one kernel for
+         * the grid (64 regions or more); off the grid, the copies as before */
+        const int S = 100, H = 4, hd = 32, DR = 256, pb = 7;
+        for (int shuffle = 0; shuffle < 2; shuffle++) {
+            std::vector<float> src = rnd((size_t)S * H * hd, 61 + shuffle), dst = rnd((size_t)H * DR * hd, 63);
+            std::vector<CcRegion> rg((size_t)S * H);
+            for (int s = 0; s < S; s++) for (int h = 0; h < H; h++)
+                rg[(size_t)s * H + h] = {((size_t)h * DR + pb + s) * hd, (size_t)s * H * hd + (size_t)h * hd, (size_t)hd};
+            if (shuffle) std::swap(rg[0], rg[(size_t)S * H - 1]);
+            std::vector<float> want = dst;
+            for (auto &x : rg) memcpy(want.data() + x.dst, src.data() + x.src, x.n * 4);
+            CcBuf *sb = up(src), *db = up(dst);
+            ck(T->begin() && T->copy_regions(db, sb, rg.data(), (int)rg.size()) && T->submit(1) &&
+               maxdiff(down(db, dst.size()).data(), want.data(), dst.size()) == 0,
+               shuffle ? "400 regions off the grid: a copy each" : "400 regions on a grid: one kernel");
+            T->free(sb); T->free(db);
+        }
+    }
     printf("matmul\n");
     {
         const int I = 96, O = 40, S = 3; unsigned s = 5;

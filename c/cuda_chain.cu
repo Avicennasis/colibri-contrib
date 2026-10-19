@@ -878,11 +878,44 @@ static int cc_zero(CcBuf *dst, size_t off, size_t n) {
     g_st.ops++;
     return cc_ok(c, cudaMemsetAsync(dst->d + off, 0, n * 4, c->stream), "zero");
 }
+/* Regions on a grid (vk_chain.c's cp2_grid): region i = (q, h) = (i / per, i % per) copies len
+ * floats from src[s0 + q*sq + h*sh ..] to dst[d0 + q*dq + h*dh ..]. A prompt chunk's K and V rows
+ * into the head-major cache are such a grid, a region per row and head: a copy each was 41366
+ * cudaMemcpyAsync calls and 521 ms of the host's time on a 1024-token prompt (Qwen3.6-35B). */
+struct CcGrid { long long d0, s0, dh, sh, dq, sq; int len, per, n; };
+__global__ static void cc_copy_grid_k(float *__restrict__ d, const float *__restrict__ s, CcGrid g) {
+    long long gid = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= (long long)g.n * g.len) return;
+    long long i = gid / g.len, j = gid - i * g.len, q = i / g.per, h = i - q * g.per;
+    d[g.d0 + q * g.dq + h * g.dh + j] = s[g.s0 + q * g.sq + h * g.sh + j];
+}
+static int cc_grid_of(const CcRegion *r, int n, CcGrid *g) {
+    if (n < 64 || !r[0].n || r[0].n > 0x7fffffff) return 0;
+    long long L = (long long)r[0].n, d0 = (long long)r[0].dst, s0 = (long long)r[0].src;
+    long long dh = (long long)r[1].dst - d0, sh = (long long)r[1].src - s0;
+    int per = 1;
+    while (per < n && (long long)r[per].dst - (long long)r[per - 1].dst == dh && (long long)r[per].src - (long long)r[per - 1].src == sh) per++;
+    if (n % per) return 0;
+    long long Q = n / per, dq = Q > 1 ? (long long)r[per].dst - d0 : 0, sq = Q > 1 ? (long long)r[per].src - s0 : 0;
+    for (int i = 0; i < n; i++) {
+        long long q = i / per, h = i % per;
+        if ((long long)r[i].n != L || (long long)r[i].dst != d0 + q * dq + h * dh || (long long)r[i].src != s0 + q * sq + h * sh) return 0;
+    }
+    *g = CcGrid{d0, s0, dh, sh, dq, sq, (int)L, per, n};
+    return 1;
+}
 static int cc_copy_regions(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
     CcCtx *c = live();
     if (!c || !dst || !src || (n > 0 && !r)) return 0;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n; i++)
         if ((r[i].dst + r[i].n) * 4 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) return 0;
+    CcGrid g;
+    if (dst != src && dst->d && src->d && cc_grid_of(r, n, &g)) {   /* one kernel for the grid */
+        long long tot = (long long)g.n * g.len;
+        cc_copy_grid_k<<<grid1((size_t)tot, 256), 256, 0, c->stream>>>(dst->d, src->d, g);
+        return launched(c, "copy regions (grid)");
+    }
+    for (int i = 0; i < n; i++) {
         if (!r[i].n) continue;
         if (!cc_ok(c, cudaMemcpyAsync(dst->d + r[i].dst, src->d + r[i].src, r[i].n * 4, cudaMemcpyDefault, c->stream), "copy regions"))
             return 0;
