@@ -116,7 +116,8 @@ typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; int planar, p
  * floats) routed to ids and w as cc_route writes them (i_off + s*i_row, w_off + s*w_row,
  * K each); expert e is entry t_off + e of the table (E of them), its matrices of format fmt (1 int8
  * rows, 2 int4 rows, 4 int4 with a scale per gs inputs, 8 fp8-e4m3 with a scale per
- * 128 x 128 block: the tier's formats), D and I multiples of 32 up to CC_MOE_DIM_MAX. hid holds S*K rows of
+ * 128 x 128 block: the tier's formats; 100 + t a GGUF's ggml type t, fmt_d down's, the types
+ * with cuda_bd.cuh's integer step), D and I multiples of 32 up to CC_MOE_DIM_MAX. hid holds S*K rows of
  * I floats (silu(gate) * up, act 0, the only one) and then S*K rows of D (down's
  * output). parts 1: the experts the table holds; parts 2: y (y_off + s*y_row) = the
  * host's row (hy at h_off + s*D, h_off >= 0; else 0) plus each slot the table holds,
@@ -129,6 +130,8 @@ typedef struct {
     int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row, h_off;
     int E;   /* the layer's experts: a step of more than CC_MOE_FRAME_ROWS rows sorts its slots by expert */
     int planar;   /* the table may hold CcExpert.planar entries: refused where the GEMMs cannot read them */
+    int fmt_d;    /* fmt >= 100 (a GGUF's blocks, ggml type fmt - 100 for gate and up): down's,
+                     0 = fmt's; a matrix's rows as the file has them, padded to words */
 } CcMoe;
 /* More rows than this (a prompt chunk): the slots sorted by expert and each expert's rows
  * through the tensor cores' GEMM where the device has it (gate and up, then down); hid

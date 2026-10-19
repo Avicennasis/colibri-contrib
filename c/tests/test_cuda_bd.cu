@@ -5,6 +5,8 @@
  *     integer sums, in double), the float form's against the CPU's dequantized rows;
  *   - a verify's 2, 3 and 4 rows, sharing every weight load, each with the bits of the
  *     same row alone (a decode step's).
+ *   - the routed experts of the dense chain (coli_cuda_moe_async, CcMoe.fmt >= 100) against
+ *     the CPU's integer form, a row and a verify's;
  *   - the backend's path: coli_cuda_tensor_upload of the file's rows (padded to words on the
  *     device where a row is not), the dense chain's matmul, the same bits as the kernel's.
  * BENCH=1 also times the GEMV at a few shapes, 1 to 4 rows. Build from c/:
@@ -160,6 +162,98 @@ out:
     free(w); free(x); free(one); free(got);
 }
 
+/* the CPU's integer form of row r (type t, n inputs) against x quantized (xq, dx, xs), in double */
+static double ref_dot(int t, const uint8_t *r, int n, const int8_t *xq, const float *dx, const int32_t *xs) {
+    static int8_t w8[16384]; static float sw[1024], mw[1024];
+    if (ref_unpack(t, r, n, w8, sw, mw)) return NAN;
+    double acc = 0;
+    for (int b = 0; b < n / 32; b++) {
+        double s0 = 0, s1 = 0;
+        for (int i = 0; i < 16; i++) s0 += w8[32 * b + i] * xq[32 * b + i];
+        for (int i = 16; i < 32; i++) s1 += w8[32 * b + i] * xq[32 * b + i];
+        acc += (double)dx[b] * ((double)sw[2 * b] * s0 + (double)sw[2 * b + 1] * s1 - (double)mw[2 * b] * xs[2 * b] - (double)mw[2 * b + 1] * xs[2 * b + 1]);
+    }
+    return acc;
+}
+/* The chain's routed experts (coli_cuda_moe_async) of a GGUF: E experts of gate/up type tg
+ * and down type td, S rows routed to K of them, against the CPU's integer form (each row
+ * quantized, then the hidden row quantized for down). */
+static void check_moe(int tg, int td, int S, int K, int E, int D, int I) {
+    long rg = ref_row_bytes(tg, D), rd = ref_row_bytes(td, I);
+    if (rg <= 0 || rd <= 0) return;
+    int bg = ref_block_bytes(tg), bdb = ref_block_bytes(td);
+    size_t gb = (size_t)rg * I, db = (size_t)rd * D;
+    uint8_t *G = (uint8_t *)malloc(gb * E), *U = (uint8_t *)malloc(gb * E), *Dn = (uint8_t *)malloc(db * E);
+    for (size_t i = 0; i < gb * E; i++) { G[i] = (uint8_t)rnd(); U[i] = (uint8_t)rnd(); }
+    for (size_t i = 0; i < db * E; i++) Dn[i] = (uint8_t)rnd();
+    for (int e = 0; e < E; e++) {
+        for (int o = 0; o < I; o++) for (long b = 0; b + bg <= rg; b += bg) { bd_fix(tg, G + e * gb + o * rg + b); bd_fix(tg, U + e * gb + o * rg + b); }
+        for (int o = 0; o < D; o++) for (long b = 0; b + bdb <= rd; b += bdb) bd_fix(td, Dn + e * db + o * rd + b);
+    }
+    ColiCudaTensor **tt = (ColiCudaTensor **)calloc((size_t)3 * E, sizeof *tt);
+    CcExpert *tab = (CcExpert *)calloc((size_t)E, sizeof *tab);
+    int ok = 1;
+    for (int e = 0; e < E && ok; e++) {
+        ok = coli_cuda_tensor_upload(&tt[3 * e], G + e * gb, NULL, 100 + tg, D, I, 0) && coli_cuda_tensor_upload(&tt[3 * e + 1], U + e * gb, NULL, 100 + tg, D, I, 0) &&
+             coli_cuda_tensor_upload(&tt[3 * e + 2], Dn + e * db, NULL, 100 + td, I, D, 0);
+        const float *sc;
+        int gsz;
+        ok = ok && coli_cuda_tensor_dev(tt[3 * e], &tab[e].g, &sc, &gsz) && coli_cuda_tensor_dev(tt[3 * e + 1], &tab[e].u, &sc, &gsz) &&
+             coli_cuda_tensor_dev(tt[3 * e + 2], &tab[e].d, &sc, &gsz);
+    }
+    float *x = (float *)malloc((size_t)S * D * 4), *w = (float *)malloc((size_t)S * K * 4), *y = (float *)malloc((size_t)S * D * 4);
+    int *ids = (int *)malloc((size_t)S * K * 4);
+    for (int i = 0; i < S * D; i++) x[i] = ((int)(rnd() % 20001) - 10000) * 1e-4f;
+    for (int s = 0; s < S; s++)
+        for (int k = 0; k < K; k++) {
+            int e;
+            do { e = (int)(rnd() % E); int dup = 0; for (int j = 0; j < k; j++) dup |= ids[s * K + j] == e; if (!dup) break; } while (1);
+            ids[s * K + k] = e; w[s * K + k] = (float)(1 + rnd() % 100) / 100.f;
+        }
+    if (S > 1) ids[K + 1] = -1;   /* a slot no expert holds adds nothing */
+    CcExpert *dtab; float *dx_, *dw, *dy, *dh; int *di;
+    size_t hf = cc_moe_hid_floats(S, K, D, I, E);
+    cudaMalloc(&dtab, (size_t)E * sizeof *tab); cudaMalloc(&dx_, (size_t)S * D * 4); cudaMalloc(&dw, (size_t)S * K * 4);
+    cudaMalloc(&dy, (size_t)S * D * 4); cudaMalloc(&dh, hf * 4); cudaMalloc(&di, (size_t)S * K * 4);
+    cudaMemcpy(dtab, tab, (size_t)E * sizeof *tab, cudaMemcpyHostToDevice); cudaMemcpy(dx_, x, (size_t)S * D * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dw, w, (size_t)S * K * 4, cudaMemcpyHostToDevice); cudaMemcpy(di, ids, (size_t)S * K * 4, cudaMemcpyHostToDevice);
+    CcMoe mp = {};
+    mp.S = S; mp.K = K; mp.D = D; mp.I = I; mp.fmt = 100 + tg; mp.fmt_d = 100 + td; mp.parts = 3; mp.E = E;
+    mp.x_row = D; mp.i_row = K; mp.w_row = K; mp.y_row = D; mp.h_off = -1;
+    ok = ok && coli_cuda_moe_async(0, dtab, dx_, di, dw, dh, dy, NULL, &mp, NULL) && cudaDeviceSynchronize() == cudaSuccess;
+    cudaMemcpy(y, dy, (size_t)S * D * 4, cudaMemcpyDeviceToHost);
+    double worst = 0;
+    if (ok) {
+        int8_t *xq = (int8_t *)malloc(16384); float *dxs = (float *)malloc(4096); int32_t *xss = (int32_t *)malloc(4096);
+        float *h = (float *)malloc((size_t)I * 4);
+        for (int s = 0; s < S; s++) {
+            double *ref = (double *)calloc((size_t)D, sizeof(double)), *mag = (double *)calloc((size_t)D, sizeof(double));
+            for (int k = 0; k < K; k++) {
+                int e = ids[s * K + k];
+                if (e < 0) continue;
+                ref_quant(x + (size_t)s * D, D, xq, dxs, xss);
+                for (int o = 0; o < I; o++) {
+                    double g = ref_dot(tg, G + e * gb + o * rg, D, xq, dxs, xss), u = ref_dot(tg, U + e * gb + o * rg, D, xq, dxs, xss);
+                    h[o] = (float)(g / (1 + exp(-g)) * u);
+                }
+                ref_quant(h, I, xq, dxs, xss);
+                for (int o = 0; o < D; o++) {
+                    double v = ref_dot(td, Dn + e * db + o * rd, I, xq, dxs, xss);
+                    ref[o] += w[s * K + k] * v; mag[o] += fabs(w[s * K + k] * v);
+                }
+            }
+            for (int o = 0; o < D; o++) { double e = fabs(y[(size_t)s * D + o] - ref[o]) / (mag[o] + 1e-3); if (!(e <= worst)) worst = e; }
+            free(ref); free(mag);
+        }
+        free(xq); free(dxs); free(xss); free(h);
+    }
+    if (!ok || !(worst <= 2e-3)) { printf("FAIL moe %s/%s S %d K %d E %d [%d x %d]: %s %.3g\n", ref_name(tg), ref_name(td), S, K, E, D, I, ok ? "off by" : "the call failed", worst); fails++; }
+    else printf("moe %-7s/%-7s S %d K %d E %d [%d x %d]: within %.2g of the CPU's integer form\n", ref_name(tg), ref_name(td), S, K, E, D, I, worst);
+    cudaFree(dtab); cudaFree(dx_); cudaFree(dw); cudaFree(dy); cudaFree(dh); cudaFree(di);
+    for (int i = 0; i < 3 * E; i++) if (tt[i]) coli_cuda_tensor_free(tt[i]);
+    free(tt); free(tab); free(G); free(U); free(Dn); free(x); free(w); free(y); free(ids);
+}
+
 int main(void) {
     int devs[1] = {0};
     if (!coli_cuda_init(devs, 1)) { printf("SKIP: no CUDA device\n"); return 0; }
@@ -176,6 +270,12 @@ int main(void) {
     const int shapes[][2] = {{2048, 300}, {4096, 70}, {768, 1000}, {12288, 40}, {2816, 33}};
     for (size_t i = 0; i < sizeof types / sizeof *types; i++)
         for (size_t k = 0; k < sizeof shapes / sizeof *shapes; k++) check(types[i], shapes[k][0], shapes[k][1], 0);
+    /* the routed experts: the commonest pairs of the published files, one row and a verify's */
+    const int pairs[][2] = {{12, 14}, {16, 18}, {17, 17}, {22, 23}, {11, 13}, {10, 12}, {19, 29}, {21, 20}, {8, 8}, {42, 42}};
+    for (size_t i = 0; i < sizeof pairs / sizeof *pairs; i++) {
+        check_moe(pairs[i][0], pairs[i][1], 1, 8, 16, 2048, 512);
+        check_moe(pairs[i][0], pairs[i][1], 3, 8, 16, 1024, 768);
+    }
     if (bench) {
         printf("BENCH (rows of x: 1 2 3 4)\n");
         const int bt[] = {12, 14, 8, 17, 22, 16, 21, 23, 11, 10};

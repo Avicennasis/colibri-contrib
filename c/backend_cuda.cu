@@ -3884,6 +3884,133 @@ static int moe_gv_launch(const CcExpert *tab, const float *x, const int *ids, fl
     moe_gv_dn_k<FMT><<<dim3(gx, gy), 256, moe_gv_smem(p->I), st>>>(tab, ids, hid, *p, l1, tiles);
     return cuda_ok(cudaGetLastError(), "chain moe gv launch");
 }
+/* A GGUF's routed experts (CcMoe.fmt >= 100: gate and up of ggml type TG, down of type TD),
+ * in the CPU's integer form (cuda_bd.cuh): gate and up as moe_gv_gu_k takes them, block
+ * (b, s) quantizing row s of x once and taking units u = k * I + o (slot k's row o) over lpr
+ * lanes; down as moe_gv_dn_k, block (pair j, tile) quantizing pair j's hidden row. A row of
+ * the matrices is rw words (the file's row padded). */
+template<int TG>
+__global__ static void __launch_bounds__(256) moe_bd_gu_k(const CcExpert *__restrict__ tab, const float *__restrict__ x,
+        const int *__restrict__ ids, float *__restrict__ hid, CcMoe p, int lpr, int rw, const bd_u32 *__restrict__ btab) {
+    extern __shared__ uint4 bd_sm4[];
+    __shared__ CcExpert ke[CC_ROUTE_KMAX];
+    __shared__ int kl[CC_ROUTE_KMAX];
+    constexpr int TW = bd_tab_words(TG);
+    BdTabs tb = bd_tables_fill<TG>(reinterpret_cast<bd_u32 *>(bd_sm4), btab);
+    int s = blockIdx.y, tid = threadIdx.x, nb = p.D / 32, qr = bd_xq_row(p.D);
+    uint4 *xq = bd_sm4 + TW / 4;
+    float *dx = reinterpret_cast<float *>(xq + qr);
+    int *xs = reinterpret_cast<int *>(dx + nb);
+    bdx_quant(x + p.x_off + (size_t)s * p.x_row, 1, p.D, xq, dx, xs);
+    if (tid < p.K) {
+        int e = ids[p.i_off + s * p.i_row + tid];
+        int on = e >= 0 && tab[p.t_off + e].g != nullptr;
+        kl[tid] = on;
+        if (on) ke[tid] = tab[p.t_off + e];
+    }
+    __syncthreads();
+    BdX X = {xq, dx, xs, qr, nb};
+    int lane = tid & 31, warp = tid >> 5, rps = 32 / lpr, sub = lane / lpr, ql = lane % lpr, nq = p.D / 32;
+    int NU = p.K * p.I, stride = (int)gridDim.x * 8 * rps;
+    for (int u0 = ((int)blockIdx.x * 8 + warp) * rps; u0 < NU; u0 += stride) {   /* uniform in the warp */
+        int u = min(u0 + sub, NU - 1), k = u / p.I, o = u - k * p.I;
+        bool live = u0 + sub < NU && kl[k];
+        float g = 0.f, uu = 0.f;
+        if (live) {
+            const bd_u32 *wg = (const bd_u32 *)ke[k].g + (size_t)o * rw, *wu = (const bd_u32 *)ke[k].u + (size_t)o * rw;
+            for (int q = ql; q < nq; q += lpr) { bdi_step<TG, 1>(wg, (bd_u32)q, X, 1, tb, &g); bdi_step<TG, 1>(wu, (bd_u32)q, X, 1, tb, &uu); }
+        }
+        g = mg_lanes_sum(g, lpr); uu = mg_lanes_sum(uu, lpr);
+        if (ql == 0 && live) hid[((size_t)s * p.K + k) * p.I + o] = (g / (1.f + expf(-g))) * uu;
+    }
+}
+template<int TD>
+__global__ static void __launch_bounds__(256) moe_bd_dn_k(const CcExpert *__restrict__ tab, const int *__restrict__ ids,
+        float *__restrict__ hid, CcMoe p, int lpr, int tiles, int rw, const bd_u32 *__restrict__ btab) {
+    extern __shared__ uint4 bd_sm4[];
+    int wgi = (int)(blockIdx.x + blockIdx.y * gridDim.x), j = wgi / tiles, tile = wgi - j * tiles;
+    if (j >= p.S * p.K) return;
+    int s = j / p.K, k = j - s * p.K, e = ids[p.i_off + s * p.i_row + k];
+    if (e < 0) return;
+    CcExpert ex = tab[p.t_off + e];
+    if (!ex.g) return;
+    constexpr int TW = bd_tab_words(TD);
+    BdTabs tb = bd_tables_fill<TD>(reinterpret_cast<bd_u32 *>(bd_sm4), btab);
+    int nb = p.I / 32, qr = bd_xq_row(p.I);
+    uint4 *xq = bd_sm4 + TW / 4;
+    float *dx = reinterpret_cast<float *>(xq + qr);
+    int *xs = reinterpret_cast<int *>(dx + nb);
+    bdx_quant(hid + (size_t)j * p.I, 1, p.I, xq, dx, xs);
+    __syncthreads();
+    BdX X = {xq, dx, xs, qr, nb};
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, rps = 32 / lpr, sub = lane / lpr, ql = lane % lpr, nq = p.I / 32;
+    int per_tile = (p.D + tiles - 1) / tiles, lo = tile * per_tile, hi = min(lo + per_tile, p.D);
+    size_t dn = (size_t)p.S * p.K * p.I;
+    for (int o0 = lo + warp * rps; o0 < hi; o0 += 8 * rps) {   /* uniform in the warp */
+        int o = o0 + sub;
+        bool live = o < hi;
+        float v = 0.f;
+        if (live) {
+            const bd_u32 *wd = (const bd_u32 *)ex.d + (size_t)o * rw;
+            for (int q = ql; q < nq; q += lpr) bdi_step<TD, 1>(wd, (bd_u32)q, X, 1, tb, &v);
+        }
+        v = mg_lanes_sum(v, lpr);
+        if (ql == 0 && live) hid[dn + (size_t)j * p.D + o] = v;
+    }
+}
+template<int TG>
+static int moe_bd_gu_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, const CcMoe *p, const bd_u32 *btab,
+                            size_t smem_max, cudaStream_t st) {
+    size_t sm = (size_t)bd_tab_words(TG) * 4 + bd_x_bytes(p->D, 1);
+    if (sm > smem_max) return 0;
+    static unsigned raised;
+    bd_smem_raise((const void *)moe_bd_gu_k<TG>, sm, smem_max, &raised);
+    int lpr = bd_lpr(p->D), upw = 8 * (32 / lpr), nwg = (p->K * p->I + upw - 1) / upw;   /* units a block */
+    if (nwg > 1024) nwg = 1024;
+    int rw = (int)((size_t)p->D / BD_BLK[TG] * BD_BYTES[TG] + 3) / 4;
+    moe_bd_gu_k<TG><<<dim3((unsigned)nwg, (unsigned)p->S), 256, sm, st>>>(tab, x, ids, hid, *p, lpr, rw, btab);
+    return 1;
+}
+template<int TD>
+static int moe_bd_dn_launch(const CcExpert *tab, const int *ids, float *hid, const CcMoe *p, const bd_u32 *btab,
+                            size_t smem_max, cudaStream_t st) {
+    size_t sm = (size_t)bd_tab_words(TD) * 4 + bd_x_bytes(p->I, 1);
+    if (sm > smem_max) return 0;
+    static unsigned raised;
+    bd_smem_raise((const void *)moe_bd_dn_k<TD>, sm, smem_max, &raised);
+    int lpr = bd_lpr(p->I), rpp = 8 * (32 / lpr), tiles = (p->D + rpp - 1) / rpp;   /* a down tile: one pass of the block */
+    uint64_t nb = (uint64_t)p->S * p->K * tiles;
+    unsigned gx = nb < 65535 ? (unsigned)nb : 65535u, gy = (unsigned)((nb + gx - 1) / gx);
+    int rw = (int)((size_t)p->I / BD_BLK[TD] * BD_BYTES[TD] + 3) / 4;
+    moe_bd_dn_k<TD><<<dim3(gx, gy), 256, sm, st>>>(tab, ids, hid, *p, lpr, tiles, rw, btab);
+    return 1;
+}
+#define BD_MOE_TYPES(X) X(8) X(10) X(11) X(12) X(13) X(14) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42)
+/* 1 = both types have an integer step and the widths whole blocks of them */
+static int moe_bd_ok(const CcMoe *p) {
+    int tg = p->fmt - 100, td = (p->fmt_d ? p->fmt_d : p->fmt) - 100;
+    return tg >= 0 && tg < 43 && td >= 0 && td < 43 && bd_fmt_ok(p->fmt) && bd_fmt_ok(td + 100) && bdi_has(tg) && bdi_has(td) &&
+           p->D % BD_BLK[tg] == 0 && p->I % BD_BLK[td] == 0 && p->K <= CC_ROUTE_KMAX && !p->planar;
+}
+static int moe_bd_launch(DeviceContext *ctx, const CcExpert *tab, const float *x, const int *ids, float *hid, const CcMoe *p, cudaStream_t st) {
+    const bd_u32 *btab = bd_table(ctx);
+    if (!btab || ((uintptr_t)(x + p->x_off) & 15) || p->x_row % 4) return 0;
+    int ok = 0;
+    switch (p->fmt - 100) {
+#define BD_GU_CASE(t) case t: ok = moe_bd_gu_launch<t>(tab, x, ids, hid, p, btab, ctx->smem_optin, st); break;
+        BD_MOE_TYPES(BD_GU_CASE)
+#undef BD_GU_CASE
+        default: return 0;
+    }
+    if (!ok) return 0;
+    switch ((p->fmt_d ? p->fmt_d : p->fmt) - 100) {
+#define BD_DN_CASE(t) case t: ok = moe_bd_dn_launch<t>(tab, ids, hid, p, btab, ctx->smem_optin, st); break;
+        BD_MOE_TYPES(BD_DN_CASE)
+#undef BD_DN_CASE
+        default: return 0;
+    }
+    return ok && cuda_ok(cudaGetLastError(), "chain moe block launch");
+}
 static int moe_gv_ok(const CcMoe *p) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_MOE_GV"); on = !(e && *e == '0'); }
@@ -3903,6 +4030,19 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream) {
     if (fault_injected()) return 0;
     if (!tab || !ids || !hid || !p || p->S < 1 || p->K < 1 || p->D < 32 || p->I < 32 || p->D % 32 || p->I % 32 || p->act) return 0;
+    if (p->fmt >= 100) {   /* a GGUF's experts: every row as a decode step's (a prompt chunk's rows too) */
+        if (!moe_bd_ok(p) || p->D > MOE_DIM_MAX || p->I > MOE_DIM_MAX) return 0;
+        DeviceContext *bc = find_ctx(device);
+        if (!select_ctx(bc)) return 0;
+        cudaStream_t bst = (cudaStream_t)stream;
+        if ((p->parts & 1) && (!x || !moe_bd_launch(bc, tab, x, ids, hid, p, bst))) return 0;
+        if (p->parts & 2) {
+            if (!w || !y || (p->h_off >= 0 && !hy)) return 0;
+            moe_sum_k<<<dim3((unsigned)((p->D + 255) / 256), (unsigned)p->S), 256, 0, bst>>>(tab, ids, w, hid, hy, y, *p);
+            if (!cuda_ok(cudaGetLastError(), "chain moe sum launch")) return 0;
+        }
+        return 1;
+    }
     if (p->fmt == 4 && (p->gs < 16 || p->gs % 16)) return 0;
     if (p->fmt != 1 && p->fmt != 2 && p->fmt != 4 && p->fmt != 8) return 0;
     if (p->D > MOE_DIM_MAX || p->I > MOE_DIM_MAX) return 0;   /* an input row in 48 KiB of shared memory, the fp8 table beside it */
