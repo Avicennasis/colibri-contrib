@@ -271,7 +271,13 @@ static int vkc_dmoe_read(VkcDmoe *d) {
     return 1;
 }
 /* layer i's gate/up and down formats, from its first entry (a layer's experts share them) */
-static int vkc_dmoe_fmt(const VkcDmoe *d, int i, int w) { return (int)d->tabh[(size_t)i * d->E * COLI_VK_XB_ENTRY + w]; }
+/* layer i's format word w (12 gate/up, 15 down): the tier's form for the layer, the same in
+ * every resident entry, read from the first resident one (0 when none is) */
+static int vkc_dmoe_fmt(const VkcDmoe *d, int i, int w) {
+    const uint32_t *t = d->tabh + (size_t)i * d->E * COLI_VK_XB_ENTRY;
+    for (int e = 0; e < d->E; e++, t += COLI_VK_XB_ENTRY) if (t[18]) return (int)t[w];
+    return 0;
+}
 /* For a step of `rows` rows on the primary device: whether any of layers lo..lo+L-1 takes
  * it; reads the tier's table again when its residents changed. 0 for good when the
  * device cannot read the tier's experts by address. */

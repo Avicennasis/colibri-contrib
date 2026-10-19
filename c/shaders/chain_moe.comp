@@ -46,6 +46,11 @@ layout(constant_id = 1) const int BD = 0;
 #ifdef IDOT
 layout(constant_id = 2) const int XQ = 256;   // uvec4s of the quantized row's codes: 16 XQ inputs at most
 #endif
+// 1, 2 or 4: the 16-byte way decodes that format only (the matrices' format, which the host
+// knows a layer's), so the other formats' bodies are not in the pipeline: with all of them
+// the gate and up pass of Qwen3.6's int4-g64 experts took 77 us a layer on an RTX PRO 4000,
+// with fmt 4's alone 42. 0: every format, by the table's word.
+layout(constant_id = 3) const int FMTC = 0;
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WRef4 { uvec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer WRef { uint v[]; };
@@ -160,6 +165,13 @@ void block_12(BLOCK_ARGS) BLOCK_BODY(12)
 void block_13(BLOCK_ARGS) BLOCK_BODY(13)
 void block(WRef4 w, SRef sc, int fmt, uint rowWords, uint gs, uint O, uint o0, uint qbase, uint remaining,
            uint RW, uint rg, uint jj, uint lpr, uint W4, out float acc[RPS]) {
+    if (FMTC != 0) {   // a pipeline of one format: another (the host's mistake) comes out as NaN
+        if (fmt != FMTC) { [[unroll]] for (uint t = 0u; t < RPS; t++) acc[t] = uintBitsToFloat(0x7fc00000u); return; }
+        if (FMTC == 1) block_1(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+        else if (FMTC == 2) block_2(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+        else block_4(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
+        return;
+    }
     if (fmt == 1) block_1(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
     else if (fmt == 2) block_2(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);
     else if (fmt == 4) block_4(w, sc, rowWords, gs, O, o0, qbase, remaining, RW, rg, jj, lpr, W4, acc);

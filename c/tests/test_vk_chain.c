@@ -1763,6 +1763,15 @@ static void test_moe(const char *what, int D, int I, int E, int S, int K, int fg
     CHECK(rec && e < 2e-4 && !bad(got, (size_t)S * yrow), "moe %s (fmt %d/%d, D %d I %d E %d S %d K %d act %d): rel err %.2e",
           what, fg, fd, D, I, E, S, K, act, e);
     if (getenv("VKC_TEST_VERBOSE")) printf("moe %s: %.2e\n", what, e);
+    {   /* the layer's formats named: each pass on its format's own pipeline (1, 2, 4), the rest as before */
+        mp.gfmt = fg; mp.dfmt = fd;
+        int rec2 = vkc_begin() && vkc_moe(xb, ib, wb, tb, hb, yb, &mp) && vkc_submit(1);
+        float *got2 = down(yb, 0, (size_t)S * yrow);
+        double e2 = 0;
+        for (int s = 0; s < S; s++) { double r = relerr(got2 + (size_t)s * yrow + 1, ref + (size_t)s * yrow + 1, (size_t)D, 1e-3); if (r > e2) e2 = r; }
+        CHECK(rec2 && e2 < 2e-4 && !bad(got2, (size_t)S * yrow), "moe %s (fmt %d/%d named): rel err %.2e", what, fg, fd, e2);
+        free(got2);
+    }
     vkc_free(lb); vkc_free(xb); vkc_free(tb); vkc_free(ib); vkc_free(wb); vkc_free(hb); vkc_free(yb);
     for (int k = 0; k < E; k++) {
         if (ex[k]) coli_vk_xb_expert_free(ex[k]);
@@ -3136,11 +3145,23 @@ static void bench_moe(void) {
     uint8_t *wg = malloc(rg * I), *wd = malloc(rd * D);
     for (size_t i = 0; i < rg * I; i++) wg[i] = (uint8_t)rnd();
     for (size_t i = 0; i < rd * D; i++) wd[i] = (uint8_t)rnd();
+    /* our own formats (fmt below 100: 1, 2, 4): a scale per row, or per COLI_VK_BENCH_GS inputs (64) */
+    int ours = fg < 100, gs = 0;
+    float *sg = NULL, *sd = NULL;
+    if (ours) {
+        const char *ge = getenv("COLI_VK_BENCH_GS");
+        gs = fg == 4 ? (ge && atoi(ge) > 0 ? atoi(ge) : 64) : 0;
+        size_t ng = gs ? (size_t)(D + gs - 1) / gs : 1, nd = gs ? (size_t)(I + gs - 1) / gs : 1;
+        sg = malloc((size_t)I * ng * sizeof *sg); sd = malloc((size_t)D * nd * sizeof *sd);
+        for (size_t i = 0; i < (size_t)I * ng; i++) sg[i] = 0.002f;
+        for (size_t i = 0; i < (size_t)D * nd; i++) sd[i] = 0.002f;
+    }
     int ok = 1;
     for (int e = 0; e < E && ok; e++)
-        ok = coli_vk_tensor_ensure(&tg[e], wg, NULL, fg, D, I, 0) && coli_vk_tensor_ensure(&tu[e], wg, NULL, fg, D, I, 0) &&
-             coli_vk_tensor_ensure(&td[e], wd, NULL, fd, I, D, 0) && (ex[e] = coli_vk_xb_expert(tg[e], tu[e], td[e])) &&
+        ok = coli_vk_tensor_ensure(&tg[e], wg, sg, fg, D, I, gs) && coli_vk_tensor_ensure(&tu[e], wg, sg, fg, D, I, gs) &&
+             coli_vk_tensor_ensure(&td[e], wd, sd, fd, I, D, gs) && (ex[e] = coli_vk_xb_expert(tg[e], tu[e], td[e])) &&
              coli_vk_xb_expert_entry(ex[e], tab + (size_t)e * COLI_VK_XB_ENTRY);
+    free(sg); free(sd);
     if (!ok) { printf("bench moe: the experts did not go up (fmt %d/%d)\n", fg, fd); return; }
     VkcBuf *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
     vkc_begin(); vkc_write(tb, 0, tab, (size_t)E * COLI_VK_XB_ENTRY * 4); vkc_submit(1);
@@ -3151,7 +3172,7 @@ static void bench_moe(void) {
         VkcBuf *ib = vkc_buf((size_t)S * K * 4 * nl, VKC_DEV), *wb = vkc_buf((size_t)S * K * 4 * nl, VKC_DEV);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *yb = vkc_buf((size_t)S * D * 4, VKC_DEV);
         VkcRoute rp = {S * nl, E, K, 0, 0, E, 0, 0, 0, K, 1, K, 1, 1, 1, 1.f, 1.f, 0.f};
-        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, rpw, 1, fg, fd, E, 0};   /* block-format experts */
+        VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, rpw, !ours, fg, fd, E, 0};   /* block-format experts, or ours */
         vkc_begin(); ok = vkc_route(lb, NULL, ib, wb, &rp) && vkc_submit(1);
         double best = 1e9;
         for (int r = -1; r < 4 && ok; r++) {   /* r -1 untimed: a driver may finish the pipeline on its first frames */

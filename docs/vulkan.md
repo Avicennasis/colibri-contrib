@@ -1933,7 +1933,13 @@ so, a token is one frame.
   the rank-order sum. A row's 16-byte weight steps are spread over a power-of-two group
   of lanes with clustered adds, one compiled body per weight format, so every format of
   the tier (int8, int4, MXFP4, int3, f32, bf16, FP8, int8 in groups) takes it. Each row
-  is computed alone: a verify's rows have a decode step's bits.
+  is computed alone: a verify's rows have a decode step's bits. Our container formats (1
+  int8 rows, 2 int4 rows, 4 int4 per group) have pipelines of their own besides
+  (`FMTC`, a specialization constant): each pass runs on its matrices' format's, so the
+  other bodies are not compiled in. With every body in, Qwen3.6 int4-g64's layer took 112
+  us on an RTX PRO 4000 (the gate and up pass alone 77); with fmt 4's alone, 73 (42), and
+  the decode went from 56.6-57.7 to 67.2-67.4 tok/s. The layer's formats come from the
+  tier's table (its first resident entry); `vkc_prewarm` makes and launches the three.
 - The books follow at the frame's end, from the ids that come down with it: the history
   (`.coli_usage`), the HITS bitmap, the tier's heat (`vkt_dev_count`); the tier's line
   counts them as `in the dense chain: N routed experts with no host step`.
