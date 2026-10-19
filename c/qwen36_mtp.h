@@ -665,11 +665,16 @@ static int q36_mtp_draft_more(Model *m, float *hidden, int tok, int pos) {
 static void q36_mtp_attach(Model *m) {
     const char *path = getenv("Q36_MTP");
     if (!path || strcmp(path, "1") || g_q36_mtp.on) return;
-    /* where a verify would not reproduce plain decoding there are no drafts (q36_spec_init):
-     * a head there would only be fed, every row brought back from the chain for nothing */
-    if (qt_ready() || g_cache_route || qq_active() || m->dn_dev) {
-        fprintf(stderr, "[mtp] Q36_MTP=1: the head stays off under %s, where there are no speculative steps\n",
-                qt_ready() || m->dn_dev ? "the CUDA tier" : g_cache_route ? "CACHE_ROUTE" : "a qpack container");
+    /* where a verify would not reproduce plain decoding there are no drafts (q36_spec_begin):
+     * a head there would only be fed, every row brought back from the chain for nothing.
+     * Under the CUDA chain with the whole tier there are, but the head has no CUDA path
+     * yet: on the CPU beside the device a draft row costs about half a decode step. */
+    if (qt_ready() || m->dn_dev || g_cache_route || qq_active()) {
+        fprintf(stderr, "[mtp] Q36_MTP=1: the head stays off under %s\n",
+                q36_cuda_tier_drafts(m) ? "the CUDA chain (no CUDA path for the head yet; prompt lookup still drafts)"
+                : qt_ready() || m->dn_dev ? "a CUDA tier holding part of the experts, where there are no speculative steps"
+                : g_cache_route ? "CACHE_ROUTE, where there are no speculative steps"
+                : "a qpack container, where there are no speculative steps");
         return;
     }
     if (!q36_mtp_load(m)) { fprintf(stderr, "[mtp] Q36_MTP=%s: the head stays off\n", path); return; }

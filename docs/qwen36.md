@@ -115,9 +115,9 @@ quote, repeated structure), the engine drafts the up to 5 tokens that followed i
 and checks them in one verify forward. The DeltaNet state is copied after each verify
 row, so a rejected draft rolls back by swapping a copy in. A gate drafts only where the
 measured acceptance and verify cost say it pays. The output is that of plain decoding,
-greedy or sampled, on the CPU and in the Vulkan dense chain. Lookup stays off under the
-CUDA tier, `CACHE_ROUTE` and a qpack container, whose results depend on what is
-resident. On a code edit, Qwen3.6-35B-A3B decoded 7.90 tok/s with lookup against 7.42 without (1.56 tokens per forward); on a chat prompt the gate declined every proposal and the speed was unchanged. How it works, the gate, the settings and the tests:
+greedy or sampled, on the CPU, in the Vulkan dense chain and in the CUDA chain with every
+routed expert on the device. Lookup stays off under a CUDA tier holding part of the
+experts, `CACHE_ROUTE` and a qpack container, whose results depend on what is resident. On a code edit, Qwen3.6-35B-A3B decoded 7.90 tok/s with lookup against 7.42 without (1.56 tokens per forward); on a chat prompt the gate declined every proposal and the speed was unchanged. How it works, the gate, the settings and the tests:
 [speculative.md](speculative.md).
 
 ## The MTP head (`Q36_MTP`)
@@ -159,7 +159,7 @@ KV cache; only draft rows need its full decoder computation. Rejected verify
 rows are rewound, and pins preserve the pending residual. The same verify
 path as prompt lookup commits tokens: output and final logits equal ordinary
 decoding, including sampled `serve` turns. As for lookup, speculation is off
-under the CUDA tier, `CACHE_ROUTE` and qpack.
+under a CUDA tier holding part of the experts, `CACHE_ROUTE` and qpack.
 
 `Q36_MTP_DRAFTS=1` is the default; `1` through `7` set the maximum depth, and
 `auto` lets the measured gate choose. `Q36_MTP_PMIN` (default `0`) stops adding
@@ -173,8 +173,10 @@ from the float probability sum.
 With the Vulkan chain the head runs on the device: its layer, its routing and its
 routed experts through the chain's device MoE, one frame a draft. `Q36_MTP_GPU=0`
 keeps the head on the CPU, and so does `Q36_MTP_DMOE=0` or a device without the
-chain's MoE. Under the CUDA tier there are no speculative steps, so `Q36_MTP=1`
-leaves the head off there and says so.
+chain's MoE. Under the CUDA tier `Q36_MTP=1` leaves the head off and says so: with
+part of the experts there are no speculative steps, and under the CUDA chain the head
+has no CUDA path yet (on the CPU beside the card a draft row cost 5.1 ms, decode fell
+from 98 to 85-88 tok/s); prompt lookup drafts there.
 
 Measured on an RTX PRO 4000 (Vulkan chain, Qwen3.6-35B-A3B int4-g64, `coli serve`,
 answers of 128 tokens, two alternated rounds of three):

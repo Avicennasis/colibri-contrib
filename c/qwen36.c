@@ -5317,6 +5317,7 @@ static float *g_hidden_sink = NULL;
 #include "qwen36_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
 static void q36_embed_row(Model *m, int id, int pos, float *row);
+static int q36_cuda_tier_drafts(Model *m);   /* the CUDA tier whole, run by the CUDA chain */
 #include "qwen36_mtp.h"    /* Q36_MTP: the MTP head drafts for the speculative step */
 static void q36_mtp_lm_head(Model *m, const float *row, float *logits) {
     Cfg *c = &m->c;
@@ -5353,6 +5354,24 @@ static void q36_embed_row(Model *m, int id, int pos, float *row) {
 #ifdef COLI_CUDA
 #include "qwen36_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
 #endif
+
+/* The CUDA tier with every routed expert on the device, run by the CUDA chain: what a step
+ * computes no longer depends on what is resident, so a verify's rows get a decode step's
+ * bits and the speculative step runs as on the Vulkan chain. A tier holding part of the
+ * experts (the rest on the CPU, residency following the routed rows, rejected drafts'
+ * too) keeps it off. */
+static int q36_cuda_tier_drafts(Model *m) {
+#ifdef COLI_CUDA
+    if (!qt_ready() || !g_cuda_chain || m->dn_dev) return 0;
+    for (int i = 0; i < m->c.n_layers; i++)
+        for (int e = 0; e < m->c.n_experts; e++)
+            if (!qt_is_resident(i, e)) return 0;
+    return 1;
+#else
+    (void)m;
+    return 0;
+#endif
+}
 
 /* The forward: ids[0..S) at pos_base through every layer, the final norm and
  * lm_head on the last `nlogits` rows (one for a step, every row of a speculative
@@ -6019,19 +6038,20 @@ static void q36_spec_begin(Model *m, Q36Spec *sp, const int *prompt, int np) {
     sp->force = q36_spec_force_mode(getenv("COLI_LOOKUP_FORCE"), &sp->force_row);
     e = getenv("COLI_SPEC_GATE");
     spec_gate_init(&sp->gate, e && *e == '0');
-    if (sp->lookup && (qt_ready() || g_cache_route || qq_active() || m->dn_dev)) {
+    int tier_off = (qt_ready() || m->dn_dev) && !q36_cuda_tier_drafts(m);
+    if (sp->lookup && (tier_off || g_cache_route || qq_active())) {
         static int said;
         if (!said && asked) {   /* the default stays quiet: nothing was asked for */
             said = 1;
             fprintf(stderr, "[qwen36] COLI_LOOKUP=1: no drafts under %s (its results depend on what is "
                             "resident, so a verify would not reproduce plain decoding)\n",
-                    qt_ready() || m->dn_dev ? "the CUDA tier" : g_cache_route ? "CACHE_ROUTE" : "a qpack container");
+                    tier_off ? "a CUDA tier holding part of the experts" : g_cache_route ? "CACHE_ROUTE" : "a qpack container");
         }
         sp->lookup = 0;
     }
     /* the MTP head (Q36_MTP) drafts under the same conditions as prompt lookup */
     sp->mtp_force = q36_spec_force_mode(getenv("Q36_MTP_FORCE"), &sp->mtp_force_row);
-    sp->mtp = g_q36_mtp.on && !(qt_ready() || g_cache_route || qq_active() || m->dn_dev);
+    sp->mtp = g_q36_mtp.on && !(tier_off || g_cache_route || qq_active());
     /* one draft by default: deeper ones measured slower here (each costs a head row on
      * the CPU and a verify row, more than their acceptance returns); "auto": the gate */
     e = getenv("Q36_MTP_DRAFTS");

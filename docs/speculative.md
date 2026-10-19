@@ -59,9 +59,14 @@ pass its row. More copies split the convolution and the recurrence into one disp
 per copy, each ending on its row. The state crosses between them through memory in f32,
 so the rows get the bits of the single dispatch.
 
-Drafting stays off where a row's result depends on what is resident: qwen36 under the
-CUDA expert tier, `CACHE_ROUTE` or a qpack container (with `COLI_LOOKUP=1` asked for, a
-`[qwen36] COLI_LOOKUP=1: no drafts under ...` line says so; the default stays quiet). One case stays inside the gate but changes the last bits: with the
+Drafting stays off where a row's result depends on what is resident: qwen36 under a
+CUDA expert tier holding part of the experts, `CACHE_ROUTE` or a qpack container (with
+`COLI_LOOKUP=1` asked for, a `[qwen36] COLI_LOOKUP=1: no drafts under ...` line says so;
+the default stays quiet). A tier holding every routed expert, run by the CUDA chain, drafts:
+nothing there depends on residency, and the chain's verify rows get a decode step's bits.
+On an RTX PRO 4000 (Qwen3.6-35B-A3B int4-g64) a code edit of 400 tokens took 3.25 s
+against 4.40 s without lookup, 2.91 tokens per forward, the same text; on a chat answer
+the gate declined almost every proposal (98.2-98.8 against 97.8-98.3 tok/s). One case stays inside the gate but changes the last bits: with the
 Vulkan expert tier on, a verify's rows, the rejected drafts' included, feed the tier's
 history, so which experts are on the device follows what was drafted. An expert on the
 device sums in a different order than on the CPU, so the logits of a run with drafts and
