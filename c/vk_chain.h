@@ -94,7 +94,8 @@ int  vkc_layer_recorded(int *layers);
 /* transfers, recorded into the open frame (offsets and counts in floats) */
 int  vkc_copy(VkcBuf *dst, size_t doff, VkcBuf *src, size_t soff, size_t n);
 int  vkc_zero(VkcBuf *dst, size_t off, size_t n);
-/* one copy command over n regions (a KV row per head, say) */
+/* n regions (a KV row per head, say): one dispatch when they lie on a grid (chain_copy2d.comp;
+ * COLI_VK_COPY_GRID=0 never), else one copy command */
 typedef struct { size_t dst, src, n; } VkcRegion;
 int  vkc_copy_regions(VkcBuf *dst, VkcBuf *src, const VkcRegion *r, int n);
 int  vkc_write(VkcBuf *dst, size_t off, const void *src, size_t bytes);   /* through the frame's staging */
@@ -823,6 +824,7 @@ typedef struct {
     unsigned long long tile_gemms;     /* prompt matmuls through chain_gemm.comp (matrix units) */
     unsigned long long moe_i8;         /* routed-expert layer steps in the CPU's integer form (chain_moe_i8) */
     unsigned long long gemv_i8;        /* a GGUF's dense GEMVs in it (chain_gemv_bd_i8) */
+    unsigned long long copy_grids;     /* region lists copied by one dispatch (chain_copy2d, vkc_copy_regions) */
 } VkcStats;
 void vkc_stats(VkcStats *st);
 /* COLI_VK_CHAIN_PROF=1: one stderr line of device time per kind of op */

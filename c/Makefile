@@ -760,6 +760,8 @@ VK_SPV   += shaders/qmatmul_grp_q.spv shaders/qmatmul_grp_gate_up_q.spv
 VK_SPV   += shaders/chain_sconv.spv shaders/chain_relattn.spv
 # blocked attention for prompt chunks (made on first use; vk_chain.c, chain_attnb.comp)
 VK_SPV   += shaders/chain_attnb.spv
+# a grid of copy regions in one dispatch (made on first use; vk_chain.c, chain_copy2d.comp)
+VK_SPV   += shaders/chain_copy2d.spv
 # the int8/int4 prompt GEMM on the matrix units (optional at run time)
 VK_SPV   += shaders/chain_gemm.spv
 # the KV cache split between the device and the host past the device's budget
