@@ -3,8 +3,10 @@
 // chain_attn.comp's causal case (no selection list, window, ring, sink or second V
 // width, head-major cache) for a prompt chunk, KHR cooperative matrix f16 x f16 -> f32.
 // Same bindings and push constants as chain_attn.comp, so vkc_attn_w picks either.
-// After llama.cpp's flash_attn_cm1.comp (MIT): 16 query rows, 64 keys a step, 4
-// subgroups of 64, the softmax on a shared copy of the scores. For Qwen3.6 on RADV:
+// After llama.cpp's flash_attn_cm1.comp (MIT): 16 query rows, 64 keys a step, 256
+// invocations, the softmax on a shared copy of the scores. The matrix work goes to 4
+// subgroups: all of them at subgroups of 64, the first 4 of 8 at 32 (NVIDIA), the others
+// staging and running the softmax with them. For Qwen3.6 on RADV:
 //  * GQA folded: the 16 rows are 16/GQ tokens x the GQ query heads of ONE kv head, so
 //    every K/V block is staged once for all of them;
 //  * two passes instead of an online softmax: pass 1 finds each row's max m and sum l,
@@ -99,7 +101,8 @@ void main() {
         skv[(d8 >> 1u) * 32u + r * 2u + (d8 & 1u)] = uvec4(pk(a.x, a.y), pk(a.z, a.w), pk(b.x, b.y), pk(b.z, b.w));
     }
     barrier();
-    [[unroll]] for (uint j = 0u; j < NDT; j++) coopMatLoad(A[j], skv, j * 32u, 2u, gl_CooperativeMatrixLayoutRowMajor);
+    bool mm = sgi < 4u;                              // subgroup-uniform: this subgroup's share of the matrix work
+    if (mm) [[unroll]] for (uint j = 0u; j < NDT; j++) coopMatLoad(A[j], skv, j * 32u, 2u, gl_CooperativeMatrixLayoutRowMajor);
     barrier();
 
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> B;
@@ -110,12 +113,14 @@ void main() {
     for (uint kb = 0u; kb < nkb; kb++) {
         stage(g, kb * BC, nt, tid, false);
         barrier();
-        Sc = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-        [[unroll]] for (uint j = 0u; j < NDT; j++) {
-            coopMatLoad(B, skv, (sgi * NDT + j) * 32u, 2u, gl_CooperativeMatrixLayoutColumnMajor);
-            Sc = coopMatMulAdd(A[j], B, Sc);
+        if (mm) {
+            Sc = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            [[unroll]] for (uint j = 0u; j < NDT; j++) {
+                coopMatLoad(B, skv, (sgi * NDT + j) * 32u, 2u, gl_CooperativeMatrixLayoutColumnMajor);
+                Sc = coopMatMulAdd(A[j], B, Sc);
+            }
+            coopMatStore(Sc, ss, sgi * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
         }
-        coopMatStore(Sc, ss, sgi * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
         barrier();
         float sv[4], bm = -1e30;
         [[unroll]] for (uint i = 0u; i < 4u; i++) {
@@ -141,12 +146,14 @@ void main() {
     for (uint kb = 0u; kb < nkb; kb++) {
         stage(g, kb * BC, nt, tid, false);
         barrier();
-        Sc = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
-        [[unroll]] for (uint j = 0u; j < NDT; j++) {
-            coopMatLoad(B, skv, (sgi * NDT + j) * 32u, 2u, gl_CooperativeMatrixLayoutColumnMajor);
-            Sc = coopMatMulAdd(A[j], B, Sc);
+        if (mm) {
+            Sc = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            [[unroll]] for (uint j = 0u; j < NDT; j++) {
+                coopMatLoad(B, skv, (sgi * NDT + j) * 32u, 2u, gl_CooperativeMatrixLayoutColumnMajor);
+                Sc = coopMatMulAdd(A[j], B, Sc);
+            }
+            coopMatStore(Sc, ss, sgi * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
         }
-        coopMatStore(Sc, ss, sgi * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
         barrier();                                   // scores complete, K block consumed
         [[unroll]] for (uint i = 0u; i < 4u; i++) {
             uint key = kb * BC + i * 16u + cl;
@@ -155,7 +162,7 @@ void main() {
         }
         stage(g, kb * BC, nt, tid, true);
         barrier();
-        [[unroll]] for (uint kt = 0u; kt < 4u; kt++) {
+        if (mm) [[unroll]] for (uint kt = 0u; kt < 4u; kt++) {
             coopMatLoad(PA, sp, kt * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint u = 0u; u < NDS; u++) {
                 coopMatLoad(B, skv, (kt * NDT + sgi * NDS + u) * 32u, 2u, gl_CooperativeMatrixLayoutRowMajor);
@@ -166,7 +173,7 @@ void main() {
     }
 
     // out: rows map to (token, head), not a uniform stride -> via this subgroup's ss tile
-    [[unroll]] for (uint u = 0u; u < NDS; u++) {
+    if (mm) [[unroll]] for (uint u = 0u; u < NDS; u++) {
         coopMatStore(Oa[u], ss, sgi * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
         subgroupMemoryBarrierShared(); subgroupBarrier();
         for (uint e = lane; e < 256u; e += gl_SubgroupSize) {

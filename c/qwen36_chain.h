@@ -501,7 +501,8 @@ static void q36c_prewarm(Model *m, const Q36Chain *ch) {
     Cfg *c = &m->c;
     int dn = 0;
     for (int i = 0; i < c->n_layers; i++) dn |= !c->is_attn[i];
-    VkcPrewarm pw = {.moe = c->n_experts > 0 ? (g_gguf ? 2 : 1) : 0, .dn_kd = dn ? c->dn_kdim : 0};
+    VkcPrewarm pw = {.moe = c->n_experts > 0 ? (g_gguf ? 2 : 1) : 0, .dn_kd = dn ? c->dn_kdim : 0,
+                     .attn_hd = c->head_dim, .attn_gq = c->kv_heads > 0 ? c->q_heads / c->kv_heads : 0};
     const void *wq; const float *sc;
     for (int i = ch->lo; i < ch->lo + ch->n; i++) {
         QW *ws[16]; int nw = q36c_layer_qws(m, i, ws);

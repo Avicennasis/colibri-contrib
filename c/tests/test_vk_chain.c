@@ -2896,15 +2896,22 @@ static void test_moe_rows_q(int fmt, int gs, int S, int K, int E, int D, int I) 
         VkcRoute rp = {S, E, K, 0, 0, E, 0, 0, 0, K, 0, K, 1, 1, 1, 1.f, 1.f, 0.f};
         VkcMoe mp = {S, K, D, I, 0, 0.f, 0.f, 0.f, 0, 0, D, 0, K, 0, K, 0, D, 0, 0, fmt, fmt, E, 0};
         VkcMoeRows rr = {0};
+        VkcStats s0, s1; vkc_stats(&s0);
         ok = vkc_begin() && vkc_write(tb, 0, tab, (size_t)E * COLI_VK_XB_ENTRY * 4) && vkc_route(lb, NULL, ib, wb, &rp) &&
              vkc_moe(xb, ib, wb, tb, hb, y0, &mp) && vkc_moe_rows(xb, ib, wb, tb, &rr, y1, &mp) && vkc_submit(1);
+        vkc_stats(&s1);
         CHECK(ok, "moe rows fmt %d S %d: the frame failed", fmt, S);
         if (ok) {
+            /* in floats as chain_moe to 1e-4; on the matrix units (qmatmul_grp_qc: f16 weights
+             * and inputs, two GEMMs) to 2e-3 of the largest output */
+            int coop = s1.grp_coop > s0.grp_coop;
             const float *a = vkc_ptr(y0), *b = vkc_ptr(y1);
             double mx = 0, ref = 0;
             for (size_t i = 0; i < (size_t)S * D; i++) { double d = fabs((double)a[i] - b[i]); if (d > mx) mx = d; if (fabs(a[i]) > ref) ref = fabs(a[i]); }
-            CHECK(mx <= 1e-4 * (ref > 1 ? ref : 1), "moe rows fmt %d S %d: max |diff| %.3g of %.3g against chain_moe", fmt, S, mx, ref);
-            printf("moe rows fmt %d gs %d S %d K %d E %d: max |diff| %.3g of %.3g against chain_moe\n", fmt, gs, S, K, E, mx, ref);
+            double tol = coop ? 2e-3 * ref : 1e-4 * (ref > 1 ? ref : 1);
+            CHECK(mx <= tol, "moe rows fmt %d S %d%s: max |diff| %.3g of %.3g against chain_moe", fmt, S, coop ? " (matrix units)" : "", mx, ref);
+            printf("moe rows fmt %d gs %d S %d K %d E %d%s: max |diff| %.3g of %.3g against chain_moe\n", fmt, gs, S, K, E,
+                   coop ? " on the matrix units" : "", mx, ref);
         }
         vkc_moe_rows_free(&rr);
         VkcBuf *fr[] = {lb, xb, tb, ib, wb, hb, y0, y1};

@@ -302,11 +302,12 @@ static void olc_fit_start(Model *m) {
     if (n == 0) vkc_fit_placed("olmoe", &g_olc_fit);   /* the chain off: nothing of it on the device */
 }
 /* The pipelines vk_chain.c makes at first use, made now, before the tier fills the device
- * (vkc_prewarm): the routed experts' (a decode step's, and a prompt chunk's grouped GEMMs). */
+ * (vkc_prewarm): the routed experts' (a decode step's, and a prompt chunk's grouped GEMMs) and the
+ * attention on the matrix units. */
 static void olc_prewarm(Model *m) {
     Cfg *c = &m->c;
     if (c->n_experts <= 0) return;
-    VkcPrewarm pw = {.moe = 1, .ex_ours = 1};
+    VkcPrewarm pw = {.moe = 1, .ex_ours = 1, .attn_hd = c->head_dim, .attn_gq = 1};
     pw.moe_d = c->hidden; pw.moe_i = c->inter;
     vkc_prewarm(&pw);
 }
