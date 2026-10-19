@@ -54,6 +54,7 @@ typedef struct VkcBuf VkcBuf;
 #define VKC_UP   1
 #define VKC_DOWN 2
 #define VKC_HOST 3   /* host memory read in place (vkc_host): bound read-only, never written */
+#define VKC_ADDR 4   /* device memory of its own with a device address (vkc_buf_addr) */
 
 int  vkc_init(void);          /* after coli_vk_init; 1 = the chain's pipelines are up */
 int  vkc_ready(void);
@@ -76,6 +77,17 @@ size_t  vkc_bytes(const VkcBuf *b);
  * a device that shares the RAM, without staged uploads); *off: ptr's byte offset in it.
  * NULL when the device cannot. vkc_free releases it after the frames that read it. */
 VkcBuf *vkc_host(const void *ptr, size_t bytes, size_t *off);
+/* Device memory of its own whose device address *addr a shader may read by (a table of
+ * entries pointing into it: vk_dmoe.h's staging), bound like a VKC_DEV buffer; not zeroed.
+ * The primary device's, where it has bufferDeviceAddress; NULL otherwise. */
+VkcBuf *vkc_buf_addr(size_t bytes, uint64_t *addr);
+/* A barrier now, in the open frame: what an op reads by address (not a binding the frame
+ * tracks) waits for every earlier op, and every later op for it. */
+int     vkc_barrier(void);
+/* n regions (uvec4s of reg from region `first`: the source's address low and high, the
+ * first word in dst, the words) copied from those addresses into dst
+ * (shaders/chain_fetch.comp): the tier's host pool into VRAM. 0 where the device cannot. */
+int     vkc_fetch(VkcBuf *reg, int first, int n, uint32_t max_words, VkcBuf *dst);
 
 /* recording */
 int  vkc_begin(void);

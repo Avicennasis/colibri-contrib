@@ -226,6 +226,10 @@ typedef struct {
      * at most VKT_FORMS - 1 distinct pairs, gate_up/down among them or not; NULL = every
      * layer gate_up/down. The arrays are read during vkt_init only. */
     const VktFmt *layer_gate_up, *layer_down;
+    /* Optional: 1 = the dense chain copies a prompt chunk's host pool experts into the
+     * device's memory a layer at a time (vk_dmoe.h): when the host pool will hold experts,
+     * room for a layer's share of them comes out of the budget (vkt_stage_room). */
+    int stage;
 } VktConfig;
 #define VKT_FORMS 8
 #define VKT_MAX_LAYERS 512
@@ -312,8 +316,19 @@ typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; } VktHost
 int  vkt_dev_table_hybrid(int layer, uint32_t *entries, VktHostExpert *hx);
 /* whether the tier keeps experts in its host pool (system RAM the device reads over PCIe) */
 int  vkt_host_pool_on(void);
+/* the device memory the budget left for a prompt chunk's staging (VktConfig.stage), 0 none */
+size_t vkt_stage_room(void);
+/* host[e]: 1 where layer `layer`'s expert e is in vkt_dev_table's entries from the host pool
+ * (a prompt chunk stages those into VRAM: vk_dmoe.h); returns how many, -1 when off */
+int  vkt_dev_host(int layer, uint8_t *host);
+/* score[e]: the tier's rank of layer `layer`'s expert e (its heat and recency: the order it
+ * keeps experts in, the higher the hotter); returns 0, -1 when off */
+int  vkt_score(int layer, uint64_t *score);
 #else
 static inline int vkt_host_pool_on(void){return 0;}
+static inline size_t vkt_stage_room(void){return 0;}
+static inline int vkt_dev_host(int l,uint8_t *h){(void)l;(void)h;return -1;}
+static inline int vkt_score(int l,uint64_t *s){(void)l;(void)s;return -1;}
 typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; } VktHostExpert;   /* rgu, rd: bytes a row */
 static inline int vkt_dev_table_hybrid(int l,uint32_t *e,VktHostExpert *h){(void)l;(void)e;(void)h;return -1;}
 static inline int  vkt_wanted(void){return 0;}

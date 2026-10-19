@@ -3119,6 +3119,7 @@ static void q38_vk_tier_start(Model *m,int cap){
                   .ram_reserve=ram_expert*(size_t)cap*(size_t)c->layers,
                   .dense_bytes=q38_vk_dense_bytes(m),
                   .chain_bytes=g_vk_chain?q38c_late_bytes(m,q38_vk_chain_ctx(m)):0,
+                  .stage=g_vk_chain,   /* the chain stages a prompt chunk's host pool experts */
                   .in_ram=q38_vk_in_ram,.ram_ctx=m,
                   .load=q38_vk_load,.release=q38_vk_release,.load_ctx=m,.load_batch=q38_vk_load_batch,
                   .layer_gate_up=lgu,.layer_down=ldn};

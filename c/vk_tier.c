@@ -80,6 +80,7 @@ static struct {
      * second device's (dmax[1] = 0 without one), 2 the host pool (dmax[2] = 0 without it) */
     int dmax[3], dres[3], dque[3];
     size_t h_budget;                   /* the host pool's bytes */
+    size_t stage_room;                 /* left out of the budget for a prompt chunk's staging (VktConfig.stage) */
     /* the second device (COLI_VK_DEV2) */
     int d2;                            /* the tier holds experts there */
     char d2_name[64];
@@ -1689,6 +1690,7 @@ static void host_init(long long all) {
 }
 
 int vkt_host_pool_on(void) { return T.on && T.dmax[2] > 0; }
+size_t vkt_stage_room(void) { return vkt_host_pool_on() ? T.stage_room : 0; }
 
 int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.on || !cfg) return 0;
@@ -1815,6 +1817,25 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         return 0;
     }
     if (T.c.max_experts > 0 && fit > T.c.max_experts) fit = T.c.max_experts;   /* the engine's count cap */
+    /* A prompt chunk's staging (VktConfig.stage, vk_dmoe.h): where the host pool will hold
+     * the experts the budget leaves, a layer's share of them and a quarter more come out of
+     * it. Allocated beside a full budget, the staging took the card to its last memory and
+     * the decode after a prompt lost 4% (Qwen3.8 IQ2_S on an RTX PRO 4000, 48.8 -> 46.6
+     * tok/s); with the room left it kept 48.8, the prompt 112 -> 148 tok/s. */
+    {
+        const char *he = getenv("COLI_VK_TIER_HOST"), *xe = getenv("COLI_VK_TIER_EXCLUSIVE"), *sg = getenv("COLI_VK_STAGE");
+        int pool = !(he && *he == '0') && !(T.uma && !(he && !strcmp(he, "1"))) && !(xe && *xe == '0') && coli_vk_tier_host_pool();
+        int blocks = 0;   /* the staging copies block types only (vk_dmoe.h) */
+        for (int l = 0; l < T.main_layers; l++) blocks |= T.form[form_of(l)].gu_fmt >= 100 || T.form[form_of(l)].dn_fmt >= 100;
+        long long per = (all - fit + T.main_layers - 1) / T.main_layers;
+        per += per / 4;
+        if (per > T.c.experts) per = T.c.experts;
+        if (T.c.stage && blocks && !(sg && *sg == '0') && pool && fit < all && per > 0 && fit - per >= 2) {
+            fit -= per; fit_raw -= per;
+            want -= (double)per * T.exp_bytes;
+            T.stage_room = (size_t)per * T.exp_bytes;
+        }
+    }
     /* Streaming (big prefill steps, see "streaming" above): COLI_VK_TIER_STREAM=0 turns
      * it off; it needs the engine's load hook and the GEMM route. Its staging slots come
      * out of the budget: the residents give up what the budget cannot hold beside them. */
@@ -1912,6 +1933,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     }
     if (T.c.chain_bytes) fprintf(stderr, "; %s left for the dense chain's KV mirror and a prompt chunk",
                                  human((double)T.c.chain_bytes, hb, sizeof hb));
+    if (T.stage_room) fprintf(stderr, "; %s for a prompt chunk's host pool experts", human((double)T.stage_room, hb, sizeof hb));
     fprintf(stderr, "), %s, %s queue, up to %d promotions per token%s%s",
             T.uma ? (cap && *cap ? "shared RAM (COLI_VK_TIER_GB)" : "shared RAM: a quarter of what the expert cache leaves")
                   : "device memory", coli_vk_xb_queue_shared() ? "shared" : "own", T.rate,
@@ -1998,6 +2020,21 @@ int vkt_dev_table(int layer, uint32_t *ent) {
         n++;
     }
     return n;
+}
+int vkt_dev_host(int layer, uint8_t *host) {
+    if (!T.on || layer < 0 || layer >= T.c.layers || !host) return -1;
+    int n = 0;
+    for (int e = 0; e < T.c.experts; e++) {
+        VSlot *v = slot(layer, e);
+        host[e] = v->state == VS_RESIDENT && v->dev == 0 && v->ex && v->host;
+        n += host[e];
+    }
+    return n;
+}
+int vkt_score(int layer, uint64_t *sc) {
+    if (!T.on || layer < 0 || layer >= T.c.layers || !sc) return -1;
+    for (int e = 0; e < T.c.experts; e++) sc[e] = score(slot(layer, e));
+    return 0;
 }
 /* the share of the host pool's experts the device keeps reading over PCIe in a hybrid
  * step (COLI_VK_HYBRID_PCIE, 0..1): a step with several such pairs splits them, so the two
