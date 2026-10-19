@@ -2259,11 +2259,15 @@ family_inkling_olmoe_chain() {
   # (these compare a warm session's logprobs with a cold one's to the last printed
   # digit: no history file and COLI_VK_TIER_BALANCE=0, so both sessions split their
   # experts between the device and the CPU alike. Use per-row attention on both:
-  # a cold prefill and a short suffix must share a reduction order for exact bits.)
+  # a cold prefill and a short suffix must share a reduction order for exact bits.
+  # The same for the experts: olmoe's cold prompt runs them on the tier, a short suffix
+  # in the frame (chain_moe_gv.comp, which the tier's experts below its GEMM's rows run
+  # too); an expert at 16 rows or more in one prompt and fewer in the other would take
+  # the tier's GEMM once, so the tier keeps every expert below it here.)
   COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 INKLING_TINY=tiny_inkling \
     $PY -m unittest tests.test_inkling_prefix_serve tests.test_inkling_dashboard_hits
-  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 OLMOE_TINY=olmoe_tiny_c \
-    $PY -m unittest tests.test_olmoe_prefix_serve tests.test_olmoe_dashboard_hits tests.test_brio_serve
+  COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_BALANCE=0 COLI_VK_ATTN_BLOCK=0 COLI_VK_TIER_GEMM_ROWS=1000 \
+    OLMOE_TINY=olmoe_tiny_c $PY -m unittest tests.test_olmoe_prefix_serve tests.test_olmoe_dashboard_hits tests.test_brio_serve
 }
 
 # inkling's and olmoe's chain under ASan and UBSan: memory safety is the gate (a
