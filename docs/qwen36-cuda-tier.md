@@ -463,6 +463,16 @@ in fp32. Against an fp64 reference the outputs are within 2e-4 to 4e-4 (relative
 largest); the CPU's own experts quantize their inputs to int8. `COLI_CUDA_TC_GEMM=0`
 keeps the block kernel.
 
+On sm_70 and later the same GEMMs run in f16 (`hcg_tile`: `hcg_dense_k`, `hcg_moe_gu_k`,
+`hcg_moe_dn_k`), at twice the TF32 fragments' rate and with a tile that keeps more of the
+card busy: 256 threads (eight warps) for 64 rows x 64 outputs, K in steps of 64, the next
+step's words and inputs fetched into registers while the tensor cores work. int8 and int4
+codes are exact in f16 (the row's scale after the sum), int4 per group goes in times its
+scale, x is rounded to f16 and held to +-65504 (a NaN stays one), sums in fp32. On the 35B,
+a 1024-token prompt: the experts' GEMMs 513 -> 236 ms, the dense ones 234 -> 97 ms; a
+467-token prompt 889-910 -> 1561-1609 tok/s; the loss above 3.2271 (TF32) -> 3.2262.
+`COLI_CUDA_TC_F16=0` keeps TF32 where it runs.
+
 It is off with cache routing or the agreement meter (their state crosses tokens on the
 host), a gate bias, more groups than the kernel keeps, or a tier on more than one card.
 `COLI_CUDA_CHAIN_MOE=0` keeps the host's step. A decode step's text is the same either
