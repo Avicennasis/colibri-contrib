@@ -565,8 +565,10 @@ the experts a device step served still light up in `HITS`, and qwen36's
 
 A decode step, an MTP verify or a prompt chunk's rarely routed experts give the batch
 experts with a row or a few. Where no grouped route takes the batch (the grouped GEMM
-and GEMV need cooperative matrices at subgroups of 64; elsewhere, and for MXFP4 and SiTU
-everywhere), each of those experts below the per-expert GEMM's 16 rows runs the dense
+and GEMV need cooperative matrices at subgroups of 64: NVIDIA, Intel and Lavapipe have
+no grouped route; on a Radeon the grouped GEMV takes int8, int4 and MXFP4 with SwiGLU or
+SiTU, 17-26% faster there than this kernel on a 780M, and MXFP4 now 2530 -> 2085 us a step
+at MiMo's shape), each of those experts below the per-expert GEMM's 16 rows runs the dense
 chain's decode kernel, `chain_moe_gv.comp`, with every row of the batch a pair of its
 own: two dispatches for the step instead of two per expert, each a GEMV of 8 outputs a
 workgroup. Formats int8, int4 (a scale a row or a group) and MXFP4; SwiGLU, clamped or

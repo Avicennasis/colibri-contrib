@@ -4017,7 +4017,7 @@ static XbCtx g_xb[2];
 static int xb_dev_ready(const XbCtx *X) { return X->d ? G2.ready : G.ready; }
 static int dev_pin_sg(VkDevice dev) { return dev == G.dev ? G.pin_sg : dev == G2.dev ? G2.pin_sg : 0; }
 struct PCV4 { int rows, n; };
-struct PCGRP { int I, O; float limit; int ibase; int kgat; int rpw; };   /* qmatmul_grp.comp, qmatmul_grp_gemv.comp (rpw) */
+struct PCGRP { int I, O; float limit; int ibase; int kgat; int rpw; int act; float a, b; };   /* qmatmul_grp.comp, qmatmul_grp_gemv.comp (rpw, act, a, b) */
 #define XB_GV_RPW 64   /* outputs per grouped-GEMV workgroup */
 #define XB_GRP_TT 4   /* 16-row tiles of an expert per workgroup: 64 rows (2, 4 or 8) */
 
@@ -4423,7 +4423,7 @@ static VkPipeline xb_grp_bd_pipe(XbCtx *X, int v, int t) {
  * the chain's (a prompt chunk's experts through the tier, its next tokens through the chain,
  * as OLMoE and Qwen run them, give a resumed prefix the cold forward's numbers). Where the
  * grouped routes do not take a batch (no cooperative matrices at subgroups of 64: NVIDIA,
- * Intel, Lavapipe; MXFP4 and SiTU everywhere) a decode step's K experts took 2K dispatches,
+ * Intel, Lavapipe) a decode step's K experts took 2K dispatches,
  * a GEMV of 8 outputs a workgroup each. COLI_VK_XB_GEMV=0 keeps those. */
 static void xb_barrier(VkCommandBuffer c);
 struct PCCGV { int mode, S, K, D, I, act; float limit, a, b; int t_off, x_off, x_row, i_off, i_row, lpr, tiles, y_off, y_row; };
@@ -4916,17 +4916,19 @@ static int xb_grp_ok(const XbCtx *X, ColiVkExpert *const *ex, const int *rows, i
         }
         if (ok && xb_grp_bd_pipe((XbCtx *)X, 1, tg - 100) && xb_grp_bd_pipe((XbCtx *)X, 0, td - 100)) return 3;
     }
-    if (!X->grp_rows || X->act != COLI_VK_ACT_SWIGLU || dr % X->align || ir % X->align) return 0;
+    if (!X->grp_rows || dr % X->align || ir % X->align) return 0;
     int mode = total >= X->grp_rows ? 1 : X->p_gv[0] ? 2 : 0;
-    if (mode == 1 && (D % 128 || I % 128)) return 0;
-    if (mode == 2 && (D % 32 || I % 32 || D > 8192 || I > 8192)) return 0;
+    /* the grouped GEMV also computes SiTU and MXFP4 (Kimi K3, MiMo, DeepSeek V4.1): on a Radeon
+     * 780M, 25-35% faster than chain_moe_gv.comp's way (xb_cgv_record), which these took */
+    if (mode == 1 && (X->act != COLI_VK_ACT_SWIGLU || D % 128 || I % 128)) return 0;
+    if (mode == 2 && ((X->act != COLI_VK_ACT_SWIGLU && X->act != COLI_VK_ACT_SITU) || D % 32 || I % 32 || D > 8192 || I > 8192)) return 0;
     if (!mode) return 0;
     for (int c = 0; c < count; c++) {
         const ColiVkTensor *t[3] = {ex[c]->g, ex[c]->u, ex[c]->d};
         for (int k = 0; k < 3; k++) {
-            int f = t[k]->fmt;
-            if (t[k]->dev || !t[k]->pool || !(f == 1 || f == 2 || f == 4) || t[k]->rowWords % 4 ||
-                (f == 4 && (t[k]->gs < 8 || t[k]->gs % (mode == 2 ? 32 : 8)))) return 0;
+            int f = t[k]->fmt;   /* MXFP4 (7) in the GEMV only */
+            if (t[k]->dev || !t[k]->pool || !(f == 1 || f == 2 || f == 4 || (f == 7 && mode == 2)) || t[k]->rowWords % 4 ||
+                ((f == 4 || f == 7) && (t[k]->gs < 8 || t[k]->gs % (mode == 2 ? 32 : 8)))) return 0;
         }
         if (ex[c]->u->fmt != ex[c]->g->fmt || ex[c]->u->gs != ex[c]->g->gs) return 0;
     }
@@ -5011,7 +5013,7 @@ static int xb_grp_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gp);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl_grp, 0, 1, &X->grp_set[slot][v], 0, NULL);
         for (int i0n = 0; i0n < nit[v]; i0n += 65535) {   /* the grid's x limit every device has */
-            struct PCGRP pc = {v ? D : I, v ? I : D, X->limit, i0n, amap ? X->st.K : 0, XB_GV_RPW};
+            struct PCGRP pc = {v ? D : I, v ? I : D, X->limit, i0n, amap ? X->st.K : 0, XB_GV_RPW, X->act, X->a, X->b};
             vkCmdPushConstants(cmd, X->pl_grp, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
             vkCmdDispatch(cmd, (uint32_t)(nit[v] - i0n < 65535 ? nit[v] - i0n : 65535), 1, 1);
         }
