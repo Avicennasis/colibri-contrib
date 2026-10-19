@@ -99,6 +99,9 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaHostAllocMapped      hipHostMallocMapped
 #define cudaHostAllocWriteCombined hipHostMallocWriteCombined
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
+#define cudaHostRegister         hipHostRegister      /* the qwen36 tier's host pool */
+#define cudaHostRegisterPortable hipHostRegisterPortable
+#define cudaHostUnregister       hipHostUnregister
 #define cudaMemcpyDefault        hipMemcpyDefault
 #define cudaMemcpyHostToHost     hipMemcpyHostToHost
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice

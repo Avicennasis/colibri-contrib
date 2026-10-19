@@ -3177,6 +3177,15 @@ __global__ static void __launch_bounds__(256) hcg_dense_k(float *__restrict__ y,
     const uint8_t *W[1] = {w}; const float *Sc[1] = {sc};
     hcg_tile<WF, 1>(y, O, rows, x, I, rows, M, W, Sc, gs, O, I, blockIdx.x * TCG_BN);
 }
+extern "C" int coli_cuda_host_register(void *p, size_t bytes) {
+    if (!p || !bytes) return 0;
+    if (cudaHostRegister(p, bytes, cudaHostRegisterPortable) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+    return 1;
+}
+extern "C" void coli_cuda_host_unregister(void *p) {
+    if (!p) return;
+    if (cudaHostUnregister(p) != cudaSuccess) (void)cudaGetLastError();
+}
 /* the f16 GEMMs (sm_70 and later; not under HIP); COLI_CUDA_TC_F16=0 keeps TF32 where it runs */
 static int hcg_ok(const DeviceContext *ctx) {
 #if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
@@ -3186,6 +3195,10 @@ static int hcg_ok(const DeviceContext *ctx) {
     if (off < 0) { const char *e = getenv("COLI_CUDA_TC_F16"); const char *g = getenv("COLI_CUDA_TC_GEMM"); off = (e && *e == '0') || (g && *g == '0'); }
     return ctx && ctx->compute_major >= 7 && !off;
 #endif
+}
+extern "C" int coli_cuda_planar_rows(int device, int D, int I) {
+    DeviceContext *ctx = find_ctx(device);
+    return hcg_ok(ctx) && D > 0 && I > 0 && D % HCG_BK == 0 && I % HCG_BK == 0;
 }
 /* the dense chain's matmul for a prompt chunk: y[s][o] for S rows */
 template<int WF>
@@ -3574,6 +3587,7 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
     int rows = f16 || (p->S > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && tcg_ok(ctx) && p->D % TCG_BK == 0 && p->I % TCG_BK == 0 &&
                (p->fmt == 1 || p->fmt == 2 || (p->fmt == 4 && p->gs >= TCG_BK && p->gs % TCG_BK == 0)) &&
                (!x || ((uintptr_t)(x + p->x_off) & 15) == 0) && p->x_row % 4 == 0);
+    if (p->planar && !(f16 && p->fmt == 4 && p->gs == 64)) return 0;   /* planar entries: only the f16 GEMMs read them */
     MoeSort m = moe_sort_of(hid, p);
     if (p->parts & 1) {
         if (!x) return 0;

@@ -7226,9 +7226,15 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
              * format that also aliases e->g is then correct without anyone
              * remembering to extend a format check here. */
             if (!keep8 && e->g && wg != (const uint8_t *)e->g) { free(e->g); e->g = e->u = e->d = NULL; }
+        } else if (wg) {
+            /* the host pool: the RAM copy the device copies a prompt chunk's experts from */
+            qt_note_host(l, eidw, wg, wu, wd, e->gs, e->us, e->ds);
         }
     }
     qt_fill_wait();
+    if (qt_chain_host_count())
+        fprintf(stderr, "[qtier] host pool: %d experts of the RAM cache page-locked for the device to copy a prompt chunk's "
+                        "experts from (COLI_CUDA_HOST_POOL=0 off)\n", qt_chain_host_count());
     free(wpl); free(wpe); free(planned);
     /* The parenthesis used to read "int8 only for non-residents", which was
      * true only while the int8 copy of every resident was freed. Since #1341

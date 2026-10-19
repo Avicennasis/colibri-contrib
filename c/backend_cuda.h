@@ -172,6 +172,16 @@ COLI_CUDA_DLLEXPORT int  coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, 
  * async expert groups. Optional in the DLL loader: 0 from a backend that
  * predates it (or on any failure), and the caller frees and uploads as before. */
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_overwrite(ColiCudaTensor *tensor, const void *weights, const float *scales);
+/* Host memory the device copies from at the bus's full rate (the qwen36 tier's RAM cache,
+ * staged for a prompt chunk's experts): coli_cuda_host_register page-locks bytes at p
+ * (portable to every context), 0 on failure (the memory stays as it was);
+ * coli_cuda_host_unregister undoes it. coli_cuda_planar_rows: whether a prompt chunk's
+ * expert GEMMs on this device read int4 per 64 in expert_ffn.h's planar blocks
+ * (CcExpert.planar; the f16 GEMMs at D and I). Optional in the DLL loader: 0 from a backend
+ * that predates them, and the tier keeps the host's step. */
+COLI_CUDA_DLLEXPORT int coli_cuda_host_register(void *p, size_t bytes);
+COLI_CUDA_DLLEXPORT void coli_cuda_host_unregister(void *p);
+COLI_CUDA_DLLEXPORT int coli_cuda_planar_rows(int device, int D, int I);
 #ifdef COLI_ANS
 /* Experimental Linux-only GPU-resident entropy tier. The archive remains in
  * VRAM and is decoded into per-device scratch immediately before a grouped

@@ -28,6 +28,8 @@ typedef struct {
     /* raw RAM pointers (slots are never evicted when cap==n_experts) -- lets
      * warmstart, lookahead and LFRU swaps run without an engine callback */
     const uint8_t *g4,*u4,*d4; const float *gs,*us,*ds;
+    /* the host pool (qt_note_host): g4 and gs page-locked for the device's copies */
+    uint8_t hreg;
 } QSlot;
 
 static struct {
@@ -1110,6 +1112,58 @@ int qt_lmhead_matmul(float *y, const float *x, int I, int O){
  * which moves the epoch; its buffers wait for the hold to drop). The books qt_issue keeps
  * for the experts it serves, qt_chain_count keeps for the chain's. */
 static void qt_lfru_tick_locked(void);
+/* ---- the host pool: the RAM cache the device copies a prompt chunk's experts from -------------
+ * A prompt chunk routes nearly every expert of a layer, and the CPU's step costs per row while a
+ * copy over the bus costs per expert: from a few dozen rows up, copying a layer's non-resident
+ * experts into VRAM (the chain's staging, one layer at a time, the copy of the next overlapping
+ * the layer before) and running them there beats the host's step. The engine's RAM cache serves
+ * the copies as it is, page-locked here (a copy at the bus's full rate, no second copy in RAM).
+ * A decode step's slots stay the CPU's. On when the RAM holds every expert (no slot is ever
+ * recycled), the RAM copy is expert_ffn.h's planar int4 per 64, one device, and the backend's
+ * f16 GEMMs read that layout (coli_cuda_planar_rows); COLI_CUDA_HOST_POOL=0 off. */
+static int G_host_on = -1;
+static unsigned long long G_host_n, G_host_bytes;
+static int host_pool_on(void){
+    if(G_host_on >= 0) return G_host_on;
+    const char *e = getenv("COLI_CUDA_HOST_POOL");
+    G_host_on = !(e && *e == '0') && G.on && !G_stream && !G_trunk_only && G_src_planar && G.wfmt == 4 && G.egs == 64 &&
+                G.ndev == 1 && coli_cuda_planar_rows(G.dev[0], G.D, G.Ih);
+    return G_host_on;
+}
+void qt_note_host(int layer,int eid,
+                  const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
+                  const float *gs,const float *us,const float *ds){
+    if(!G.on || !g4 || !gs || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return;
+    size_t mb = (size_t)G.D*G.Ih/2, sb = (2*G.sc_gu + G.sc_d)*sizeof(float);
+    /* one block each: the three matrices and the three scale arrays, as the engine's slot holds them */
+    if(u4 != g4 + mb || d4 != g4 + 2*mb || us != gs + G.sc_gu || ds != gs + 2*G.sc_gu) return;
+    pthread_mutex_lock(&G.mx);
+    QSlot *s = qs(layer,eid);
+    int skip = !host_pool_on() || s->hreg || G.th_stop;   /* decided once, under the lock (the warm start's threads) */
+    if(!skip){ s->g4=g4; s->u4=u4; s->d4=d4; s->gs=gs; s->us=us; s->ds=ds; }
+    pthread_mutex_unlock(&G.mx);
+    if(skip) return;
+    if(!coli_cuda_host_register((void *)g4, 3*mb)) return;
+    if(!coli_cuda_host_register((void *)gs, sb)){ coli_cuda_host_unregister((void *)g4); return; }
+    pthread_mutex_lock(&G.mx);
+    s->hreg = 1; G.epoch++;
+    G_host_n++; G_host_bytes += 3*mb + sb;
+    pthread_mutex_unlock(&G.mx);
+}
+int qt_chain_host(int layer,int eid,const void **w,size_t *wb,const float **sc,size_t *sb){
+    if(!G.on || G_host_on <= 0 || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
+    pthread_mutex_lock(&G.mx);
+    QSlot *s = qs(layer,eid);
+    int r = s->hreg;
+    if(r){
+        *w = s->g4; *wb = 3*((size_t)G.D*G.Ih/2);
+        *sc = s->gs; *sb = (2*G.sc_gu + G.sc_d)*sizeof(float);
+    }
+    pthread_mutex_unlock(&G.mx);
+    return r;
+}
+int qt_chain_host_count(void){ return G.on && G_host_on > 0 ? (int)G_host_n : 0; }
+
 unsigned qt_chain_epoch(void){
     if(!G.on) return 0;
     pthread_mutex_lock(&G.mx);
@@ -1639,8 +1693,11 @@ void qt_shutdown(void){
     /* The uploader is stopped, but a decode group may still own the tensors. */
     for(int di=0;di<G.ndev;di++)
         if(G.is_cnt[di]) coli_cuda_expert_group_take(G.dev[di]);
+    if(G_host_n) fprintf(stderr,"[qtier] host pool: %llu experts (%.2f GB of the RAM cache) page-locked for the device's copies\n",
+                         G_host_n, G_host_bytes/1073741824.0);
     for(size_t i=0;i<(size_t)G.nl*G.ne;i++){
         QSlot *s=&G.slot[i];
+        if(s->hreg){ coli_cuda_host_unregister((void *)s->g4); coli_cuda_host_unregister((void *)s->gs); s->hreg=0; }
         if(s->tg) coli_cuda_tensor_free(s->tg);
         if(s->tu) coli_cuda_tensor_free(s->tu);
         if(s->td) coli_cuda_tensor_free(s->td);
@@ -1656,6 +1713,7 @@ void qt_shutdown(void){
     memset(G.is_cnt,0,sizeof G.is_cnt);
     G.on=0;
     G_fp8_stream=0; G_stream=0; G_trunk_only=0; G_src_planar=0;
+    G_host_on=-1; G_host_n=G_host_bytes=0;
     coli_cuda_shutdown();
 }
 

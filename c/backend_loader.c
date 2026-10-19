@@ -102,6 +102,9 @@ typedef int            (*fn_dn_set_state)(ColiCudaDn *d, const float *ring, cons
 typedef int            (*fn_dn_get_state)(ColiCudaDn *d, float *ring, float *rec);
 typedef int            (*fn_dn_step)(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz, ColiCudaTensor *outp, const float *x, float *out, const float *egh, const float *beta);
 typedef int            (*fn_tensor_overwrite)(ColiCudaTensor *tensor, const void *weights, const float *scales);
+typedef int            (*fn_host_register)(void *p, size_t bytes);
+typedef void           (*fn_host_unregister)(void *p);
+typedef int            (*fn_planar_rows)(int device, int D, int I);
 typedef const ColiCudaChainOps *(*fn_chain_ops)(void);
 typedef int            (*fn_e8_set_grid)(const void *grid);
 typedef int            (*fn_fp8_set_lut)(const float *lut);
@@ -190,6 +193,7 @@ static struct {
     fn_tensor_upload_g tensor_upload_g;
     fn_dn_create dn_create; fn_dn_free dn_free; fn_dn_set_state dn_set_state; fn_dn_get_state dn_get_state; fn_dn_step dn_step;   /* optional: gated delta layer on the device */
     fn_tensor_overwrite tensor_overwrite;   /* optional: DLLs before it leave it NULL */
+    fn_host_register host_register; fn_host_unregister host_unregister; fn_planar_rows planar_rows;   /* optional: the tier's RAM staged for a prompt chunk */
     fn_chain_ops chain_ops;                 /* optional: the dense chain (cuda_chain.h); NULL = none */
     fn_e8_set_grid     e8_set_grid;
     fn_fp8_set_lut     fp8_set_lut;
@@ -1449,6 +1453,9 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(dn_get_state, fn_dn_get_state)
     RESOLVE_OPT(dn_step, fn_dn_step)
     RESOLVE_OPT(tensor_overwrite, fn_tensor_overwrite)
+    RESOLVE_OPT(host_register, fn_host_register)
+    RESOLVE_OPT(host_unregister, fn_host_unregister)
+    RESOLVE_OPT(planar_rows, fn_planar_rows)
     RESOLVE_OPT(chain_ops, fn_chain_ops)
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
     RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
@@ -1674,6 +1681,17 @@ int coli_cuda_dn_step(ColiCudaDn *d, ColiCudaTensor *proj, ColiCudaTensor *projz
 int coli_cuda_tensor_overwrite(ColiCudaTensor *tensor, const void *weights, const float *scales){
     if(!g_cuda.available || !g_cuda.tensor_overwrite) return 0;   /* older DLL: the tier frees and uploads instead */
     return g_cuda.tensor_overwrite(tensor, weights, scales);
+}
+
+int coli_cuda_host_register(void *p, size_t bytes){
+    if(!g_cuda.available || !g_cuda.host_register) return 0;   /* older DLL: the host's step for those experts */
+    return g_cuda.host_register(p, bytes);
+}
+void coli_cuda_host_unregister(void *p){
+    if(g_cuda.available && g_cuda.host_unregister) g_cuda.host_unregister(p);
+}
+int coli_cuda_planar_rows(int device, int D, int I){
+    return g_cuda.available && g_cuda.planar_rows ? g_cuda.planar_rows(device, D, I) : 0;
 }
 
 const ColiCudaChainOps *coli_cuda_chain_ops(void){
