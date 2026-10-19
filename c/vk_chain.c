@@ -132,6 +132,7 @@ typedef struct {
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
+    VkPipeline gemv4x;                /* chain_gemv.comp with x read from its buffer (a row past the staging) */
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
     VkShaderModule mod_tg; VkPipeline tg;
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
@@ -481,10 +482,12 @@ int vkc_init(void) {
         int xs = (int)((pp.limits.maxComputeSharedMemorySize - 128) / 16);   /* past the subgroups' 32 sums */
         if (xs > 4096) xs = 4096;
         if (!(e && *e == '0') && xs >= 256 && (KC.mod_gemv4 = load_module(KC.core.spv_path, "chain_gemv.spv"))) {
-            int32_t v = xs;
-            VkSpecializationMapEntry me = {0, 0, 4};
-            VkSpecializationInfo si = {1, &me, 4, &v};
+            /* and its variant for a row past the staging, x read from its buffer */
+            VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+            int32_t v[2] = {xs, 0}, vx[2] = {xs, 1};
+            VkSpecializationInfo si = {2, me, sizeof v, v}, six = {2, me, sizeof vx, vx};
             if ((KC.gemv4 = make_pipe(KC.mod_gemv4, &si))) KC.gemv4_xs = xs;
+            KC.gemv4x = KC.gemv4 ? make_pipe(KC.mod_gemv4, &six) : VK_NULL_HANDLE;
         }
     }
     /* the int8/int4 decode GEMV with lanes per row and rows per workgroup chosen per
@@ -1227,11 +1230,12 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
     x->last_frame = y->last_frame = KC.serial;
     struct VkcPC pc = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs};
     int ok;
-    /* the vectorized GEMV where the row is whole 16-byte steps and fits the staging */
+    /* the vectorized GEMV where the row is whole 16-byte steps: x staged where the row fits
+     * the staging with its pads, else read from its buffer (xg) */
     int per = ti->fmt == 1 ? 16 : ti->fmt == 4 ? 32 : ti->fmt == 11 || ti->fmt == 14 ? 8 : ti->fmt == 10 ? 4 : 0;
+    int xg = (ti->rowWords / 4) * per / 4 + (ti->rowWords / 4) * per / 32 > KC.gemv4_xs;
     int v4 = path < 0 && KC.gemv4 && per && ti->rowWords % 4 == 0 && ti->I % 4 == 0 &&
-             (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) &&
-             (ti->rowWords / 4) * per / 4 + (ti->rowWords / 4) * per / 32 <= KC.gemv4_xs;   /* the row staged with its pads */
+             (ti->fmt != 4 || (ti->gs > 0 && ti->gs % 32 == 0)) && (xg ? KC.gemv4x : KC.gemv4);
     KC.kind = path >= 0 ? PK_GEMM : ti->fmt == 1 ? PK_GEMV8 : PK_GEMV;
     int xv = ti->I / 4 + ti->I / 32;   /* a row of x staged, with chain_gemv2's padding */
     /* a matrix of few long rows: a row a workgroup with every lane on it (an RTX PRO 4000,
@@ -1270,7 +1274,8 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
          * leave the device short of workgroups: a decode's or a verify's rows (a prompt's
          * would stage x once a row of W) */
         if (!(e && *e) && S <= 4 && wg < 128 && nq >= 256) { pc7.lpr = 0; wg = ti->O; }
-        ok = record(KC.gemv4, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)S, 1);
+        KC.st.gemv_xg += xg;
+        ok = record(xg ? KC.gemv4x : KC.gemv4, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)S, 1);
     }
     else if (path >= 0 && KC.tg && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
              ti->I % 64 == 0 && ti->O % 128 == 0 && ti->rowWords % 4 == 0) {
@@ -2763,6 +2768,7 @@ void vkc_shutdown(void) {
     if (KC.mod_tg) vkDestroyShaderModule(KC.dev, KC.mod_tg, NULL);
     for (int i = 0; i < KC.ndnrec; i++) vkDestroyPipeline(KC.dev, KC.dnrec[i], NULL);
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
+    if (KC.gemv4x) vkDestroyPipeline(KC.dev, KC.gemv4x, NULL);
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);
     if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
     if (KC.mod_gv2) vkDestroyShaderModule(KC.dev, KC.mod_gv2, NULL);
