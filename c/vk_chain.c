@@ -133,6 +133,8 @@ typedef struct {
     VkPipeline pipe[P_NPIPE];
     VkPipeline gemm[VKC_GEMM_MAX]; int gemm_bm[VKC_GEMM_MAX], gemm_bn[VKC_GEMM_MAX], ngemm;
     VkPipeline dnrec[VKC_DNREC_MAX]; int dnrec_kd[VKC_DNREC_MAX], ndnrec;
+    VkShaderModule mod_dnrr; int dnrr_tried;   /* chain_dnrec_rows.spv: a prompt chunk's rows, made on first use */
+    VkPipeline dnrr[VKC_DNREC_MAX]; int dnrr_kd[VKC_DNREC_MAX], ndnrr;
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
     VkPipeline gemv4x;                /* chain_gemv.comp with x read from its buffer (a row past the staging) */
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
@@ -1525,10 +1527,38 @@ static VkPipeline dnrec_pipe(int KD) {
     KC.dnrec[KC.ndnrec] = p; KC.dnrec_kd[KC.ndnrec++] = KD;
     return p;
 }
+/* chain_dnrec_rows.comp for KD: its rows a block (R) as many as the shared memory holds, at
+ * most 16 (NULL past VKC_DNREC_MAX keys, or when COLI_VK_DNREC_ROWS=0) */
+static VkPipeline dnrr_pipe(int KD) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_DNREC_ROWS"); on = !(e && *e == '0'); }
+    if (!on) return VK_NULL_HANDLE;
+    for (int i = 0; i < KC.ndnrr; i++) if (KC.dnrr_kd[i] == KD) return KC.dnrr[i];
+    if (KC.ndnrr == VKC_DNREC_MAX) return VK_NULL_HANDLE;
+    if (!KC.mod_dnrr) {
+        if (KC.dnrr_tried) return VK_NULL_HANDLE;
+        KC.dnrr_tried = 1;
+        if (!(KC.mod_dnrr = load_module(KC.core.spv_path, "chain_dnrec_rows.spv"))) return VK_NULL_HANDLE;
+    }
+    int nspl = 1;   /* as dnrec_pipe */
+    while (nspl < 8 && KD / nspl > 16 && KD % (2 * nspl) == 0) nspl *= 2;
+    size_t row = (size_t)2 * (KD + nspl) * 4 + 2 * 128 * 4 + 2 * 4;   /* q, k (each part padded a word), v, o, beta, decay */
+    int R = 16;
+    while (R > 1 && (size_t)R * row > kc_shared_limit()) R /= 2;
+    int32_t v[4] = {KD, nspl, 128 * nspl, R};
+    VkSpecializationMapEntry me[4] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}};
+    VkSpecializationInfo si = {4, me, sizeof v, v};
+    VkPipeline p = make_pipe(KC.mod_dnrr, &si);
+    KC.dnrr[KC.ndnrr] = p; KC.dnrr_kd[KC.ndnrr++] = KD;   /* a failed make is remembered as NULL */
+    return p;
+}
 int vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *prm, VkcBuf *y, VkcBuf *snap, const VkcDnRec *p) {
     KC.kind = PK_DNREC;
     if (p->VD > 128 || KD < 1 || KD > 256 || p->VH % p->KH) return 0;
-    VkPipeline pipe = dnrec_pipe(KD);
+    /* a prompt chunk's rows: the norms a block of rows at a time, the rows in order with no
+     * barrier (chain_dnrec_rows.comp); a decode's or a verify's few through chain_dnrec */
+    VkPipeline pipe = p->S >= VKC_DNREC_ROWS ? dnrr_pipe(KD) : VK_NULL_HANDLE;
+    if (!pipe) pipe = dnrec_pipe(KD);
     if (!pipe) return 0;
     VkcBind bd[7] = {B(cv, 0), B(ab, 0), B(z, 0), B(st, 1), B(prm, 0), B(y, 1), B(snap, snap != NULL && snap != st)};
     if (snap == st) bd[6].written = 0;
@@ -1922,7 +1952,7 @@ int vkc_prewarm(const VkcPrewarm *pw) {
         }
     }
     /* DeltaNet's recurrence, made (its launch wants a layer's state) */
-    if (ok && pw->dn_kd > 0 && pw->dn_kd <= 256) n += dnrec_pipe(pw->dn_kd) != VK_NULL_HANDLE;
+    if (ok && pw->dn_kd > 0 && pw->dn_kd <= 256) n += (dnrec_pipe(pw->dn_kd) != VK_NULL_HANDLE) + (dnrr_pipe(pw->dn_kd) != VK_NULL_HANDLE);
     /* a prompt chunk's experts (vkc_moe_rows), made and launched once with no rows: a
      * pipeline made later, with the tier holding the card, slowed every launch after it,
      * the decode's too (Qwen3.8-Flash-Next on an RTX PRO 4000: 37.7 -> 25.5 tok/s once its
@@ -2849,6 +2879,8 @@ void vkc_shutdown(void) {
     if (KC.tg) vkDestroyPipeline(KC.dev, KC.tg, NULL);
     if (KC.mod_tg) vkDestroyShaderModule(KC.dev, KC.mod_tg, NULL);
     for (int i = 0; i < KC.ndnrec; i++) vkDestroyPipeline(KC.dev, KC.dnrec[i], NULL);
+    for (int i = 0; i < KC.ndnrr; i++) if (KC.dnrr[i]) vkDestroyPipeline(KC.dev, KC.dnrr[i], NULL);
+    if (KC.mod_dnrr) vkDestroyShaderModule(KC.dev, KC.mod_dnrr, NULL);
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
     if (KC.gemv4x) vkDestroyPipeline(KC.dev, KC.gemv4x, NULL);
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);

@@ -161,7 +161,10 @@ long long vkc_attn_slice_budget(void);   /* COLI_VK_ATTN_SLICE below: rows x pos
 /* chain_dnconv.comp */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } VkcDnConv;
 int  vkc_dnconv(VkcBuf *in, VkcBuf *w, VkcBuf *ring, VkcBuf *out, VkcBuf *snap, const VkcDnConv *p);
-/* chain_dnrec.comp (KD a specialization constant, VD <= 128) */
+/* chain_dnrec.comp (KD a specialization constant, VD <= 128); from VKC_DNREC_ROWS rows
+ * chain_dnrec_rows.comp, the same arithmetic a block of rows at a time (COLI_VK_DNREC_ROWS=0
+ * keeps chain_dnrec) */
+#define VKC_DNREC_ROWS 8
 typedef struct { int S, VH, KH, VD, Ktot, cv_off, cv_row, b_off, b_row, a_off, a_row, z_off, z_row,
                  y_off, y_row, snap_row, flags; float eps, qscale; int st_off, snap_off, prm_off; } VkcDnRec;
 int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *prm, VkcBuf *y, VkcBuf *snap, const VkcDnRec *p);
