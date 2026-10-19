@@ -2099,6 +2099,14 @@ pipeline runs that layer); a prompt chunk's grouped GEMMs keep their float sums.
 acceleration (Lavapipe) keeps the float form unless a test asks (`vkc_moe_set_idot`).
 The chain's line counts the layer steps that took it (`N in the integer form`).
 
+Both block formats' pipelines (the float form's and the integer form's) are made for a
+layer's pair of types (`chain_moe.comp`'s `BTG` and `BTD`), so each holds those two
+decoders alone: Qwen3.8's IQ2_S/Q2_0 decode 50.0-50.8 -> 51.1-51.9 tok/s on the RTX PRO
+4000, and a software device no longer builds every type's decoders at a layer's first
+launch (minutes on Lavapipe). The engines' prewarm makes one a pair of the file's gate/up
+and down types (every type's past 16 pairs); a step with no known types keeps the
+pipeline of every type.
+
 Measured on the RTX PRO 4000 (`COLI_VK_CHAIN_BENCH=moe`, the float form with
 `COLI_VK_IDOT=0`), a layer's experts in microseconds:
 
