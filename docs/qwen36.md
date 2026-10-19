@@ -170,10 +170,28 @@ The probability is then conditional on this vocabulary. Verification still
 uses the model's full vocabulary. Scores over 20 below the best are omitted
 from the float probability sum.
 
-A Vulkan build can run the head through the device chain, including its routed
-MoE. `Q36_MTP_GPU=0` keeps the head on the CPU, and so does `Q36_MTP_DMOE=0` or a
-device without the chain's MoE. The checkpoint port's GPU runtime and
-performance need validation on hardware; its CPU paths are covered by CI.
+With the Vulkan chain the head runs on the device: its layer, its routing and its
+routed experts through the chain's device MoE, one frame a draft. `Q36_MTP_GPU=0`
+keeps the head on the CPU, and so does `Q36_MTP_DMOE=0` or a device without the
+chain's MoE. Under the CUDA tier there are no speculative steps, so `Q36_MTP=1`
+leaves the head off there and says so.
+
+Measured on an RTX PRO 4000 (Vulkan chain, Qwen3.6-35B-A3B int4-g64, `coli serve`,
+answers of 128 tokens, two alternated rounds of three):
+
+| `Q36_MTP_DRAFTS` | decode | drafts accepted |
+|---|---|---|
+| no head | 84.2-86.0 tok/s | |
+| 1 (the default) | 93.9-97.4 tok/s | 84% |
+| 2 | 82.0-83.7 tok/s | 62% |
+| 3 | 67.6-70.7 tok/s | 42% (a 300-token answer) |
+
+A verify of more rows reads more routed experts: from the runs' forward counts, a
+verify of two rows costs about 1.5 decode steps and one of three about 2. With a
+draft row at 1.7 ms, one draft is the depth that pays. On that machine's CPU alone
+(Core i5-13500, answers of 96 tokens) one draft takes decode from 13.7-13.9 to
+14.7-14.9 tok/s, 74% of the drafts accepted. Greedy answers with and without the head are byte-identical.
+`tests/vulkan_engines.sh qwen-spec` runs the harness below in the chain on Lavapipe.
 
 Historical measurements from the earlier MTP prototype, Radeon 8060S (Strix
 Halo, RADV), Qwen3.6-35B-A3B int4-g64, 24 GB tier, chain on, 256-token answer:

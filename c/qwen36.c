@@ -5419,7 +5419,7 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
 #ifndef QWEN36_NO_MAIN
         echo = g_echo_k > 0 && g_echo_id && S > 1;
 #endif
-        if (g_hidden_sink) echo = 1;
+        if (g_hidden_sink || g_q36_mtp.on) echo = 1;   /* the head reads every row */
         chain_logit = falloc((int64_t)nlogits * c->vocab);
         chain_n = q36cc_forward(m, x, S, pos_base, lf, echo, nlogits, chain_logit, &rows_only);
         if (!chain_n) {
@@ -5439,7 +5439,7 @@ static float *step_ex_control(Model *m, const int *ids, int S, int pos_base, int
         if (lf) fclose(lf);
         return NULL;
     }
-    if (g_q36_mtp.on && !chain_logit) q36_mtp_feed(m, ids, S, pos_base, x);   /* the CUDA chain leaves x as it was */
+    if (g_q36_mtp.on) q36_mtp_feed(m, ids, S, pos_base, x);   /* either chain brought every row back */
     if (g_hidden_sink) {
         #pragma omp parallel for schedule(static)
         for (int s = 0; s < S; s++)

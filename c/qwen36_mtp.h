@@ -472,7 +472,6 @@ static int q36_mg_row(Model *m, int tok, const float *hid, int pos, float *logit
              vkc_matmul(vk_qw_tensor(p->nvoc ? &p->dvoc : &m->lm_head), g->fin, 0, g->outd, 0, 1) && vkc_submit(1);
     }
     if (!ok) return 0;
-picked:
     if (p->vid) {   /* the listed ids' scores, every other id out */
         /* the pick and its probability on the compact scores (the list's padding repeats
          * its last id: counted once); the full logits only for the CPU's own path */
@@ -666,6 +665,13 @@ static int q36_mtp_draft_more(Model *m, float *hidden, int tok, int pos) {
 static void q36_mtp_attach(Model *m) {
     const char *path = getenv("Q36_MTP");
     if (!path || strcmp(path, "1") || g_q36_mtp.on) return;
+    /* where a verify would not reproduce plain decoding there are no drafts (q36_spec_init):
+     * a head there would only be fed, every row brought back from the chain for nothing */
+    if (qt_ready() || g_cache_route || qq_active() || m->dn_dev) {
+        fprintf(stderr, "[mtp] Q36_MTP=1: the head stays off under %s, where there are no speculative steps\n",
+                qt_ready() || m->dn_dev ? "the CUDA tier" : g_cache_route ? "CACHE_ROUTE" : "a qpack container");
+        return;
+    }
     if (!q36_mtp_load(m)) { fprintf(stderr, "[mtp] Q36_MTP=%s: the head stays off\n", path); return; }
 }
 static void q36_mtp_report(void) {
