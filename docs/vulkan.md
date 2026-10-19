@@ -1940,6 +1940,16 @@ so, a token is one frame.
   us on an RTX PRO 4000 (the gate and up pass alone 77); with fmt 4's alone, 73 (42), and
   the decode went from 56.6-57.7 to 67.2-67.4 tok/s. The layer's formats come from the
   tier's table (its first resident entry); `vkc_prewarm` makes and launches the three.
+- Where D and I are whole 16-byte steps (multiples of 32), our formats' gate and up pass
+  and down pass run on `chain_moe_gv.comp` instead, laid out as the dense decode GEMV
+  (`chain_gemv.comp`) lays a matrix: the gate and up pass stages x once a workgroup and
+  takes (expert, output) units across the row's experts, gate's and up's rows of a unit
+  against the same x loads, row s's experts looked up once a workgroup; the down pass
+  stages a pair's hidden row and takes its rows; about eight 16-byte steps a lane in both
+  (chain_moe.comp spread a 2048-input row over 32 lanes, two steps each). Qwen3.6 int4-g64
+  on an RTX PRO 4000: a layer 47-53 us (as the CUDA chain's 51), the gate and up pass 80
+  -> 66 us and down 29 -> 17 in the chain profile, the decode 67.3-68.4 -> 76.5-78.3 tok/s,
+  the teacher-forced loss the same (1.7576). `COLI_VK_MOE_GV=0` keeps chain_moe.comp's.
 - The books follow at the frame's end, from the ids that come down with it: the history
   (`.coli_usage`), the HITS bitmap, the tier's heat (`vkt_dev_count`); the tier's line
   counts them as `in the dense chain: N routed experts with no host step`.

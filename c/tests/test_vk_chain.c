@@ -1705,6 +1705,9 @@ static void moe_mv(float *y, const MoeMat *m, const float *x) {
 /* E experts of gate/up format fg and down format fd (gs for the grouped ones), one of
  * them not resident (a zero entry); the device routes S rows (softmax, top K, normalized)
  * and computes the layer, the table's entries from t_off on */
+/* 1: test_moe runs only the formats-named step (the unnamed one compiles chain_moe.comp's
+ * every-format pipeline for each new staging size, 40 s on an RTX PRO 4000 at D 1024) */
+static int g_moe_named_only;
 static void test_moe(const char *what, int D, int I, int E, int S, int K, int fg, int fd, int gs, int act, float limit) {
     const float a = 2.5f, b = 7.f;
     MoeMat *g = calloc((size_t)E, sizeof *g), *u = calloc((size_t)E, sizeof *u), *d = calloc((size_t)E, sizeof *d);
@@ -1753,14 +1756,14 @@ static void test_moe(const char *what, int D, int I, int E, int S, int K, int fg
     int rec = vkc_begin() && vkc_write(tb, 0, tab, (size_t)(t_off + E) * COLI_VK_XB_ENTRY * 4) &&
               vkc_route(lb, NULL, ib, wb, &rp) && vkc_submit(1);
     clock_gettime(CLOCK_MONOTONIC, &ts1);
-    rec = rec && vkc_begin() && vkc_moe(xb, ib, wb, tb, hb, yb, &mp) && vkc_submit(1);
+    rec = rec && (g_moe_named_only || (vkc_begin() && vkc_moe(xb, ib, wb, tb, hb, yb, &mp) && vkc_submit(1)));
     clock_gettime(CLOCK_MONOTONIC, &ts2);
     double tr = (ts1.tv_sec - ts0.tv_sec) + (ts1.tv_nsec - ts0.tv_nsec) * 1e-9, tm = (ts2.tv_sec - ts1.tv_sec) + (ts2.tv_nsec - ts1.tv_nsec) * 1e-9;
     if (tr + tm > 1.0) fprintf(stderr, "[test] moe %s: the route frame %.1f s, the experts' frame %.1f s\n", what, tr, tm);
     float *got = down(yb, 0, (size_t)S * yrow);
     double e = 0;
     for (int s = 0; s < S; s++) { double r = relerr(got + (size_t)s * yrow + 1, ref + (size_t)s * yrow + 1, (size_t)D, 1e-3); if (r > e) e = r; }
-    CHECK(rec && e < 2e-4 && !bad(got, (size_t)S * yrow), "moe %s (fmt %d/%d, D %d I %d E %d S %d K %d act %d): rel err %.2e",
+    CHECK(rec && (g_moe_named_only || (e < 2e-4 && !bad(got, (size_t)S * yrow))), "moe %s (fmt %d/%d, D %d I %d E %d S %d K %d act %d): rel err %.2e",
           what, fg, fd, D, I, E, S, K, act, e);
     if (getenv("VKC_TEST_VERBOSE")) printf("moe %s: %.2e\n", what, e);
     {   /* the layer's formats named: each pass on its format's own pipeline (1, 2, 4), the rest as before */
@@ -3598,6 +3601,29 @@ int main(int argc, char **argv) {
         test_moe("SwiGLU clamped", 256, 88, 6, 3, 2, 4, 4, 32, 0, 0.05f);
         test_moe("SiTU-GLU", 256, 88, 6, 1, 4, 1, 1, 32, 1, 0.f);
         test_moe("top-1, three rows", 256, 88, 8, 3, 1, 2, 2, 32, 0, 0.f);
+        /* D and I whole 16-byte steps in our formats: the named run takes chain_moe_gv.comp
+         * (a dense GEMV's layout), D 2048 at eight lanes a row */
+        {
+            VkcStats g0; vkc_stats(&g0);
+            g_moe_named_only = 1;
+            /* the expert batch is sized for one shape at a time */
+            if (coli_vk_xb_init(2048, 256, COLI_VK_ACT_SWIGLU, 0, 0, 0)) test_moe("gv int4-g64, D 2048", 2048, 256, 6, 2, 3, 4, 4, 64, 0, 0.f);
+            if (coli_vk_xb_init(1024, 128, COLI_VK_ACT_SWIGLU, 0, 0, 0)) {
+                test_moe("gv int8 rows", 1024, 128, 6, 2, 3, 1, 1, 32, 0, 0.f);
+                test_moe("gv int4 rows", 1024, 128, 6, 2, 3, 2, 2, 32, 0, 0.f);
+            }
+            if (!coli_vk_xb_init(512, 96, COLI_VK_ACT_SWIGLU, 0, 0, 0)) { fails++; printf("FAIL: moe gv: the expert batch did not start\n"); }
+            test_moe("gv int4 gate/up, int8 down", 512, 96, 6, 2, 3, 4, 1, 32, 0, 0.f);
+            test_moe("gv int4 in groups of 8", 512, 96, 6, 2, 3, 4, 4, 8, 0, 0.f);
+            test_moe("gv SwiGLU clamped", 512, 96, 6, 3, 2, 4, 4, 32, 0, 0.05f);
+            test_moe("gv SiTU-GLU", 512, 96, 6, 1, 4, 1, 1, 32, 1, 0.f);
+            test_moe("gv top-1, three rows", 512, 96, 8, 3, 1, 2, 2, 32, 0, 0.f);
+            g_moe_named_only = 0;
+            VkcStats g1; vkc_stats(&g1);
+            const char *ge = getenv("COLI_VK_MOE_GV");
+            printf("  routed-expert steps on chain_moe_gv: %llu\n", g1.moe_gv - g0.moe_gv);
+            if (!(ge && *ge == '0')) CHECK(g1.moe_gv - g0.moe_gv >= 8, "chain_moe_gv took the named runs of our formats");
+        }
         /* a prompt chunk's rows through the grouped GEMMs, against chain_moe: K-quants,
          * grid types and Q2_0, 40 rows (an expert's tiles past one) */
         test_moe_rows(GQ_Q4_K, GQ_Q5_K, 40, 4, 12, 512, 256);
