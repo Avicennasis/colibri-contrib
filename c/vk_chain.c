@@ -48,6 +48,7 @@ static const char *const pipe_file[P_NPIPE] = {
     "chain_ew.spv", "chain_qsa.spv", "chain_ple.spv", "qmatmul.spv"};
 #define VKC_GEMM_MAX 4
 #define VKC_DNREC_MAX 8
+#define VKC_FA_MAX 8   /* chain_attn_flash pipelines, a (head dim, query heads a KV head) each */
 #define VKC_FRAMES 16
 #define VKC_STAGE0 (((size_t)16 << 20) / VKC_FRAMES)   /* a frame's first staging buffer: 16 MiB over the frames, as when they were 4 of 4 MiB */
 #define VKC_BIND 8
@@ -139,12 +140,13 @@ typedef struct {
     VkPipeline dnrr[VKC_DNREC_MAX]; int dnrr_kd[VKC_DNREC_MAX], ndnrr;
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
     VkPipeline gemv4x;                /* chain_gemv.comp with x read from its buffer (a row past the staging) */
+    VkShaderModule mod_adec; VkPipeline adec; int adec_tried; VkcBuf *adec_x;   /* chain_attn_dec.comp and its scratch */
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
     VkShaderModule mod_tg; VkPipeline tg;
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
     /* chain_attn_flash.comp: the attention core on the matrix units for prompt chunks,
      * one pipeline per (head dim, query heads per kv head) */
-    VkShaderModule mod_fa; VkPipeline fa[4]; int fa_hd[4], fa_gq[4], nfa;
+    VkShaderModule mod_fa; VkPipeline fa[VKC_FA_MAX]; int fa_hd[VKC_FA_MAX], fa_gq[VKC_FA_MAX], nfa;
     VkPipeline kdarec[VKC_KDA_MAX]; int kdarec_kd[VKC_KDA_MAX], nkdarec;   /* chain_kda's recurrence per key dim */
     VkCommandPool cpool;
     VkcFrame fr[VKC_FRAMES];
@@ -1466,7 +1468,7 @@ static int attn_slice_next(void) {   /* the open frame out, a new one in */
  * NULL when the shader is missing or the pipeline fails */
 static VkPipeline fa_pipe(int hd, int gq) {
     for (int i = 0; i < KC.nfa; i++) if (KC.fa_hd[i] == hd && KC.fa_gq[i] == gq) return KC.fa[i];
-    if (!KC.mod_fa || KC.nfa == 4) return VK_NULL_HANDLE;
+    if (!KC.mod_fa || KC.nfa == VKC_FA_MAX) return VK_NULL_HANDLE;
     int32_t sv[2] = {hd, gq};
     VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
     VkSpecializationInfo si = {2, me, sizeof sv, sv};
@@ -1499,6 +1501,64 @@ int vkc_attn_block_rows(void) {
     int v = e && *e ? atoi(e) : 16;
     return v < 0 ? 0 : v;
 }
+/* ---- a decode's attention split over its positions (chain_attn_dec.comp) ----------
+ * chain_attn gives a (head, row) one workgroup that walks the positions in turn: a decode
+ * step's few rows leave the device all but idle (Qwen3.6's 16 heads, about 160 us a
+ * layer at 700 positions on an RTX PRO 4000). From VKC_ATTN_DEC_MIN positions a call of
+ * up to 4 rows without a selection list runs in blocks of L positions, a workgroup a
+ * (head, block, row), the blocks then joined. COLI_VK_ATTN_DEC=0 keeps chain_attn. */
+#define VKC_ATTN_DEC_MIN 128
+static VkPipeline adec_pipe(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_ATTN_DEC"); on = !(e && *e == '0'); }
+    if (!on || KC.adec || KC.adec_tried) return KC.adec;
+    KC.adec_tried = 1;
+    if ((KC.mod_adec = load_module(KC.core.spv_path, "chain_attn_dec.spv"))) KC.adec = make_pipe(KC.mod_adec, NULL);
+    return KC.adec;
+}
+/* the blocks' scratch, at least `bytes`: a smaller one goes with the open frame (freed when
+ * the frame comes back), so a call never waits on the frames before it */
+static VkcBuf *adec_scratch(size_t bytes) {
+    if (KC.adec_x && KC.adec_x->bytes >= bytes) return KC.adec_x;
+    VkcFrame *f = open_frame();
+    if (!f) return NULL;
+    VkcBuf *nb = vkc_buf(bytes + bytes / 2, VKC_DEV);
+    if (!nb) return NULL;
+    if (KC.adec_x) {
+        if (f->ntmp == f->ctmp) {
+            int c = f->ctmp ? 2 * f->ctmp : 8;
+            VkcBuf **t = realloc(f->tmp, (size_t)c * sizeof *t);
+            if (!t) { buf_release(nb); return NULL; }
+            f->tmp = t; f->ctmp = c;
+        }
+        f->tmp[f->ntmp++] = KC.adec_x;
+    }
+    return KC.adec_x = nb;
+}
+static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *snk, const VkcAttnW *w) {
+    int S = w->a.S, last = w->a.pos_base + S;   /* the last row's positions */
+    int n = w->win > 0 && w->win < last ? w->win : last;
+    /* Only where a prompt chunk of this attention would take chain_attn_flash (f16, so a
+     * row's bits already depend on how a forward is cut into steps): elsewhere the prompt's
+     * chain_attnb gives a row the bits chain_attn gives it alone, and a prefix resumed must
+     * answer to the last digit as the prompt recomputed does (tests/test_brio_serve.py) */
+    int G = w->a.H / w->a.KVH;
+    if (!(KC.mod_fa && vkc_attn_flash_rows() > 0 && !w->win && !w->ring && !w->kv_pm && !w->sink && w->vd == w->a.hd &&
+          w->a.hd % 64 == 0 && 16 % G == 0 && fa_pipe(w->a.hd, G))) return 0;
+    if (S < 1 || S > 4 || n < VKC_ATTN_DEC_MIN || !adec_pipe()) return 0;
+    int L = 64, nb = (n + L - 1) / L;
+    while (L < 256 && (int64_t)w->a.H * nb > 1024) { L *= 2; nb = (n + L - 1) / L; }
+    VkcBuf *xs = adec_scratch((size_t)S * w->a.H * nb * (w->vd + 2) * 4);
+    if (!xs) return 0;
+    struct { VkcAttnW w; int mode, L, nb; } pc = {*w, 0, L, nb};
+    VkcBind bd[8] = {B(q, 0), B(kc, 0), B(vc, 0), B(o, 1), B(gate, 0), B(NULL, 0), B(snk, 0), B(xs, 1)};
+    int ok = record(KC.adec, bd, 8, &pc, sizeof pc, (uint32_t)w->a.H, (uint32_t)nb, (uint32_t)S);
+    pc.mode = 1;
+    bd[7].written = 0;
+    ok = ok && record(KC.adec, bd, 8, &pc, sizeof pc, (uint32_t)w->a.H, (uint32_t)S, 1);
+    KC.st.attn_dec += ok;
+    return ok;
+}
 int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *sel, VkcBuf *snk,
                const VkcAttnW *p) {
     KC.kind = PK_ATTN;
@@ -1512,6 +1572,8 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
     VkPipeline fp = KC.mod_fa && fl > 0 && w.a.S >= fl && !(sel && w.a.sel_row > 0) && !w.win && !w.ring && !w.kv_pm &&
                     !w.sink && w.vd == w.a.hd && w.a.hd % 64 == 0 && 16 % G == 0 ? fa_pipe(w.a.hd, G) : VK_NULL_HANDLE;
     int blocked = !fp && blk > 0 && w.a.S >= blk && G <= 32 && kab_pipe(), br = w.a.sel_row > 0 ? 1 : 32 / G;
+    /* a decode's or a verify's rows over many positions: split over them */
+    if (!fp && !blocked && !(sel && w.a.sel_row > 0) && attn_dec(q, kc, vc, o, gate, snk, &w)) return 1;
     int S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd),
                                         fp ? 16 / G : blocked ? br : 1);
     int ok = 1;
@@ -2061,6 +2123,17 @@ int vkc_prewarm(const VkcPrewarm *pw) {
             KC.kind = PK_ATTN;
             ok = record(fp, ab, 7, &a, sizeof a, 1, 1, 1); n += ok;
         }
+    }
+    /* a decode's attention over its positions' blocks (chain_attn_dec), its join launched on
+     * one row of one position */
+    if (ok && pw->attn_hd > 0 && adec_pipe()) {
+        struct { VkcAttnW w; int mode, L, nb; } pc;
+        memset(&pc, 0, sizeof pc);
+        pc.w.a = (VkcAttn){.S = 1, .H = 1, .KVH = 1, .hd = 64, .cap = 1, .q_row = 64, .q_seg = 64, .o_row = 64, .scale = 1.f};
+        pc.w.vd = 64; pc.mode = 1; pc.L = 64; pc.nb = 1;
+        VkcBind ab[8] = {B(x, 0), B(x, 0), B(x, 0), B(y, 1), B(NULL, 0), B(NULL, 0), B(NULL, 0), B(x, 0)};
+        KC.kind = PK_ATTN;
+        ok = record(KC.adec, ab, 8, &pc, sizeof pc, 1, 1, 1); n += ok;
     }
     /* a prompt chunk's K/V rows into the cache (vkc_copy_regions' grid), launched with no regions */
     if (ok && cp2_pipe()) {
@@ -2913,6 +2986,7 @@ void vkc_shutdown(void) {
     if (g_kd == 0) { g_hyb_dev = VK_NULL_HANDLE; g_hyb_g = g_hyb_h = VK_NULL_HANDLE; }
     KC.tsem_g = KC.tsem_h = VK_NULL_HANDLE;
     if (KC.dummy) buf_release(KC.dummy);
+    if (KC.adec_x) buf_release(KC.adec_x);
     for (int k = 0; k < 3; k++) {
         VkaPool *P = &KC.pool[k].p;
         for (int b = 0; b < P->nb; b++) {
@@ -2946,6 +3020,8 @@ void vkc_shutdown(void) {
     if (KC.mod_dnrr) vkDestroyShaderModule(KC.dev, KC.mod_dnrr, NULL);
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
     if (KC.gemv4x) vkDestroyPipeline(KC.dev, KC.gemv4x, NULL);
+    if (KC.adec) vkDestroyPipeline(KC.dev, KC.adec, NULL);
+    if (KC.mod_adec) vkDestroyShaderModule(KC.dev, KC.mod_adec, NULL);
     if (KC.mod_gemv4) vkDestroyShaderModule(KC.dev, KC.mod_gemv4, NULL);
     if (KC.gv2) vkDestroyPipeline(KC.dev, KC.gv2, NULL);
     if (KC.mod_gv2) vkDestroyShaderModule(KC.dev, KC.mod_gv2, NULL);
