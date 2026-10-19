@@ -310,7 +310,10 @@ void vkt_dev_count(int layer, int S, int K, const int *idx);
  * as vkt_dev_table gives it, its hx[e] zero. The count is vkt_dev_table's. */
 typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; } VktHostExpert;   /* rgu, rd: bytes a row */
 int  vkt_dev_table_hybrid(int layer, uint32_t *entries, VktHostExpert *hx);
+/* whether the tier keeps experts in its host pool (system RAM the device reads over PCIe) */
+int  vkt_host_pool_on(void);
 #else
+static inline int vkt_host_pool_on(void){return 0;}
 typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; } VktHostExpert;   /* rgu, rd: bytes a row */
 static inline int vkt_dev_table_hybrid(int l,uint32_t *e,VktHostExpert *h){(void)l;(void)e;(void)h;return -1;}
 static inline int  vkt_wanted(void){return 0;}

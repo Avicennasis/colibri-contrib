@@ -422,6 +422,7 @@ typedef struct {
     int gfmt;     /* the layer's gate/up format (100 + a ggml type), 0 unknown: picks the block path's shape */
     int dfmt, E;  /* vkc_moe_rows: down's format, and the layer's experts (its table's entries from t_off) */
     int stage_n;  /* the widest input row its staging is sized for: 0 = D's or I's, < 0 = the device's largest */
+    int floats;   /* vkc_moe_rows: 1 keeps the grouped GEMMs in floats where the matrix units' would run */
 } VkcMoe;
 int vkc_moe_ready(void);
 /* A prompt chunk's routed experts, every row on the device (chain_moe_rows.comp): the
