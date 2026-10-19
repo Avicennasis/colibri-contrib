@@ -2307,6 +2307,10 @@ position's IH x ID products took a decode step on an RTX PRO 4000 (32 index head
 top 2048) 16.2 ms a layer at 8000 positions and 63.8 at 32000; now 345 us and 1.25 ms,
 the k-pooled form (pools of 8) 2.19 ms -> 86 us at 8000 positions. The selection's
 counts are subgroup sums (integers: the same totals in any order).
+DeepSeek V4/V4.1's indexer scores (`chain_dsv4`, modes 3 and 9) take the same grid
+(mode 10, the queries in shared memory or read where they are as modes 3 and 9 do): its 64
+heads of 128 over 2000 compressed columns 8.1 ms -> 141 us, over 8000 31.6 ms -> 470 us.
+`COLI_VK_DSA_GRID=0` keeps every row's scores in its own workgroup.
 
 `make vk-chain-check VK=1` runs them against double-precision references of colibri.c's
 absorbed attention: every weight format both ways through the per-head blocks, RoPE in

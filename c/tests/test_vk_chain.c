@@ -3373,6 +3373,29 @@ static void bench_dsa(void) {
         if (r && dt < best) best = dt;
     }
     if (ok) printf("bench dsa IH %d ID %d, one row over %d positions%s, top %d: %.0f us\n", IH, ID, T, pool ? " in pools" : "", topk, best * 1e6);
+    /* COLI_VK_BENCH_V4=ratio: DeepSeek V4's indexer scores (vkc_dsv4_score) over T / ratio compressed columns */
+    const char *ve = getenv("COLI_VK_BENCH_V4");
+    if (ve && atoi(ve) > 0) {
+        int ratio = atoi(ve), W = T / ratio;
+        VkcDsScore sp = {1, T - 1, ratio, IH, ID, W, 0, IH * ID, 0, IH, 0, ID, 0, W, 0.5f, 0, 0};
+        double b4 = 1e9; int ok4 = 1;
+        for (int r = 0; r < 4 && ok4; r++) {
+            ok4 = vkc_begin() && vkc_dsv4_score(qb, wb, kb, NULL, scb, &sp);
+            double t0 = bnow(); ok4 = vkc_submit(1) && ok4; double dt = bnow() - t0;
+            if (r && dt < b4) b4 = dt;
+        }
+        if (ok4) printf("bench dsv4 score IH %d ID %d, one row over %d columns: %.0f us\n", IH, ID, W, b4 * 1e6);
+        VkcBuf *lb4 = vkc_buf((size_t)(topk + 1) * 4, VKC_DEV);
+        VkcDsTopk tp = {1, W, topk, W, 0, topk, 0, 0};   /* S, width, topk, sc_row, l_off, l_row, base, order */
+        double bt = 1e9;
+        for (int r = 0; r < 4 && ok4 && lb4; r++) {
+            ok4 = vkc_begin() && vkc_dsv4_score(qb, wb, kb, NULL, scb, &sp) && vkc_dsv4_topk(scb, lb4, &tp);
+            double t0 = bnow(); ok4 = vkc_submit(1) && ok4; double dt = bnow() - t0;
+            if (r && dt < bt) bt = dt;
+        }
+        if (ok4) printf("bench dsv4 score and top %d over %d columns: %.0f us\n", topk, W, bt * 1e6);
+        vkc_free(lb4);
+    }
     vkc_free(sb2);
     vkc_free(qb); vkc_free(wb); vkc_free(kb); vkc_free(scb); vkc_free(sb); free(q); free(w); free(k);
 }
@@ -3877,6 +3900,12 @@ int main(int argc, char **argv) {
         test_ds_index(2, 900, 1, 3, 64, 100, 4, 8, 0); test_ds_index(4, 300, 4, 16, 64, 16, 1, 3, 1); test_ds_index(3, 1, 2, 2, 16, 4, 2, 1, 0);
         test_ds_engram(1, 4, 128); test_ds_engram(3, 2, 300);
         test_ds_index(3, 37, 4, 64, 128, 16, 2, 2, 1); test_ds_index(2, 60, 4, 96, 64, 8, 2, 2, 0);   /* DeepSeek V4's 64 x 128, past the staging */
+        {   /* many columns: the scores on a grid (mode 10), DeepSeek V4's heads both ways (the random stream kept) */
+            unsigned rng_was = rng;
+            test_ds_index(2, 600, 4, 64, 128, 16, 2, 2, 1); test_ds_index(1, 2000, 4, 96, 64, 64, 4, 4, 0);
+            test_ds_index(3, 500, 2, 16, 64, 32, 2, 3, 0);
+            rng = rng_was;
+        }
         printf("dsv4 done\n");
         int in;
         for (in = 0; in < 2; in++) {
