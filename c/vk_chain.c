@@ -146,6 +146,8 @@ typedef struct {
      * one pipeline per (head dim, query heads per kv head) */
     VkShaderModule mod_fa; VkPipeline fa[4]; int fa_hd[4], fa_gq[4], nfa;
     VkPipeline kdarec[VKC_KDA_MAX]; int kdarec_kd[VKC_KDA_MAX], nkdarec;   /* chain_kda's recurrence per key dim */
+    VkShaderModule mod_kdar; int kdar_tried;   /* chain_kda_rows.spv: a prompt chunk's rows, made on first use */
+    VkPipeline kdar[VKC_KDA_MAX]; int kdar_kd[VKC_KDA_MAX], nkdar;
     VkCommandPool cpool;
     VkcFrame fr[VKC_FRAMES];
     int cur;                          /* the open frame, -1 none */
@@ -1774,6 +1776,29 @@ static VkPipeline kda_pipe(int KD) {
     KC.kdarec[KC.nkdarec] = p; KC.kdarec_kd[KC.nkdarec++] = KD;
     return p;
 }
+/* chain_kda_rows.spv for KD: its rows a block (R) as many as the shared memory holds, at
+ * most 16 (NULL past VKC_KDA_MAX keys, or when COLI_VK_KDA_ROWS=0) */
+static VkPipeline kdar_pipe(int KD) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_VK_KDA_ROWS"); on = !(e && *e == '0'); }
+    if (!on) return VK_NULL_HANDLE;
+    for (int i = 0; i < KC.nkdar; i++) if (KC.kdar_kd[i] == KD) return KC.kdar[i];
+    if (KC.nkdar == VKC_KDA_MAX) return VK_NULL_HANDLE;
+    if (!KC.mod_kdar) {
+        if (KC.kdar_tried) return VK_NULL_HANDLE;
+        KC.kdar_tried = 1;
+        if (!(KC.mod_kdar = load_module(KC.core.spv_path, "chain_kda_rows.spv"))) return VK_NULL_HANDLE;
+    }
+    size_t row = ((size_t)3 * KD + 2 * 128 + 4) * 4;   /* q, k, alpha, v, o and four scalars a row */
+    int R = 16;
+    while (R > 1 && (size_t)R * row > kc_shared_limit()) R /= 2;
+    int32_t v[2] = {KD, R};
+    VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
+    VkSpecializationInfo si = {2, me, sizeof v, v};
+    VkPipeline p = make_pipe(KC.mod_kdar, &si);
+    KC.kdar[KC.nkdar] = p; KC.kdar_kd[KC.nkdar++] = KD;   /* a failed make is remembered as NULL */
+    return p;
+}
 int vkc_kda_rec(int KD, VkcBuf *m, VkcBuf *f, VkcBuf *b, VkcBuf *g, VkcBuf *prm, VkcBuf *st, VkcBuf *y, const VkcKdaRec *p) {
     return vkc_kda_rec_flags(KD, m, f, b, g, prm, st, y, p, 0);
 }
@@ -1782,7 +1807,10 @@ int vkc_kda_rec_flags(int KD, VkcBuf *m, VkcBuf *f, VkcBuf *b, VkcBuf *g, VkcBuf
     KC.kind = PK_KDA;
     if (!KC.mpipe[PM_KDA] || KD < 1 || KD > 256 || p->VD < 1 || p->VD > 128 || p->H < 1 || p->S < 1 ||
         (flags & ~(VKC_KDA_EXP_A | VKC_KDA_K3))) return 0;
-    VkPipeline pipe = kda_pipe(KD);
+    /* a prompt chunk's rows a block at a time (chain_kda_rows: the same bits); a decode's
+     * or a verify's few through chain_kda */
+    VkPipeline pipe = p->S >= VKC_KDA_ROWS ? kdar_pipe(KD) : VK_NULL_HANDLE;
+    if (!pipe) pipe = kda_pipe(KD);
     if (!pipe) return 0;
     struct { int mode; VkcKdaRec b; int flags; } pc = {1, *p, flags};
     VkcBind bd[7] = {B(m, 0), B(prm, 0), B(st, 1), B(y, 1), B(f, 0), B(b, 0), B(g, 0)};
@@ -2934,6 +2962,8 @@ void vkc_shutdown(void) {
         if (KC.mod[i]) vkDestroyShaderModule(KC.dev, KC.mod[i], NULL);
     }
     for (int i = 0; i < KC.nkdarec; i++) vkDestroyPipeline(KC.dev, KC.kdarec[i], NULL);
+    for (int i = 0; i < KC.nkdar; i++) if (KC.kdar[i]) vkDestroyPipeline(KC.dev, KC.kdar[i], NULL);
+    if (KC.mod_kdar) vkDestroyShaderModule(KC.dev, KC.mod_kdar, NULL);
     for (int i = 0; i < PM_N; i++) {
         if (KC.mpipe[i]) vkDestroyPipeline(KC.dev, KC.mpipe[i], NULL);
         if (KC.mmod[i]) vkDestroyShaderModule(KC.dev, KC.mmod[i], NULL);

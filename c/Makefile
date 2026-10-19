@@ -734,7 +734,7 @@ VK_SPV   += shaders/chain_norm.spv shaders/chain_rope.spv shaders/chain_attn.spv
 # blocks, the DSA indexer's selection
 VK_SPV   += shaders/chain_mla.spv shaders/chain_hgemv.spv shaders/chain_dsa.spv
 # Kimi Delta Attention and manifold-constrained hyper-connections (vk_chain.h)
-VK_SPV   += shaders/chain_kda.spv shaders/chain_mhc.spv
+VK_SPV   += shaders/chain_kda.spv shaders/chain_kda_rows.spv shaders/chain_mhc.spv
 # the int8 decode GEMV with per-matrix rows per workgroup (optional at run time)
 VK_SPV   += shaders/chain_gemv2.spv
 # DeepSeek V4.1 Flash and DeepSeek V4 attention (vk_chain.h: vkc_dsv4_*)
@@ -954,6 +954,9 @@ shaders/qmatmul_grp_gate_up_bdc.spv: shaders/qmatmul_grp_bdc.comp shaders/bdstep
 shaders/qmatmul_grp_gate_up_q.spv: shaders/qmatmul_grp_q.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
+shaders/chain_kda_rows.spv: shaders/chain_kda.comp
+	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
+	$(GLSLC) --target-env=vulkan1.2 -DROWS $< -o $@
 shaders/qmatmul_grp_gate_up_qc.spv: shaders/qmatmul_grp_qc.comp
 	@command -v $(GLSLC) >/dev/null 2>&1 || { echo "glslc not found: install shaderc (for VK=1)" >&2; exit 1; }
 	$(GLSLC) --target-env=vulkan1.2 -DGATE_UP $< -o $@
