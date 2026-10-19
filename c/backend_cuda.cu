@@ -4,6 +4,7 @@
 #include "fp8_format.h"   /* FP8_BLOCK: the shared fmt=8 scale-block edge (see that header) */
 
 #include "backend_gpu_compat.h"
+#include "cuda_bd.cuh"        /* a GGUF's block formats: fmt 100 + ggml type (blockdec_host.h's table) */
 
 static_assert(FP8_BLOCK == 128, "fmt=8 on-disk containers carry ceil(dim/128)-edged scale "
               "grids (mint tool, docs/FORMATS.md); FP8_BLOCK is container format, not a "
@@ -70,6 +71,7 @@ struct ColiCudaTensor {
     int fmt, I, O, device;
     int gs;                    /* quant group size; 0 = per-row scales (#334) */
     int ng;                    /* number of scale groups per row = ceil(I/gs) for fmt=4 */
+    int row_words;             /* fmt >= 100 (a GGUF's blocks): a row's 32-bit words, zero-padded */
     size_t scale_count;        /* scale elements: ue8m0 bytes for fmt=7, floats otherwise */
     int tracked;
     int weights_owned;
@@ -117,6 +119,8 @@ typedef struct {
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
     void *moe_tab; size_t moe_tab_cap; float *moe_host; size_t moe_host_cap;   /* group_moe_launch's table and row ids */
+    bd_u32 *bdtab;          /* blockdec_host.h's table, made with the first block-format tensor */
+    size_t smem_optin;      /* shared bytes a block may ask for (the block GEMVs past 48 KiB) */
 #ifdef COLI_ANS
     void *ans_raw; size_t ans_raw_cap;
     void *ans_host; size_t ans_host_cap;
@@ -1330,6 +1334,11 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         cudaDeviceProp prop{};
         if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { coli_cuda_shutdown(); return 0; }
         ctx->compute_major=prop.major;ctx->compute_minor=prop.minor;
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+        ctx->smem_optin=48*1024;
+#else
+        ctx->smem_optin=prop.sharedMemPerBlockOptin>48*1024?(size_t)prop.sharedMemPerBlockOptin:48*1024;
+#endif
         if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream,cudaStreamNonBlocking),"stream creation")){
             coli_cuda_shutdown();return 0;
         }
@@ -1356,6 +1365,7 @@ extern "C" void coli_cuda_shutdown(void) {
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
         if (!select_ctx(ctx)) continue;
+        if (ctx->bdtab) cudaFree(ctx->bdtab);
         if (ctx->mxfp4_weights) cudaFree(ctx->mxfp4_weights);
         if (ctx->mxfp4_scales) cudaFree(ctx->mxfp4_scales);
         if (ctx->mxfp4_expert_weights) cudaFree(ctx->mxfp4_expert_weights);
@@ -1480,6 +1490,61 @@ extern "C" void coli_cuda_group_stats_device(
     if(d2h_ms) *d2h_ms=index<0?0:g_device_group_d2h_ms[index];
 }
 
+/* ---- a GGUF's block formats (cuda_bd.cuh): fmt 100 + ggml type, the rows as the file
+ * stores them, each padded to whole words; no scale array (the scales are in the blocks).
+ * The decoders' table (blockdec_host.h) goes to a device with its first such tensor. */
+static std::mutex g_bdtab_mx;
+static const bd_u32 *bd_table(DeviceContext *ctx) {
+    std::lock_guard<std::mutex> lk(g_bdtab_mx);
+    if (ctx->bdtab) return ctx->bdtab;
+    std::vector<uint32_t> t(BDT_WORDS);
+    bdtab_fill(t.data(), NULL);
+    bd_u32 *d = NULL;
+    if (!cuda_ok(cudaMalloc(&d, (size_t)BDT_WORDS * 4), "block table allocation")) return NULL;
+    if (!cuda_ok(cudaMemcpy(d, t.data(), (size_t)BDT_WORDS * 4, cudaMemcpyHostToDevice), "block table upload")) { cudaFree(d); return NULL; }
+    ctx->bdtab = d;
+    return d;
+}
+/* the file's bytes of a row of I inputs, 0 when the format or the width is not one cuda_bd.cuh takes */
+static size_t bd_file_row_bytes(int fmt, int I) {
+    if (!bd_fmt_ok(fmt) || I < 32 || I % 32 || I % BD_BLK[fmt - 100]) return 0;
+    return (size_t)I / BD_BLK[fmt - 100] * BD_BYTES[fmt - 100];
+}
+/* O rows of rb bytes from the host into rows of row_words words (zero padding) */
+static int bd_rows_copy(ColiCudaTensor *t, const void *weights) {
+    size_t rb = bd_file_row_bytes(t->fmt, t->I), pitch = (size_t)t->row_words * 4;
+    if (pitch == rb) return cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "block tensor upload");
+    return cuda_ok(cudaMemset(t->weights, 0, t->weight_bytes), "block tensor padding") &&
+           cuda_ok(cudaMemcpy2D(t->weights, pitch, weights, rb, rb, (size_t)t->O, cudaMemcpyHostToDevice), "block tensor upload");
+}
+static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device) {
+    DeviceContext *ctx = find_ctx(device);
+    size_t rb = bd_file_row_bytes(fmt, I);
+    if (!weights || !rb || O < 1 || !select_ctx(ctx) || !bd_table(ctx)) return 0;
+    ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
+    if (!t) return 0;
+    t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->ng = 1;
+    t->row_words = (int)((rb + 3) / 4);
+    t->weight_bytes = (size_t)t->row_words * 4 * (size_t)O;
+    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) { coli_cuda_tensor_free(t); return 0; }
+    t->weights_owned = 1;
+    if (!bd_rows_copy(t, weights)) { coli_cuda_tensor_free(t); return 0; }
+    t->tracked = 1;
+    ctx->tensor_count++;
+    ctx->tensor_bytes += t->weight_bytes;
+    *tensor = t;
+    return 1;
+}
+/* y[S, O] = x[S, I] W^T for a block-format tensor, on stream st (device pointers) */
+static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st) {
+    const bd_u32 *tab = bd_table(ctx);
+    if (!tab || ((uintptr_t)x & 15)) return 0;
+    const char *e = std::getenv("COLI_CUDA_BD_FLOAT");   /* 1: the float form for every type (tests) */
+    if (!bd_gemv_launch(y, x, (const bd_u32 *)t->weights, tab, t->fmt, t->I, t->O, t->row_words, S, ctx->smem_optin, e && *e == '1', st)) return 0;
+    return cuda_ok(cudaGetLastError(), "block gemv launch");
+}
+extern "C" int coli_cuda_block_elems(int fmt) { return bd_file_row_bytes(fmt, 256) && fmt >= 100 ? (int)BD_BLK[fmt - 100] : 0; }
+
 /* group size for the NEXT upload on this thread (fmt=4): routed through a
  * thread_local so the widely-wired upload signature (and the Windows DLL ABI)
  * stays untouched. pin_load uploads in parallel, hence thread_local. */
@@ -1501,6 +1566,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         int want_gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
         return t->fmt == fmt && t->I == I && t->O == O && t->device == device && t->gs == want_gs;
     }
+    if (fmt >= 100) return bd_tensor_upload(tensor, weights, fmt, I, O, device);
     DeviceContext *ctx = find_ctx(device);
     if (!weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
     size_t rb = row_bytes(fmt, I);
@@ -1567,6 +1633,7 @@ extern "C" int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *weights
 #ifdef COLI_ANS
     if (t->compressed) return 0;            /* archive bytes, not a weight buffer of this size */
 #endif
+    if (t->fmt >= 100) { DeviceContext *c = find_ctx(t->device); return select_ctx(c) && bd_rows_copy(t, weights); }
     if (t->fmt && t->fmt != 6 && (!scales || !t->scales)) return 0;
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
@@ -1742,6 +1809,7 @@ extern "C" int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tensor,
 extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                                           const void *weights,
                                           const float *scales) {
+    if (tensor && weights && tensor->fmt >= 100) { DeviceContext *c = find_ctx(tensor->device); return select_ctx(c) && bd_rows_copy(tensor, weights); }
     if (!tensor || !weights || (tensor->fmt && tensor->fmt != 6 && !scales)) return 0;
 #ifdef COLI_ANS
     if(tensor->compressed) return 0;
@@ -1821,7 +1889,8 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->dx, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
-    quant_matmul_launch(ctx->dy, ctx->dx, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
+    if (fmt >= 100) { if (!bd_tensor_gemv(ctx, t, ctx->dy, ctx->dx, S, 0)) return 0; }
+    else quant_matmul_launch(ctx->dy, ctx->dx, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->dy, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
@@ -2089,6 +2158,7 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     if (gate && ((gate->fmt == 4 && gate->gs <= 0) ||
                  (up && up->fmt == 4 && up->gs <= 0) ||
                  (down && down->fmt == 4 && down->gs <= 0))) return 0;
+    if ((gate && gate->fmt >= 100) || (up && up->fmt >= 100) || (down && down->fmt >= 100)) return 0;   /* the block formats: the chain's GEMVs only */
     if (!gate || !up || !down || !x || !y || S < 1 ||
         gate->device != up->device || gate->device != down->device ||
         gate->I != up->I || gate->O != up->O ||
@@ -2466,6 +2536,8 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     if (!gates || !ups || !downs || !rows || !x || count < 1 || count > 64) return 0;
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
+    for (int i = 0; i < count; i++)   /* the block formats: the chain's GEMVs only */
+        if ((gates[i] && gates[i]->fmt >= 100) || (ups[i] && ups[i]->fmt >= 100) || (downs[i] && downs[i]->fmt >= 100)) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0,all_s4=1,any_e8=0,all_e8=1,
         all_q4=1,any_g4=0,any_f8=0,all_f8=1;
     GroupDesc host[64];
@@ -3364,6 +3436,7 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
     cudaStream_t st = (cudaStream_t)stream;
+    if (t->fmt >= 100) return bd_tensor_gemv(ctx, t, y_dev, x_dev, S, st);   /* a GGUF's blocks: cuda_bd.cuh */
     if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288) {
         unsigned bx = (unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS);
         const int8_t *w = (const int8_t *)t->weights;
@@ -4089,6 +4162,8 @@ extern "C" int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gate
         int home_device, const float *x_src_dev, float *partial_slot_dev){
     if(!gates||!ups||!downs||!weights||count<1||count>64||!x_src_dev||!partial_slot_dev) return 0;
     ColiCudaTensor *first=gates[0]; if(!first) return 0;
+    for(int i=0;i<count;i++)   /* the block formats: the chain's GEMVs only */
+        if((gates[i]&&gates[i]->fmt>=100)||(ups[i]&&ups[i]->fmt>=100)||(downs[i]&&downs[i]->fmt>=100)) return 0;
     int device=first->device,D=first->I,I=first->O;
     GroupDesc host[64];
     int total=0,all_s4=1;
@@ -4213,6 +4288,7 @@ extern "C" int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x
     if (fault_injected()) return 0;
     if(!t||S<1) return 0;
     DeviceContext *ctx=find_ctx(t->device); if(!select_ctx(ctx)) return 0;
+    if(t->fmt>=100) return bd_tensor_gemv(ctx,t,y_dev,x_dev,S,0);
     dim3 grid((unsigned)t->O,(unsigned)S);
     quant_matmul<<<grid,256>>>(y_dev,x_dev,t->weights,t->scales,t->fmt,S,t->I,t->O,
         row_bytes(t->fmt,t->I),t->gs,t->ng);

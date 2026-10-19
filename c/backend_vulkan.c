@@ -8,8 +8,7 @@
 // M2 scope: correctness + a standalone GPU-vs-CPU test harness. Synchronous
 // submit/wait per call; async queues and zero-copy import come in M4.
 #include "backend_vulkan.h"
-#include "ggml_grids.h"              /* the block formats' tables (blockdec_table.h) */
-#include "shaders/blockdec_table.h"
+#include "blockdec_host.h"           /* the block formats' sizes and table (blockdec_table.h) */
 #include "vk_alloc.h"
 #include "vk_load.h"
 #include <pthread.h>
@@ -803,11 +802,7 @@ static int scratch_reserve(Scratch *s, size_t bytes) { return scratch_reserve_mt
  * GGUF file stores them; 200, 201, 202 are colibri's int2-g32, int2-g16 and int3-g16 experts
  * (203 vq2: codes | 4-bit scales per 32 | f32 row scale, its codebooks in the table buffer)
  * as codes | group scales (I/32 bytes) | f32 row scale. The scales live in the rows: the
- * scale array is bound but unused. Elements and bytes per block, by ggml type. */
-static const uint16_t BD_BLK[43] = {1,1,32,32,0,0,32,32,32,0,256,256,256,256,256,0,256,256,256,256,32,256,256,256,
-                                    0,0,0,0,0,256,0,0,0,0,256,256,0,0,0,32,64,128,64};
-static const uint16_t BD_BYTES[43] = {4,2,18,20,0,0,22,24,34,0,84,110,144,176,210,0,66,74,98,50,18,110,82,136,
-                                      0,0,0,0,0,56,0,0,0,0,54,66,0,0,0,17,36,18,18};
+ * scale array is bound but unused. Elements and bytes per block: blockdec_host.h. */
 static int bd_fmt(int fmt) { return (fmt >= 102 && fmt < 143 && BD_BLK[fmt - 100] >= 32) || (fmt >= 200 && fmt <= 203); }
 static size_t bd_row_bytes(int fmt, int I) {
     if (fmt == 203) return (size_t)I / 4 + (size_t)I / 64 + 4;
@@ -1992,28 +1987,6 @@ static ColiVkTensor *g_bdtab[2];
 static pthread_mutex_t g_bdtab_mx = PTHREAD_MUTEX_INITIALIZER;
 static int bd_dev_ready(int dev);   /* after G2 */
 static uint32_t g_vq2_words[BDT_WORDS - BDT_VQ2];   /* coli_vk_set_vq2_books */
-static void bdtab_fill(uint32_t *t) {
-    memset(t, 0, (size_t)BDT_WORDS * 4);
-    memcpy(t + BDT_VQ2, g_vq2_words, sizeof g_vq2_words);
-    for (int i = 0; i < 43; i++) { t[BDT_BLK + i] = BD_BLK[i]; t[BDT_BYTES + i] = BD_BYTES[i]; }
-    for (int i = 0; i < 128; i++) t[BDT_KSIGNS + i] = GGML_KSIGNS_IQ2XS[i];
-    for (int i = 0; i < 16; i++) {
-        t[BDT_IQ4NL + i] = (uint32_t)(int32_t)GGML_KVALUES_IQ4NL[i];
-        t[BDT_MXFP4 + i] = (uint32_t)(int32_t)GGML_KVALUES_MXFP4[i];
-    }
-    /* the grids' bytes as little-endian words, as the shader reads them */
-    memcpy(t + BDT_IQ2XXS, GGML_IQ2XXS_GRID, sizeof GGML_IQ2XXS_GRID);
-    memcpy(t + BDT_IQ2XS, GGML_IQ2XS_GRID, sizeof GGML_IQ2XS_GRID);
-    memcpy(t + BDT_IQ2S, GGML_IQ2S_GRID, sizeof GGML_IQ2S_GRID);
-    memcpy(t + BDT_IQ3XXS, GGML_IQ3XXS_GRID, sizeof GGML_IQ3XXS_GRID);
-    memcpy(t + BDT_IQ3S, GGML_IQ3S_GRID, sizeof GGML_IQ3S_GRID);
-    memcpy(t + BDT_IQ1S, GGML_IQ1S_GRID, sizeof GGML_IQ1S_GRID);
-}
-_Static_assert(BDT_IQ2XS - BDT_IQ2XXS == sizeof GGML_IQ2XXS_GRID / 4 && BDT_IQ2S - BDT_IQ2XS == sizeof GGML_IQ2XS_GRID / 4 &&
-               BDT_IQ3XXS - BDT_IQ2S == sizeof GGML_IQ2S_GRID / 4 && BDT_IQ3S - BDT_IQ3XXS == sizeof GGML_IQ3XXS_GRID / 4 &&
-               BDT_IQ1S - BDT_IQ3S == sizeof GGML_IQ3S_GRID / 4 && BDT_VQ2 - BDT_IQ1S == sizeof GGML_IQ1S_GRID / 4 &&
-               BDT_WORDS - BDT_VQ2 == 2 * 256 * 8 / 4,
-               "shaders/blockdec_table.h does not match ggml_grids.h");
 /* the table's buffer on device dev, made now if it is not there yet; NULL handle when
  * the device has no room for it (no block format goes there then) */
 static VkBuffer bdtab_buf(int dev) {
@@ -2023,7 +1996,7 @@ static VkBuffer bdtab_buf(int dev) {
     if (!g_bdtab[dev] && bd_dev_ready(dev)) {
         uint32_t *w = malloc((size_t)BDT_WORDS * 4);
         ColiVkTensor *n = NULL;
-        if (w) { bdtab_fill(w); upload_tensor_pool(dev ? &g_wpool2 : &g_wpool, &n, w, NULL, 10, BDT_WORDS, 1, 0); free(w); }
+        if (w) { bdtab_fill(w, g_vq2_words); upload_tensor_pool(dev ? &g_wpool2 : &g_wpool, &n, w, NULL, 10, BDT_WORDS, 1, 0); free(w); }
         __atomic_store_n(&g_bdtab[dev], n, __ATOMIC_RELEASE);
     }
     t = g_bdtab[dev];
