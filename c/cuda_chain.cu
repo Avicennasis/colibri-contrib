@@ -744,7 +744,11 @@ static int cc_init(int device) {
     if (!cc_ok(nullptr, cudaStreamCreateWithFlags(&c->stream, cudaStreamNonBlocking), "stream")) return 0;
     if (!cc_ok(nullptr, cudaEventCreateWithFlags(&c->ev, cudaEventDisableTiming), "event")) { cudaStreamDestroy(c->stream); return 0; }
     c->ev_ok = 1; c->up = 1; c->lost = 0; c->in_frame = 0; c->ev_pending = 0;
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)   /* the flash attention's tensor cores (CUDA only) */
     if (cudaDeviceGetAttribute(&c->major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) { c->major = 0; (void)cudaGetLastError(); }
+#else
+    c->major = 0;
+#endif
     if (c == &g_cc[g_ncc]) g_ncc++;
     g_cur = (int)(c - g_cc);
     return 1;
