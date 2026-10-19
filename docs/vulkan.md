@@ -590,7 +590,20 @@ tests/test_vk_chain, device time a layer, 48 layers of distinct experts):
 | 8 int4 with a scale a row (Inkling), 7168 x 2048 | 1332 us | 463 us |
 | 8 int8, 6144 x 2048 | 1333 us | 762 us |
 
-`COLI_VK_XB_GEMV=0` keeps the per-expert GEMVs.
+A GGUF's experts (the block formats) take the same way for a batch whose experts all have 4
+rows or fewer (a decode step, an MTP verify): `chain_moe.comp`'s block path (bdstep.glsl, its
+float form, a pipeline per pair of types), every row a pair, down's rows copied to the
+batch's. The grouped GEMM of the block formats works in 32-row tiles and the per-expert
+GEMVs a row a subgroup:
+
+| shape | grouped GEMM | chain kernel |
+|---|---|---|
+| GLM: 8 Q4_K, 6144 x 2048 | 2694 us | 512 us |
+| GLM: 8 Q6_K, 6144 x 2048 | 3277 us | 830 us |
+| Kimi K3: 8 IQ2_S/Q2_0, 7168 x 2048 | 3136 us | 434 us |
+| DeepSeek: 6 Q4_K, 4096 x 2048 | 1393 us | 303 us |
+
+A prompt chunk's experts keep the grouped GEMM. `COLI_VK_XB_GEMV=0` keeps the per-expert GEMVs.
 
 ### RAM and VRAM without the same experts (`COLI_VK_TIER_EXCLUSIVE`)
 
