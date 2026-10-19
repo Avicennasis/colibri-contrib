@@ -89,7 +89,9 @@ void coli_cuda_tensor_free(ColiCudaTensor *t) {
 int coli_cuda_host_register(void *p, size_t bytes) { (void)p; (void)bytes; return 0; }
 void coli_cuda_host_unregister(void *p) { (void)p; }
 int coli_cuda_planar_rows(int device, int D, int I) { (void)device; (void)D; (void)I; return 0; }
-int coli_cuda_block_elems(int fmt) { (void)fmt; return 0; }
+/* a GGUF's block formats: fake_block_elems for every fmt >= 100 (0: the backend takes none) */
+static int fake_block_elems;
+int coli_cuda_block_elems(int fmt) { return fmt >= 100 ? fake_block_elems : 0; }
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *t) { return t ? (size_t)t->I * (size_t)t->O : 0; }
 int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *w, const float *sc) {
     if (!t || !w || fake_overwrite_fail) return 0;
