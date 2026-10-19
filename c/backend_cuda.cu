@@ -116,6 +116,7 @@ typedef struct {
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
+    void *moe_tab; size_t moe_tab_cap; float *moe_host; size_t moe_host_cap;   /* group_moe_launch's table and row ids */
 #ifdef COLI_ANS
     void *ans_raw; size_t ans_raw_cap;
     void *ans_host; size_t ans_host_cap;
@@ -1374,6 +1375,8 @@ extern "C" void coli_cuda_shutdown(void) {
         if (ctx->host_kv) cudaFreeHost(ctx->host_kv);
         if (ctx->stream) cudaStreamDestroy(ctx->stream);
         if (ctx->group_desc) cudaFree(ctx->group_desc);
+        if (ctx->moe_tab) cudaFree(ctx->moe_tab);
+        if (ctx->moe_host) cudaFreeHost(ctx->moe_host);
 #ifdef COLI_ANS
         if(ctx->ans_copy_pending)cudaStreamSynchronize(ctx->stream);
         if(ctx->ans_host)cudaFreeHost(ctx->ans_host);
@@ -1397,6 +1400,7 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
         ctx->host_x_cap=ctx->host_y_cap=ctx->host_kv_cap=0;
         ctx->group_desc=nullptr; ctx->group_desc_cap=0;
+        ctx->moe_tab=nullptr; ctx->moe_tab_cap=0; ctx->moe_host=nullptr; ctx->moe_host_cap=0;
     }
     g_nctx = 0;
     /* g_fp8_lut_ready is PROCESS-WIDE while the e4m3 table (c_e4m3, a
@@ -2174,6 +2178,54 @@ static void f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
     grouped_down_f8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
 }
 
+/* The kernels the CUDA chain runs a decode step's routed experts on (coli_cuda_moe_async: a
+ * block of output rows of one (row, slot) pair a launch, its input row in shared memory,
+ * 16-byte weight loads), for a small group whose experts share one format: every row of the
+ * group a pair of its own (S rows, K 1), the experts a table of their own. The grouped
+ * kernels further down take a block of 256 threads per output row and a byte a thread a
+ * step: GLM-5.2's eight int4-g64 experts of 6144 x 2048 took 1165 us a step on an RTX PRO
+ * 4000 with the round trip, these 537 without it. The sync and the async group take it alike,
+ * so their bits stay one path's. COLI_CUDA_GROUP_MOE=0 keeps the grouped kernels. */
+extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
+                                   float *hid, float *y, const float *hy, const CcMoe *p, void *stream);
+static int group_moe_ok(const GroupDesc *host, int count, int total, int D, int I) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_GROUP_MOE"); on = !(e && *e == '0'); }
+    if (!on || count < 1 || total > CC_MOE_FRAME_ROWS || D < 32 || I < 32 || D % 32 || I % 32 ||
+        D > CC_MOE_DIM_MAX || I > CC_MOE_DIM_MAX) return 0;
+    int f = host[0].gf, gs = host[0].ggs;
+    if (!(f == 1 || f == 2 || (f == 4 && gs >= 16 && gs % 16 == 0))) return 0;
+    for (int c = 0; c < count; c++)
+        if (host[c].gf != f || host[c].uf != f || host[c].df != f ||
+            (f == 4 && (host[c].ggs != gs || host[c].ugs != gs || host[c].dgs != gs))) return 0;
+    return 1;
+}
+static uint64_t g_group_moe_calls;   /* groups group_moe_launch took (tests/test_grouped_g4_cuda.cu) */
+/* the group's x already in ctx->x (its rows expert by expert); y into ctx->y the same way */
+static int group_moe_launch(DeviceContext *ctx, int device, const GroupDesc *host, int count, const int *rows,
+                            int total, int D, int I) {
+    size_t tb = (size_t)count * sizeof(CcExpert), nb = tb + (size_t)total * sizeof(int);
+    if (!reserve_bytes(&ctx->moe_tab, &ctx->moe_tab_cap, nb) || !reserve_pinned(&ctx->moe_host, &ctx->moe_host_cap, nb) ||
+        !reserve(&ctx->gate, &ctx->gate_cap, (size_t)total * (I + D) * sizeof(float))) return 0;
+    CcExpert *t = (CcExpert *)ctx->moe_host;
+    int *ids = (int *)((char *)ctx->moe_host + tb);
+    for (int c = 0, r = 0; c < count; c++) {
+        t[c].g = host[c].g; t[c].u = host[c].u; t[c].d = host[c].d;
+        t[c].gs = host[c].gs; t[c].us = host[c].us; t[c].ds = host[c].ds; t[c].planar = 0; t[c].pad_ = 0;
+        for (int k = 0; k < rows[c]; k++) ids[r++] = c;
+    }
+    if (!cuda_ok(cudaMemcpyAsync(ctx->moe_tab, ctx->moe_host, nb, cudaMemcpyHostToDevice, ctx->stream), "expert group table")) return 0;
+    CcMoe mp; std::memset(&mp, 0, sizeof mp);
+    mp.S = total; mp.K = 1; mp.D = D; mp.I = I; mp.fmt = host[0].gf; mp.gs = host[0].gf == 4 ? host[0].ggs : 0;
+    mp.parts = 1; mp.x_row = D; mp.i_row = 1; mp.E = count;
+    if (!coli_cuda_moe_async(device, (const CcExpert *)ctx->moe_tab, ctx->x, (const int *)((char *)ctx->moe_tab + tb), nullptr,
+                             ctx->gate, nullptr, nullptr, &mp, (void *)ctx->stream)) return 0;
+    g_group_moe_calls++;
+    /* hid: the S hidden rows, then the S output rows */
+    return cuda_ok(cudaMemcpyAsync(ctx->y, ctx->gate + (size_t)total * I, (size_t)total * D * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, ctx->stream), "expert group rows");
+}
+
 static int expert_group_impl(ColiCudaTensor *const *gates,
                              ColiCudaTensor *const *ups,
                              ColiCudaTensor *const *downs,
@@ -2312,6 +2364,8 @@ static int expert_group_impl(ColiCudaTensor *const *gates,
             }
             off16+=r;
         }
+    }else if(group_moe_ok(host,count,total,D,I)){
+        if(!group_moe_launch(ctx,device,host,count,rows,total,D,I))return 0;
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
         int dual=!getenv("COLI_CUDA_DUAL_PROJ")||atoi(getenv("COLI_CUDA_DUAL_PROJ"));
@@ -2457,6 +2511,8 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         /* fp8-e4m3 groups on the async decode path: same launch helper as the
          * sync dispatch, silu fused in the dual epilogue. */
         f8_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,max_rows,count);
+    }else if(group_moe_ok(host,count,total,D,I)){
+        if(!group_moe_launch(ctx,device,host,count,rows,total,D,I))return 0;
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
