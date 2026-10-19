@@ -710,6 +710,10 @@ def engine_path(directory, family):
 # ---------------------------------------------------------------- building
 
 
+#: CUDA engines that hand a GGUF to Vulkan in a build with both (qwen36.c, qwen38.c)
+GGUF_ON_VULKAN = ("qwen36", "qwen38")
+
+
 def make_command(family, backend, tc, make_args=()):
     """The make invocation for this engine and backend (argv, cwd, env).
     `make_args` are the extra variables the decision asked for
@@ -721,6 +725,11 @@ def make_command(family, backend, tc, make_args=()):
         args.append("VK=1")
     elif backend == "cuda":
         args.append("CUDA=1")
+        # Vulkan too where it builds, for the engines that run a GGUF on it when CUDA
+        # cannot (their CUDA tier takes no ggml block types; the Windows CUDA package
+        # has both already): a GGUF on an NVIDIA card stays on the card
+        if family.id in GGUF_ON_VULKAN and tc.get("can_build_vulkan") and host_os() != "win32":
+            args.append("VK=1")
         if not any(arg.startswith("CUDA_ARCH=") for arg in make_args):
             args.append(f"CUDA_ARCH={os.environ.get('CUDA_ARCH') or 'native'}")
     args += list(make_args)

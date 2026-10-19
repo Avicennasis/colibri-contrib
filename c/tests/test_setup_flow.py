@@ -545,6 +545,10 @@ class CudaBackendChoice(unittest.TestCase):
                              ["deepseek-v4", "ARCH=native", "CUDA=1", "CUDA_ARCH=native", "NO_TC=1"])
             cmd, _cwd, _env = setup_flow.make_command(family_by_id("qwen36"), "cuda", TC_ALL,
                                                       ["CUDA_ARCH=sm_70"])
+            self.assertEqual(cmd[cmd.index("qwen36"):], ["qwen36", "ARCH=native", "CUDA=1", "VK=1", "CUDA_ARCH=sm_70"])
+            # without the Vulkan toolchain, or on Windows (its CUDA package has both), CUDA alone
+            cmd, _cwd, _env = setup_flow.make_command(family_by_id("qwen36"), "cuda", dict(TC_ALL, can_build_vulkan=False),
+                                                      ["CUDA_ARCH=sm_70"])
             self.assertEqual(cmd[cmd.index("qwen36"):], ["qwen36", "ARCH=native", "CUDA=1", "CUDA_ARCH=sm_70"])
 
     def test_a_pending_cuda_rebuild_checks_the_cards_it_was_for(self):
