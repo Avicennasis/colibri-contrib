@@ -3616,6 +3616,150 @@ static int moe_rows_launch(const CcExpert *tab, const float *x, const int *ids, 
     return cuda_ok(cudaGetLastError(), "chain moe rows launch");
 }
 
+/* A decode step's routed experts in a dense GEMV's layout (vk_chain.c's chain_moe_gv.comp
+ * on Vulkan): the input row staged once in shared memory with a float4 of pad every eight
+ * (a lane's 16-byte step reads consecutive float4s, the next lane's start nine on: no bank
+ * conflict), each output row lpr lanes of 16-byte weight steps, gate and up in the same loop,
+ * the lanes joined by shuffles. moe_gu_k and moe_dn_k took a warp a row with 8-byte steps
+ * and lanes 16 floats apart: GLM-5.2's eight int4-g64 experts (6144 x 2048) 537 us a step on
+ * an RTX PRO 4000. Formats 1, 2 and 4 (the CUDA tier's signed nibbles, weight 2j low), rows
+ * 16-byte aligned (cudaMalloc'd tensors), the staged row within 48 KiB; else moe_launch. */
+#define MOE_GV_SMEM (49152 - 4096)   /* the staged row's dynamic shared memory: the slots' table beside it */
+__host__ __device__ static inline int moe_gv_lanes(int fmt, int n) {   /* about eight 16-byte steps a lane, 1 to 32 */
+    int steps = n / (fmt == 1 ? 16 : 32), l = 1;
+    while (l < 32 && l * 2 * 8 <= steps) l *= 2;
+    return l;
+}
+static inline size_t moe_gv_smem(int n) { return ((size_t)n / 4 + (size_t)n / 32 + 1) * sizeof(float4); }
+__device__ __forceinline__ int mgx(int k) { return k + (k >> 3); }
+__device__ __forceinline__ float mg_s4(unsigned w, int i) { return (float)((int)(w << (28 - 4 * i)) >> 28); }
+__device__ __forceinline__ float mg_s8(unsigned w, int i) { return (float)((int)(w << (24 - 8 * i)) >> 24); }
+__device__ __forceinline__ float mg_dot4w(unsigned w, const float4 a, const float4 b) {
+    return a.x * mg_s4(w, 0) + a.y * mg_s4(w, 1) + a.z * mg_s4(w, 2) + a.w * mg_s4(w, 3) +
+           b.x * mg_s4(w, 4) + b.y * mg_s4(w, 5) + b.z * mg_s4(w, 6) + b.w * mg_s4(w, 7);
+}
+__device__ __forceinline__ float mg_dot8w(unsigned w, const float4 a) {
+    return a.x * mg_s8(w, 0) + a.y * mg_s8(w, 1) + a.z * mg_s8(w, 2) + a.w * mg_s8(w, 3);
+}
+/* one 16-byte step q of a row against the staged row: 16 int8 or 32 int4 weights */
+template<int FMT>
+__device__ __forceinline__ float mg_step(uint4 v, int q, const float4 *xs) {
+    if (FMT == 1) {
+        int b = q * 4;
+        return mg_dot8w(v.x, xs[mgx(b)]) + mg_dot8w(v.y, xs[mgx(b + 1)]) + mg_dot8w(v.z, xs[mgx(b + 2)]) + mg_dot8w(v.w, xs[mgx(b + 3)]);
+    }
+    int b = q * 8;
+    return mg_dot4w(v.x, xs[mgx(b)], xs[mgx(b + 1)]) + mg_dot4w(v.y, xs[mgx(b + 2)], xs[mgx(b + 3)]) +
+           mg_dot4w(v.z, xs[mgx(b + 4)], xs[mgx(b + 5)]) + mg_dot4w(v.w, xs[mgx(b + 6)], xs[mgx(b + 7)]);
+}
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#define mg_shfl_xor(v, o) __shfl_xor((v), (o), 32)   /* 32-lane groups on a wave64 device too */
+#else
+#define mg_shfl_xor(v, o) __shfl_xor_sync(0xffffffffu, (v), (o), 32)
+#endif
+__device__ __forceinline__ float mg_lanes_sum(float v, int lpr) {
+    for (int off = lpr >> 1; off > 0; off >>= 1) v += mg_shfl_xor(v, off);
+    return v;
+}
+/* gate and up: block (b, s) stages row s once and takes units u = k * I + o (slot k's row o),
+ * a unit lpr lanes; hid[s*K + k][o] = silu(gate . x) * (up . x) */
+template<int FMT>
+__global__ static void __launch_bounds__(256) moe_gv_gu_k(const CcExpert *__restrict__ tab, const float *__restrict__ x,
+        const int *__restrict__ ids, float *__restrict__ hid, CcMoe p, int lpr) {
+    extern __shared__ float4 mg_xs[];
+    float4 *xs = mg_xs;
+    __shared__ CcExpert ke[CC_ROUTE_KMAX];
+    __shared__ int kl[CC_ROUTE_KMAX];
+    int s = blockIdx.y, tid = threadIdx.x;
+    size_t xb = (size_t)p.x_off + (size_t)s * p.x_row;
+    for (int i = tid; i < p.D / 4; i += 256) xs[mgx(i)] = make_float4(x[xb + 4 * i], x[xb + 4 * i + 1], x[xb + 4 * i + 2], x[xb + 4 * i + 3]);
+    if (tid < p.K) {
+        int e = ids[p.i_off + s * p.i_row + tid];
+        int on = e >= 0 && tab[p.t_off + e].g != nullptr;
+        kl[tid] = on;
+        if (on) ke[tid] = tab[p.t_off + e];
+    }
+    __syncthreads();
+    int lane = tid & 31, warp = tid >> 5, rps = 32 / lpr, sub = lane / lpr, ql = lane % lpr;
+    int per = FMT == 1 ? 16 : 32, nq = p.D / per, ng = FMT == 4 ? (p.D + p.gs - 1) / p.gs : 1;
+    int NU = p.K * p.I, stride = (int)gridDim.x * 8 * rps;
+    for (int u0 = ((int)blockIdx.x * 8 + warp) * rps; u0 < NU; u0 += stride) {   /* uniform in the warp */
+        int u = min(u0 + sub, NU - 1), k = u / p.I, o = u - k * p.I;
+        bool live = u0 + sub < NU && kl[k];
+        float g = 0.f, uu = 0.f;
+        if (live) {
+            const uint4 *wg = (const uint4 *)ke[k].g + (size_t)o * nq, *wu = (const uint4 *)ke[k].u + (size_t)o * nq;
+            for (int q = ql; q < nq; q += lpr) {
+                uint4 vg = wg[q], vu = wu[q];
+                if (FMT == 4) {
+                    int gi = o * ng + (q * 32) / p.gs;
+                    g += mg_step<FMT>(vg, q, xs) * ke[k].gs[gi]; uu += mg_step<FMT>(vu, q, xs) * ke[k].us[gi];
+                } else { g += mg_step<FMT>(vg, q, xs); uu += mg_step<FMT>(vu, q, xs); }
+            }
+        }
+        g = mg_lanes_sum(g, lpr); uu = mg_lanes_sum(uu, lpr);
+        if (ql == 0 && live) {
+            if (FMT != 4) { g *= ke[k].gs[o]; uu *= ke[k].us[o]; }
+            hid[((size_t)s * p.K + k) * p.I + o] = (g / (1.f + expf(-g))) * uu;
+        }
+    }
+}
+/* down: block (pair j, tile) stages pair j's hidden row and takes the tile's rows, a row
+ * lpr lanes: hid[S*K + j][o] = down_e[o] . hid[j] */
+template<int FMT>
+__global__ static void __launch_bounds__(256) moe_gv_dn_k(const CcExpert *__restrict__ tab, const int *__restrict__ ids,
+        float *__restrict__ hid, CcMoe p, int lpr, int tiles) {
+    extern __shared__ float4 mg_xs[];
+    float4 *xs = mg_xs;
+    int wgi = (int)(blockIdx.x + blockIdx.y * gridDim.x), j = wgi / tiles, tile = wgi - j * tiles;
+    if (j >= p.S * p.K) return;
+    int s = j / p.K, k = j - s * p.K, e = ids[p.i_off + s * p.i_row + k];
+    if (e < 0) return;
+    CcExpert ex = tab[p.t_off + e];
+    if (!ex.g) return;
+    int tid = threadIdx.x;
+    const float *hr = hid + (size_t)j * p.I;
+    for (int i = tid; i < p.I / 4; i += 256) xs[mgx(i)] = make_float4(hr[4 * i], hr[4 * i + 1], hr[4 * i + 2], hr[4 * i + 3]);
+    __syncthreads();
+    int lane = tid & 31, warp = tid >> 5, rps = 32 / lpr, sub = lane / lpr, ql = lane % lpr;
+    int per = FMT == 1 ? 16 : 32, nq = p.I / per, ng = FMT == 4 ? (p.I + p.gs - 1) / p.gs : 1;
+    int per_tile = (p.D + tiles - 1) / tiles, lo = tile * per_tile, hi = min(lo + per_tile, p.D);
+    size_t dn = (size_t)p.S * p.K * p.I;
+    for (int o0 = lo + warp * rps; o0 < hi; o0 += 8 * rps) {   /* uniform in the warp */
+        int o = o0 + sub;
+        bool live = o < hi;
+        int oc = min(o, p.D - 1);
+        float v = 0.f;
+        if (live) {
+            const uint4 *wd = (const uint4 *)ex.d + (size_t)oc * nq;
+            for (int q = ql; q < nq; q += lpr) {
+                float d = mg_step<FMT>(wd[q], q, xs);
+                v += FMT == 4 ? d * ex.ds[oc * ng + (q * 32) / p.gs] : d;
+            }
+        }
+        v = mg_lanes_sum(v, lpr);
+        if (ql == 0 && live) hid[dn + (size_t)j * p.D + o] = FMT != 4 ? v * ex.ds[oc] : v;
+    }
+}
+template<int FMT>
+static int moe_gv_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, const CcMoe *p, cudaStream_t st) {
+    int l0 = moe_gv_lanes(FMT, p->D), l1 = moe_gv_lanes(FMT, p->I);
+    int upw = 8 * (32 / l0), nwg = (p->K * p->I + upw - 1) / upw;   /* units a block */
+    if (nwg > 1024) nwg = 1024;
+    moe_gv_gu_k<FMT><<<dim3((unsigned)nwg, (unsigned)p->S), 256, moe_gv_smem(p->D), st>>>(tab, x, ids, hid, *p, l0);
+    int rpp = 8 * (32 / l1), tiles = (p->D + rpp - 1) / rpp;   /* a down tile: one pass of the block */
+    uint64_t nb = (uint64_t)p->S * p->K * tiles;
+    unsigned gx = nb < 65535 ? (unsigned)nb : 65535u, gy = (unsigned)((nb + gx - 1) / gx);
+    moe_gv_dn_k<FMT><<<dim3(gx, gy), 256, moe_gv_smem(p->I), st>>>(tab, ids, hid, *p, l1, tiles);
+    return cuda_ok(cudaGetLastError(), "chain moe gv launch");
+}
+static int moe_gv_ok(const CcMoe *p) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_MOE_GV"); on = !(e && *e == '0'); }
+    return on && (p->fmt == 1 || p->fmt == 2 || (p->fmt == 4 && p->gs % 32 == 0)) && p->K <= CC_ROUTE_KMAX &&
+           moe_gv_smem(p->D) <= MOE_GV_SMEM && moe_gv_smem(p->I) <= MOE_GV_SMEM;
+}
+
 template<int FMT>
 static int moe_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, const CcMoe *p, cudaStream_t st) {
     size_t sg = ((size_t)p->D + (FMT == 8 ? 256 : 0)) * sizeof(float), sd = ((size_t)p->I + (FMT == 8 ? 256 : 0)) * sizeof(float);
@@ -3649,6 +3793,8 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
         if (!x) return 0;
         int ok = rows ? (p->fmt == 1 ? moe_rows_launch<1>(tab, x, ids, hid, m, p, st, f16) : p->fmt == 2 ? moe_rows_launch<2>(tab, x, ids, hid, m, p, st, f16)
                                                      : moe_rows_launch<4>(tab, x, ids, hid, m, p, st, f16))
+               : moe_gv_ok(p) ? (p->fmt == 1 ? moe_gv_launch<1>(tab, x, ids, hid, p, st) : p->fmt == 2 ? moe_gv_launch<2>(tab, x, ids, hid, p, st)
+                                                : moe_gv_launch<4>(tab, x, ids, hid, p, st))
                : p->fmt == 1 ? moe_launch<1>(tab, x, ids, hid, p, st) : p->fmt == 2 ? moe_launch<2>(tab, x, ids, hid, p, st)
                : p->fmt == 4 ? moe_launch<4>(tab, x, ids, hid, p, st) : moe_launch<8>(tab, x, ids, hid, p, st);
         if (!ok) return 0;
