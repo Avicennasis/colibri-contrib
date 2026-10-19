@@ -264,6 +264,7 @@ static void formats(void) {
         CHECK(on, "%s: the tier did not start", cs[c].name);
         if (!on) { model_free(); continue; }
         Books bk = {0, 0}; double worst = 0;
+        ColiVkXbStats x0, x1; coli_vk_xb_stats(&x0);
         static const int Ss[] = {1, 3, 20, 1, 2, 24};
         for (int t = 0; t < 6; t++)
             for (int l = 0; l < L; l++) {
@@ -272,7 +273,9 @@ static void formats(void) {
                 double r = step(l, Ss[t], idx, w, &bk);
                 if (r > worst) worst = r;
             }
-        printf("  %-34s device %3llu of %3llu assignments, worst relative error %.2e\n", cs[c].name, bk.dev, bk.routed, worst);
+        coli_vk_xb_stats(&x1);   /* the steps of a few rows: the chain's kernels where the device has them */
+        printf("  %-34s device %3llu of %3llu assignments, worst relative error %.2e, %llu batches on the chain's kernels\n",
+               cs[c].name, bk.dev, bk.routed, worst, x1.chain_gemv_batches - x0.chain_gemv_batches);
         CHECK(bk.dev > 0, "%s: nothing ran on the device", cs[c].name);
         CHECK(worst < 2e-3, "%s: device rows off the reference (%.3g)", cs[c].name, worst);
         vkt_shutdown(); model_free();
@@ -391,6 +394,7 @@ static void blocks(void) {
         CHECK(on, "%s: the tier did not start", cs[c].name);
         if (!on) { model_free(); continue; }
         Books bk = {0, 0}; double worst = 0;
+        ColiVkXbStats x0, x1; coli_vk_xb_stats(&x0);
         static const int Ss[] = {1, 3, 20, 1, 2, 24};
         for (int t = 0; t < 6; t++)
             for (int l = 0; l < L; l++) {
@@ -399,7 +403,9 @@ static void blocks(void) {
                 double r = step(l, Ss[t], idx, w, &bk);
                 if (r > worst) worst = r;
             }
-        printf("  %-34s device %3llu of %3llu assignments, worst relative error %.2e\n", cs[c].name, bk.dev, bk.routed, worst);
+        coli_vk_xb_stats(&x1);   /* the steps of a few rows: the chain's kernels where the device has them */
+        printf("  %-34s device %3llu of %3llu assignments, worst relative error %.2e, %llu batches on the chain's kernels\n",
+               cs[c].name, bk.dev, bk.routed, worst, x1.chain_gemv_batches - x0.chain_gemv_batches);
         CHECK(bk.dev > 0, "%s: nothing ran on the device", cs[c].name);
         CHECK(worst < 2e-3, "%s: device rows off the reference (%.3g)", cs[c].name, worst);
         vkt_shutdown(); model_free();

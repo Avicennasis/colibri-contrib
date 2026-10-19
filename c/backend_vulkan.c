@@ -3995,6 +3995,14 @@ typedef struct XbCtx {
     XbBuf cgv_ids[3], cgv_tab[3];
     int cgv;
     unsigned long long cgv_batches;
+    /* chain_moe.comp's block formats (a GGUF's experts), the dense chain's decode kernel, for
+     * a batch of experts of 4 rows or fewer (xb_cbd_record): a pipeline per (gate and up's
+     * type, down's type, staging), the hidden and output rows of each batch in flight */
+    VkShaderModule sh_cbd; VkDescriptorSetLayout dsl_cbd; VkPipelineLayout pl_cbd; VkDescriptorPool cbd_pool;
+    VkDescriptorSet cbd_set[3]; XbBuf cbd_ids[3], cbd_tab[3], cbd_h[3];
+    struct { int tg, td, xs; VkPipeline p; } cbd_p[64]; int cbd_np, cbd_xs;
+    int cbd;
+    unsigned long long cbd_batches;
     /* a big step's whole-step buffers (coli_vk_xb_step_*): its token rows once (xt), every
      * assignment's output row in place (ys, s*K + k), the routed sum (out) and its inputs */
     struct {
@@ -4534,6 +4542,137 @@ static int xb_cgv_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *
     return 1;
 }
 
+/* chain_moe.comp's block formats in the expert batch: the dense chain's decode kernel for a
+ * GGUF's experts (bdstep.glsl, a row over a few lanes, its float form), for a batch whose
+ * experts all have XB_CBD_ROWS rows or fewer (a decode step, an MTP verify). The grouped GEMM
+ * of the block formats takes 32-row tiles and the per-expert GEMVs a row a subgroup: a decode
+ * step's eight Q4_K experts of GLM's 6144 x 2048 took 2712 us on an RTX PRO 4000, eight
+ * IQ2_S/Q2_0 of Kimi K3's 7168 x 2048 3144. Its passes 0 (gate and up) and 1 (down) with
+ * every row a pair (K 1), down's rows copied to the batch's. COLI_VK_XB_GEMV=0 keeps the
+ * per-expert GEMVs and the grouped GEMM. */
+#define XB_CBD_ROWS 4
+struct PCCBD { int mode, S, K, D, I, act; float limit, a, b;
+               int t_off, x_off, x_row, i_off, i_row, w_off, w_row, y_off, y_row, rpw, spl; };
+static void xb_cbd_init(XbCtx *X) {
+    const char *e = getenv("COLI_VK_XB_GEMV");
+    if (X->d || !G.has_bda || !bd_shaders() || (e && *e == '0')) return;
+    VkPhysicalDeviceProperties lp; vkGetPhysicalDeviceProperties(X->phys, &lp);
+    uint32_t sl = lp.limits.maxComputeSharedMemorySize;
+    int xs = (int)((sl > 8768 ? sl - 8768 : 0) / 4) & ~3;   /* past bdstep.glsl's tables, as vk_chain.c's */
+    X->cbd_xs = xs > 8192 ? 8192 : xs >= 1024 ? xs : 0;
+    if (!X->cbd_xs) return;
+    char path[1100];
+    derive_dir_file(X->spv, "chain_moe.spv", path, sizeof path);
+    if (!(X->sh_cbd = load_spv(X->dev, path))) return;
+    if (!xb_layout(X, 7, 0u, sizeof(struct PCCBD), &X->dsl_cbd, &X->pl_cbd)) return;
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 21};
+    VkDescriptorPoolCreateInfo dp = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 3, .poolSizeCount = 1, .pPoolSizes = &ps};
+    if (vkCreateDescriptorPool(X->dev, &dp, NULL, &X->cbd_pool) != VK_SUCCESS) { X->cbd_pool = VK_NULL_HANDLE; return; }
+    VkDescriptorSetLayout l3[3] = {X->dsl_cbd, X->dsl_cbd, X->dsl_cbd};
+    VkDescriptorSetAllocateInfo da = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = X->cbd_pool, .descriptorSetCount = 3, .pSetLayouts = l3};
+    if (vkAllocateDescriptorSets(X->dev, &da, X->cbd_set) != VK_SUCCESS) return;
+    X->cbd = 1;
+}
+/* the pipeline of block types tg (gate and up) and td (down), ggml types, for the batch's
+ * rows (vk_chain.c's moe_pipe_f: the row padded to 256, a vec4 of pad every 8) */
+static VkPipeline xb_cbd_pipe(XbCtx *X, int tg, int td) {
+    int sn = X->D > X->I ? X->D : X->I, np = (sn + 255) & ~255, need = (np + np / 8 + 4 + 3) / 4, xs = 4 * need;
+    if (!X->cbd || xs > X->cbd_xs) return VK_NULL_HANDLE;
+    for (int k = 0; k < X->cbd_np; k++)
+        if (X->cbd_p[k].tg == tg && X->cbd_p[k].td == td && X->cbd_p[k].xs == xs) return X->cbd_p[k].p;
+    if (X->cbd_np >= 64) return VK_NULL_HANDLE;
+    int32_t v[5] = {xs, 1, 0, tg + 1, td + 1};   /* XS, BD, FMTC, BTG, BTD: the layer's types plus one */
+    VkSpecializationMapEntry me[5] = {{0, 0, 4}, {1, 4, 4}, {3, 8, 4}, {4, 12, 4}, {5, 16, 4}};
+    VkSpecializationInfo si = {5, me, sizeof v, v};
+    VkPipeline p = VK_NULL_HANDLE;
+    if (!xb_pipeline(X, X->sh_cbd, X->pl_cbd, &si, &p)) p = VK_NULL_HANDLE;
+    X->cbd_p[X->cbd_np].tg = tg; X->cbd_p[X->cbd_np].td = td; X->cbd_p[X->cbd_np].xs = xs; X->cbd_p[X->cbd_np].p = p;
+    X->cbd_np++;   /* a failed one stays, so it is tried once */
+    return p;
+}
+/* whether every expert of the batch is the kernel's: block formats of one pair of types,
+ * XB_CBD_ROWS rows or fewer, entries readable by address */
+static int xb_cbd_takes(XbCtx *X, ColiVkExpert *const *ex, const int *rows, int count, int v4) {
+    if (!X->cbd || v4 || count < 1 || (X->act != COLI_VK_ACT_SWIGLU && X->act != COLI_VK_ACT_SITU)) return 0;
+    int tg = ex[0]->g->fmt, td = ex[0]->d->fmt;
+    if (!bd_fmt(tg) || !bd_fmt(td) || tg >= 200 || td >= 200) return 0;
+    uint32_t ent[COLI_VK_XB_ENTRY];
+    for (int c = 0; c < count; c++)
+        if (rows[c] > XB_CBD_ROWS || ex[c]->g->fmt != tg || ex[c]->u->fmt != tg || ex[c]->d->fmt != td ||
+            !coli_vk_xb_expert_entry(ex[c], ent)) return 0;
+    return xb_cbd_pipe(X, tg - 100, td - 100) != VK_NULL_HANDLE;
+}
+/* Record the batch (laid out at off[], rows at the same index past x0, i0, y0) into cmd:
+ * passes 0 and 1 into the slot's hidden rows, then each expert's output rows to its own. */
+static int xb_cbd_record(XbCtx *X, VkCommandBuffer cmd, int slot, ColiVkExpert *const *ex, const int *rows,
+                         int count, const size_t *off, size_t x0, size_t y0) {
+    const int D = X->D, I = X->I;
+    const size_t dr = (size_t)D * 4;
+    if (dr % X->align) return 0;
+    int span = 0;
+    for (int c = 0; c < count; c++) { int end = (int)((off[3 * c] - x0) / dr) + rows[c]; if (end > span) span = end; }
+    int tg = ex[0]->g->fmt - 100, td = ex[0]->d->fmt - 100;
+    VkPipeline pipe = xb_cbd_pipe(X, tg, td);
+    VkBuffer bt = bdtab_buf(0);
+    if (!pipe || !bt) return 0;
+    XbBuf *ib = &X->cbd_ids[slot], *tb = &X->cbd_tab[slot], *hb = &X->cbd_h[slot];
+    size_t ni = (size_t)span * 4, nt = (size_t)count * COLI_VK_XB_ENTRY * 4, nh = (size_t)span * (size_t)(I + D) * 4;
+    if ((ni > ib->region && !xb_buf(X, ib, xb_up(ni + ni / 2, 4096), X->mt_host, 1)) ||
+        (nt > tb->region && !xb_buf(X, tb, xb_up(nt + nt / 2, 4096), X->mt_host, 1)) ||
+        (nh > hb->region && !xb_buf(X, hb, xb_up(nh + nh / 2, 4096), X->mt_dev, 0))) return 0;   /* hid: the device's, as X->h */
+    int *ids = ib->ptr; uint32_t *tab = tb->ptr;
+    for (int r = 0; r < span; r++) ids[r] = -1;
+    for (int c = 0; c < count; c++) {
+        if (!coli_vk_xb_expert_entry(ex[c], tab + (size_t)c * COLI_VK_XB_ENTRY)) return 0;
+        int r0 = (int)((off[3 * c] - x0) / dr);
+        for (int r = 0; r < rows[c]; r++) ids[r0 + r] = c;
+    }
+    VkDescriptorBufferInfo bi[7] = {{X->x.buf, x0, (size_t)span * dr}, {ib->buf, 0, ni}, {ib->buf, 0, ni},
+                                    {tb->buf, 0, nt}, {hb->buf, 0, nh}, {hb->buf, 0, nh}, {bt, 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet w[7];
+    for (int b = 0; b < 7; b++)
+        w[b] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = X->cbd_set[slot],
+            .dstBinding = (uint32_t)b, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[b]};
+    vkUpdateDescriptorSets(X->dev, 7, w, 0, NULL);
+    /* vk_chain.c's vkc_moe: the rows a workgroup and 32-weight steps a lane, pass by pass */
+    int kq = tg == 8 || tg == 10 || tg == 11 || tg == 12 || tg == 13 || tg == 14;
+    int wide = kq || (long long)span * ((I + 63) / 64) >= 128;
+    int rg = wide ? 64 : 32, sg = wide ? 16 : 8, rd = 128, sd = 8;
+    struct PCCBD pc = {0, span, 1, D, I, X->act, X->limit, X->a, X->b, 0, 0, D, 0, 1, 0, 1, 0, D, rg, sg};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, X->pl_cbd, 0, 1, &X->cbd_set[slot], 0, NULL);
+    for (int v = 0; v < 2; v++) {
+        uint64_t n = (uint64_t)span * (uint64_t)(v ? (D + rd - 1) / rd : (I + rg - 1) / rg);
+        uint32_t gx = n < 65535 ? (uint32_t)n : 65535u, gy = (uint32_t)((n + gx - 1) / gx);
+        if (v) { pc.mode = 1; pc.rpw = rd; pc.spl = sd; }
+        vkCmdPushConstants(cmd, X->pl_cbd, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        vkCmdDispatch(cmd, gx, gy, 1);
+        xb_barrier(cmd);
+    }
+    /* down's rows (hid past the span's hidden rows) to the batch's output rows, expert by expert */
+    VkMemoryBarrier tb2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &tb2, 0, NULL, 0, NULL);
+    VkBufferCopy *rg2 = malloc((size_t)count * sizeof *rg2);
+    if (!rg2) return 0;
+    for (int c = 0; c < count; c++) {
+        size_t r0 = (off[3 * c] - x0) / dr;
+        rg2[c] = (VkBufferCopy){((size_t)span * I + r0 * D) * 4, off[3 * c + 2], (size_t)rows[c] * dr};
+    }
+    vkCmdCopyBuffer(cmd, hb->buf, X->y.buf, (uint32_t)count, rg2);
+    free(rg2);
+    VkMemoryBarrier hb2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &hb2, 0, NULL, 0, NULL);
+    X->cbd_batches++;
+    (void)y0;
+    return 1;
+}
+
 static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a, float b) {
     if (X->ready) {   /* the activation rides the push constants; the geometry changes
                        * only while no expert is allocated (scratch grows by bytes) */
@@ -4597,6 +4736,7 @@ static int xb_init(XbCtx *X, int d, int D, int I, int act, float limit, float a,
     xb_grp_init(X);
     xb_grp_bd_init(X);
     xb_cgv_init(X);
+    xb_cbd_init(X);
     VkCommandPoolCreateInfo cp = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = X->q_fam};
     VKCHECK(vkCreateCommandPool(X->dev, &cp, NULL, &X->cpool), "xb cmd pool");
@@ -4901,7 +5041,11 @@ static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQuer
     if (!route) { vkEndCommandBuffer(cmd); return 0; }
     for (int c = 0; c < count; c++)
         if ((bd_fmt(ex[c]->g->fmt) && !X->p_gu_bd) || (bd_fmt(ex[c]->d->fmt) && !X->p_mv_bd)) { vkEndCommandBuffer(cmd); free(route); return 0; }
-    int ngemm = 0, cooperative = 0, grouped = !v4 && xb_grp_record(X, cmd, slot, ex, rows, count, off, x0, i0, y0, amap);
+    int ngemm = 0, cooperative = 0, grouped = 0;
+    /* a decode step's GGUF experts on the chain's kernel (xb_cbd_record), else the routes below */
+    if (!amap && xb_cbd_takes(X, ex, rows, count, v4) && xb_cbd_record(X, cmd, slot, ex, rows, count, off, x0, y0))
+        goto recorded;
+    grouped = !v4 && xb_grp_record(X, cmd, slot, ex, rows, count, off, x0, i0, y0, amap);
     if (grouped) ngemm = count;
     else {
         for (int c = 0; c < count; c++) {
@@ -5003,6 +5147,7 @@ static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQuer
             } else vkCmdDispatch(cmd, (uint32_t)((D + 7) / 8), (uint32_t)rows[c], 1);
         }
     }
+recorded:
     /* the host reads y after the fence */
     VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
@@ -5128,7 +5273,7 @@ static void xb_stats(const XbCtx *X, ColiVkXbStats *st) {
     st->sub_batches = X->sub_batches; st->sub_experts = X->sub_experts; st->sub_rows = X->sub_rows;
     st->sub_gemm = X->sub_gemm; st->sub_ms = X->sub_ms;
     st->cooperative_matmuls = X->cooperative_matmuls; st->grouped_batches = X->grp_batches; st->gemv_batches = X->gv_batches;
-    st->chain_gemv_batches = X->cgv_batches;
+    st->chain_gemv_batches = X->cgv_batches + X->cbd_batches;
 }
 void coli_vk_xb_stats(ColiVkXbStats *st) { xb_stats(&g_xb[0], st); }
 void coli_vk_xb_stats_dev(int dev, ColiVkXbStats *st) {
@@ -5434,8 +5579,8 @@ static void xb_shutdown(XbCtx *X) {
     if (X->grp_pool) vkDestroyDescriptorPool(X->dev, X->grp_pool, NULL);
     XbBuf *sb[8] = {&X->st.xt, &X->st.ys, &X->st.out, &X->st.w, &X->st.use, &X->grp_map[0], &X->grp_map[1], &X->grp_map[2]};
     for (int k = 0; k < 8; k++) if (sb[k]->buf) { vkDestroyBuffer(X->dev, sb[k]->buf, NULL); vkFreeMemory(X->dev, sb[k]->mem, NULL); }
-    for (int k = 0; k < 6; k++) {
-        XbBuf *cb = k < 3 ? &X->cgv_ids[k] : &X->cgv_tab[k - 3];
+    for (int k = 0; k < 15; k++) {
+        XbBuf *cb = k < 3 ? &X->cgv_ids[k] : k < 6 ? &X->cgv_tab[k - 3] : k < 9 ? &X->cbd_ids[k - 6] : k < 12 ? &X->cbd_tab[k - 9] : &X->cbd_h[k - 12];
         if (cb->buf) { vkDestroyBuffer(X->dev, cb->buf, NULL); vkFreeMemory(X->dev, cb->mem, NULL); }
     }
     if (X->st.pipe) vkDestroyPipeline(X->dev, X->st.pipe, NULL);
@@ -5448,6 +5593,11 @@ static void xb_shutdown(XbCtx *X) {
         if (X->sh_gv[v]) vkDestroyShaderModule(X->dev, X->sh_gv[v], NULL);
     }
     for (int f = 0; f < 4; f++) for (int v = 0; v < 2; v++) if (X->p_cgv[f][v]) vkDestroyPipeline(X->dev, X->p_cgv[f][v], NULL);
+    for (int k = 0; k < X->cbd_np; k++) if (X->cbd_p[k].p) vkDestroyPipeline(X->dev, X->cbd_p[k].p, NULL);
+    if (X->sh_cbd) vkDestroyShaderModule(X->dev, X->sh_cbd, NULL);
+    if (X->pl_cbd) vkDestroyPipelineLayout(X->dev, X->pl_cbd, NULL);
+    if (X->dsl_cbd) vkDestroyDescriptorSetLayout(X->dev, X->dsl_cbd, NULL);
+    if (X->cbd_pool) vkDestroyDescriptorPool(X->dev, X->cbd_pool, NULL);
     if (X->sh_cgv) vkDestroyShaderModule(X->dev, X->sh_cgv, NULL);
     if (X->pl_cgv) vkDestroyPipelineLayout(X->dev, X->pl_cgv, NULL);
     if (X->dsl_cgv) vkDestroyDescriptorSetLayout(X->dev, X->dsl_cgv, NULL);
