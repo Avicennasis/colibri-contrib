@@ -12949,6 +12949,30 @@ int main(int argc, char **argv){
 #endif
     const char *snap=getenv("SNAP");
     if(!snap){ coli_print_launcher_help("GLM-5.2", "SNAP=<model directory> ./colibri ..."); return 1; }
+#ifdef COLI_CUDA
+    {   /* A GGUF (a gguf_import folder, its gguf.json) under CUDA kept every matrix and routed
+         * expert on the CPU (QT_GGML: the CUDA backend takes no ggml block types, see
+         * qt_cuda_upload); Vulkan's tier and chain take them. A build with both backends
+         * runs a GGUF on Vulkan, the same card, when CUDA was asked for and COLI_VULKAN was not
+         * set (qwen38.c's way); COLI_VULKAN=0 keeps CUDA. */
+        char gj[4096]; snprintf(gj,sizeof gj,"%s/gguf.json",snap);
+        const char *cu=getenv("COLI_CUDA"), *vk=getenv("COLI_VULKAN");
+        FILE *gf=fopen(gj,"rb");
+        if(gf){
+            fclose(gf);
+            if(cu&&*cu=='1'&&!(vk&&*vk)){
+#ifdef COLI_VULKAN
+                setenv("COLI_VULKAN","1",1); setenv("COLI_CUDA","0",1);
+                fprintf(stderr,"[gguf] the CUDA backend has no ggml block types: this GGUF runs on Vulkan, the same card "
+                               "(COLI_VULKAN=0 keeps CUDA, the matrices and experts then on the CPU)\n");
+#else
+                fprintf(stderr,"[gguf] the CUDA backend has no ggml block types: this GGUF's matrices and experts run on the CPU "
+                               "(a VK=1 build runs them on the card through Vulkan)\n");
+#endif
+            }
+        }
+    }
+#endif
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;

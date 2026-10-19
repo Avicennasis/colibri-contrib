@@ -1363,8 +1363,26 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     }
     int D = c->hidden, K = c->conv_k;
     double t0 = now_s();
+    int cuda_off = 0;   /* a build with both backends running on Vulkan */
+    (void)cuda_off;
+#if defined(COLI_CUDA) && defined(COLI_VULKAN)
+    {   /* The CUDA backend runs the dense bf16 matrices a call each (backend_cuda_ink.cu) and
+         * leaves the routed experts on the CPU, the Vulkan tier off (ink_vk_tier_start); Vulkan's
+         * chain and expert tier run both on the card. A build with both backends runs on Vulkan,
+         * the same card, unless COLI_VULKAN=0 asks for CUDA (qwen38.c's way for a GGUF). */
+        const char *vk = getenv("COLI_VULKAN");
+        if (!(vk && *vk == '0') && !getenv("NOGPU")) {
+            if (!(vk && *vk)) {
+                setenv("COLI_VULKAN", "1", 1);
+                fprintf(stderr, "[cuda] the CUDA backend leaves the routed experts on the CPU: this run uses Vulkan, the same card "
+                                "(its dense chain and expert tier; COLI_VULKAN=0 keeps CUDA)\n");
+            }
+            cuda_off = 1;
+        }
+    }
+#endif
 #ifdef COLI_CUDA
-    if (!getenv("NOGPU")) {
+    if (!getenv("NOGPU") && !cuda_off) {
         int dev = getenv("GPU_DEV") ? atoi(getenv("GPU_DEV")) : 0;
         if (ink_cuda_init(dev) == 0) {
             g_cuda = 1;

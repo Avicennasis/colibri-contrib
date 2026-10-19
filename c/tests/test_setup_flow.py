@@ -542,7 +542,7 @@ class CudaBackendChoice(unittest.TestCase):
             cmd, _cwd, _env = setup_flow.make_command(family_by_id("deepseek_v4"), "cuda", TC_ALL,
                                                       ["NO_TC=1"])
             self.assertEqual(cmd[cmd.index("deepseek-v4"):],
-                             ["deepseek-v4", "ARCH=native", "CUDA=1", "CUDA_ARCH=native", "NO_TC=1"])
+                             ["deepseek-v4", "ARCH=native", "CUDA=1", "VK=1", "CUDA_ARCH=native", "NO_TC=1"])
             cmd, _cwd, _env = setup_flow.make_command(family_by_id("qwen36"), "cuda", TC_ALL,
                                                       ["CUDA_ARCH=sm_70"])
             self.assertEqual(cmd[cmd.index("qwen36"):], ["qwen36", "ARCH=native", "CUDA=1", "VK=1", "CUDA_ARCH=sm_70"])
@@ -550,6 +550,11 @@ class CudaBackendChoice(unittest.TestCase):
             cmd, _cwd, _env = setup_flow.make_command(family_by_id("qwen36"), "cuda", dict(TC_ALL, can_build_vulkan=False),
                                                       ["CUDA_ARCH=sm_70"])
             self.assertEqual(cmd[cmd.index("qwen36"):], ["qwen36", "ARCH=native", "CUDA=1", "CUDA_ARCH=sm_70"])
+            # GLM-5.2 (a GGUF), Kimi K3 and Inkling run on Vulkan where CUDA lacks their work
+            for fid in ("glm", "kimi", "inkling"):
+                cmd, _cwd, _env = setup_flow.make_command(family_by_id(fid), "cuda", TC_ALL, ["CUDA_ARCH=sm_70"])
+                self.assertIn("VK=1", cmd, fid)
+                self.assertIn("CUDA=1", cmd, fid)
 
     def test_a_pending_cuda_rebuild_checks_the_cards_it_was_for(self):
         cfg = {"backend": "cpu", "gpu_pending": ["cuda"], "family": "qwen36",
