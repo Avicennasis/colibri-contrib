@@ -1459,6 +1459,33 @@ static void test_kpool(int S, int pos_base, int IH, int ID, int pool, int topk, 
  * the squares, q then scaled; alpha from A = exp(A_log) as the engine keeps it; the
  * recurrence k * ((v - kS) * beta); the output RMSNorm (its sum in double) and gate.
  * S rows over two calls (the state and the window carried on the device). */
+/* a prompt chunk's rows through chain_kda_rows (S rows in one call) against chain_kda's
+ * one row a call: the outputs and the state bit for bit, GLM-5.3's form and Kimi K3's */
+static void test_kda_rows(int H, int KD, int S, int flags) {
+    int VD = KD, P = H * KD, C = 3 * P;
+    float lb = -5.f, neps = 1e-6f, eps = 1e-5f;
+    float *m = fvec((size_t)S * C, 1.f), *f = fvec((size_t)S * P, 1.f), *b = fvec((size_t)S * H, 2.f), *g = fvec((size_t)S * P, 2.f);
+    float *state = fvec((size_t)H * KD * VD, 0.3f), *prm = malloc((size_t)(H + P + VD) * 4);
+    for (int i = 0; i < H; i++) prm[i] = (flags & VKC_KDA_EXP_A) ? 0.5f + frnd() * 0.25f : frnd() * 0.5f;
+    for (int i = 0; i < P; i++) prm[H + i] = frnd() * 0.5f;
+    for (int i = 0; i < VD; i++) prm[H + P + i] = 0.5f + (rnd() % 100) / 100.f;
+    VkcBuf *mb = up(m, (size_t)S * C), *fb = up(f, (size_t)S * P), *bb = up(b, (size_t)S * H), *gb = up(g, (size_t)S * P), *pb = up(prm, (size_t)H + P + VD);
+    VkcBuf *s1 = up(state, (size_t)H * KD * VD), *s2 = up(state, (size_t)H * KD * VD);
+    VkcBuf *y1 = vkc_buf((size_t)S * P * 4, VKC_DOWN), *y2 = vkc_buf((size_t)S * P * 4, VKC_DOWN);
+    VkcKdaRec rp = {S, H, VD, P, 0, C, 0, P, 0, H, 0, P, 0, P, 0, 0, lb, neps, eps};
+    int ok = vkc_begin() && vkc_kda_rec_flags(KD, mb, fb, bb, gb, pb, s1, y1, &rp, flags);
+    for (int r = 0; r < S && ok; r++) {
+        VkcKdaRec one = {1, H, VD, P, r * C, C, r * P, P, r * H, H, r * P, P, r * P, P, 0, 0, lb, neps, eps};
+        ok = vkc_kda_rec_flags(KD, mb, fb, bb, gb, pb, s2, y2, &one, flags);
+    }
+    ok = vkc_submit(1) && ok;
+    float *st1 = down(s1, 0, (size_t)H * KD * VD), *st2 = down(s2, 0, (size_t)H * KD * VD);
+    int same = ok && !memcmp(vkc_ptr(y1), vkc_ptr(y2), (size_t)S * P * 4) && !memcmp(st1, st2, (size_t)H * KD * VD * 4) && !bad(vkc_ptr(y1), (size_t)S * P);
+    CHECK(same, "kda rows H %d KD %d S %d flags %d: a block of rows differs from one row a call", H, KD, S, flags);
+    if (same) printf("kda rows H %d KD %d S %d flags %d: one row a call's bits\n", H, KD, S, flags);
+    vkc_free(mb); vkc_free(fb); vkc_free(bb); vkc_free(gb); vkc_free(pb); vkc_free(s1); vkc_free(s2); vkc_free(y1); vkc_free(y2);
+    free(m); free(f); free(b); free(g); free(state); free(prm); free(st1); free(st2);
+}
 static void test_kda_k3(int H, int KD, int CK, float xs) {
     int VD = KD, P = H * KD, C = 3 * P, S = 6;
     float lb = -5.f, neps = 1e-6f, eps = 1e-5f, qscale = 1.f / sqrtf((float)KD);
@@ -3323,6 +3350,32 @@ static void bench_rows(void) {
     free(t); free(ex); free(tab); free(wg); free(wd); free(sg); free(sd);
 }
 
+/* COLI_VK_CHAIN_BENCH=kda: the KDA recurrence (GLM-5.3's, Kimi K3's linear attention) for a
+ * prompt chunk: H heads (COLI_VK_BENCH_VH, 32) of KD = VD = 128 (COLI_VK_BENCH_KD), S rows
+ * (COLI_VK_BENCH_ROWS, 512); COLI_VK_KDA_ROWS=0 for chain_kda's one row at a time */
+static void bench_kda(void) {
+    int H = 32, KD = 128, S = 512;
+    const char *he = getenv("COLI_VK_BENCH_VH"), *ke = getenv("COLI_VK_BENCH_KD"), *re = getenv("COLI_VK_BENCH_ROWS");
+    if (he && atoi(he) > 0) H = atoi(he);
+    if (ke && atoi(ke) > 0) KD = atoi(ke);
+    if (re && atoi(re) > 0) S = atoi(re);
+    int VD = KD, P = H * KD, C = 3 * P;
+    float *m = fvec((size_t)S * C, 1.f), *f = fvec((size_t)S * P, 1.f), *b = fvec((size_t)S * H, 2.f), *g = fvec((size_t)S * P, 2.f);
+    float *state = fvec((size_t)H * KD * VD, 0.3f), *prm = fvec((size_t)H + P + VD, 0.5f);
+    VkcBuf *mb = up(m, (size_t)S * C), *fb = up(f, (size_t)S * P), *bb = up(b, (size_t)S * H), *gb = up(g, (size_t)S * P), *pb = up(prm, (size_t)H + P + VD);
+    VkcBuf *sb = up(state, (size_t)H * KD * VD), *yb = vkc_buf((size_t)S * P * 4, VKC_DEV);
+    VkcKdaRec rp = {S, H, VD, P, 0, C, 0, P, 0, H, 0, P, 0, P, 0, 0, -5.f, 1e-6f, 1e-5f};
+    double best = 1e9; int ok = 1;
+    for (int r = 0; r < 4 && ok; r++) {
+        ok = vkc_begin() && vkc_kda_rec(KD, mb, fb, bb, gb, pb, sb, yb, &rp);
+        double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+        if (r && dt < best) best = dt;
+    }
+    if (ok) printf("bench kda H %d KD %d, %d rows: %.0f us a layer (%.2f us a row)\n", H, KD, S, best * 1e6, best * 1e6 / S);
+    vkc_free(mb); vkc_free(fb); vkc_free(bb); vkc_free(gb); vkc_free(pb); vkc_free(sb); vkc_free(yb);
+    free(m); free(f); free(b); free(g); free(state); free(prm);
+}
+
 /* COLI_VK_CHAIN_BENCH=route: the router's pick (vkc_route), 48 one-row routes in a frame
  * as a forward's layers run them: E experts (COLI_VK_BENCH_E, 512 by default), top 10,
  * softmax, the ids in host-readable memory as vk_dmoe.h keeps them. */
@@ -3501,6 +3554,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "moe")) bench_moe();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dn")) bench_dn();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "rows")) bench_rows();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "kda")) bench_kda();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "route")) bench_route();
         else bench_gemv();
         vkc_shutdown(); coli_vk_shutdown(); return 0;
@@ -3679,6 +3733,7 @@ int main(int argc, char **argv) {
         test_kda_k3(2, 16, 4, 1.f); test_kda_k3(3, 32, 4, 1.f); test_kda_k3(2, 128, 4, 1.f); test_kda_k3(1, 64, 2, 1.f);
         test_kda_k3(2, 16, 4, 0.002f);
         printf("kda k3 done\n");
+        test_kda_rows(2, 128, 37, 0); test_kda_rows(3, 64, 9, 0); test_kda_rows(2, 128, 40, VKC_KDA_EXP_A | VKC_KDA_K3); test_kda_rows(1, 32, 17, VKC_KDA_K3);
     }
     if (!vkc_ares_ready()) { fails++; printf("FAIL: the AttnRes shader did not load\n"); }
     else {

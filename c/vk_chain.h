@@ -352,6 +352,9 @@ int vkc_mla(const VkcMla *m, VkcMlaScratch *s, VkcBuf *x, size_t x_off, int S, i
 int vkc_kda_ready(void);
 typedef struct { int S, C, K, P, in_off, in_row, in_part, out_off, out_row, w_off, win_off; } VkcKdaConv;
 int vkc_kda_conv(VkcBuf *in, VkcBuf *w, VkcBuf *win, VkcBuf *out, const VkcKdaConv *p);
+/* from VKC_KDA_ROWS rows the recurrence runs a block of rows at a time (chain_kda_rows.spv:
+ * the same bits; COLI_VK_KDA_ROWS=0 keeps chain_kda's) */
+#define VKC_KDA_ROWS 8
 #define VKC_KDA_EXP_A 1
 #define VKC_KDA_K3    2
 typedef struct { int S, H, VD, P, m_off, m_row, f_off, f_row, b_off, b_row, g_off, g_row, y_off, y_row, st_off, prm_off;
