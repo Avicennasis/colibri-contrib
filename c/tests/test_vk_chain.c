@@ -2758,7 +2758,9 @@ static void test_moe_rows(int tg, int td, int S, int K, int E, int D, int I) {
     }
     if (!ok) { CHECK(0, "moe rows %s/%s: the experts did not go up", gq_type_name(tg), gq_type_name(td)); goto done; }
     {
-        float *lg = fvec((size_t)S * E, 2.f), *x = fvec((size_t)S * D, 1.f);
+        /* random K-quant blocks: an x of 1 put the hidden rows past f16's range (the matrix
+         * units hold an operand to 65504, the float form does not), a tenth keeps them in it */
+        float *lg = fvec((size_t)S * E, 2.f), *x = fvec((size_t)S * D, .1f);
         VkcBuf *lb = up(lg, (size_t)S * E), *xb = up(x, (size_t)S * D), *tb = vkc_buf((size_t)E * COLI_VK_XB_ENTRY * 4, VKC_DEV);
         VkcBuf *ib = vkc_buf((size_t)S * K * 4, VKC_DOWN), *wb = vkc_buf((size_t)S * K * 4, VKC_DEV);
         VkcBuf *hb = vkc_buf((size_t)S * K * (I + D) * 4, VKC_DEV), *y0 = vkc_buf((size_t)S * D * 4, VKC_DOWN), *y1 = vkc_buf((size_t)S * D * 4, VKC_DOWN);
@@ -2782,6 +2784,12 @@ static void test_moe_rows(int tg, int td, int S, int K, int E, int D, int I) {
                   gq_type_name(tg), gq_type_name(td), S, coop ? " (matrix units)" : "", mx, ref);
             printf("moe rows %s/%s S %d K %d E %d%s: max |diff| %.3g of %.3g against chain_moe\n", gq_type_name(tg), gq_type_name(td), S, K, E,
                    coop ? " on the matrix units" : "", mx, ref);
+            if (coop) {   /* an x a thousand times that: the hidden far past 65504, the sums finite */
+                for (size_t i = 0; i < (size_t)S * D; i++) x[i] *= 1000.f;
+                int okb = vkc_begin() && vkc_write(xb, 0, x, (size_t)S * D * 4) && vkc_moe_rows(xb, ib, wb, tb, &rr, y1, &mp) && vkc_submit(1);
+                CHECK(okb && !bad(vkc_ptr(y1), (size_t)S * D), "moe rows %s/%s S %d (matrix units): f16's range exceeded, the rows stay finite",
+                      gq_type_name(tg), gq_type_name(td), S);
+            }
         }
         vkc_moe_rows_free(&rr);
         VkcBuf *fr[] = {lb, xb, tb, ib, wb, hb, y0, y1};
