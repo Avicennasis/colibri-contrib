@@ -27,6 +27,7 @@ CHECKED_BY_HOST = {
     "chain_attn_full.spv": ("vk_chain.c", "ATTN_FULL_SHARED"),
     "qmatmul_grp_gate_up.spv": ("backend_vulkan.c", "GRP_GATE_UP_SHARED"),
     "qmatmul_gemm_bd.spv": ("vk_chain.c", "GEMM_BD_SHARED"),
+    "qmatmul_gemm_bdc.spv": ("vk_chain.c", "GEMM_BDC_SHARED"),
     "qmatmul_grp_bd.spv": ("backend_vulkan.c", "GRP_BD_SHARED"),
     "qmatmul_grp_gate_up_bd.spv": ("backend_vulkan.c", "GRP_BD_SHARED"),
 }

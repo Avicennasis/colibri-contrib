@@ -418,6 +418,9 @@ static uint32_t kc_shared_limit(void) {
 /* qmatmul_gemm_bd.comp's fixed shared memory, held to the compiled shader's by
  * tests/test_vk_shared_memory.py: a device with less keeps the GEMV for a prompt's rows */
 #define GEMM_BD_SHARED 44544u
+/* and qmatmul_gemm_bdc.comp's (its tiles, its partial-tile patch and bdstep's tables): a device with
+ * less keeps the floats' GEMM there */
+#define GEMM_BDC_SHARED 33344u
 /* an ASan or UBSan build (gcc defines __SANITIZE_ADDRESS__; clang has __has_feature) */
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_UNDEFINED__)
 #define VKC_SANITIZED 1
@@ -1146,7 +1149,7 @@ static VkPipeline bdg_pipe(int t, int rowWords) {
     /* on the matrix units where the device has them (qmatmul_gemm_bdc.comp; COLI_VK_CHAIN_GEMM=0 off) */
     if (!KC.bdgc_tried[t]) {
         KC.bdgc_tried[t] = 1;
-        if (KC.bd && coop_on("COLI_VK_CHAIN_GEMM")) {
+        if (KC.bd && coop_on("COLI_VK_CHAIN_GEMM") && kc_shared_limit() >= GEMM_BDC_SHARED) {
             if (!KC.mod_bdgc) KC.mod_bdgc = load_module(KC.core.spv_path, "qmatmul_gemm_bdc.spv");
             int32_t v = t;
             VkSpecializationMapEntry me = {0, 0, 4};
