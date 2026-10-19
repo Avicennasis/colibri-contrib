@@ -2299,6 +2299,15 @@ DeepSeek V4 and Kimi K3 chains can take as they are:
 | `vkc_kda_conv`, `vkc_kda_rec` | `chain_kda` | Kimi Delta Attention (`delta_attention.h`): the short convolution with its window, the gated delta rule with a decay per key row and the state on the device, GLM-5.3's output RMSNorm and sigmoid gate; the l2 sums and the norm's sum in the CPU's order |
 | `vkc_mhc` | `chain_mhc` | manifold-constrained hyper-connections (`hyper_connections.h`): the mix logits' split with Sinkhorn, the collapse, the write back, the plain mean of the last collapse; and a clamped SwiGLU |
 
+The indexers' scores run on a grid (modes 3 and 4): a workgroup a block of 256 / IH
+positions (or pools) and a row, a thread a (position, head) for the head's dot, then a
+thread a position joining the heads, each sum in the order mode 0 or 2 makes it, so the
+same bits; the selection then reads them. A row's one workgroup computing every
+position's IH x ID products took a decode step on an RTX PRO 4000 (32 index heads of 128,
+top 2048) 16.2 ms a layer at 8000 positions and 63.8 at 32000; now 345 us and 1.25 ms,
+the k-pooled form (pools of 8) 2.19 ms -> 86 us at 8000 positions. The selection's
+counts are subgroup sums (integers: the same totals in any order).
+
 `make vk-chain-check VK=1` runs them against double-precision references of colibri.c's
 absorbed attention: every weight format both ways through the per-head blocks, RoPE in
 both styles in place and into a cache row, LayerNorm with and without a bias, and the

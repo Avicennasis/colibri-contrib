@@ -3349,6 +3349,34 @@ static void bench_mla(void) {
     free(qa); free(qr); free(lat); free(rope);
 }
 
+/* COLI_VK_CHAIN_BENCH=dsa: a DSA indexer's selection (vkc_dsa_select: GLM-5.2's) for a decode
+ * row: IH index heads (COLI_VK_BENCH_VH, 32) of ID 128 over T positions (COLI_VK_BENCH_ROWS,
+ * 8000), top 2048 */
+static void bench_dsa(void) {
+    int IH = 32, ID = 128, T = 8000, topk = 2048;
+    const char *he = getenv("COLI_VK_BENCH_VH"), *te = getenv("COLI_VK_BENCH_ROWS");
+    if (he && atoi(he) > 0) IH = atoi(he);
+    if (te && atoi(te) > 0) T = atoi(te);
+    float *q = fvec((size_t)IH * ID, 1.f), *w = fvec((size_t)IH, 1.f), *k = fvec((size_t)T * ID, 1.f);
+    VkcBuf *qb = up(q, (size_t)IH * ID), *wb = up(w, (size_t)IH), *kb = up(k, (size_t)T * ID);
+    VkcBuf *scb = vkc_buf((size_t)T * 4, VKC_DEV), *sb = vkc_buf((size_t)(topk + 1) * 4, VKC_DEV);
+    VkcDsa p = {1, T - 1, IH, ID, topk, 0, 0, IH * ID, 0, IH, 0, ID, T, topk + 1, 0.1f, 0.5f};
+    /* COLI_VK_BENCH_POOL=n: GLM-5.3's pooled form instead, T / n pooled keys (the same rows) */
+    const char *pe = getenv("COLI_VK_BENCH_POOL");
+    int pool = pe && atoi(pe) > 0 ? atoi(pe) : 0;
+    VkcDsaPick pp = {1, T - 1, IH, ID, topk, pool, 0, IH * ID, 0, IH, 0, 0, T, topk + pool + 1, 1.f, 0.1f};
+    VkcBuf *sb2 = pool ? vkc_buf((size_t)(topk + pool + 1) * 4, VKC_DEV) : NULL;
+    double best = 1e9; int ok = 1;
+    for (int r = 0; r < 4 && ok; r++) {
+        ok = vkc_begin() && (pool ? vkc_dsa_pool_select(qb, wb, kb, scb, sb2, &pp) : vkc_dsa_select(qb, wb, kb, scb, sb, &p));
+        double t0 = bnow(); ok = vkc_submit(1) && ok; double dt = bnow() - t0;
+        if (r && dt < best) best = dt;
+    }
+    if (ok) printf("bench dsa IH %d ID %d, one row over %d positions%s, top %d: %.0f us\n", IH, ID, T, pool ? " in pools" : "", topk, best * 1e6);
+    vkc_free(sb2);
+    vkc_free(qb); vkc_free(wb); vkc_free(kb); vkc_free(scb); vkc_free(sb); free(q); free(w); free(k);
+}
+
 /* COLI_VK_CHAIN_BENCH=route: the router's pick (vkc_route), 48 one-row routes in a frame
  * as a forward's layers run them: E experts (COLI_VK_BENCH_E, 512 by default), top 10,
  * softmax, the ids in host-readable memory as vk_dmoe.h keeps them. */
@@ -3526,6 +3554,7 @@ int main(int argc, char **argv) {
         if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "bd")) bench_bd();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "moe")) bench_moe();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dn")) bench_dn();
+        else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "dsa")) bench_dsa();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "mla")) bench_mla();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "rows")) bench_rows();
         else if (!strcmp(getenv("COLI_VK_CHAIN_BENCH"), "route")) bench_route();
@@ -3703,11 +3732,23 @@ int main(int argc, char **argv) {
         }
         printf("mla done\n");
         test_dsa(1, 30, 2, 16, 8, 0, 0); test_dsa(4, 40, 4, 32, 16, 0, 0); test_dsa(3, 5, 2, 16, 64, 0, 0);
+        {   /* past VKC_DSA_GRID positions: the scores on a grid first (the random stream kept) */
+            unsigned rng_was = rng;
+            test_dsa(2, 1500, 4, 32, 256, 0, 0); test_dsa(1, 3000, 8, 64, 512, 0, 1); test_dsa(3, 1100, 2, 16, 64, 0, 0);
+            rng = rng_was;
+        }
         test_dsa(3, 5, 2, 16, 64, 1, 0); test_dsa(2, 700, 3, 64, 100, 0, 0); test_dsa(1, 9, 64, 64, 4, 0, 0);
         test_dsa(2, 900, 2, 16, 50, 0, 1);
         printf("dsa done\n");
         test_kpool(3, 20, 4, 16, 2, 8, 1); test_kpool(2, 9, 1, 16, 4, 8, 1); test_kpool(4, 300, 4, 64, 4, 64, 1);
         test_kpool(1, 2, 4, 16, 2, 4, 0); test_kpool(2, 30, 16, 16, 2, 6, 1);
+        {   /* many pools: their scores on a grid first (the random stream kept); the pooled keys are
+             * softmax means made on the device, so a run with many pools can meet a near tie that
+             * a software device's exp settles otherwise than the CPU's */
+            unsigned rng_was = rng;
+            test_kpool(2, 1000, 4, 32, 4, 128, 1);
+            rng = rng_was;
+        }
         printf("kpool done\n");
     }
     if (!vkc_kda_ready() || !vkc_mhc_ready()) { fails++; printf("FAIL: the KDA or mHC shaders did not load\n"); }

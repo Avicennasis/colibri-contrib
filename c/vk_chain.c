@@ -1821,13 +1821,23 @@ int vkc_mla_hgemv(ColiVkTensor *t, VkcBuf *x, VkcBuf *y, VkcBuf *gate, const Vkc
     return record(KC.mpipe[PM_HGEMV], bd, 5, &pc, sizeof pc, (uint32_t)wg, (uint32_t)p->S, 1);
 }
 
+#define VKC_DSA_GRID 32   /* positions (pools) from which vkc_dsa_select (vkc_dsa_pool_select) scores on a grid */
 int vkc_dsa_select(VkcBuf *iq, VkcBuf *hw, VkcBuf *keys, VkcBuf *sc, VkcBuf *sel, const VkcDsa *p) {
     KC.kind = PK_DSA;
     if (!KC.mla_ok || p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 64 || p->ID < 1 || p->IH * p->ID > 4096 ||
         p->topk < 1 || p->pos_base < 0 || p->sc_row < p->pos_base + p->S ||
         p->sel_row < 1 + (p->topk < p->pos_base + p->S ? p->topk : p->pos_base + p->S)) return 0;
-    struct { int mode; VkcDsa b; } pc = {0, *p};
+    struct { int mode; VkcDsa b; int scored; } pc = {0, *p, 0};
     VkcBind bd[5] = {B(iq, 0), B(hw, 0), B(keys, 0), B(sc, 1), B(sel, 1)};
+    /* past VKC_DSA_GRID positions the scores on a grid of 256 positions a workgroup first
+     * (mode 3, the same bits), then each row's selection from them */
+    int nk = p->pos_base + p->S;
+    if (nk > p->topk && nk >= VKC_DSA_GRID) {
+        pc.mode = 3;
+        int P = 256 / p->IH > 0 ? 256 / p->IH : 1;   /* positions a workgroup: a thread a (position, head) */
+        if (!record(KC.mpipe[PM_DSA], bd, 5, &pc, sizeof pc, (uint32_t)((nk + P - 1) / P), (uint32_t)p->S, 1)) return 0;
+        pc.mode = 0; pc.scored = 1;
+    }
     return record(KC.mpipe[PM_DSA], bd, 5, &pc, sizeof pc, (uint32_t)p->S, 1, 1);
 }
 
@@ -1845,8 +1855,16 @@ int vkc_dsa_pool_select(VkcBuf *iq, VkcBuf *hw, VkcBuf *pk, VkcBuf *sc, VkcBuf *
     if (!KC.mla_ok || p->S < 1 || p->S > 65535 || p->IH < 1 || p->IH > 64 || p->ID < 1 || p->IH * p->ID > 4096 ||
         p->pool < 1 || p->topk < p->pool || p->topk % p->pool || p->topk / p->pool > 1024 || p->pos_base < 0 ||
         p->sc_row < (p->pos_base + p->S) / p->pool || p->sel_row < 1 + p->topk + (p->tail ? p->pool - 1 : 0)) return 0;
-    struct { int mode; VkcDsaPick b; } pc = {2, *p};
+    struct { int mode; VkcDsaPick b; int scored; } pc = {2, *p, 0};
     VkcBind bd[6] = {B(iq, 0), B(hw, 0), B(NULL, 0), B(sc, 1), B(sel, 1), B(pk, 0)};
+    /* past VKC_DSA_GRID pools their scores on a grid first (mode 4, the same bits) */
+    int np = (p->pos_base + p->S) / p->pool;
+    if (np >= VKC_DSA_GRID) {
+        pc.mode = 4;
+        int P = 256 / p->IH > 0 ? 256 / p->IH : 1;   /* pools a workgroup: a thread a (pool, head) */
+        if (!record(KC.mpipe[PM_DSA], bd, 6, &pc, sizeof pc, (uint32_t)((np + P - 1) / P), (uint32_t)p->S, 1)) return 0;
+        pc.mode = 2; pc.scored = 1;
+    }
     return record(KC.mpipe[PM_DSA], bd, 6, &pc, sizeof pc, (uint32_t)p->S, 1, 1);
 }
 
