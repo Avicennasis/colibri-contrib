@@ -284,6 +284,9 @@ void coli_vk_xb_expert_free(ColiVkExpert *e);
  * them by address: bufferDeviceAddress off, the second device, a tensor outside a pool. */
 #define COLI_VK_XB_ENTRY 32
 int coli_vk_xb_expert_entry(const ColiVkExpert *e, uint32_t *entry);
+/* The same entry for three tensors outside the tier (an MTP head's expert, say): 0 when the
+ * device cannot read one of them by address. Valid while the tensors are. */
+int coli_vk_tensor_xb_entry(const ColiVkTensor *gate, const ColiVkTensor *up, const ColiVkTensor *down, uint32_t *entry);
 /* Submit and return: count experts, rows[c] activation rows each, the rows given as
  * sum(rows) pointers to D floats, expert by expert. 0 = nothing was submitted (the
  * caller computes those experts itself). One batch in flight at a time. */

@@ -4602,8 +4602,12 @@ static uint64_t vk_addr(VkBuffer b) {
  * which the sets bind as their offsets. `slot`: whose tables and sets (0 the single
  * batch, 1 + h a sub-batch half). 0 = not taken, nothing recorded. */
 int coli_vk_xb_expert_entry(const ColiVkExpert *e, uint32_t *o) {
-    if (!e || !o || !G.ready || !G.has_bda) return 0;
-    const ColiVkTensor *t[3] = {e->g, e->u, e->d};
+    if (!e) return 0;
+    return coli_vk_tensor_xb_entry(e->g, e->u, e->d, o);
+}
+int coli_vk_tensor_xb_entry(const ColiVkTensor *g, const ColiVkTensor *u, const ColiVkTensor *d, uint32_t *o) {
+    if (!o || !G.ready || !G.has_bda) return 0;
+    const ColiVkTensor *t[3] = {g, u, d};
     /* a block format (a GGUF's experts) has no scales: chain_moe.comp reads its blocks and
      * the table, and the entry's scale address stays its weights' (never read) */
     for (int k = 0; k < 3; k++)
