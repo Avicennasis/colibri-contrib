@@ -463,6 +463,15 @@ in fp32. Against an fp64 reference the outputs are within 2e-4 to 4e-4 (relative
 largest); the CPU's own experts quantize their inputs to int8. `COLI_CUDA_TC_GEMM=0`
 keeps the block kernel.
 
+A prompt chunk's attention (16 rows or more, `COLI_CUDA_CHAIN_FLASH`; no selection list)
+runs on the tensor cores too (`cc_attn_fk`, sm_70 and later, head dim 64, 128 or 256): a
+block takes 16 query rows, the query heads of one kv head times 16 / GQ tokens, so each
+block of 64 keys is staged once for all of them as f16; two passes (each row's max and
+sum, then exp(s - m) * V into the fragments, divided by the sum at the end). The kernel
+it replaces gave each (head, row) a block that read every K and V row again. On the
+35B, a 1024-token prompt: 226 ms of attention -> 23 ms; a 467-token prompt 819-837 ->
+890-903 tok/s; the loss above 3.2223 -> 3.2271.
+
 On sm_70 and later the same GEMMs run in f16 (`hcg_tile`: `hcg_dense_k`, `hcg_moe_gu_k`,
 `hcg_moe_dn_k`), at twice the TF32 fragments' rate and with a tile that keeps more of the
 card busy: 256 threads (eight warps) for 64 rows x 64 outputs, K in steps of 64, the next
