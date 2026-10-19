@@ -3579,6 +3579,16 @@ int main(int argc, char **argv) {
     test_attn_win(3, 40, 4, 2, 48, 32, 8, 10, 0, 1); test_attn_win(4, 6, 4, 2, 64, 48, 0, 0, 1, 1);
     test_attn_win(2, 300, 4, 2, 16, 16, 150, 0, 1, 1); test_attn_win(130, 3, 4, 2, 24, 40, 16, 0, 0, 0);
     test_attn_win(1, 500, 8, 4, 192, 128, 128, 128, 1, 1);
+    /* a decode's or a verify's rows over many positions (chain_attn_dec.comp's blocks); the
+     * random stream as before them, so the tests after them draw what they drew */
+    {
+        unsigned rng_was = rng;
+        test_attn_hk(3, 250, 16, 2, 256, 0); test_attn_hk(1, 299, 4, 2, 128, 0);
+        test_attn_win(4, 900, 8, 2, 128, 128, 0, 0, 1, 0); test_attn_win(1, 2000, 4, 2, 64, 64, 512, 512, 0, 1);
+        test_attn_win(2, 3000, 16, 4, 64, 96, 0, 0, 0, 0);
+        VkcStats ad; vkc_stats(&ad); printf("  decode attentions in blocks of positions: %llu\n", ad.attn_dec);
+        rng = rng_was;
+    }
     /* prompt chunks through the blocked attention (chain_attnb.comp, from 16 rows): Qwen3.6's
      * and Qwen3.8's head groups (8 and 12 a KV head), one head a KV head, lists, the window,
      * the ring, position-major rows and the sink; then the same cases on chain_attn */
