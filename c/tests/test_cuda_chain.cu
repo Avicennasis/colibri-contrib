@@ -14,6 +14,7 @@
  *   lost      a failed launch (COLI_GPU_FAIL_AFTER) marks the device lost to the chain
  * Needs a device: run by hand (make cuda-chain-check CUDA=1); gpu-compile builds it. */
 #include "../backend_cuda.h"
+#include "../backend_gpu_compat.h"   /* the runtime's names under HIP too (the planar blocks' host memory) */
 #define COLI_CUDA_CHAIN_NO_WRAPPERS
 #include "../cuda_chain.h"
 #include <cstdio>
