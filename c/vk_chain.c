@@ -48,6 +48,7 @@ static const char *const pipe_file[P_NPIPE] = {
     "chain_ew.spv", "chain_qsa.spv", "chain_ple.spv", "qmatmul.spv"};
 #define VKC_GEMM_MAX 4
 #define VKC_DNREC_MAX 8
+#define VKC_FA_MAX 8   /* chain_attn_flash pipelines, a (head dim, query heads a KV head) each */
 #define VKC_FRAMES 16
 #define VKC_STAGE0 (((size_t)16 << 20) / VKC_FRAMES)   /* a frame's first staging buffer: 16 MiB over the frames, as when they were 4 of 4 MiB */
 #define VKC_BIND 8
@@ -145,7 +146,7 @@ typedef struct {
     VkShaderModule mmod[PM_N]; VkPipeline mpipe[PM_N]; int mla_ok;   /* chain_mla, chain_hgemv, chain_dsa */
     /* chain_attn_flash.comp: the attention core on the matrix units for prompt chunks,
      * one pipeline per (head dim, query heads per kv head) */
-    VkShaderModule mod_fa; VkPipeline fa[4]; int fa_hd[4], fa_gq[4], nfa;
+    VkShaderModule mod_fa; VkPipeline fa[VKC_FA_MAX]; int fa_hd[VKC_FA_MAX], fa_gq[VKC_FA_MAX], nfa;
     VkPipeline kdarec[VKC_KDA_MAX]; int kdarec_kd[VKC_KDA_MAX], nkdarec;   /* chain_kda's recurrence per key dim */
     VkCommandPool cpool;
     VkcFrame fr[VKC_FRAMES];
@@ -1467,7 +1468,7 @@ static int attn_slice_next(void) {   /* the open frame out, a new one in */
  * NULL when the shader is missing or the pipeline fails */
 static VkPipeline fa_pipe(int hd, int gq) {
     for (int i = 0; i < KC.nfa; i++) if (KC.fa_hd[i] == hd && KC.fa_gq[i] == gq) return KC.fa[i];
-    if (!KC.mod_fa || KC.nfa == 4) return VK_NULL_HANDLE;
+    if (!KC.mod_fa || KC.nfa == VKC_FA_MAX) return VK_NULL_HANDLE;
     int32_t sv[2] = {hd, gq};
     VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
     VkSpecializationInfo si = {2, me, sizeof sv, sv};
@@ -1537,6 +1538,13 @@ static VkcBuf *adec_scratch(size_t bytes) {
 static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBuf *snk, const VkcAttnW *w) {
     int S = w->a.S, last = w->a.pos_base + S;   /* the last row's positions */
     int n = w->win > 0 && w->win < last ? w->win : last;
+    /* Only where a prompt chunk of this attention would take chain_attn_flash (f16, so a
+     * row's bits already depend on how a forward is cut into steps): elsewhere the prompt's
+     * chain_attnb gives a row the bits chain_attn gives it alone, and a prefix resumed must
+     * answer to the last digit as the prompt recomputed does (tests/test_brio_serve.py) */
+    int G = w->a.H / w->a.KVH;
+    if (!(KC.mod_fa && vkc_attn_flash_rows() > 0 && !w->win && !w->ring && !w->kv_pm && !w->sink && w->vd == w->a.hd &&
+          w->a.hd % 64 == 0 && 16 % G == 0 && fa_pipe(w->a.hd, G))) return 0;
     if (S < 1 || S > 4 || n < VKC_ATTN_DEC_MIN || !adec_pipe()) return 0;
     int L = 64, nb = (n + L - 1) / L;
     while (L < 256 && (int64_t)w->a.H * nb > 1024) { L *= 2; nb = (n + L - 1) / L; }

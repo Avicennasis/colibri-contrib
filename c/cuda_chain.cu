@@ -1168,7 +1168,14 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
     static int dec = -1;
     if (dec < 0) { const char *e = getenv("COLI_CUDA_ATTN_DEC"); dec = !(e && *e == '0'); }
     int last = p->pos_base + p->S;
-    if (dec && p->S <= 4 && p->sel_row <= 0 && last >= CC_ATTN_DEC_MIN) {
+    /* only where a prompt chunk takes cc_attn_fk (f16 on the tensor cores): elsewhere a row's
+     * bits do not depend on how a forward is cut into steps, and a prefix resumed answers as
+     * the prompt recomputed does */
+    int fk = 0;
+#if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
+    fk = fl > 0 && c->major >= 7 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256);
+#endif
+    if (dec && fk && p->S <= 4 && p->sel_row <= 0 && last >= CC_ATTN_DEC_MIN) {
         int L = 64, nb = (last + L - 1) / L;
         while (L < 256 && p->H * nb > 1024) { L *= 2; nb = (last + L - 1) / L; }
         size_t need = (size_t)p->S * p->H * nb * (p->hd + 2) * sizeof(float);
