@@ -504,7 +504,7 @@ the device, since no Vulkan tier runs.
 | `COLI_VK_XB_GROUPED` | on where supported | `0`: a step's experts keep their own dispatches where the grouped GEMM would take them (cooperative matrices at subgroup size 64, `bufferDeviceAddress`, widths multiples of 128, int8/int4, SwiGLU). |
 | `COLI_VK_XB_GROUPED_ROWS` | `64` | Assignments in a batch from which the grouped GEMM takes it. |
 | `COLI_VK_XB_STEP` | on where supported | `0`: a prompt step packs its rows per expert and sums on the host, as before the whole-step buffers. On a Radeon 8060S (Qwen3.6, 1011-token prompt) the grouped GEMM and the step buffers took the experts' device time from 762 to 344 ms and the first token from 2.08 to 1.49 s, perplexity unchanged (7.65). |
-| `COLI_VK_XB_GEMV` | on where supported | `0`: a decode step's experts keep a GEMV dispatch each instead of the grouped GEMV (`qmatmul_grp_gemv.comp`). On a Radeon 8060S (Qwen3.6, a 256-token answer, tier 24 GB) the grouped GEMV took decode from 37.2 to 42.5 tok/s with the int8 trunk and from 45.0 to 53.5 with the int4 trunk. |
+| `COLI_VK_XB_GEMV` | on where supported | `0`: a decode step's experts keep a GEMV dispatch each instead of the grouped GEMV (`qmatmul_grp_gemv.comp`). On a Radeon 8060S (Qwen3.6, a 256-token answer, tier 24 GB) the grouped GEMV took decode from 37.2 to 42.5 tok/s with the int8 trunk and from 45.0 to 53.5 with the int4 trunk. It also keeps the experts below 16 rows the grouped routes leave (any device without them: NVIDIA, Intel, Lavapipe; MXFP4 and SiTU everywhere) on the per-expert GEMVs instead of the dense chain's decode kernel; see "The tier's small experts on the chain's kernel". |
 | `COLI_VK_TIER_QUEUE` | a second queue | `0`: the tier shares the main queue (its batches and the dense matmuls then serialize). |
 | `COLI_VK_TIER_STREAM` | on | A prompt step's cold experts streamed to the device ([below](#big-prompt-chunks-and-expert-streaming)); `0` off. `_SLOTS`, `_ROWS`, `_HALF`, `_PAR` there. |
 | `COLI_VK_DENSE` | on, but off on a device sharing the CPU's RAM while the tier is on | `0`: the dense trunk stays on the CPU and the device takes the routed experts only; `1`: the trunk on the device whatever the device. Unset: on a discrete GPU, or with the tier off, on the device; on an integrated GPU or Lavapipe with the tier on, on the CPU. The startup line says which and why. (The GLM engine reads it through the same rule with its own default, off.) |
@@ -560,6 +560,52 @@ waits for that batch's join.
 The dashboard's expert map (`EMAP`) shows a device-resident expert as tier 2 (VRAM),
 the experts a device step served still light up in `HITS`, and qwen36's
 `CACHE_ROUTE` ranks them like CUDA-resident ones.
+
+### The tier's small experts on the chain's kernel
+
+A decode step, an MTP verify or a prompt chunk's rarely routed experts give the batch
+experts with a row or a few. Where no grouped route takes the batch (the grouped GEMM
+and GEMV need cooperative matrices at subgroups of 64: NVIDIA, Intel and Lavapipe have
+no grouped route; on a Radeon the grouped GEMV takes int8, int4 and MXFP4 with SwiGLU or
+SiTU, 17-26% faster there than this kernel on a 780M, and MXFP4 now 2530 -> 2085 us a step
+at MiMo's shape), each of those experts below the per-expert GEMM's 16 rows runs the dense
+chain's decode kernel, `chain_moe_gv.comp`, with every row of the batch a pair of its
+own: two dispatches for the step instead of two per expert, each a GEMV of 8 outputs a
+workgroup. Formats int8, int4 (a scale a row or a group) and MXFP4; SwiGLU, clamped or
+not, and SiTU. DeepSeek V4's activation and the block formats keep their routes.
+
+The chain and the tier take the lanes a row from the same rule (`coli_vk_gv_lanes`) and
+pin the same subgroup size, so a row has the same bits on either: a prompt chunk's
+experts through the tier and the next tokens' through the chain (OLMoE and Qwen, the
+frame's own experts for short steps) give a resumed prefix the cold forward's numbers.
+tests/test_vk_chain compares them pair by pair.
+
+A decode step's experts on an RTX PRO 4000 (`COLI_VK_CHAIN_BENCH=xb` in
+tests/test_vk_chain, device time a layer, 48 layers of distinct experts):
+
+| shape | per-expert GEMVs | chain kernel |
+|---|---|---|
+| GLM-5.3: 8 int4-g64, 6144 x 2048 | 1595 us | 442 us |
+| Kimi K3: 8 MXFP4, 7168 x 2048, SiTU | 1677 us | 572 us |
+| DeepSeek V4.1: 6 MXFP4, 4096 x 2048 | 1604 us | 256 us |
+| MiMo: 8 MXFP4, 4096 x 2048 | 1411 us | 338 us |
+| 8 int4 with a scale a row (Inkling), 7168 x 2048 | 1332 us | 463 us |
+| 8 int8, 6144 x 2048 | 1333 us | 762 us |
+
+A GGUF's experts (the block formats) take the same way for a batch whose experts all have 4
+rows or fewer (a decode step, an MTP verify): `chain_moe.comp`'s block path (bdstep.glsl, its
+float form, a pipeline per pair of types), every row a pair, down's rows copied to the
+batch's. The grouped GEMM of the block formats works in 32-row tiles and the per-expert
+GEMVs a row a subgroup:
+
+| shape | grouped GEMM | chain kernel |
+|---|---|---|
+| GLM: 8 Q4_K, 6144 x 2048 | 2694 us | 512 us |
+| GLM: 8 Q6_K, 6144 x 2048 | 3277 us | 830 us |
+| Kimi K3: 8 IQ2_S/Q2_0, 7168 x 2048 | 3136 us | 434 us |
+| DeepSeek: 6 Q4_K, 4096 x 2048 | 1393 us | 303 us |
+
+A prompt chunk's experts keep the grouped GEMM. `COLI_VK_XB_GEMV=0` keeps the per-expert GEMVs.
 
 ### RAM and VRAM without the same experts (`COLI_VK_TIER_EXCLUSIVE`)
 
