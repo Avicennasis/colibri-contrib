@@ -1696,6 +1696,23 @@ an 8-token prompt the CPU's integer and float sums (`GQ_EXACT=1`) put the logits
 37% apart, and the chain against the CPU's float sums 2e-3 on the first row and up to 8%
 after it.
 
+**A GGUF (colibri).** GLM-5.2's matrices from a GGUF go up the same way: the file's blocks
+(100 + the ggml type), rows the CPU keeps interleaved by 16 back to the file's first
+(`glmc_gq_rows`). A GGUF splits `kv_b` into the per-head `k_b` and `v_b`, which are the
+absorbed core's `k_abs` and `v_abs`: they go up dequantized as floats, as glm53's, and the
+per-matrix path never takes them for a whole `kv_b`. Before, the chain had no form for
+either and every layer stayed on the CPU. UD-IQ1_S (202 GB) on an RTX PRO 4000 with 62 GB
+of RAM and two NVMe drives, a 166-token prompt and 128 tokens: the trunk on the CPU with
+the tier on the whole card (2165 experts) gave 2.6 tok/s of prompt and 0.67-0.68 of
+decode, the trunk on the device (78 layers, 16 GiB) with the tier on the rest (580
+experts) 2.8-2.9 and 0.72-0.74 (the CPU alone 1.9 and 0.46). The model is three times the
+RAM: the CPU's share of the experts read from the disk is the cost either way, and
+giving the tier more of the card measured no better (39 layers on the device and 1313
+experts: 2.7 and 0.67-0.85; 20 layers and 1685 experts: 2.5-2.7 and 0.62-0.68). With
+the device's float form (`GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0`) the greedy
+text is the CPU's float form's for 40 tokens, and the first 4 tokens' top-10 logprobs
+agree within 1e-4; the integer forms fork at a tie, as the CPU's own two forms do.
+
 **The state.** The KV caches (GLM-5.2's latent, rope keys and index keys; GLM-5.3's
 latent, index keys and pool gates) stay the host's: each step copies its new rows back,
 and the device mirror has a watermark that every host write lowers (the CPU's attention,

@@ -2420,6 +2420,24 @@ PY
 # glm53 with f32, int8 and int4 trunks, streamed and resident experts, an image, prefill
 # chunks and chain chunks, swiglu_limit 0, a lost device whose KDA state is rebuilt on
 # the CPU, serve sessions, and its pin-branch harness with the chain on.
+# A GGUF's block types on colibri's chain (tests/test_gguf_import.py write_glmdsa: kv_b split as
+# k_b and v_b in Q8_0, the MLA core reading them as floats; a Q4_K and Q8_0 trunk with the DSA
+# indexer; Q4_K and IQ2_XXS experts with Q5_K and Q6_K down; a Q6_K head), against the CPU's
+# float form (GQ_EXACT=1; COLI_VK_IDOT=0 keeps the device's float form, COLI_VK_CHAIN_GEMM=0 the
+# prompt's GEMM in fp32: see mimo_gguf_tiny). The ref's tokens are none the model makes: the
+# gate compares the chain with the CPU.
+glm_gguf_tiny() {   # glm_gguf_tiny/, imported, and its ref.json (the prompt and 8 tokens)
+  $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the GGUF gates"
+import sys
+sys.path.insert(0, "tests")
+import numpy as np
+from test_gguf_import import write_glmdsa
+write_glmdsa("glm_gguf_tiny.gguf", np.random.default_rng(9))
+PY
+  rm -rf glm_gguf_tiny
+  $PY tools/gguf_import.py glm_gguf_tiny.gguf glm_gguf_tiny > /dev/null
+  echo '{"prompt_ids": [5, 6, 7, 8, 20, 21, 22, 23], "full_ids": [5, 6, 7, 8, 20, 21, 22, 23, 1, 2, 3, 4, 5, 6, 7, 8]}' > glm_gguf_tiny/ref.json
+}
 family_glm_chain() {
   make colibri glm53 tests/test_vk_chain VK=1
   ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
@@ -2446,6 +2464,13 @@ family_glm_chain() {
   # drafts: n-gram, and the MTP head at depths 1 to 3 (accepted and rejected)
   mla_gate colibri "chain colibri n-gram drafts" 1 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 -- 64 16 16
   for d in 1 2 3; do mla_gate colibri "chain colibri MTP depth $d" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=$d -- 64 16 16; done
+  # a GGUF's block types, the experts on the tier as the file has them
+  glm_gguf_tiny
+  local gg=(SNAP=glm_gguf_tiny REF=glm_gguf_tiny/ref.json GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0)
+  for cap in 64 1; do mla_gate colibri "chain colibri GGUF cap=$cap" 1 "${gg[@]}" -- $cap 16 16; done
+  grep -q "tier colibri: the GGUF experts' blocks go to the device" vk.log && [ "$(tier_count colibri vk.log)" -gt 0 ] ||
+    { cat vk.log; fail "chain colibri GGUF: the tier took no expert as the file has it"; }
+  mla_gate colibri "chain colibri GGUF, DSA top-4" 1 "${gg[@]}" DSA_TOPK=4 -- 64 16 16
   mla_gate colibri "chain colibri MTP with DSA top-4" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DSA_TOPK=4 -- 64 16 16
   mla_gate colibri "chain colibri MTP, 4-bit" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
   # around the chain: the tier off, the per-matrix trunk and core, the GEMM and GEMV choices
