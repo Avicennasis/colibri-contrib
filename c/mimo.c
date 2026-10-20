@@ -1881,6 +1881,29 @@ static int vk_in_ram(void *ctx, int li, int e) {
     const Model *m = ctx;
     return m->cache[li].by_expert && m->cache[li].by_expert[e] >= 0;
 }
+/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size). */
+static void vk_ram_given(void *ctx, size_t bytes) {
+    Model *m = ctx;
+    const Cfg *c = &m->c;
+    int L = 0, was = 0, now = 0;
+    for (int i = 0; i < c->n_layers; i++) L += c->moe[i] && m->cache[i].s != NULL;
+    if (L < 1 || !m->e_bytes) return;
+    const size_t per = (size_t)(m->e_bytes + 8192) * (size_t)L;
+    const int cut = (int)((bytes + per - 1) / per);
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        if (!c->moe[i] || !lc->s) continue;
+        int cap = lc->cap - cut;
+        if (cap < c->topk) cap = c->topk;
+        if (cap < lc->n) cap = lc->n;   /* slots filled already stay */
+        if (cap > lc->cap) cap = lc->cap;
+        was = lc->cap; now = cap; lc->cap = cap;
+    }
+    fprintf(stderr, "[VK] mimo: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
+            bytes / 1073741824.0, now, was);
+}
 
 /* The routed experts on the shared tier (vk_tier.c): the release's MXFP4 with its
  * e8m0 group scales, SwiGLU. This engine keeps no expert history, so the tier
@@ -1908,6 +1931,7 @@ static void vk_tier_start(Model *m) {
                     .gate_up = f, .down = f, .act = VKT_ACT_SWIGLU,
                     .max_rows = MIMO_VK_ROWS * c->topk,
                     .ram_reserve = (size_t)(m->e_bytes + 8192) * (size_t)cap * (size_t)nmoe,
+                    .ram_floor = (size_t)(m->e_bytes + 8192) * (size_t)c->topk * (size_t)nmoe, .ram_given = vk_ram_given,
                     .dense_bytes = g_mc_fit.L && vkc_fit_partial(&g_mc_fit) ? mc_kv_bytes_n(m, g_mc_fit.n) :   /* a partial chain: placed already, its caches to come */
                                    (coli_vk_dense_device_only() ? 0 :   /* placed already (mimo_dho_start) */
                                     coli_vk_dense() ? vk_dense_bytes(m, 1) : g_vk_chain ? vk_dense_bytes(m, 0) : 0) +

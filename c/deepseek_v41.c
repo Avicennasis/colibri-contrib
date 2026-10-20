@@ -5594,6 +5594,34 @@ static int vk_in_ram(void *ctx, int layer, int e) {
     for (int i = 0; i < cache->n; i++) if (cache->slot[i].eid == e) return 1;
     return 0;
 }
+/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size); the windows of the slots past it go. */
+static size_t g_v41_vk_slot_bytes;
+static void vk_ram_given(void *ctx, size_t bytes) {
+    Model *m = ctx;
+    const Cfg *c = &m->c;
+    int L = 0, was = 0, now = 0;
+    for (int i = 0; m->cache && i < c->n_layers; i++) L += m->cache[i].slot != NULL;
+    if (L < 1 || !g_v41_vk_slot_bytes) return;
+    const size_t per = g_v41_vk_slot_bytes * (size_t)L;
+    const int cut = (int)((bytes + per - 1) / per);
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        if (!lc->slot) continue;
+        int cap = lc->cap - cut;
+        if (cap < c->n_activated) cap = c->n_activated;
+        if (cap < lc->n) cap = lc->n;   /* slots filled already stay */
+        if (cap > lc->cap) cap = lc->cap;
+        for (int k = cap; k < lc->cap; k++)   /* never read: their windows back */
+            for (int part = 0; part < V41_EXPERT_TENSORS; part++) {
+                free(lc->slot[k].base[part]); lc->slot[k].base[part] = NULL; *slot_part(&lc->slot[k], part) = NULL;
+            }
+        was = lc->cap; now = cap; lc->cap = cap;
+    }
+    fprintf(stderr, "[VK] deepseek_v41: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
+            bytes / 1073741824.0, now, was);
+}
 /* A GGUF's experts on the tier as the file has them (shaders/blockdec.glsl), the forms by
  * layer as published files mix them; MXFP4 ones as the checkpoint's FP4 the slots hold. Gate
  * and up share a type and every type has a device form, or the tier stays off (0). The most
@@ -5677,6 +5705,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
     if (m->gx && !v41_vk_gguf_forms(m, &gu, &dn, &lgu, &ldn)) return;
     size_t expert = 0;
     for (int part = 0; part < V41_EXPERT_TENSORS; part++) expert += (size_t)slot_part_bytes(m, part);
+    g_v41_vk_slot_bytes = expert;
     /* The DSpark stages (index n_layers + stage): their experts are the backbone's form,
      * the tier's extra layers. By default on a discrete GPU only: on a GPU that shares
      * the RAM, qwen38's head measured no faster there (docs/vulkan.md, "The MTP head's
@@ -5691,6 +5720,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap) {
                     .extra_layers = stages, .extra_gate_up = f, .extra_down = f,
                     .max_rows = MOE_ROW_CHUNK * c->n_activated,
                     .ram_reserve = expert * (size_t)cap * (size_t)c->n_layers,
+                    .ram_floor = expert * (size_t)c->n_activated * (size_t)c->n_layers, .ram_given = vk_ram_given,
                     .dense_bytes = vk_dense_bytes(m), .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_unhold, .load_ctx = m, .load_batch = vk_load_batch};
     rt_init("deepseek_v41", c->n_layers, c->n_routed);

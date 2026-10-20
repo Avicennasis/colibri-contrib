@@ -5364,18 +5364,13 @@ static int glm53_in_ram(void *ctx, int layer, int eid) {
     return 0;
 }
 /* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
- * ram_given): fewer slots a layer, top-k at least. A cap the user set (--cap,
- * GLM53_EXPERT_GB) stays. */
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size). */
 static void glm53_ram_given(void *ctx, size_t bytes) {
     GModel *m = ctx;
     const Cfg *c = &m->c;
     const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin, sparse = m->layer_end - from;
     if (!m->ecache || sparse < 1 || !m->e_slot) return;
-    if (g_cap_override > 0 || getenv("GLM53_EXPERT_GB")) {
-        fprintf(stderr, "[VK] glm53: the expert cache keeps the size it was given beside the tier's host pool of %.1f GiB\n",
-                bytes / 1073741824.0);
-        return;
-    }
     const size_t per = (size_t)m->e_slot * (size_t)sparse;   /* a slot in every sparse layer */
     const int cut = (int)((bytes + per - 1) / per);
     int was = 0, now = 0;

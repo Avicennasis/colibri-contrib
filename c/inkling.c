@@ -2146,6 +2146,30 @@ static int ink_vk_in_ram(void *ctx, int layer, int e) {
     Slot *s = slot_indexed((Model *)ctx, layer, e);
     return s && s->filled;
 }
+/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size). */
+static size_t g_ink_vk_slot_bytes;
+static void ink_vk_ram_given(void *ctx, size_t bytes) {
+    Model *m = ctx;
+    const Cfg *c = &m->c;
+    int L = 0, was = 0, now = 0;
+    for (int i = 0; m->cache && i < c->n_layers; i++) L += m->cache[i].slots != NULL;
+    if (L < 1 || !g_ink_vk_slot_bytes) return;
+    const size_t per = g_ink_vk_slot_bytes * (size_t)L;
+    const int cut = (int)((bytes + per - 1) / per);
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        if (!lc->slots) continue;
+        int cap = lc->cap - cut;
+        if (cap < c->topk) cap = c->topk;
+        if (cap < lc->n) cap = lc->n;   /* slots filled already stay */
+        if (cap > lc->cap) cap = lc->cap;
+        was = lc->cap; now = cap; lc->cap = cap;
+    }
+    fprintf(stderr, "[VK] inkling: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
+            bytes / 1073741824.0, now, was);
+}
 /* Bytes the dense matrices marked for the device will take there (the budget leaves
  * them room), from the geometry: int8 1 byte, int4-g64 0.5625, f32 4, bf16 2. */
 static size_t inkc_fit_later(const Model *m);   /* inkling_chain.h */
@@ -2239,12 +2263,14 @@ static void ink_vk_tier_start(Model *m) {
         int64_t slotb = m->xq ? m->rb13*2*I + m->rb2*D + (2*I+D)*4
                       : m->quant_bits ? 3*I*D + (2*I+D)*4 : 3*I*D*4;
         if (!m->gx) fd = f;
+        g_ink_vk_slot_bytes = (size_t)slotb;
         VktConfig vc = {.engine = "inkling", .layers = c->n_layers, .experts = c->n_experts,
                         .hidden = c->hidden, .inter = c->moe_inter, .topk = c->topk,
                         .gate_up = f, .down = fd, .layer_gate_up = lgu, .layer_down = ldn,
                         .act = VKT_ACT_SWIGLU,
                         .max_rows = INK_VK_ROWS * c->topk,
                         .ram_reserve = (size_t)slotb * (size_t)m->cache[0].cap * (size_t)nsp,
+                        .ram_floor = (size_t)slotb * (size_t)c->topk * (size_t)nsp, .ram_given = ink_vk_ram_given,
                         .dense_bytes = ink_vk_dense_bytes(m),
                         .in_ram = ink_vk_in_ram, .ram_ctx = m,
                         .load = ink_vk_load, .release = ink_vk_unhold, .load_ctx = m, .load_batch = ink_vk_load_batch};
