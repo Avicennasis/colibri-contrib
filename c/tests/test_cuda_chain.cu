@@ -400,6 +400,52 @@ int main(void) {
         ColiCudaTensor *t0 = NULL;
         ck(coli_cuda_tensor_upload(&t0, w.data(), ones.data(), 0, I, O, 0), "an f32 tensor resident");
         ck(T->begin() && T->matmul(t0, xb, 7, yb, 0, 1) && T->submit(1) && maxdiff(down(yb, O).data(), ref0.data(), O) < 1e-4, "f32 rows: the CPU's dot");
+        {   /* a prompt chunk's rows of an f32 matrix (the tiled GEMM): widths that are no tile's multiple */
+            const int S3 = 70, I3 = 200, O3 = 100;
+            std::vector<float> x3 = rnd((size_t)S3 * I3, 12), w3 = rnd((size_t)I3 * O3, 13), one3(O3, 1.f), r3((size_t)S3 * O3);
+            for (int s = 0; s < S3; s++) for (int o = 0; o < O3; o++) {
+                double a = 0; for (int i = 0; i < I3; i++) a += (double)x3[(size_t)s * I3 + i] * w3[(size_t)o * I3 + i]; r3[(size_t)s * O3 + o] = (float)a;
+            }
+            ColiCudaTensor *t3 = NULL;
+            CcBuf *xb3 = T->buf((size_t)S3 * I3 * 4, CC_DEV), *yb3 = T->buf((size_t)S3 * O3 * 4, CC_DOWN);
+            int ok3 = xb3 && yb3 && coli_cuda_tensor_upload(&t3, w3.data(), one3.data(), 0, I3, O3, 0) && T->begin() &&
+                      T->write(xb3, 0, x3.data(), x3.size() * 4) && T->matmul(t3, xb3, 0, yb3, 0, S3) && T->submit(1);
+            ck(ok3 && maxdiff((const float *)T->ptr(yb3), r3.data(), r3.size()) < 1e-4, "f32 rows, a prompt chunk's 70 (the tiled GEMM)");
+            coli_cuda_tensor_free(t3); T->free(xb3); T->free(yb3);
+        }
+        {   /* few outputs of long f32 rows, a decode step's and a verify's rows (the wide GEMV): each row its one-row bits */
+            const int S4 = 3, I4 = 10240, O4 = 4;
+            std::vector<float> x4 = rnd((size_t)S4 * I4, 14), w4 = rnd((size_t)I4 * O4, 15), one4(O4, 1.f), r4((size_t)S4 * O4);
+            for (int s = 0; s < S4; s++) for (int o = 0; o < O4; o++) {
+                double a = 0; for (int i = 0; i < I4; i++) a += (double)x4[(size_t)s * I4 + i] * w4[(size_t)o * I4 + i]; r4[(size_t)s * O4 + o] = (float)a;
+            }
+            ColiCudaTensor *t4 = NULL;
+            CcBuf *xb4 = T->buf((size_t)S4 * I4 * 4, CC_DEV), *yb4 = T->buf((size_t)S4 * O4 * 4, CC_DOWN), *yb1 = T->buf((size_t)O4 * 4, CC_DOWN);
+            int ok4 = xb4 && yb4 && yb1 && coli_cuda_tensor_upload(&t4, w4.data(), one4.data(), 0, I4, O4, 0) && T->begin() &&
+                      T->write(xb4, 0, x4.data(), x4.size() * 4) && T->matmul(t4, xb4, 0, yb4, 0, S4) && T->submit(1);
+            ck(ok4 && maxdiff((const float *)T->ptr(yb4), r4.data(), r4.size()) < 1e-3, "f32 rows, 4 outputs of 10240 (the GEMV for few outputs)");
+            int same = ok4;
+            for (int s = 0; s < S4 && same; s++)
+                same = T->begin() && T->matmul(t4, xb4, (size_t)s * I4, yb1, 0, 1) && T->submit(1) &&
+                       !memcmp(T->ptr(yb1), (const float *)T->ptr(yb4) + (size_t)s * O4, (size_t)O4 * 4);
+            ck(same, "and each of its three rows the one-row call's bits");
+            coli_cuda_tensor_free(t4); T->free(xb4); T->free(yb4); T->free(yb1);
+        }
+        for (int shape = 0; shape < 3; shape++) {   /* and quant_matmul's bits (coli_cuda_matmul still runs it) */
+            static const int sI[3] = {10240, 2048, 2048}, sO[3] = {4, 256, 1};
+            const int I5 = sI[shape], O5 = sO[shape], S5 = 2;
+            std::vector<float> x5 = rnd((size_t)S5 * I5, 16 + shape), w5 = rnd((size_t)I5 * O5, 19 + shape), one5(O5, 1.f), q5((size_t)S5 * O5);
+            ColiCudaTensor *t5 = NULL, *tq = NULL;
+            CcBuf *xb5 = T->buf((size_t)S5 * I5 * 4, CC_DEV), *yb5 = T->buf((size_t)S5 * O5 * 4, CC_DOWN);
+            int ok5 = xb5 && yb5 && coli_cuda_tensor_upload(&t5, w5.data(), one5.data(), 0, I5, O5, 0) && T->begin() &&
+                      T->write(xb5, 0, x5.data(), x5.size() * 4) && T->matmul(t5, xb5, 0, yb5, 0, S5) && T->submit(1) &&
+                      coli_cuda_matmul(&tq, q5.data(), x5.data(), w5.data(), one5.data(), 0, S5, I5, O5, 0, 0);
+            char what[96]; snprintf(what, sizeof what, "f32 rows, %d outputs of %d: quant_matmul's bits", O5, I5);
+            ck(ok5 && !memcmp(T->ptr(yb5), q5.data(), q5.size() * 4), what);
+            if (ok5 && memcmp(T->ptr(yb5), q5.data(), q5.size() * 4))
+                printf("  (largest difference %.3g)\n", maxdiff((const float *)T->ptr(yb5), q5.data(), q5.size()));
+            coli_cuda_tensor_free(t5); coli_cuda_tensor_free(tq); T->free(xb5); T->free(yb5);
+        }
         coli_cuda_tensor_free(t); coli_cuda_tensor_free(t0); T->free(xb); T->free(yb);
     }
     printf("norm\n");
@@ -794,7 +840,7 @@ int main(void) {
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 10, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 18, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;
