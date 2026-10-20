@@ -239,6 +239,13 @@ int    coli_vk_tensor_copy(ColiVkTensor *const *dst, ColiVkTensor *const *src, i
  * coli_vk_tensor_refill_as does; with mapped memory the CPU copies. All n before it
  * returns. 0 = a source not in the host pool, no room, or the copy failed. */
 int    coli_vk_tensor_copy_as(ColiVkTensor *const *dst, ColiVkTensor *const *src, int n);
+/* coli_vk_tensor_copy_as without a wait: with staged uploads the copies go at the head of
+ * sub-batch half h's next submit (coli_vk_xb_sub_issue / _step), a barrier between them and
+ * its dispatches, so the engine thread goes on and the bus runs beside the device's batch
+ * before; mapped memory copies here. The dsts must not be read by a batch in flight.
+ * coli_vk_xb_sub_copy_drop forgets the copies no submit took (a step that ended early). */
+int    coli_vk_xb_sub_copy(int h, ColiVkTensor *const *dst, ColiVkTensor *const *src, int n);
+void   coli_vk_xb_sub_copy_drop(void);
 int    coli_vk_staged(void);   /* 1 = resident data goes to the device through staged uploads */
 size_t coli_vk_tensor_row_bytes(int fmt, int I);
 int coli_vk_block_elems(int fmt);   /* block formats (100 + ggml type, 200-203): elements per block; else 0 */

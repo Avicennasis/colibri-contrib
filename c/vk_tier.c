@@ -196,7 +196,7 @@ static struct {
      * through the slots too, copied there on the device (st_copy_group) instead of read in
      * place by the GEMMs; bpool[e] marks them in the step */
     int pool_copy; uint8_t *bpool;
-    unsigned long long pc_experts; double pc_ms, pc_bytes;
+    unsigned long long pc_experts; double pc_bytes;
 } T;
 
 /* "2.31 GiB", "35.0 MiB", "9.5 KiB": the budget lines read on a 24 GB card and a tiny fixture alike */
@@ -1100,10 +1100,11 @@ static int pool_block(const VSlot *v) {
         if (!t[k] || !coli_vk_tensor_info(t[k], &ti) || ti.fmt < 100 || ti.fmt >= 164) return 0;
     return 1;
 }
-/* host pool experts copied into slots on the device (coli_vk_tensor_copy_as): their bytes
- * cross the bus once, by the copy engine, where a big step's grouped GEMMs read them in
- * place at a third of its rate */
-static void st_copy_group(int layer, const int *eids, const int *slots, int n, uint8_t *ok) {
+/* host pool experts copied into slots on the device: their bytes cross the bus once, where a
+ * big step's grouped GEMMs read them in place at a third of its rate. The copies go at the
+ * head of sub-batch half `half`'s next submit (coli_vk_xb_sub_copy), the one these slots
+ * serve first: the engine thread goes on to the step's cold experts meanwhile. */
+static void st_copy_group(int layer, const int *eids, const int *slots, int n, uint8_t *ok, int half) {
     ColiVkTensor *dst[3 * 64], *src[3 * 64];
     int nt = 0;
     double bytes = 0;
@@ -1116,19 +1117,18 @@ static void st_copy_group(int layer, const int *eids, const int *slots, int n, u
             dst[nt] = T.st[slots[i]].t[k]; src[nt++] = t[k];
         }
     }
-    double t0 = vkt_now_ms();
-    const int good = nt > 0 && coli_vk_tensor_copy_as(dst, src, nt);
+    const int good = nt > 0 && coli_vk_xb_sub_copy(half, dst, src, nt);
     for (int i = 0; i < n; i++) {
         VStage *v = &T.st[slots[i]];
         ok[i] = (uint8_t)good;
         if (!good) { v->state = SS_FREE; continue; }
         v->layer = layer; v->eid = eids[i]; v->state = SS_FILLED; v->pending = 0; v->pref = 0;
     }
-    if (good) { T.pc_experts += (unsigned long long)n; T.pc_ms += vkt_now_ms() - t0; T.pc_bytes += bytes; }
+    if (good) { T.pc_experts += (unsigned long long)n; T.pc_bytes += bytes; }
 }
 /* experts into slots: pool[i] set (or NULL), the host pool's copied on the device, the rest
  * loaded by the engine and uploaded */
-static void st_fill_group(int layer, const int *eids, const int *slots, int n, uint8_t *ok, const uint8_t *pool) {
+static void st_fill_group(int layer, const int *eids, const int *slots, int n, uint8_t *ok, const uint8_t *pool, int half) {
     VktExpertSrc srcs[64]; void *hs[64];
     if (n > 64) n = 64;
     if (pool) {
@@ -1138,8 +1138,8 @@ static void st_fill_group(int layer, const int *eids, const int *slots, int n, u
             if (pool[i]) { ci[nc] = i; ce[nc] = eids[i]; cs[nc++] = slots[i]; }
             else { li[nl] = i; le[nl] = eids[i]; ls[nl++] = slots[i]; }
         }
-        if (nc) { st_copy_group(layer, ce, cs, nc, got); for (int j = 0; j < nc; j++) ok[ci[j]] = got[j]; }
-        if (nl) { st_fill_group(layer, le, ls, nl, got, NULL); for (int j = 0; j < nl; j++) ok[li[j]] = got[j]; }
+        if (nc) { st_copy_group(layer, ce, cs, nc, got, half); for (int j = 0; j < nc; j++) ok[ci[j]] = got[j]; }
+        if (nl) { st_fill_group(layer, le, ls, nl, got, NULL, half); for (int j = 0; j < nl; j++) ok[li[j]] = got[j]; }
         return;
     }
     double ms = 0;
@@ -1438,7 +1438,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
                 if (nfree < gn) gn = nfree;
                 uint8_t gok[64], gpool[64];
                 for (int i = 0; i < gn; i++) gpool[i] = T.bpool ? T.bpool[gid[i]] : 0;
-                st_fill_group(layer, gid, gsl, gn, gok, gpool);
+                st_fill_group(layer, gid, gsl, gn, gok, gpool, cur ? curh : (int)(T.sk % 2));   /* the half they go to */
                 for (int i = 0; i < gn; i++) {
                     if (gok[i]) eslot[gid[i]] = gsl[i];
                     else if (gpool[i]) { cls[gid[i]] = BC_DEV; T.bpool[gid[i]] = 0; }   /* not copied: read in place */
@@ -1485,6 +1485,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     }
     SUBMIT_CURRENT();
 #undef SUBMIT_CURRENT
+    coli_vk_xb_sub_copy_drop();   /* copies no submit took (a step that ended early): their slots go back free */
     free(order); free(bex); free(brows); free(bx); free(bw); free(bidx); free(eslot);
     total += d2_taken;
     T.big_taken = total;
@@ -1575,7 +1576,7 @@ int vkt_stream_prefetch(int layer, int S) {
         int gn = nc - used < T.st_per ? nc - used : T.st_per, gsl[64]; uint8_t gok[64];
         if (gn > 64) gn = 64;
         for (int i = 0; i < gn; i++) gsl[i] = used + i;
-        st_fill_group(layer, cand + used, gsl, gn, gok, NULL);
+        st_fill_group(layer, cand + used, gsl, gn, gok, NULL, 0);
         for (int i = 0; i < gn; i++) if (gok[i]) { T.st[gsl[i]].pref = 1; got++; }
         used += gn;
     }
@@ -2485,8 +2486,7 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
         if (T.st_sums) fprintf(stderr, ", %llu steps summed on the device", T.st_sums);
         if (T.pc_experts) {
             char hc[32];
-            fprintf(stderr, ", %llu host pool experts copied into the slots (%s, %.2f GB/s)", T.pc_experts,
-                    human(T.pc_bytes, hc, sizeof hc), T.pc_ms > 0 ? T.pc_bytes / T.pc_ms / 1e6 : 0.0);
+            fprintf(stderr, ", %llu host pool experts copied into the slots (%s)", T.pc_experts, human(T.pc_bytes, hc, sizeof hc));
         }
     }
     if (T.dmax[2]) {
