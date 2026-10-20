@@ -317,7 +317,7 @@ $(V4_BINARY): $(V4_OBJS) $(V4_VK_SPV)
 # VK=1: the Vulkan backend compiled with this engine's flags, and the shaders.
 backend_vulkan_v4.o: backend_vulkan.c backend_vulkan.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c backend_vulkan.c -o $@
-vk_tier_v4.o: vk_tier.c vk_tier.h backend_vulkan.h tier.h $(V4_FLAGS_STAMP)
+vk_tier_v4.o: vk_tier.c vk_tier.h backend_vulkan.h tier.h ggml_quants.h ggml_grids.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c vk_tier.c -o $@
 vk_chain_v4.o: vk_chain.c vk_chain.h vk_alloc.h shaders/chain_qsa.h backend_vulkan.h $(V4_FLAGS_STAMP)
 	$(CC) $(CFLAGS) -c vk_chain.c -o $@

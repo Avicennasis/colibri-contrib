@@ -336,6 +336,16 @@ int  vkt_dev_changes(unsigned since, int *slots, int max);
 typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; } VktHostExpert;   /* rgu, rd: bytes a row */
 int  vkt_dev_table_hybrid(int layer, uint32_t *entries, VktHostExpert *hx);
 int  vkt_dev_entry(int layer, int eid, uint32_t *ent, uint32_t *ent_hybrid, VktHostExpert *hx, uint8_t *host);
+/* The CPU's form of np pairs of the host pool's experts (the hybrid steps: vk_dmoe.h's, and
+ * the tier's own batch steps): pair p is hx[p] on the row xr[p] (D floats), its output into
+ * out + p * D. SwiGLU, the gate clamped from above at limit and up to [-limit, limit] first
+ * when limit > 0; every matmul as the CPU computes a GGUF's (ggml_quants.h: int8 activations
+ * and integer dots, with GQ_EXACT=1 the float reference), each output its own dot, so how the
+ * nt threads split them moves no bit (nt 0: COLI_VK_HYBRID_THREADS, else OpenMP's). gu
+ * (np * 2 * I floats) and hh (np * I) its scratch.
+ * 0 = a row it could not quantize, or no memory. */
+int  vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
+                    float limit, int nt, float *gu, float *hh, float *out);
 /* whether the tier keeps experts in its host pool (system RAM the device reads over PCIe) */
 int  vkt_host_pool_on(void);
 /* the device memory the budget left for a prompt chunk's staging (VktConfig.stage), 0 none */
@@ -354,6 +364,7 @@ static inline int vkt_score(int l,uint64_t *s){(void)l;(void)s;return -1;}
 typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; } VktHostExpert;   /* rgu, rd: bytes a row */
 static inline int vkt_dev_table_hybrid(int l,uint32_t *e,VktHostExpert *h){(void)l;(void)e;(void)h;return -1;}
 static inline int vkt_dev_entry(int l,int e,uint32_t *t,uint32_t *th,VktHostExpert *h,uint8_t *o){(void)l;(void)e;(void)t;(void)th;(void)h;(void)o;return -1;}
+static inline int vkt_host_pairs(const VktHostExpert *const *h,const float *const *x,int n,int D,int I,float l,int t,float *g,float *u,float *o){(void)h;(void)x;(void)n;(void)D;(void)I;(void)l;(void)t;(void)g;(void)u;(void)o;return 0;}
 static inline int vkt_dev_changes(unsigned s,int *c,int m){(void)s;(void)c;(void)m;return -1;}
 static inline int  vkt_wanted(void){return 0;}
 static inline int  vkt_init(const VktConfig *c, uint32_t *const *h){(void)c;(void)h;return 0;}

@@ -2247,6 +2247,32 @@ OpenMP's 14 threads, 44 to 45 with the regions' rows in chunks; the same greedy 
 (160 of them) on and off. The CPU spends about 155 us a pair (IQ2_S gate and up 86 us,
 Q2_0 down 28 us): the device's own experts take less, so a step waits for the CPU.
 
+**The tier's own steps take the hybrid too.** Where a model does not fit the card whole
+(GLM-5.3, Inkling), a layer's routed experts run in the tier's batch, outside the chain's
+frame, and the device read the host pool's experts of that batch over the bus: 8 GB/s for GLM-5.3's (7.5 ms a layer of 8 against 0.25 ms from
+VRAM, `COLI_VK_CHAIN_BENCH=xb` with `COLI_VK_BENCH_HOST=1`). In a step of up to 8 rows the
+tier now leaves those of a GGUF's block types out of the device's batch and the CPU computes
+them in place at the join (`vkt_host_pairs`, the same code as the chain's worker), while the
+device computes the ones it holds; the join hands their rows back as the device's, so no
+engine changes. The same share stays with the device over PCIe, a prompt step keeps them
+all on the device, and `COLI_VK_HYBRID=0` turns it off. SwiGLU only: DeepSeek V4's expert
+rounds as its own kernel does, and Kimi K3's is SiTU. The run's line adds `hybrid: N steps,
+P host pool pairs computed by the CPU in place (T ms, U us a pair)`. Measured on the RTX PRO
+4000 with the i5-13500, each server on a copy of one history, 128 tokens, a warm-up and a run:
+
+| model | decode, `COLI_VK_HYBRID=0` | decode, the default | the CPU a pair |
+|---|---|---|---|
+| GLM-5.3 Flash UD-IQ2_XXS (95 GB) | 3.22, 3.31 tok/s | 3.53, 4.97 tok/s | 508 us |
+| the same, 199 tokens after a 59-token prompt, two runs | 3.22, 3.20 tok/s | 5.06, 5.24 tok/s | 494 us |
+| Inkling-Small UD-IQ2_XXS (77 GB) | 11.10, 10.54 tok/s | 15.06, 15.75 tok/s | 862 us |
+
+The prompts are unchanged; GLM-5.3's warm-up still overlaps the warm start's uploads. GLM-5.3
+gave the same greedy text (40 tokens) on and off, in 17.7 s against 26.7 s; with the device's
+share of the pool at 0, 0.3 and 0.5 its 199-token runs decoded at 5.01/4.96, 5.06/5.24 and
+3.92/4.02 tok/s. Alone (the bench
+above), the CPU takes 300 to 340 us a pair of GLM-5.3's at 12 to 20 threads, the device 700
+to 940 over the bus.
+
 **A prompt chunk's host pool experts in VRAM.** A prompt chunk routes nearly every expert
 of a layer, and the grouped GEMMs of a GGUF's block types read the host pool in place at
 about 4 GB/s. Before a chunk's layer runs, its host pool experts of block types are now

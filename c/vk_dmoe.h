@@ -143,14 +143,6 @@ static int vkc_hyb_threads(void) {
     return 1;
 #endif
 }
-/* a row of type t (I inputs) against act a's one row: the CPU's integer form, or with
- * GQ_EXACT=1 its float reference (gq_dequant_row), as its own matmuls would take it */
-static inline void vkc_hyb_row(float *y, const gq_act *a, const float *xf, const uint8_t *row, int t, int I, float *tmp) {
-    if (!gq_exact_mode()) { gq_row_all(y, 1, a, row, t, I); return; }
-    double acc = 0; gq_dequant_row(t, row, tmp, I);
-    for (int i = 0; i < I; i++) acc += (double)tmp[i] * xf[i];
-    *y = (float)acc;
-}
 /* layer i's host pool pairs of the step's n rows, their weighted sum into the CPU's rows */
 static void vkc_hyb_compute(VkcDmoe *d, const VkcHybJob *j) {
     int E = d->E, K = d->K, D = d->D, I = d->I, n = j->n;
@@ -171,45 +163,14 @@ static void vkc_hyb_compute(VkcDmoe *d, const VkcHybJob *j) {
         w->cap = w->gu && w->hh && w->dn ? np : 0;
         if (!w->cap) { w->err = 1; return; }
     }
-    float *gu = w->gu, *hh = w->hh, *dn = w->dn;
-    gq_act ax[VKC_DMOE_ROWS], ah[VKC_DMOE_ROWS * VKC_ROUTE_KMAX];
-    memset(ax, 0, sizeof ax); memset(ah, 0, sizeof(gq_act) * (size_t)np);
-    for (int s = 0; s < n; s++) if (gq_act_set(&ax[s], x + (size_t)s * D, 1, D)) w->err = 1;
-    /* gate and up of every pair, the activation, then down: one parallel region, the
-     * rows handed out in chunks (the cores of a hybrid CPU do not run at one speed) */
-    int nt = vkc_hyb_threads();
-    #pragma omp parallel num_threads(nt)
-    {
-        float *tmp = gq_exact_mode() ? malloc((size_t)(D > I ? D : I) * sizeof(float)) : NULL;
-        #pragma omp for schedule(dynamic, 32)
-        for (int r = 0; r < np * 2 * I; r++) {
-            int p = r / (2 * I), o = r % (2 * I); const VktHostExpert *h = &hx[ids[ps[p] * K + pk[p]]];
-            const uint8_t *row = o < I ? h->g + (size_t)o * h->rgu : h->u + (size_t)(o - I) * h->rgu;
-            vkc_hyb_row(gu + (size_t)p * 2 * I + o, &ax[ps[p]], x + (size_t)ps[p] * D, row, h->tg, D, tmp);
-        }
-        #pragma omp for schedule(static)
-        for (int p = 0; p < np; p++) {
-            const float *g = gu + (size_t)p * 2 * I, *u = g + I; float *h = hh + (size_t)p * I;
-            for (int o = 0; o < I; o++) {
-                float gv = g[o], uv = u[o];
-                if (j->limit > 0.f) { gv = gv < j->limit ? gv : j->limit; uv = uv < -j->limit ? -j->limit : uv > j->limit ? j->limit : uv; }
-                h[o] = gv / (1.f + expf(-gv)) * uv;
-            }
-            if (gq_act_set(&ah[p], h, 1, I)) w->err = 1;
-        }
-        #pragma omp for schedule(dynamic, 64)
-        for (int r = 0; r < np * D; r++) {
-            int p = r / D, o = r % D; const VktHostExpert *h = &hx[ids[ps[p] * K + pk[p]]];
-            vkc_hyb_row(dn + (size_t)p * D + o, &ah[p], hh + (size_t)p * I, h->d + (size_t)o * h->rd, h->td, I, tmp);
-        }
-        free(tmp);
-    }
+    float *dn = w->dn;
+    const VktHostExpert *hp[VKC_DMOE_ROWS * VKC_ROUTE_KMAX]; const float *xp[VKC_DMOE_ROWS * VKC_ROUTE_KMAX];
+    for (int p = 0; p < np; p++) { hp[p] = &hx[ids[ps[p] * K + pk[p]]]; xp[p] = x + (size_t)ps[p] * D; }
+    if (!vkt_host_pairs(hp, xp, np, D, I, j->limit, vkc_hyb_threads(), w->gu, w->hh, dn)) w->err = 1;
     for (int p = 0; p < np; p++) {   /* in rank order within a row */
         float wv = wt[ps[p] * K + pk[p]]; float *ys = y + (size_t)ps[p] * D; const float *o = dn + (size_t)p * D;
         for (int c = 0; c < D; c++) ys[c] += wv * o[c];
     }
-    for (int s = 0; s < n; s++) gq_act_free(&ax[s]);
-    for (int p = 0; p < np; p++) gq_act_free(&ah[p]);
 }
 static void *vkc_hyb_main(void *arg) {
     (void)arg;
