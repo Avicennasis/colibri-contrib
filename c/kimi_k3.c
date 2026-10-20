@@ -2166,6 +2166,28 @@ static void k3c_adopt_shared(Model *m);
 static void k3c_report(void);
 static int g_k3c_on;
 static int k3_vk_in_ram(void *ctx, int li, int e){ return slot_indexed((Model*)ctx,li,e)!=NULL; }
+/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size). */
+static size_t g_k3_vk_slot_bytes;
+static void k3_vk_ram_given(void *ctx, size_t bytes){
+    Model *m=(Model*)ctx; const Cfg *c=&m->c; int L=0,was=0,now=0;
+    for(int i=0;m->ecache&&i<c->n_layers;i++) L+=m->ecache[i].s!=NULL;
+    if(L<1||!g_k3_vk_slot_bytes) return;
+    const size_t per=g_k3_vk_slot_bytes*(size_t)L;
+    const int cut=(int)((bytes+per-1)/per);
+    for(int i=0;i<c->n_layers;i++){
+        LCache *lc=&m->ecache[i];
+        if(!lc->s) continue;
+        int cap=lc->cap-cut;
+        if(cap<c->topk) cap=c->topk;
+        if(cap<lc->n) cap=lc->n;   /* slots filled already stay */
+        if(cap>lc->cap) cap=lc->cap;
+        was=lc->cap; now=cap; lc->cap=cap;
+    }
+    fprintf(stderr,"[VK] kimi_k3: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
+            bytes/1073741824.0,now,was);
+}
 static int  k3_vk_load(void *ctx,int li,int e,VktExpertSrc *src,void **h);
 static int  k3_vk_load_batch(void *ctx,int li,const int *e,int n,VktExpertSrc *srcs,void **h);
 static void k3_vk_unhold(void *ctx,void *h);
@@ -2258,12 +2280,14 @@ static void k3_vk_tier_start(Model *m){
     if(g_k3_dho) k3_dho_place(m);                /* then the host copies go, before the tier sizes its budget */
     if(cuda_on) fprintf(stderr,"[VK] tier kimi_k3: the CUDA expert tier is on and wins; the Vulkan tier stays off\n");
     else if(nmoe&&vkt_wanted()){
+        g_k3_vk_slot_bytes=(size_t)(m->e_slot+8192);
         VktConfig vc={.engine="kimi_k3",.layers=c->n_layers,.experts=c->n_experts,
                       .hidden=c->latent,.inter=c->moe_inter,.topk=c->topk,
                       .gate_up={VKT_SRC_MXFP4_E8M0,32},.down={VKT_SRC_MXFP4_E8M0,32},
                       .act=VKT_ACT_SITU,.act_a=c->situ_b1,.act_b=c->situ_b2,
                       .max_rows=K3_VK_ROWS*c->topk,
                       .ram_reserve=(size_t)(m->e_slot+8192)*(size_t)cap*(size_t)nmoe,
+                      .ram_floor=(size_t)(m->e_slot+8192)*(size_t)c->topk*(size_t)nmoe,.ram_given=k3_vk_ram_given,
                       .dense_bytes=coli_vk_dense()&&!g_k3c_on&&!g_k3_dho&&!g_k3_partial?k3_vk_dense_bytes(m):0,   /* the chain's are there already; a partial chain: nothing more goes up */
                       .in_ram=k3_vk_in_ram,.ram_ctx=m,
                       .load=k3_vk_load,.release=k3_vk_unhold,.load_ctx=m,.load_batch=k3_vk_load_batch};

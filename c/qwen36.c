@@ -7579,6 +7579,32 @@ static int vk_in_ram(void *ctx, int layer, int e) {
     pthread_mutex_unlock(&g_pilot_mx);
     return r;
 }
+/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size). */
+static size_t g_vk_slot_bytes;
+static void vk_ram_given(void *ctx, size_t bytes) {
+    Model *m = ctx;
+    const Cfg *c = &m->c;
+    int L = 0, was = 0, now = 0;
+    for (int i = 0; m->cache && i < c->n_layers; i++) L += m->cache[i].slots != NULL;
+    if (L < 1 || !g_vk_slot_bytes) return;
+    const size_t per = g_vk_slot_bytes * (size_t)L;
+    const int cut = (int)((bytes + per - 1) / per);
+    pthread_mutex_lock(&g_pilot_mx);
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        if (!lc->slots) continue;
+        int cap = lc->cap - cut;
+        if (cap < c->topk) cap = c->topk;
+        if (cap < lc->n) cap = lc->n;   /* slots filled already stay */
+        if (cap > lc->cap) cap = lc->cap;
+        was = lc->cap; now = cap; lc->cap = cap;
+    }
+    pthread_mutex_unlock(&g_pilot_mx);
+    fprintf(stderr, "[VK] qwen36: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
+            bytes / 1073741824.0, now, was);
+}
 /* After the device, the chain, a qpack container and the CUDA tier are decided, before
  * the expert tier sizes its budget: the dense matrices go up now, so the tier sees them
  * placed. The CUDA tier and a qpack container keep the host copies (the dense part
@@ -7671,7 +7697,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
         gu = (VktFmt){gs ? VKT_SRC_I8_GS : VKT_SRC_I8_ROW, gs}; dn = gu;
     }
     int64_t ng = (int64_t)c->inter * c->hidden;
-    size_t slot = g_gguf ? (size_t)m->gqe_max
+    size_t slot = g_vk_slot_bytes = g_gguf ? (size_t)m->gqe_max
                 : (size_t)(xf_mode(m) ? (2 * ng + ng) / 2 : 3 * ng) +
                   (size_t)(2 * scale_count_gu(c) + scale_count_d(c)) * sizeof(float);
     VktConfig vc = {.engine = "qwen36", .layers = c->n_layers, .experts = c->n_experts,
@@ -7679,6 +7705,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
                     .gate_up = gu, .down = dn, .act = VKT_ACT_SWIGLU,
                     .max_rows = QWEN_VK_ROWS * c->topk,
                     .ram_reserve = slot * (size_t)cap * (size_t)c->n_layers,
+                    .ram_floor = slot * (size_t)c->topk * (size_t)c->n_layers, .ram_given = vk_ram_given,
                     .dense_bytes = vk_dense_bytes(m), .stage = g_vk_chain,
                     .in_ram = vk_in_ram, .ram_ctx = m,
                     .load = vk_load, .release = vk_release, .load_ctx = m,

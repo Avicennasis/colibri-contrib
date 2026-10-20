@@ -11143,6 +11143,21 @@ static int vk_in_ram(void *ctx,int layer,int eid){
     Model *m=ctx;
     return pin_indexed(m,layer,eid)!=NULL || ecache_indexed(m,layer,eid,0)!=NULL;
 }
+/* The tier's host pool took `bytes` of the RAM the expert LRU was sized from (vk_tier.h,
+ * ram_given): a lower cap, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool instead,
+ * and the LRU keeps its size). */
+static void vk_ram_given(void *ctx,size_t bytes){
+    Model *m=ctx; const Cfg *c=&m->c;
+    const double row=expert_cache_row_bytes(m,m->ebits);   /* a slot in every sparse layer */
+    if(row<=0||!m->ecn) return;
+    int cut=(int)(((double)bytes+row-1)/row), was=m->ecap, cap=m->ecap-cut;
+    if(cap<c->topk) cap=c->topk;
+    for(int i=0;i<=c->n_layers;i++) if(cap<m->ecn[i]) cap=m->ecn[i];   /* slots filled already stay */
+    if(cap>m->ecap) cap=m->ecap;
+    m->ecap=cap;
+    fprintf(stderr,"[VK] colibri: the tier's host pool took %.1f GiB of the RAM the expert LRU was sized from: %d slots a layer, not %d\n",
+            bytes/1073741824.0,cap,was);
+}
 /* The tier's streaming (a big prompt chunk's cold experts on the device): a group of
  * experts as vk_cpu_pairs resolves them -- the pin set, the LRU, the misses read into
  * the working-set slots in parallel -- each valid until the tier gives it back. The
@@ -11307,6 +11322,7 @@ static void vk_tier_start(Model *m){
                   .extra_layers=xgu.kind!=VKT_SRC_NONE, .extra_gate_up=xgu, .extra_down=xdn,
                   .max_rows=GLM_VK_ROWS*c->topk,
                   .ram_reserve=(size_t)((double)m->ecap*expert_cache_row_bytes(m,m->ebits)),
+                  .ram_floor=(size_t)((double)c->topk*expert_cache_row_bytes(m,m->ebits)), .ram_given=vk_ram_given,
                   .dense_bytes=(size_t)dense,
                   .in_ram=vk_in_ram, .ram_ctx=m,
                   .max_experts=g_vk_experts>0 ? g_vk_experts : 0,

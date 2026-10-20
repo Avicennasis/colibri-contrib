@@ -1119,6 +1119,32 @@ static int olmoe_vk_in_ram(void *ctx, int layer, int e) {
     pthread_mutex_unlock(&g_pilot_mx);
     return r;
 }
+/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size). */
+static size_t g_olmoe_vk_slot_bytes;
+static void olmoe_vk_ram_given(void *ctx, size_t bytes) {
+    Model *m = ctx;
+    const Cfg *c = &m->c;
+    int L = 0, was = 0, now = 0;
+    for (int i = 0; m->cache && i < c->n_layers; i++) L += m->cache[i].slots != NULL;
+    if (L < 1 || !g_olmoe_vk_slot_bytes) return;
+    const size_t per = g_olmoe_vk_slot_bytes * (size_t)L;
+    const int cut = (int)((bytes + per - 1) / per);
+    pthread_mutex_lock(&g_pilot_mx);
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        if (!lc->slots) continue;
+        int cap = lc->cap - cut;
+        if (cap < c->topk) cap = c->topk;
+        if (cap < lc->n) cap = lc->n;   /* slots filled already stay */
+        if (cap > lc->cap) cap = lc->cap;
+        was = lc->cap; now = cap; lc->cap = cap;
+    }
+    pthread_mutex_unlock(&g_pilot_mx);
+    fprintf(stderr, "[VK] olmoe: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
+            bytes / 1073741824.0, now, was);
+}
 /* COLI_VULKAN=1: describe the experts to the tier (int8 rows with an f32 scale per
  * row, gate, up and down as the merged container holds them: fmt 1), after the
  * weights and the history (COLI_USAGE, read by model_init_range), and warm it from
@@ -1196,11 +1222,13 @@ static void olmoe_vk_tier_start(Model *m) {
         }
         dense += coli_vk_f32_payload(m->lm_head, D, c->vocab);
     }
+    g_olmoe_vk_slot_bytes = slotb;
     VktConfig vc = {.engine = "olmoe", .layers = c->n_layers, .experts = c->n_experts,
                     .hidden = c->hidden, .inter = c->inter, .topk = c->topk,
                     .gate_up = gu, .down = dn, .layer_gate_up = lgu, .layer_down = ldn,
                     .act = VKT_ACT_SWIGLU, .max_rows = OLMOE_VK_ROWS * c->topk,
                     .ram_reserve = slotb * (size_t)m->cache[0].cap * (size_t)c->n_layers,
+                    .ram_floor = slotb * (size_t)c->topk * (size_t)c->n_layers, .ram_given = olmoe_vk_ram_given,
                     .dense_bytes = dense, .in_ram = olmoe_vk_in_ram, .ram_ctx = m,
                     .load = olmoe_vk_load, .release = olmoe_vk_release, .load_ctx = m,
                     .stage = 1};   /* the chain (decided after the tier) stages a prompt chunk's host pool experts */

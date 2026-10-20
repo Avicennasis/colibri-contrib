@@ -2995,6 +2995,28 @@ static int q38_vk_in_ram(void *ctx,int layer,int e){
     int si=lc->by_expert?lc->by_expert[e]:-1;
     return si>=0&&si<lc->n&&lc->slots[si].eid==e;
 }
+/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size). */
+static size_t g_q38_vk_slot_bytes;
+static void q38_vk_ram_given(void *ctx,size_t bytes){
+    Model *m=(Model*)ctx;Cfg *c=&m->c;int L=0,was=0,now=0;
+    for(int i=0;m->cache&&i<c->layers;i++)L+=m->cache[i].slots!=NULL;
+    if(L<1||!g_q38_vk_slot_bytes)return;
+    const size_t per=g_q38_vk_slot_bytes*(size_t)L;
+    const int cut=(int)((bytes+per-1)/per);
+    for(int i=0;i<c->layers;i++){
+        LCache *lc=&m->cache[i];
+        if(!lc->slots)continue;
+        int cap=lc->cap-cut;
+        if(cap<c->topk)cap=c->topk;
+        if(cap<lc->n)cap=lc->n;   /* slots filled already stay */
+        if(cap>lc->cap)cap=lc->cap;
+        was=lc->cap;now=cap;lc->cap=cap;
+    }
+    fprintf(stderr,"[VK] qwen38: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
+            bytes/1073741824.0,now,was);
+}
 /* The tier's streaming (a big prompt chunk's cold experts on the device): an expert's
  * bytes as the CPU path has them, through the layer's RAM cache (a slot stays valid
  * until the next load); several at once through the parallel reads. */
@@ -3131,12 +3153,14 @@ static void q38_vk_tier_start(Model *m,int cap){
         else { fm=q38_vk_native_fmt(m,c->layers,c->layers+1,&ram_mtp); fmd=fm; }
         if(fm.kind==VKT_SRC_NONE)fprintf(stderr,"[VK] tier qwen38: the MTP head's experts mix formats; they stay on the CPU\n");
     }
+    g_q38_vk_slot_bytes=ram_expert;
     VktConfig vc={.engine="qwen38",.layers=c->layers,.experts=c->experts,.hidden=H,.inter=F,.topk=c->topk,
                   .gate_up=f,.down=fd,.act=VKT_ACT_SWIGLU,
                   .extra_layers=fm.kind!=VKT_SRC_NONE,.extra_gate_up=fm,.extra_down=fmd,
                   .extra_whole=q38c_mtp_planned(m),   /* the head's layer on the device: its experts whole, in the frame */
                   .max_rows=q38_moe_prefill_rows(c,q38_prefill_batch_rows())*c->topk,
                   .ram_reserve=ram_expert*(size_t)cap*(size_t)c->layers,
+                  .ram_floor=ram_expert*(size_t)c->topk*(size_t)c->layers,.ram_given=q38_vk_ram_given,
                   .dense_bytes=q38_vk_dense_bytes(m),
                   .chain_bytes=g_vk_chain?q38c_late_bytes(m,q38_vk_chain_ctx(m)):0,
                   .stage=g_vk_chain,   /* the chain stages a prompt chunk's host pool experts */

@@ -679,6 +679,8 @@ typedef struct {
      * (g53_dho_reload); vk_gone = 1 while the device holds it alone */
     char *vk_name;
     int vk_kind, vk_gone;
+    int vk_hgemv;                         /* read per head by the chain's MLA (k_b, v_b): a GGUF's goes up
+                                           * dequantized, which that op reads (glm53_chain.h) */
 } Mat;
 
 enum { G53_GGML = 32 };
@@ -924,6 +926,7 @@ static void absorb_kvb(GModel *m, GLayer *l, const char *name) {
             if (st_find(&m->S, kb) && st_find(&m->S, vb)) {
                 l->kvb_kt = load_mat(m, (int64_t)H * L, QK, "%s", kb);
                 l->kvb_v = load_mat(m, (int64_t)H * V, L, "%s", vb);
+                l->kvb_kt.vk_hgemv = l->kvb_v.vk_hgemv = 1;
                 return;
             }
         }
@@ -2172,11 +2175,11 @@ static void expert_mats(const GModel *m, int layer, const Slot *slot, Mat *gate,
     }
     const Mat shape[3] = {
         { 4, NULL, NULL, slot->piece[0], (const float *)slot->piece[1],
-          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0 },
+          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, 0 },
         { 4, NULL, NULL, slot->piece[2], (const float *)slot->piece[3],
-          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0 },
+          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, 0 },
         { 4, NULL, NULL, slot->piece[4], (const float *)slot->piece[5],
-          hidden, inter, 64, NULL, 0, NULL, NULL, 0, 0 },
+          hidden, inter, 64, NULL, 0, NULL, NULL, 0, 0, 0 },
     };
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
@@ -5360,6 +5363,28 @@ static int glm53_in_ram(void *ctx, int layer, int eid) {
     for (int j = 0; j < cache->n; j++) if (cache->s[j].eid == eid) return 1;
     return 0;
 }
+/* The tier's host pool took `bytes` of the RAM the expert cache was sized from (vk_tier.h,
+ * ram_given): fewer slots a layer, top-k at least (COLI_VK_TIER_HOST_GB sizes the pool
+ * instead, and the cache keeps its size). */
+static void glm53_ram_given(void *ctx, size_t bytes) {
+    GModel *m = ctx;
+    const Cfg *c = &m->c;
+    const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin, sparse = m->layer_end - from;
+    if (!m->ecache || sparse < 1 || !m->e_slot) return;
+    const size_t per = (size_t)m->e_slot * (size_t)sparse;   /* a slot in every sparse layer */
+    const int cut = (int)((bytes + per - 1) / per);
+    int was = 0, now = 0;
+    for (int i = from; i < m->layer_end; i++) {
+        LCache *cache = &m->ecache[i];
+        int cap = cache->cap - cut;
+        if (cap < c->topk) cap = c->topk;
+        if (cap < cache->n) cap = cache->n;   /* slots filled already stay */
+        if (cap > cache->cap) cap = cache->cap;
+        was = cache->cap; now = cap; cache->cap = cap;
+    }
+    fprintf(stderr, "[VK] glm53: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
+            bytes / 1073741824.0, now, was);
+}
 /* Bytes the resident matrices will take on the device: they upload at first use,
  * after the tier has taken its budget. */
 static size_t glm53_mat_dev_bytes(const Mat *w) {
@@ -5434,6 +5459,7 @@ static void glm53_vk_tier_start(GModel *m) {
                         .act = VKT_ACT_SWIGLU, .act_limit = c->swiglu_limit,
                         .max_rows = GLM53_VK_ROWS * c->topk,
                         .ram_reserve = (size_t)cap * (size_t)sparse * (size_t)m->e_slot,
+                        .ram_floor = (size_t)c->topk * (size_t)sparse * (size_t)m->e_slot, .ram_given = glm53_ram_given,
                         /* a partial chain: nothing more of the trunk goes up, but the chain's first
                          * forward allocates its scratch and the N layers' MLA caches */
                         .dense_bytes = g_g53_partial ? g_g53c_lazy
