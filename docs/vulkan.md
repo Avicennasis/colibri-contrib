@@ -2700,6 +2700,28 @@ engine has them. For a step of at least `COLI_VK_TIER_GEMM_ROWS` rows (16),
   Inkling's forks at a near tie after 36 words ("beautification" against "initiatives"):
   a pool expert's rows now run in the slots' batches, where the backend may pick another
   of its GEMM routes for them than in the residents' batch, as for a streamed expert.
+- **A pool expert of a row or two stays on the CPU.** A prompt step's host pool experts of
+  block types with at most `COLI_VK_HYBRID_BIG_ROWS` rows (2) are computed by the CPU in
+  place at the join (`vkt_host_pairs`, as the decode's hybrid steps), while the device
+  computes the step's batches, instead of crossing the bus for a row or two. An expert's
+  pairs go together: its rows are read once for all of them and each pair keeps the bits
+  it has on its own (the kernels of `ggml_quants.h` take each activation row apart). The
+  tier's line adds `, and S prompt steps' P pairs` to its hybrid part. Measured on the RTX
+  PRO 4000, MiMo-V2.6-Flash Q2_K_S (106 GB), a 464-token prompt, three runs each on a copy
+  of one history:
+
+  | `COLI_VK_HYBRID_BIG_ROWS` | prefill | the device's time | the CPU waiting for it | the prompt's pairs on the CPU |
+  |---|---|---|---|---|
+  | 0 | 36.9-37.8 tok/s | 27.9 s | 25.3 s | 0 |
+  | 2 (the default) | 38.5-39.4 tok/s | 23.7 s | 21.2 s | 6756 |
+  | 4 | 38.3-39.1 tok/s | 21.2 s | 18.8 s | 16145 |
+  | 8 | 37.0-37.8 tok/s | 18.2 s | 16.0 s | 37030 |
+  | 16 | 28.3-29.4 tok/s | 13.8 s | 11.6 s | 102413 |
+
+  Past 4 rows the CPU becomes the longer side. Grouped, a pair costs 290-380 us against
+  410 for a decode step's (each pair its own rows). On GLM-5.2 UD-IQ1_S, whose prompt the
+  CPU's cold experts hold (230 s of CPU against 26 s of device time), 0, 1, 2 and 4 rows
+  gave the same 2.9-3.5 tok/s.
 - **Nothing pollutes the resident set.** A streamed expert is not offered for promotion:
   a prompt's whole working set passes through the slots and would otherwise flush the
   residents. Its routings count as heat, as every routing does, and the slots are free
@@ -2770,6 +2792,7 @@ experts came from the host pool (`135 streamed (135 of them copied from the host
 | `COLI_VK_TIER_STREAM_HALF` | x rows within 32 MiB | Rows of a sub-batch (tests: small ones cut experts into parts). |
 | `COLI_VK_TIER_STREAM_PAR` | on | `0`: a streamed expert's conversion on the engine thread alone. |
 | `COLI_VK_TIER_POOL_COPY` | on with the host pool and streaming | `0`: a big step's host pool experts of block types are read in place over PCIe again, not copied into the slots. |
+| `COLI_VK_HYBRID_BIG_ROWS` | `2` | A big step's host pool experts of block types with at most this many rows are computed by the CPU in place; `0` none. |
 
 ### Validation and timing
 

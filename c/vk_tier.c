@@ -2523,7 +2523,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     T.hybrid = T.dmax[2] > 0 && T.c.act == VKT_ACT_SWIGLU && !(hy && *hy == '0');
     /* and a prompt step's host pool experts of at most COLI_VK_HYBRID_BIG_ROWS rows */
     const char *hbr = getenv("COLI_VK_HYBRID_BIG_ROWS");
-    T.hy_big = hbr && *hbr ? atoi(hbr) : 1;
+    T.hy_big = hbr && *hbr ? atoi(hbr) : 2;
     /* a prompt step's host pool experts of block types copied into the streaming's slots by
      * the copy engine (12.6 GB/s on a PCIe 4.0 x8 card), where the grouped GEMMs read them
      * in place at about 4 (COLI_VK_TIER_POOL_COPY=0: in place) */
