@@ -552,7 +552,7 @@ order its CPU-only run does, and keeps a history for the warm start where it has
 | inkling | int4 container `I4U_PAIRS_ROW` (fmt 2); int8 container `I8_ROW` (fmt 1); runtime int8 rows, `I8_AS_I4_ROW` at 2 to 4 bits (fmt 2) and `I8_ROW` above; `F32` at `bits=0` (fmt 10). Gate and up come from the fused `gate_up` tensor, up I rows in | SwiGLU | `<snap>/.coli_usage` or `PIN=<path>`, in the generate and serve modes; the ref.json oracle reads none | [Inkling and OLMoE](#inkling-and-olmoe) |
 | olmoe | int8 rows `I8_ROW` (fmt 1), gate, up and down as the merged container holds them | SwiGLU | `COLI_USAGE` only | [Inkling and OLMoE](#inkling-and-olmoe) |
 | kimi_k3 (Kimi K3) | the checkpoint's MXFP4 with ue8m0 scales `MXFP4_E8M0` 32 (fmt 7): gate `w1`, up `w3`, down `w2`, in the latent space | SiTU-GLU (`VKT_ACT_SITU`) | `COLI_USAGE` (default `<snap>/.coli_usage`) | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
-| mimo (MiMo-V2.6 Flash and Pro) | the release's MXFP4 `MXFP4_E8M0` 32 (fmt 7) | SwiGLU | none: the tier fills as experts pass by | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
+| mimo (MiMo-V2.6 Flash and Pro) | the release's MXFP4 `MXFP4_E8M0` 32 (fmt 7); a GGUF's other block types as the file has them (100 + the ggml type), each layer its own | SwiGLU | `COLI_USAGE` (default `<snap>/.coli_usage`) | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
 | deepseek_v41 (DeepSeek V4.1 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7), as the checkpoint stores it | SwiGLU with `swiglu_limit` | `COLI_USAGE` (default `<snap>/.coli_usage`), kept only while the tier is on | the backbone's layers; the DSpark stages, with caches of their own, are extra layers ([below](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)) |
 | deepseek_v4 (DeepSeek V4 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7); pinned experts unpacked from rows16 | `VKT_ACT_SWIGLU_V4` | the store's own `<model>/.coli_usage` | [DeepSeek V4's activation](#deepseek-v4s-activation) |
 | colibri (GLM-5.2) | `F32` (fmt 10), int8 `I8_ROW` (fmt 1), int4 per row `I4U_PAIRS_ROW` (fmt 2), int4-gs `I4U_PAIRS_GS` (fmt 4), int3-g64 `I3_G64` (fmt 5); down may have its own | SwiGLU | `<snap>/.coli_usage` | [GLM-5.2 and GLM-5.3 Flash](#glm-52-and-glm-53-flash-on-the-tier) |
@@ -1397,6 +1397,31 @@ step loses nothing the host holds, and the CPU runs the step's remaining rows fr
 the caches end. Nothing is rebuilt, and a turn with a picture recovers too. The line is
 `[VK] mimo chain: the device was lost at position P; ...`.
 
+**A GGUF of block types** (ggml-org's MiMo-V2.6-Flash Q2_K_S, say: K-quant experts and
+trunk). The engine used to take a GGUF only with MXFP4 experts and a BF16 trunk. A trunk
+matrix of a ggml block type now stays the file's rows (`DW_GQ`): the CPU multiplies it in
+its integer form (`ggml_quants.h`), the chain uploads it as the device's block format, and
+the per-matrix path leaves it to the CPU. The experts are read as the file has them (a slot
+`[down | gate | up]`, each layer its types), computed on the CPU with the same kernels and
+taken by the tier as their blocks, the commonest pair of types as the main form. A block
+embedding becomes the bf16 rows the engine keeps.
+
+**The expert history.** mimo now counts its routing (`route_trace.h`) and keeps it in
+`COLI_USAGE` (default `<model>/.coli_usage`), and the tier starts warm from it
+(`vkt_plan`, `vkt_put`). Before, every start had the tier empty, filling as experts passed
+by. On MiMo-V2.6-Flash Q2_K_S (106 GB) with an RTX PRO 4000 and 62 GB of RAM, three
+120-word prompts of 128 tokens on one server: decode 2.0, 2.9, 3.8 tok/s cold, then 7.8 from
+the first request once a run had written the history (85% of the routed experts on the
+device, about 1230 disk loads a turn instead of about 21500).
+
+**A prompt chunk's scratch.** The chain reserved its scratch for each prompt's rows, so a
+longer prompt than the first had to grow it after the tier's promotions had filled the
+budget: on the server above the second request's 172 rows were refused and the chain was
+off for the rest of the session (decode 7.9 then 3.4-3.9 tok/s, prefill 7.9 then 6.0 and 3.9). The
+first prompt now reserves the whole chunk (`mc_chunk_rows`, sized from the room free at
+the first forward), and a refused growth runs the prompt in chunks of the rows the chain
+holds instead of turning it off: prefill 8.1-8.2 and decode 7.8-7.9 tok/s on every request.
+
 **What stays off the device.** The router's top-k and the routed experts the tier does
 not hold, the embedding gather, the vision tower (on the device only with
 `COLI_VK_DENSE=1`, through the per-matrix path), and runs with `MIMO_TRACE` (the CPU's
@@ -1670,6 +1695,23 @@ This model's greedy text forks at near ties where the CPU's own two forms fork t
 an 8-token prompt the CPU's integer and float sums (`GQ_EXACT=1`) put the logits 28 to
 37% apart, and the chain against the CPU's float sums 2e-3 on the first row and up to 8%
 after it.
+
+**A GGUF (colibri).** GLM-5.2's matrices from a GGUF go up the same way: the file's blocks
+(100 + the ggml type), rows the CPU keeps interleaved by 16 back to the file's first
+(`glmc_gq_rows`). A GGUF splits `kv_b` into the per-head `k_b` and `v_b`, which are the
+absorbed core's `k_abs` and `v_abs`: they go up dequantized as floats, as glm53's, and the
+per-matrix path never takes them for a whole `kv_b`. Before, the chain had no form for
+either and every layer stayed on the CPU. UD-IQ1_S (202 GB) on an RTX PRO 4000 with 62 GB
+of RAM and two NVMe drives, a 166-token prompt and 128 tokens: the trunk on the CPU with
+the tier on the whole card (2165 experts) gave 2.6 tok/s of prompt and 0.67-0.68 of
+decode, the trunk on the device (78 layers, 16 GiB) with the tier on the rest (580
+experts) 2.8-2.9 and 0.72-0.74 (the CPU alone 1.9 and 0.46). The model is three times the
+RAM: the CPU's share of the experts read from the disk is the cost either way, and
+giving the tier more of the card measured no better (39 layers on the device and 1313
+experts: 2.7 and 0.67-0.85; 20 layers and 1685 experts: 2.5-2.7 and 0.62-0.68). With
+the device's float form (`GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0`) the greedy
+text is the CPU's float form's for 40 tokens, and the first 4 tokens' top-10 logprobs
+agree within 1e-4; the integer forms fork at a tie, as the CPU's own two forms do.
 
 **The state.** The KV caches (GLM-5.2's latent, rope keys and index keys; GLM-5.3's
 latent, index keys and pool gates) stay the host's: each step copies its new rows back,

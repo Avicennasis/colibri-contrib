@@ -70,6 +70,7 @@ typedef struct {
     int lo, d;                                 /* its layers start at lo, on device d (vkc_device) */
     int nl, full;                              /* layers on the device (lo..lo+nl-1); the head there too */
     int rows;                                  /* scratch capacity in rows */
+    int held;                                  /* the most rows its device buffers were reserved for */
     int rd_off[2];                             /* the RoPE table of each layer kind in cs */
     VkcBuf *prm;                               /* the norms and the sink logits */
     size_t *o_ln1, *o_ln2, *o_sink, o_final;
@@ -302,6 +303,7 @@ static int mc_scratch(MimoChain *ch, Model *m, int rows, int out) {
         ch->host_out = ho;
     }
     ch->rows = rows;   /* o_kvd and rd_off are laid out for exactly this many */
+    if (rows > ch->held) ch->held = rows;
     return 1;
 }
 
@@ -576,8 +578,17 @@ static int mc_forward(Model *m, float *h, int S, int pos_base, float *logits, in
         if (rows > CH2) rows = CH2;
         if (ch2->ks.on && rows > ch2->ks.chunk) rows = ch2->ks.chunk;
     }
+    /* The first prompt reserves the whole chunk (CH rows, sized from the room free at the
+     * first forward) while that room is there: the expert tier's promotions fill its budget
+     * as the conversation goes, and a later prompt's larger scratch was refused (MiMo-V2.6
+     * Flash on a 24 GB card, the second request: the chain off for the session) */
+    if (!ch2 && !ch->held && S > 2 && CH > rows) mc_scratch(ch, m, CH, ch->full && logits && all_rows ? CH : 1);
     int out = logits && all_rows ? rows : 1;
     int sc = mc_scratch(ch, m, rows, ch->full ? out : 1);
+    if (!sc && !ch2 && ch->held > 0 && ch->held < rows) {   /* no room to grow: chunks of the rows it holds */
+        rows = ch->held; out = logits && all_rows ? rows : 1;
+        sc = mc_scratch(ch, m, rows, ch->full ? out : 1);
+    }
     if (sc && ch2) { vkc_device(1); sc = mc_scratch(ch2, m, rows, ch2->full ? out : 1); vkc_device(0); }
     if (!sc) {
         fprintf(stderr, "[VK] mimo chain: device memory for %d rows refused; per-matrix path\n", rows);
