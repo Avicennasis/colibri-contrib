@@ -1077,16 +1077,25 @@ static int cc_rope(CcBuf *x, CcBuf *cs, const CcRope *p) {
  * of exp(score - m) and acc[d] = sum exp(score - m) V[t][d] into the scratch; mode 1: a
  * block a (head, row): the blocks joined, acc / l, the gate. COLI_CUDA_ATTN_DEC=0 never. */
 #define CC_ATTN_DEC_MIN 128
+/* the positions a block of cc_attn_dec_k takes for a row of n positions over H heads, as a
+ * decode step of that row alone chooses it: 64, doubled to 256 at most while there would be
+ * more than 1024 blocks */
+__host__ __device__ static inline int cc_attn_dec_len(int n, int H) {
+    int L = 64, nb = (n + L - 1) / L;
+    while (L < 256 && H * nb > 1024) { L *= 2; nb = (n + L - 1) / L; }
+    return L;
+}
+#define CC_ATTN_DEC_ROWS 8   /* a decode step's or a verify's rows (every engine's verify) */
 __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restrict__ q, const float *__restrict__ kc,
         const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, float *__restrict__ xs,
-        CcAttn p, int mode, int L, int nb) {
+        CcAttn p, int mode, int nb) {
     __shared__ float qs[256];
     __shared__ float sc[256];
     __shared__ float red[8];
     int tid = threadIdx.x, wp = tid >> 5, lane = tid & 31, h = blockIdx.x, hd = p.hd, stride = hd + 2;
     if (mode == 0) {
         int b = blockIdx.y, s = blockIdx.z, kvh = h / (p.H / p.KVH);
-        int n = p.pos_base + s + 1, t0 = b * L, cnt = min(L, n - t0);
+        int n = p.pos_base + s + 1, L = cc_attn_dec_len(n, p.H), t0 = b * L, cnt = min(L, n - t0);
         size_t xo = ((size_t)(s * p.H + h) * nb + b) * stride;
         if (cnt <= 0) {   /* past the row's positions: an empty block */
             if (tid == 0) { xs[xo] = -3.0e38f; xs[xo + 1] = 0.f; }
@@ -1128,7 +1137,7 @@ __global__ static void __launch_bounds__(256) cc_attn_dec_k(const float *__restr
         if (tid == 0) { xs[xo] = M; xs[xo + 1] = l; }
         return;
     }
-    int s = blockIdx.y, n = p.pos_base + s + 1, nbr = (n + L - 1) / L;
+    int s = blockIdx.y, n = p.pos_base + s + 1, L = cc_attn_dec_len(n, p.H), nbr = (n + L - 1) / L;
     size_t xo = (size_t)(s * p.H + h) * nb * stride;
     float M = -3.0e38f;
     for (int b = 0; b < nbr; b++) M = fmaxf(M, xs[xo + (size_t)b * stride]);
@@ -1176,9 +1185,22 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
 #if !defined(__HIP__) && !defined(__HIP_PLATFORM_AMD__)
     fk = fl > 0 && c->major >= 7 && 16 % G == 0 && (p->hd == 64 || p->hd == 128 || p->hd == 256);
 #endif
-    if (dec && fk && p->S <= 4 && p->sel_row <= 0 && last >= CC_ATTN_DEC_MIN) {
-        int L = 64, nb = (last + L - 1) / L;
-        while (L < 256 && p->H * nb > 1024) { L *= 2; nb = (last + L - 1) / L; }
+    if (dec && fk && p->S <= CC_ATTN_DEC_ROWS && p->sel_row <= 0 && last >= CC_ATTN_DEC_MIN) {
+        /* each row as a decode step of it alone: its own blocks of positions (cc_attn_dec_len),
+         * and the rows whose positions are fewer than CC_ATTN_DEC_MIN through cc_attn_k */
+        int k = CC_ATTN_DEC_MIN - (p->pos_base + 1);
+        if (k > 0) {
+            CcAttn a = *p; a.S = k;
+            cc_attn_k<<<dim3((unsigned)p->H, (unsigned)k), 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), nullptr, a);
+            if (!launched(c, "attn")) return 0;
+            CcAttn b = *p; b.S -= k; b.pos_base += k; b.q_off += k * p->q_row; b.o_off += k * p->o_row; b.g_off += k * p->g_row;
+            return cc_attn(q, kc, vc, o, gate, sel, &b);
+        }
+        int nb = 1;
+        for (int r = 0; r < p->S; r++) {
+            int n = p->pos_base + r + 1, L = cc_attn_dec_len(n, p->H), m = (n + L - 1) / L;
+            if (m > nb) nb = m;
+        }
         size_t need = (size_t)p->S * p->H * nb * (p->hd + 2) * sizeof(float);
         if (need > c->adec_bytes) {   /* rare: the context past what it was; the frames before done first */
             if (c->adec) { if (!cc_ok(c, cudaStreamSynchronize(c->stream), "attn scratch")) return 0; cudaFree(c->adec); }
@@ -1189,9 +1211,9 @@ static int cc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf 
         }
         if (c->adec) {
             cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)nb, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 0, L, nb);
+                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 0, nb);
             cc_attn_dec_k<<<dim3((unsigned)p->H, (unsigned)p->S), 256, 0, c->stream>>>(
-                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 1, L, nb);
+                fp(q), fp(kc), fp(vc), fpw(o), fp(gate), c->adec, *p, 1, nb);
             return launched(c, "attn (positions in blocks)");
         }
     }

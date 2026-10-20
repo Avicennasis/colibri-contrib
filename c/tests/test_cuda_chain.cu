@@ -493,7 +493,8 @@ int main(void) {
     }
     {   /* a decode's or a verify's rows over many positions: in blocks of positions (cc_attn_dec_k) */
         struct { int H, KV, hd, S, pos_base, cap, gate; } cs[] = {{16, 2, 256, 3, 2500, 3000, 1}, {4, 2, 32, 1, 140, 300, 1},
-                                                                   {8, 8, 128, 4, 700, 800, 0}};
+                                                                   {8, 8, 128, 4, 700, 800, 0}, {16, 2, 256, 6, 700, 800, 1},
+                                                                   {16, 2, 128, 6, 125, 300, 1}, {16, 2, 128, 6, 4093, 4200, 0}};
         for (auto &k : cs) {
             const int qdim = 2 * k.hd, k_off = 32;
             std::vector<float> q = rnd((size_t)k.S * k.H * qdim, 51), kc = rnd((size_t)k_off + (size_t)k.KV * k.cap * k.hd, 52),
@@ -507,6 +508,21 @@ int main(void) {
             snprintf(what, sizeof what, "H %d/%d hd %d: %d rows after %d positions, in blocks", k.H, k.KV, k.hd, k.S, k.pos_base);
             ck(T->begin() && T->attn(qb, kb, vb, ob, k.gate ? qb : NULL, NULL, &p) && T->submit(1) &&
                maxdiff(down(ob, o.size()).data(), ref.data(), o.size()) < 1e-4, what);
+            /* a verify's rows: each the bits of a decode step of that row alone (the blocks of positions
+             * its own count chooses, past 128 positions and across the doubling of the block at 4096) */
+            if (k.S > 1) {
+                std::vector<float> all = down(ob, o.size());
+                CcBuf *o1 = T->buf((size_t)k.H * k.hd * 4, CC_DEV);
+                int same = 1;
+                for (int r = 0; r < k.S && same; r++) {
+                    CcAttn p1 = p; p1.S = 1; p1.pos_base = k.pos_base + r; p1.q_off = p.q_off + r * p.q_row; p1.g_off = p.g_off + r * p.g_row; p1.o_off = 0;
+                    same = T->begin() && T->attn(qb, kb, vb, o1, k.gate ? qb : NULL, NULL, &p1) && T->submit(1) &&
+                           !memcmp(down(o1, (size_t)k.H * k.hd).data(), all.data() + (size_t)r * k.H * k.hd, (size_t)k.H * k.hd * 4);
+                }
+                snprintf(what, sizeof what, "and each of the %d rows a one-row step's bits", k.S);
+                ck(same, what);
+                T->free(o1);
+            }
             T->free(qb); T->free(kb); T->free(vb); T->free(ob);
         }
     }
