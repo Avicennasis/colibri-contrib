@@ -99,6 +99,35 @@ static ColiVkTensor *olc_tensor(int d, void **vk, const float *w, int I, int O) 
     return (ColiVkTensor *)*vk;
 }
 
+/* A GGUF's matrix (OlmGx) on the device: its blocks as the file has them (100 + the ggml
+ * type, the device's block formats; rows held interleaved by 16 go back to the file's
+ * first). -1: no block form for its type or width. */
+static int olc_gq_fmt(const OlmGx *g, int I) {
+    if (!g->b) return -1;
+    const int b = gq_r16_base(g->t), t = b >= 0 ? b : g->t, be = coli_vk_block_elems(100 + t);
+    return be > 0 && I % be == 0 ? 100 + t : -1;
+}
+static ColiVkTensor *olc_gq_tensor(int d, void **vk, const OlmGx *g, int I, int O) {
+    if (*vk == (void *)&g_vk_refused) return NULL;
+    if (*vk) return (ColiVkTensor *)*vk;
+    const int f = olc_gq_fmt(g, I), b = gq_r16_base(g->t);
+    uint8_t *rows = NULL;
+    if (f < 0 || (b >= 0 && (O % 16 || !(rows = malloc((size_t)gq_row_bytes(f - 100, I) * (size_t)O))))) {
+        *vk = &g_vk_refused; return NULL;
+    }
+    if (rows) gq_r16_unpack(g->t, rows, g->b, O, I);
+    const void *src = rows ? (const void *)rows : (const void *)g->b;
+    int ok = d ? coli_vk_tensor_ensure2((ColiVkTensor **)vk, src, NULL, f, I, O, 0)
+               : coli_vk_tensor_ensure((ColiVkTensor **)vk, src, NULL, f, I, O, 0);
+    free(rows);
+    if (!ok) { *vk = &g_vk_refused; return NULL; }
+    return (ColiVkTensor *)*vk;
+}
+/* olc_tensor, or a GGUF's (g->b set) as its blocks */
+static ColiVkTensor *olc_mat(int d, void **vk, const float *w, const OlmGx *g, int I, int O) {
+    return g && g->b ? olc_gq_tensor(d, vk, g, I, O) : olc_tensor(d, vk, w, I, O);
+}
+
 static VkcFit g_olc_fit;      /* the partial chain's fit (olc_fit_start); g_olc_fit_on (olmoe.c): it ran */
 /* The layers after the primary's on COLI_VK_DEV2's device (docs/vulkan.md, "Layers on two
  * devices"): a second chain from layer g_olc_fit.n, its own fit on that device's memory.
@@ -185,9 +214,9 @@ static OlmChain *olc_setup_dev(Model *m, int d) {
     int placed = 0;
     for (int i = lo; i < lo + n && ok; i++) {
         Layer *l = &m->L[i];
-        int lok = olc_tensor(d, &l->vk_q, l->q, D, D) && olc_tensor(d, &l->vk_k, l->k, D, D) &&
-                  olc_tensor(d, &l->vk_v, l->v, D, D) && olc_tensor(d, &l->vk_o, l->o, D, D) &&
-                  olc_tensor(d, &l->vk_gate, l->gate, D, E);
+        int lok = olc_mat(d, &l->vk_q, l->q, &l->gq, D, D) && olc_mat(d, &l->vk_k, l->k, &l->gk, D, D) &&
+                  olc_mat(d, &l->vk_v, l->v, &l->gv, D, D) && olc_mat(d, &l->vk_o, l->o, &l->go, D, D) &&
+                  olc_mat(d, &l->vk_gate, l->gate, &l->ggate, D, E);
         if (!lok) {
             if (!fit) { fprintf(stderr, "[VK] olmoe chain: a matrix did not reach the device; per-matrix path\n"); return NULL; }
             for (int j = i; j < lo + n; j++) olc_layer_cpu(ch, m, j);
@@ -215,7 +244,7 @@ static OlmChain *olc_setup_dev(Model *m, int d) {
     if (!placed) return NULL;
     /* the head: with every layer, and room for it (the fit's tail), on the chain that ends
      * at the last layer */
-    ch->head = lo + placed == L && (!fit || fit->tail) && olc_tensor(d, &m->vk_lm_head, m->lm_head, D, c->vocab);
+    ch->head = lo + placed == L && (!fit || fit->tail) && olc_mat(d, &m->vk_lm_head, m->lm_head, &m->ghead, D, c->vocab);
     if (!ch->head) {
         if (fit) fit->tail = 0;
         /* the second device's chain may still take it (it is set up after this one) */
@@ -263,8 +292,10 @@ static void olc_fit_start(Model *m) {
     for (int i = 0; i < L; i++) {
         const Layer *l = &m->L[i];
         const float *w[5] = {l->q, l->k, l->v, l->o, l->gate};
+        const OlmGx *g[5] = {&l->gq, &l->gk, &l->gv, &l->go, &l->ggate};
         for (int j = 0; j < 5; j++) {
-            int O = j < 4 ? D : E, f = w[j] ? coli_vk_f32_fmt(w[j], (size_t)D * O) : 10;
+            int O = j < 4 ? D : E, f = g[j]->b ? olc_gq_fmt(g[j], D) : w[j] ? coli_vk_f32_fmt(w[j], (size_t)D * O) : 10;
+            if (f < 0) f = 10;   /* no block form: the layer will not place (olc_gq_tensor refuses it) */
             per[i] += vkc_fit_tensor(f, D, O, 0); mat[i] += coli_vk_tensor_payload(f, D, O, 0);
         }
         per[i] += 2 * vkc_fit_buf((size_t)H * 3 * B * hd * sizeof(float)) + 4 * (size_t)D * sizeof(float);
@@ -277,7 +308,8 @@ static void olc_fit_start(Model *m) {
     olc_res(&cnt.xd, (size_t)rows * D, VKC_DOWN);
     if (g_pilot) olc_res(&cnt.xpd, (size_t)rows * D, VKC_DOWN);
     g_olc_fitsum = NULL;
-    size_t tail = m->lm_head ? vkc_fit_tensor(coli_vk_f32_fmt(m->lm_head, (size_t)D * c->vocab), D, c->vocab, 0) : 0;
+    size_t tail = m->lm_head ? vkc_fit_tensor(coli_vk_f32_fmt(m->lm_head, (size_t)D * c->vocab), D, c->vocab, 0)
+                : olc_gq_fmt(&m->ghead, D) >= 0 ? vkc_fit_tensor(olc_gq_fmt(&m->ghead, D), D, c->vocab, 0) : 0;
     int n = vkc_fit("olmoe", L, per, mat, fixed, tail, &g_olc_fit);
     /* the chain's pipelines now, after the fit read the free memory */
     if (n > 0 && !vkc_init()) { free(per); free(mat); return; }   /* no chain after all (olc_start finds it so too): no fit */
@@ -574,7 +606,7 @@ static int olc_forward_seg(Model *m, OlmChain *ch, float *xh, int S, int pos_bas
                  vkc_matmul((ColiVkTensor *)l->vk_gate, ch->h2, 0, ch->lg, 0, n);
             if (dl) {   /* the routing and the experts here, and on to the next layer */
                 VkcRoute rp = {.kind = 0, .n_group = 1, .topk_group = 1, .norm = c->norm_topk ? 1 : 0, .temp = 1.f, .scale = 1.f};
-                VkcMoe mp = {.D = D, .I = c->inter, .act = 0};
+                VkcMoe mp = {.D = D, .I = c->inter, .act = 0, .blocks = m->gx};   /* a GGUF's experts: their block decoders */
                 ok = ok && vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->h2, &rp, &mp);
                 prev_dev = 1;
                 if (ok && i + 1 < hi) ok = vkc_layer_recorded(&sent);   /* the device starts on these layers */
