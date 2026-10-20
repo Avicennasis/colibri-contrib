@@ -1,6 +1,7 @@
 """The listen backlog of APIServer (c/openai_server.py).
 
-socketserver.TCPServer listens with request_queue_size 5 unless told otherwise.
+socketserver.TCPServer listens with request_queue_size 5 unless told otherwise
+(socket.SOMAXCONN from Python 3.15: 128 on macOS, 4096 on current Linux).
 That is the kernel's accept queue: the completed handshakes the accept loop has
 not drained yet. Once it is full, Linux drops the next SYN (ListenOverflows in
 /proc/net/netstat) and that client sits out the SYN retransmit timer -- 1 s,
@@ -20,7 +21,6 @@ is checked.
 
 import shutil
 import socket
-import socketserver
 import subprocess
 import sys
 import threading
@@ -112,7 +112,6 @@ class ListenBacklogTest(unittest.TestCase):
     def test_backlog_holds_the_connection_cap(self):
         self.assertEqual(APIServer.request_queue_size, 128)
         self.assertGreaterEqual(APIServer.request_queue_size, APIServer.MAX_CONNECTIONS)
-        self.assertNotEqual(APIServer.request_queue_size, socketserver.TCPServer.request_queue_size)
 
     @unittest.skipUnless(sys.platform.startswith("linux"),
                          "reads the Linux kernel's accept queue and its overflow counter")
