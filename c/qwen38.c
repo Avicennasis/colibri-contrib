@@ -2342,20 +2342,17 @@ int main(int argc, char **argv) {
             g_q38_gguf = 1; g_q38_a_direct = 1; g_q38_dn_tiled = 1;
             fprintf(stderr, "[gguf] %s: %d file(s), %d tensors, read in place (native ggml types, no conversion)\n",
                     gp, g_q38gg.n_files, g_q38gg.n_tensors);
-            /* The CUDA tier takes no ggml block types (qwen36.c's note): a CUDA run of a GGUF
-             * computed every routed expert on the CPU (Qwen3.8 IQ2_S/Q2_0, RTX PRO 4000: 28
-             * tok/s of prompt, 9 of decode; 114-116 and 46-49 on Vulkan, the same card). A
-             * build with both backends runs a GGUF on Vulkan when CUDA was asked for and
-             * COLI_VULKAN was not set; COLI_VULKAN=0 keeps CUDA. */
+            /* The CUDA chain runs a GGUF (its experts on the card and in a host pool), a little
+             * behind the Vulkan chain on the same card (Qwen3.8-Flash-Next IQ2_XS, RTX PRO 4000:
+             * prompt 186 against 195 tok/s, decode 48 against 50): a build with both backends
+             * runs a GGUF on Vulkan when CUDA was asked for and COLI_VULKAN was not set;
+             * COLI_VULKAN=0 keeps CUDA. A CUDA-only build runs it on the CUDA chain. */
             {   const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
                 if (cu && *cu == '1' && !(vk && *vk)) {
 #if defined(COLI_CUDA) && defined(COLI_VULKAN)
                     setenv("COLI_VULKAN", "1", 1); setenv("COLI_CUDA", "0", 1);
-                    fprintf(stderr, "[gguf] the CUDA backend has no ggml block types: this GGUF runs on Vulkan, the same card "
-                                    "(COLI_VULKAN=0 keeps CUDA, the routed experts then on the CPU)\n");
-#else
-                    fprintf(stderr, "[gguf] the CUDA backend has no ggml block types: this GGUF's routed experts run on the CPU "
-                                    "(a VK=1 build runs them on the card through Vulkan)\n");
+                    fprintf(stderr, "[gguf] this GGUF runs on Vulkan, the same card: a little faster than the CUDA chain there "
+                                    "(COLI_VULKAN=0 keeps CUDA)\n");
 #endif
                 }
             }
@@ -2509,6 +2506,15 @@ int main(int argc, char **argv) {
      * now that the tier placed the trunk and the CPU holds its int8 rows (the chain's own
      * copies of the rest come from the same bytes) */
     if (q38cc_env_on() && q38cc_setup(&m, g_q38_mux_slots)) { g_cuda_chain=1; atexit(cc_shutdown); }
+    /* The MTP head stays on the CPU beside the CUDA chain, and its drafts cost more than they
+     * save there (an RTX PRO 4000, Qwen3.8-Flash-Next IQ2_XS with the host pool: plain decode
+     * 46-48 tok/s, the head's drafts 42.5-44.7, the prompt 180 against 150 tok/s as the head
+     * reads every prompt row): unset, Q38_MTP leaves it off as beside the Vulkan chain. */
+    if (g_cuda_chain && m.mtp && !(getenv("Q38_MTP") && *getenv("Q38_MTP"))) {
+        m.mtp = 0;
+        fprintf(stderr, "[qwen38] speculative decoding with the MTP head: off (the CUDA chain runs every layer on the device, "
+                        "the head would run on the CPU; Q38_MTP=1 drafts)\n");
+    }
 #endif
     q38_expert_report(&m, cap);         /* expert format, bytes per expert, what the cache costs */
 #ifdef COLI_VULKAN
@@ -2539,6 +2545,10 @@ int main(int argc, char **argv) {
         if(!g_q38_mtp_dump){perror(getenv("Q38_MTP_DUMP"));return 1;}
     }
     q38_telemetry_init(snap, &m);
+    if (g_q38_gguf_tier) q38_tier_warm(&m);   /* the CUDA tier's warm start, the history's most used experts first */
+#ifdef COLI_CUDA
+    if (g_cuda_chain) q38cc_pool_init(&m);    /* the experts the card leaves, in RAM it reads over the bus */
+#endif
 #ifdef COLI_VULKAN
     q38_vk_tier_start(&m, cap);   /* COLI_VULKAN=1: hot routed experts on the device (vk_tier.c) */
     if(g_vk_ready&&!vkt_ready()&&!g_vk_dense)g_vk_dense=coli_vk_dense_decide("qwen38",0,1);   /* no tier after all */
