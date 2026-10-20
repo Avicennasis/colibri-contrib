@@ -1587,6 +1587,7 @@ class WholeSetup(HomeTestCase):
 
 FAKE_SERVER = r'''
 import http.server, json, os, signal, sys, tempfile
+from unittest import mock
 port = int(sys.argv[sys.argv.index("--port") + 1])
 pidfile = os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.pid")
 with open(pidfile, "w") as f:
@@ -1611,7 +1612,11 @@ def bye(*_):
     except OSError: pass
     os._exit(0)
 signal.signal(signal.SIGTERM, bye)
-http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+# HTTPServer resolves its server_name during bind. This loopback fixture does
+# not use DNS, which can stall each startup on macOS CI.
+with mock.patch("socket.getfqdn", return_value="localhost"):
+    server = http.server.HTTPServer(("127.0.0.1", port), H)
+server.serve_forever()
 '''
 
 
@@ -1719,7 +1724,10 @@ class ServerControl(HomeTestCase):
                         self.send_header("Content-Length", str(len(body)))
                         self.end_headers()
                         self.wfile.write(body)
-                blocker = ThreadingHTTPServer(("127.0.0.1", 0), ForeignHealth)
+                # Avoid irrelevant reverse DNS during fixture construction;
+                # binding, HTTP health checks and server readiness stay real.
+                with mock.patch("socket.getfqdn", return_value="localhost"):
+                    blocker = ThreadingHTTPServer(("127.0.0.1", 0), ForeignHealth)
                 thread = threading.Thread(target=blocker.serve_forever, daemon=True)
                 thread.start()
                 try:
@@ -1752,7 +1760,8 @@ class ServerControl(HomeTestCase):
                         self.send_header("Content-Length", str(len(body)))
                         self.end_headers()
                         self.wfile.write(body)
-                server = ThreadingHTTPServer(("127.0.0.1", 0), OccupiedPort)
+                with mock.patch("socket.getfqdn", return_value="localhost"):
+                    server = ThreadingHTTPServer(("127.0.0.1", 0), OccupiedPort)
                 thread = threading.Thread(target=server.serve_forever, daemon=True)
                 thread.start()
                 try:
