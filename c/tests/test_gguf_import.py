@@ -918,7 +918,7 @@ class DeepSeek41DSparkHead(unittest.TestCase):
             self.assertIn("its target layers are not the model's", p.stdout.decode())
 
 
-class DeepSeek41LlamaConfig(unittest.TestCase):
+class DeepSeek41PublishedConfig(unittest.TestCase):
     """The published deepseek41 GGUFs (K-quant and IQ types): no deepseek41.config, so the
     checkpoint's text_config from the keys, and the sidecar from the ple keys, whose head offsets
     run over every table in one tensor (per_layer_token_embd); the planner keeps it on disk."""
