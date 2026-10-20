@@ -2810,8 +2810,8 @@ v41_chain_fixtures() {
 # A published deepseek41 GGUF (tests/test_gguf_import.py write_deepseek41: IQ1_S experts
 # with IQ2_XXS, Q4_K and Q5_K in other layers, a Q5_K, Q6_K and Q8_0 trunk, BF16
 # compressors and indexers, every engram table in one IQ4_NL tensor) and its DSpark head
-# in a GGUF of its own beside it (write_dflash: MXFP4 experts, Q8_0 projections),
-# imported, with the CPU's own 8 tokens without drafts in the float form (GQ_EXACT=1) as
+# in a GGUF of its own (write_dflash: MXFP4 experts, Q8_0 projections), imported with
+# --mtp naming the head, with the CPU's own 8 tokens without drafts in the float form (GQ_EXACT=1) as
 # its reference (ds41_gguf_tiny/tokens.txt too): no oracle reads these weights. The gates
 # take the float forms, as mimo_gguf_gate does.
 v41_gguf_tiny() {
@@ -2824,7 +2824,7 @@ write_deepseek41("ds41_gguf_tiny.gguf", np.random.default_rng(3))
 write_dflash("dspark-ds41_gguf_tiny-Q8_0.gguf", np.random.default_rng(4))
 PY
   rm -rf ds41_gguf_tiny
-  $PY tools/gguf_import.py ds41_gguf_tiny.gguf ds41_gguf_tiny > /dev/null
+  $PY tools/gguf_import.py ds41_gguf_tiny.gguf ds41_gguf_tiny --mtp dspark-ds41_gguf_tiny-Q8_0.gguf > /dev/null
   local ids="5, 6, 7, 8, 20, 21, 22, 23, 30, 31, 32, 33" out
   echo "{\"prompt_ids\": [$ids], \"output_ids\": [0, 0, 0, 0, 0, 0, 0, 0]}" > ds41_gguf_tiny/ref.json
   grep -q '"dspark"' ds41_gguf_tiny/gguf.json || fail "deepseek_v41 GGUF: the import found no DSpark head"

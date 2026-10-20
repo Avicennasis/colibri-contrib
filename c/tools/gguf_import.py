@@ -825,7 +825,8 @@ DSPARK_PREFERENCE = ("Q8_0", "BF16")
 
 
 def dspark_candidates(src):
-    """dspark-*.gguf next to the model: its folder, the parent, a dspark/ folder in either; Q8_0 first."""
+    """dspark-*.gguf next to the model, to name (main links one only with --mtp): its folder, the
+    parent, a dspark/ folder in either; Q8_0 first."""
     seen, found = set(), []
     for d in (src.parent, src.parent / "dspark", src.parent.parent, src.parent.parent / "dspark"):
         for f in sorted(d.glob("dspark-*.gguf")) if d.is_dir() else ():
@@ -1087,9 +1088,9 @@ def main():
     ap.add_argument("out", type=Path)
     ap.add_argument("--mode", choices=("link", "copy"), default="link")
     ap.add_argument("--mtp", type=Path, default=None,
-                    help="qwen4exp: the MTP head's GGUF (mtp-*.gguf); deepseek41: the DSpark head's (dspark-*.gguf, "
-                         "arch dflash). Unset, one next to the model is used (its folder, the parent, an MTP/ or "
-                         "dspark/ folder in either; Q8_0 first)")
+                    help="qwen4exp: the MTP head's GGUF (mtp-*.gguf), unset one next to the model (its folder, "
+                         "the parent, an MTP/ folder in either; shared-Q8_0 first); deepseek41: the DSpark head's "
+                         "(dspark-*.gguf, arch dflash), which drafts only when named")
     ap.add_argument("--no-mtp", action="store_true", help="qwen4exp, deepseek41: no draft head, plain decoding")
     ap.add_argument("--indexer-compress-ratio", type=int, default=0,
                     help="qwen4exp: when the GGUF's attention.compress_ratios are all 0 (a converter "
@@ -1121,18 +1122,21 @@ def main():
             cfg["mtp_num_hidden_layers"] = 1
             cfg["mtp"] = {"layer_types": ["full_attention"], "rope_theta": cfg["rope_parameters"]["rope_theta"]}
             cfg["mtp_use_dedicated_embeddings"] = False
+    # DeepSeek V4.1's DSpark head drafts only when --mtp names it: on UD-IQ1_S with the Q8_0
+    # head (an RTX PRO 4000, 62 GB of RAM) 22-33% of the drafts were accepted and decode
+    # went from 5.0-5.3 tok/s to 4.3-4.6 (docs/gguf.md). A head next to the model is named.
     dspark_file = None
     if arch == "deepseek41" and not args.no_mtp and not any(n.startswith("mtp.") for n in tensors):
         text = cfg.get("text_config", cfg)
-        for cand in ([args.mtp] if args.mtp else dspark_candidates(src)):
-            keys, why = dspark_head(cand, meta)
-            if keys:
-                dspark_file = cand.resolve(); mtp_where = str(dspark_file)
-                text.update(keys)
-                break
-            if args.mtp:
-                sys.exit(f"--mtp {cand}: {why}")
-            print(f"  {cand.name}: not this model's DSpark head ({why})")
+        if args.mtp:
+            keys, why = dspark_head(args.mtp, meta)
+            if not keys:
+                sys.exit(f"--mtp {args.mtp}: {why}")
+            dspark_file = args.mtp.resolve(); mtp_where = str(dspark_file)
+            text.update(keys)
+        else:
+            mtp_where = next((f"none linked; {c} is this model's, --mtp links it (measured slower on "
+                              f"UD-IQ1_S, docs/gguf.md)" for c in dspark_candidates(src) if dspark_head(c, meta)[0]), None)
     tok, tcfg, gen = tokenizer_files(meta)
     args.out.mkdir(parents=True, exist_ok=True)
     cfg["colibri_gguf"] = {"arch": arch, "mode": args.mode, "source": str(src), **model_name(meta)}

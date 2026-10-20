@@ -876,14 +876,16 @@ class DeepSeek41Config(unittest.TestCase):
 
 @unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
 class DeepSeek41DSparkHead(unittest.TestCase):
-    """The published files' DSpark head, a dflash GGUF next to the model: the importer
-    finds it, checks it against the model's keys and names it in gguf.json."""
+    """The published files' DSpark head, a dflash GGUF: --mtp links it (checked against the
+    model's keys, named in gguf.json); one next to the model is only named, since its
+    drafts measured slower on UD-IQ1_S."""
     def test_the_head_next_to_the_model(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             write_deepseek41(d / "ds41.gguf", np.random.default_rng(3))
-            write_dflash(d / "dspark-ds41-Q8_0.gguf", np.random.default_rng(4))
-            for flag, want in (([], True), (["--no-mtp"], False)):
+            head = d / "dspark-ds41-Q8_0.gguf"
+            write_dflash(head, np.random.default_rng(4))
+            for flag, want in ((["--mtp", str(head)], True), ([], False)):
                 out = d / ("dir" if want else "plain")
                 p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(d / "ds41.gguf"), str(out), *flag],
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -892,6 +894,7 @@ class DeepSeek41DSparkHead(unittest.TestCase):
                 text = json.loads((out / "config.json").read_text())["text_config"]
                 if not want:
                     self.assertNotIn("dspark", link); self.assertNotIn("n_mtp_layers", text)
+                    self.assertIn(f"none linked; {head} is this model's, --mtp links it", p.stdout.decode())
                     continue
                 self.assertEqual(Path(link["dspark"]), (d / "dspark-ds41-Q8_0.gguf").resolve())
                 self.assertEqual({k: v for k, v in text.items() if k == "n_mtp_layers" or k.startswith("dspark_")},
@@ -903,12 +906,16 @@ class DeepSeek41DSparkHead(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             write_deepseek41(d / "ds41.gguf", np.random.default_rng(3))
-            write_dflash(d / "dspark-other-Q8_0.gguf", np.random.default_rng(4), targets=(2, 4, 5))
+            other = d / "dspark-other-Q8_0.gguf"
+            write_dflash(other, np.random.default_rng(4), targets=(2, 4, 5))
             p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(d / "ds41.gguf"), str(d / "out")],
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             self.assertEqual(p.returncode, 0, p.stdout.decode())
-            self.assertIn("not this model's DSpark head (its target layers are not the model's)", p.stdout.decode())
-            self.assertNotIn("dspark", json.loads((d / "out" / "gguf.json").read_text()))
+            self.assertIn("DSpark head: none found", p.stdout.decode())   # not named: not this model's
+            p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(d / "ds41.gguf"), str(d / "out2"),
+                                "--mtp", str(other)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("its target layers are not the model's", p.stdout.decode())
 
 
 class DeepSeek41LlamaConfig(unittest.TestCase):
