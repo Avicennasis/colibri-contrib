@@ -110,6 +110,106 @@ def write_model(path, rng, dense=False, same_gate_up=False, token=None):
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
 
 
+def write_mimo2(path, rng, types=None):
+    """llama.cpp's mimo2 (MiMo-V2.6), small: a full-attention layer with a dense MLP, then
+    sliding-window layers with sinks and routed experts in a GGUF's block types as a K-quant
+    file has them (Q4_K gate and up, Q6_K and Q5_K down, IQ2_XXS in one layer), qkv as one
+    [Q|K|V], the head Q6_K and the embedding Q8_0 (the mimo engine's GGUF gates). types: a
+    tensor's GGUF name -> its type instead."""
+    types = types or {}
+    w = gguf.GGUFWriter(str(path), "mimo2")
+    p = "mimo2."
+    layers, h, mi, e, k, heads, hd, vd = 4, 256, 256, 8, 2, 4, 48, 32
+    pattern = [0, 1, 1, 1]
+    kv = [2 if x == 0 else 4 for x in pattern]
+    for key, v in (("block_count", layers), ("embedding_length", h), ("feed_forward_length", 256),
+                   ("attention.head_count", heads), ("attention.key_length", hd), ("attention.value_length", vd),
+                   ("attention.sliding_window", 8), ("expert_count", e), ("expert_used_count", k),
+                   ("expert_feed_forward_length", mi), ("rope.dimension_count", 16), ("context_length", 256)):
+        w.add_uint32(p + key, v)
+    w.add_array(p + "attention.head_count_kv", kv)
+    w.add_array(p + "attention.sliding_window_pattern", pattern)
+    w.add_float32(p + "rope.freq_base", 1e7); w.add_float32(p + "rope.freq_base_swa", 1e4)
+    w.add_float32(p + "attention.layer_norm_rms_epsilon", 1e-6); w.add_float32(p + "attention.value_scale", 0.707)
+    toks = [f"<0x{b:02X}>" if b < 256 else f"t{b}" for b in range(VOCAB - 3)] + ["<|endoftext|>", "<|im_start|>", "<|im_end|>"]
+    w.add_tokenizer_model("gpt2"); w.add_token_list(toks)
+    w.add_token_types([1] * (VOCAB - 3) + [3, 3, 3]); w.add_token_merges([])
+    w.add_eos_token_id(VOCAB - 1); w.add_bos_token_id(VOCAB - 3)
+
+    def f32(name, shape, std=0.02): w.add_tensor(name, (rng.standard_normal(shape) * std).astype(np.float32))
+    def q(name, shape, t):
+        t = types.get(name, t)
+        if t == "F32": w.add_tensor(name, (rng.standard_normal(shape) * 0.02).astype(np.float32)); return
+        w.add_tensor(name, blocks(t, shape, rng), raw_dtype=QT[t])
+    q("token_embd.weight", (VOCAB, h), "Q8_0"); q("output.weight", (VOCAB, h), "Q6_K")
+    w.add_tensor("output_norm.weight", np.ones(h, np.float32))
+    for L in range(layers):
+        b = f"blk.{L}."
+        w.add_tensor(b + "attn_norm.weight", np.ones(h, np.float32)); w.add_tensor(b + "ffn_norm.weight", np.ones(h, np.float32))
+        q(b + "attn_qkv.weight", (heads * hd + kv[L] * (hd + vd), h), "Q4_K" if L % 2 else "Q8_0")
+        q(b + "attn_output.weight", (h, heads * vd), "Q8_0")
+        if pattern[L]:
+            f32(b + "attn_sinks.weight", (heads,), 0.5)
+        if L == 0:
+            q(b + "ffn_gate.weight", (256, h), "Q4_K"); q(b + "ffn_up.weight", (256, h), "Q4_K")
+            q(b + "ffn_down.weight", (h, 256), "Q6_K")
+            continue
+        f32(b + "ffn_gate_inp.weight", (e, h), 0.5); w.add_tensor(b + "exp_probs_b.bias", np.zeros(e, np.float32))
+        gu = "IQ2_XXS" if L == 1 else "Q4_K"
+        q(b + "ffn_gate_exps.weight", (e, mi, h), gu); q(b + "ffn_up_exps.weight", (e, mi, h), gu)
+        q(b + "ffn_down_exps.weight", (e, h, mi), "Q6_K" if L % 2 else "Q5_K")
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+
+
+def write_glmdsa(path, rng):
+    """llama.cpp's glm-dsa (GLM-5.2), small: a dense first layer, then MoE layers with a shared
+    expert; MLA with kv_b split as k_b and v_b in Q8_0 (the colibri engine keeps them as the
+    file's blocks), the DSA indexer, experts in Q4_K and IQ2_XXS with Q5_K and Q6_K down, a
+    Q4_K and Q8_0 trunk, the head Q6_K and the embedding Q8_0 (colibri's GGUF chain gates)."""
+    w = gguf.GGUFWriter(str(path), "glm-dsa")
+    p = "glm-dsa."
+    layers, h, mi, e, k, heads, ql, kvl, nope, rope, vd, ih, idh = 4, 256, 256, 8, 2, 4, 64, 32, 32, 8, 32, 2, 16
+    for key, v in (("block_count", layers), ("embedding_length", h), ("feed_forward_length", 256),
+                   ("expert_feed_forward_length", mi), ("attention.head_count", heads), ("rope.dimension_count", rope),
+                   ("expert_count", e), ("expert_used_count", k), ("expert_shared_count", 1), ("leading_dense_block_count", 1),
+                   ("attention.q_lora_rank", ql), ("attention.kv_lora_rank", kvl), ("attention.key_length_mla", nope + rope),
+                   ("attention.value_length_mla", vd), ("attention.indexer.top_k", 4096), ("attention.indexer.head_count", ih),
+                   ("attention.indexer.key_length", idh), ("context_length", 512)):
+        w.add_uint32(p + key, v)
+    w.add_float32(p + "rope.freq_base", 1e4); w.add_float32(p + "attention.layer_norm_rms_epsilon", 1e-5)
+    w.add_float32(p + "expert_weights_scale", 1.0); w.add_bool(p + "expert_weights_norm", True)
+    toks = [f"<0x{b:02X}>" if b < 256 else f"t{b}" for b in range(VOCAB - 3)] + ["<|endoftext|>", "<|user|>", "<|assistant|>"]
+    w.add_tokenizer_model("gpt2"); w.add_token_list(toks)
+    w.add_token_types([1] * (VOCAB - 3) + [3, 3, 3]); w.add_token_merges([])
+    w.add_eos_token_id(VOCAB - 3); w.add_bos_token_id(VOCAB - 2)
+
+    def f32(name, shape, std=0.02): w.add_tensor(name, (rng.standard_normal(shape) * std).astype(np.float32))
+    def ones(name, n): w.add_tensor(name, np.ones(n, np.float32))
+    def q(name, shape, t): w.add_tensor(name, blocks(t, shape, rng), raw_dtype=QT[t])
+    q("token_embd.weight", (VOCAB, h), "Q8_0"); q("output.weight", (VOCAB, h), "Q6_K"); ones("output_norm.weight", h)
+    for L in range(layers):
+        b = f"blk.{L}."
+        ones(b + "attn_norm.weight", h); ones(b + "ffn_norm.weight", h)
+        q(b + "attn_q_a.weight", (ql, h), "Q4_K"); ones(b + "attn_q_a_norm.weight", ql)
+        q(b + "attn_q_b.weight", (heads * (nope + rope), ql), "Q8_0")
+        q(b + "attn_kv_a_mqa.weight", (kvl + rope, h), "Q4_K"); ones(b + "attn_kv_a_norm.weight", kvl)
+        q(b + "attn_k_b.weight", (heads * kvl, nope), "Q8_0"); q(b + "attn_v_b.weight", (heads * vd, kvl), "Q8_0")
+        q(b + "attn_output.weight", (h, heads * vd), "Q8_0")
+        q(b + "indexer.attn_q_b.weight", (ih * idh, ql), "Q8_0"); q(b + "indexer.attn_k.weight", (idh, h), "Q8_0")
+        f32(b + "indexer.proj.weight", (ih, h)); ones(b + "indexer.k_norm.weight", idh)
+        w.add_tensor(b + "indexer.k_norm.bias", np.zeros(idh, np.float32))
+        if L == 0:
+            q(b + "ffn_gate.weight", (256, h), "Q4_K"); q(b + "ffn_up.weight", (256, h), "Q4_K"); q(b + "ffn_down.weight", (h, 256), "Q6_K")
+            continue
+        f32(b + "ffn_gate_inp.weight", (e, h), 0.5); w.add_tensor(b + "exp_probs_b.bias", np.zeros(e, np.float32))
+        q(b + "ffn_gate_shexp.weight", (mi, h), "Q8_0"); q(b + "ffn_up_shexp.weight", (mi, h), "Q8_0")
+        q(b + "ffn_down_shexp.weight", (h, mi), "Q8_0")
+        gu = "IQ2_XXS" if L == 1 else "Q4_K"
+        q(b + "ffn_gate_exps.weight", (e, mi, h), gu); q(b + "ffn_up_exps.weight", (e, mi, h), gu)
+        q(b + "ffn_down_exps.weight", (e, h, mi), "Q6_K" if L % 2 else "Q5_K")
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+
+
 def engine_tokens(snap, ref, env=None):
     p = subprocess.run([str(ENGINE), "2", "8", str(ref)], env=dict(os.environ, SNAP=str(snap), OMP_NUM_THREADS="2",
                        COLI_NO_OMP_TUNE="1", **(env or {})), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -521,6 +621,48 @@ class Mimo2Config(unittest.TestCase):
         self.assertEqual((cfg["add_full_attention_sink_bias"], cfg["add_swa_attention_sink_bias"]), (False, True))
         self.assertEqual(int(cfg["head_dim"] * cfg["partial_rotary_factor"]), 64)
         self.assertEqual((cfg["rope_theta"], cfg["swa_rope_theta"], cfg["sliding_window"]), (10000000.0, 10000.0, 128))
+
+
+MIMO = HERE / ("mimo.exe" if sys.platform == "win32" else "mimo")
+
+
+@unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+@unittest.skipUnless(MIMO.is_file(), "mimo is not built")
+class MimoGguf(unittest.TestCase):
+    """A mimo2 GGUF of block types (write_mimo2: K-quant and IQ2_XXS experts, a Q8_0 and Q4_K
+    trunk, a Q6_K head, a Q8_0 embedding) on the mimo engine's CPU: the link directory and the
+    copy container give the same tokens, on the integer and on the float path."""
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(); d = Path(cls.tmp.name)
+        src = d / "tiny-mimo2.gguf"
+        write_mimo2(src, np.random.default_rng(5))
+        for mode in ("link", "copy"):
+            p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(src), str(d / mode), "--mode", mode],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            assert p.returncode == 0, p.stdout.decode()
+        cls.dir = d
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def tokens(self, mode, env=None):
+        p = subprocess.run([str(MIMO), str(self.dir / mode), "--ids", "5 6 7 8 20 21 22 23", "--ngen", "6"],
+                           env=dict(os.environ, COLI_TEMP="0", OMP_NUM_THREADS="2", COLI_NO_OMP_TUNE="1", **(env or {})),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(p.returncode, 0, p.stderr.decode("utf-8", "replace")[-2000:])
+        err = p.stderr.decode("utf-8", "replace")
+        self.assertIn("GGUF experts: IQ2_XXS gate", err)
+        lines = [l for l in p.stdout.decode().splitlines() if l.strip()]
+        self.assertTrue(lines, err[-2000:])
+        return lines[-1].split()
+
+    def test_same_tokens_from_link_and_copy(self):
+        for env in ({}, {"GQ_EXACT": "1"}):
+            link, copy = self.tokens("link", env), self.tokens("copy", env)
+            self.assertEqual(len(link), 6, link)
+            self.assertEqual(link, copy, env)
 
 
 class DeepSeek41Config(unittest.TestCase):

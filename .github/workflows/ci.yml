@@ -248,6 +248,7 @@ jobs:
           # MiMo-V2.6's dense chain (COLI_VK_CHAIN=1), and the same under ASan and UBSan
           - family: mimo-chain
             req: c/tools/requirements-mimo-tiny.txt
+            extra: gguf>=0.19   # the GGUF chain gates write their tiny model with gguf-py
           - family: mimo-chain-sanitize
             req: c/tools/requirements-mimo-tiny.txt
           # GLM-5.2 (colibri) and GLM-5.3 Flash (glm53) on the routed-expert tier, and
@@ -260,6 +261,7 @@ jobs:
           # ops, and the same under ASan and UBSan
           - family: glm-chain
             req: c/tools/requirements-glm53-tiny.txt
+            extra: gguf>=0.19   # the GGUF chain gates write their tiny model with gguf-py
           - family: glm-chain-sanitize
             req: c/tools/requirements-glm53-tiny.txt
           # the dense chain (COLI_VK_CHAIN=1) of deepseek_v41 and deepseek_v4, and the same
