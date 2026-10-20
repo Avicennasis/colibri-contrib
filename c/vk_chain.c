@@ -2312,11 +2312,16 @@ int vkc_moe(VkcBuf *x, VkcBuf *ids, VkcBuf *w, VkcBuf *table, VkcBuf *hid, VkcBu
      *   past that (three rows 323.5 -> 305.0 us a layer);
      *   down: 128 rows at 8 steps, every lane of the workgroup on a row (Q5_K 36.5 -> 25.3
      *   us, Q2_0 35.2 -> 31.5).
-     * Qwen3.6's layer, one row: 82.8 -> 70 us. A rpw of the caller's keeps both passes. */
+     * Qwen3.6's layer, one row: 82.8 -> 70 us. A rpw of the caller's keeps both passes.
+     * The choice by the layer's shape, not the step's rows: rows and steps a workgroup set a
+     * row's lanes (the shader's lpr) and so its sums' order, and a speculative verify's rows
+     * must get their decode steps' bits (by the rows, a verify of 2 took the wide passes and
+     * a decode step the narrow ones: speculative decoding's output then followed the drafts'
+     * count, and the three-row gain above is given up for that). */
     int rg = pc.rpw, sg = 8, rd = pc.rpw, sd = 8;
     if (p->blocks && p->rpw <= 0 && p->gfmt >= 100) {
         int t = p->gfmt - 100, kq = t == 8 || t == 10 || t == 11 || t == 12 || t == 13 || t == 14;
-        int wide = kq || (long long)p->S * p->K * ((p->I + 63) / 64) >= 128;
+        int wide = kq || (long long)p->K * ((p->I + 63) / 64) >= 128;
         rg = wide ? 64 : 32; sg = wide ? 16 : 8; rd = 128; sd = 8;
     }
     /* gate and up, then down, each (pair, rpw outputs) a workgroup; then the rank-order sum.
