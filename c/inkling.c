@@ -1284,8 +1284,9 @@ static void ink_dho_place(Model *m, int layer_begin, int layer_end) {
                               );
 }
 
-/* 1 for a GGUF read in place (st_gguf.h): its matrices are ggml blocks, which the dense chain
- * does not read (the expert tier does, ink_vk_gguf_forms). */
+/* 1 for a GGUF read in place (st_gguf.h): its matrices are ggml blocks, which the per-matrix
+ * path does not read; the dense chain takes them as the device's block formats (inkc_tensor)
+ * and the expert tier its experts (ink_vk_gguf_forms). */
 static int ink_is_gguf(const Model *m) {
     for (int i = 0; i < m->S.n; i++) if (st_is_ggml(m->S.t[i].dtype)) return 1;
     return 0;
@@ -1306,7 +1307,7 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
     /* COLI_VK_DENSE_HOST: with the dense part on the device (the per-matrix path, or the
      * chain: asked here silently, inkc_start says it after the tier), every matrix the
      * shaders read is marked and goes up now, its host copy given back */
-    int chain = !other_gpu && layer_begin == 0 && layer_end == m->c.n_layers && !ink_is_gguf(m) &&
+    int chain = !other_gpu && layer_begin == 0 && layer_end == m->c.n_layers &&
                 coli_vk_chain_decide(NULL, g_vk_tier_try, INKLING_CHAIN_IGPU) != COLI_VK_CHAIN_OFF;
     /* the chain's fit before any upload and before the expert cache is sized: the first n
      * layers on the device, the others (and lm_head, unless the tail went up) on the CPU
@@ -1314,7 +1315,8 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
     if (chain) inkc_fit_start(m);
     int end = g_inkc_fit.L ? g_inkc_fit.n : layer_end, head = g_inkc_fit.L ? g_inkc_fit.tail : 1;
     int on_device = (coli_vk_dense() || chain) && !other_gpu && !(g_inkc_fit.L && !g_inkc_fit.n);
-    if (coli_vk_dense_host_decide("inkling", on_device, ink_dho_bytes(m, layer_begin, end, head))) {
+    /* a GGUF's blocks go up with the chain only (inkc_tensor), their host copies kept */
+    if (coli_vk_dense_host_decide("inkling", on_device && !ink_is_gguf(m), ink_dho_bytes(m, layer_begin, end, head))) {
         g_ink_dho = 1; g_ink_dho_model = m;
         if (g_inkc_fit.L) coli_vk_dense_host_layers(g_inkc_fit.n, g_inkc_fit.L);
         ink_vk_mark_dense(m, layer_begin, end, head);

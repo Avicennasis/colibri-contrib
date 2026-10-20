@@ -992,13 +992,14 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
      * the expert tier will be tried (vk_tier.h step 0): on a device sharing the
      * CPU's RAM the dense matrices then stay on the CPU unless COLI_VK_DENSE=1. */
     if (!g_vk_ready) g_vk_ready = coli_vk_init_env_tier("olmoe", vkt_wanted() && m->c.n_experts > 0);
-    /* a GGUF: its dense matrices are ggml blocks, which the chain and the dense weights on the
-     * device do not take; they stay on the CPU, the routed experts go to the tier */
+    /* a GGUF: its dense matrices are ggml blocks, which the chain takes as the device's block
+     * formats (olmoe_chain.h, olc_gq_tensor); the per-matrix path and the dense weights on the
+     * device only do not, so outside the chain they stay on the CPU */
     const int gguf = m->ghead.b || m->L[0].gq.b;
-    if (gguf && g_vk_ready) fprintf(stderr, "[VK] olmoe: a GGUF: the dense chain and the dense matrices on the device stay off (ggml blocks)\n");
-    if (g_vk_ready && !gguf) olc_fit_start(m);   /* COLI_VK_CHAIN: how many layers the chain places (vkc_fit), before any upload */
+    if (gguf && g_vk_ready) fprintf(stderr, "[VK] olmoe: a GGUF: the dense matrices on the device go up with the chain only (ggml blocks)\n");
+    if (g_vk_ready) olc_fit_start(m);   /* COLI_VK_CHAIN: how many layers the chain places (vkc_fit), before any upload */
     if (g_vk_ready && !gguf) olm_dho_start(m);   /* COLI_VK_DENSE_HOST: the dense matrices on the device only, before the tier sizes its budget */
-    if (g_vk_ready && !gguf) { olc_place(m); olm_dho_finish(m); }   /* the chain's layers on the device now, so the tier sizes after them */
+    if (g_vk_ready) { olc_place(m); if (!gguf) olm_dho_finish(m); }   /* the chain's layers on the device now, so the tier sizes after them */
     if (g_vk_ready) olmoe_vk_tier_start(m);   /* after the history: COLI_USAGE, read above */
     if (g_vk_ready && !gguf && !vkt_ready() && !coli_vk_dense()) coli_vk_dense_decide("olmoe", 0, 1);   /* no tier after all */
     if (g_vk_ready && !gguf && coli_vk_dense())
@@ -1006,7 +1007,7 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
                 "go to the GPU on first use; %s\n", 5 * m->c.n_layers + 1,
                 vkt_ready() ? "routed experts go to the expert tier, the embedding lookup stays on the CPU"
                             : "routed experts and the embedding lookup stay on the CPU");
-    if (!gguf) olc_start(m);   /* COLI_VK_CHAIN: every layer's dense part as one frame on the device */
+    olc_start(m);   /* COLI_VK_CHAIN: every layer's dense part as one frame on the device */
 #endif
 }
 

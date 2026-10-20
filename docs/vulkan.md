@@ -463,7 +463,11 @@ of them on the device the way a GPU-equipped PC should use its card:
   the OOM killer; the pool now takes 45 GiB and the cache 10 slots a layer instead of 127,
   and the same prompt runs at 11.2 tok/s with the process at 58 GB. The pool beats the
   cache there: with `COLI_VK_TIER_HOST=0` (every free byte the cache's) the decode ran at
-  0.7-1.4 tok/s against 3.2-3.3. `COLI_VK_TIER_HOST_GB` sizes the pool and leaves the
+  0.7-1.4 tok/s against 3.2-3.3. DeepSeek V4's expert store keeps its `ram_reserve` on
+  purpose: its CPU computes a step's cold experts fast enough that the split helps, and
+  on DeepSeek V4 Flash 0731 UD-IQ2_XXS (85 GB) a pool of 41 GiB with the store cut to 22
+  slots a layer decoded at 5.5-5.6 tok/s against 5.9-6.2 with the store whole and a pool
+  of 5 GiB. `COLI_VK_TIER_HOST_GB` sizes the pool and leaves the
   cache as it was.
 - **A fresh install starts warm.** A model downloaded a minute ago has no history,
   so its first runs would fill the tier one routing at a time. `coli setup` copies a
@@ -1432,7 +1436,15 @@ turns it on) and on a CPU device:
 ### OLMoE and Inkling
 
 olmoe (`olmoe_chain.h`) and inkling (`inkling_chain.h`) run the chain too, with the same
-knobs, default rule and `[VK] <engine> chain: ...` line as qwen36.
+knobs, default rule and `[VK] <engine> chain: ...` line as qwen36. A GGUF's matrices go up
+as the file's blocks (`olc_gq_tensor`, `inkc_tensor`: 100 + the ggml type, rows the
+loader interleaved by 16 back to the file's first, whole groups of them for Inkling's
+head, whose unpadded vocabulary stops inside the last one), OLMoE's experts in the frame
+with their block decoders; outside the chain (the per-matrix path, the dense weights on
+the device only) a GGUF's dense part stays on the CPU. Before, both chains were off for a
+GGUF. On an RTX PRO 4000: OLMoE-1B-7B Q4_K_M decode 71-73 -> 210 tok/s and a 176-token
+prompt 549 -> 2454 tok/s (the CPU's greedy text); Inkling-Small UD-IQ2_XXS (77 GB, 62 GB
+of RAM) decode 6.9-7.1 -> 9.4-10.4 tok/s and a 173-token prompt 22.2-22.7 -> 17.6-29.2.
 
 | | olmoe | inkling |
 |---|---|---|
@@ -1847,7 +1859,18 @@ where, per layer:
 
 The matrices are the per-matrix path's device copies, found in the same map (fp8 as
 fmt 12, bf16 as fmt 11), and the mHC mixes in f32 (fmt 10), which only the chain
-multiplies. Every matrix takes the per-row GEMV, never the tiled GEMM: a row's bits then
+multiplies. A GGUF's go up in their own types (`v4c_gq_fmt`): the device's block
+formats as the file has them (rows the loader interleaved by 16 back to the file's
+first), a float view as stored; the grouped `wo_a`, which `vkc_mla_hgemv` reads a group
+at a time and which has no block form there, goes up as int8 with a scale per 32 from a
+Q8_0 (fmt 13, the same numbers) and as floats from any other type. Before, a GGUF's chain
+was off and the trunk ran on the CPU: on DeepSeek V4 Flash 0731 UD-IQ2_XXS (85 GB, an RTX
+PRO 4000 with 62 GB of RAM) decode 2.2-2.5 -> 5.6-6.2 tok/s and a 163-token prompt 6-10 ->
+16-19 tok/s, a 703-token one at 20-21.5; the logits within the model's own spread (its
+CPU's integer and float sums 6-9% apart, the chain 4-9% from the floats, the same greedy
+tokens). A whole chain (every layer and the head) gives the tier no dense bytes still to
+come: its matrices were counted twice before, and the tier's budget went from 10.3 to
+16.5 GiB. Every matrix takes the per-row GEMV, never the tiled GEMM: a row's bits then
 do not depend on how a forward is cut into chunks, nor on whether the row is a prompt
 row, a decode step or a verify row, which is what the CPU gives (its batched and
 per-token kernels agree bit for bit), and what makes a reused prefix give the bits of a

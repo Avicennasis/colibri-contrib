@@ -245,13 +245,106 @@ static ColiVkTensor *v4c_tensor(int fmt, const void *data, const float *scales, 
     if (!ok && !e->tensor) e->refused = 1;
     return ok ? e->tensor : NULL;
 }
-/* an fp8 matrix "<prefix>.weight" with its ".scale", a group of rows of it when rows > 0 */
+/* A GGUF's matrix (its dtype a ggml view) on the device: its blocks as the file has them
+ * (100 + the type; rows the loader interleaved by 16 go back to the file's), a float view as
+ * the loader stored it (f32 10, bf16 11, f16 14). For the grouped output's per-head reader
+ * (vkc_mla_hgemv, which has no block form) Q8_0 goes up as int8 with a scale per 32 (fmt 13,
+ * the same numbers) and any other type as floats. -1: no device form. */
+static int v4c_gq_fmt(int dtype, int I, int hgemv) {
+    const int t = st_ggml_type(dtype), b = gq_r16_base(t), base = b >= 0 ? b : t;
+    if (base == GQ_F32) return 10;
+    if (base == GQ_BF16) return 11;
+    if (base == GQ_F16) return hgemv ? 10 : 14;
+    if (hgemv) return base == GQ_Q8_0 && I % 32 == 0 ? 13 : 10;
+    const int be = coli_vk_block_elems(100 + base);
+    return be > 0 && I % be == 0 ? 100 + base : -1;
+}
+/* v4c_tensor for a GGUF's matrix in v4c_gq_fmt's form `fmt`: the same per-matrix map (or the
+ * second device's slot), its rows converted as that form wants them. */
+static ColiVkTensor *v4c_gq_tensor(int fmt, int dtype, const unsigned char *data, int rows, int columns) {
+    if (!g_v4_vk_ready || !data || fmt < 0 || rows < 1 || columns < 1) return NULL;
+    const int t = st_ggml_type(dtype), b = gq_r16_base(t), base = b >= 0 ? b : t;
+    const int fl = base == GQ_F32 || base == GQ_F16 || base == GQ_BF16;   /* a float view, stored as that float */
+    const int64_t held = fl ? (int64_t)columns * (base == GQ_F32 ? 4 : 2) : gq_row_bytes(t, columns),
+                  rb = fl ? held : gq_row_bytes(base, columns);
+    if (held <= 0 || rb <= 0 || (b >= 0 && rows % 16)) return NULL;
+    int d2 = vkc_device_now();
+    ColiVkTensor **slot = NULL;
+    V4VkEntry *e = NULL;
+    if (d2) {
+        if (!(slot = v4c_d2_slot(data))) return NULL;
+        if (*slot) return *slot;
+    } else {
+        e = v4_vk_find(data, fmt, rows, columns);
+        if (e && e->tensor) return e->tensor;
+        if (e && e->refused) return NULL;
+    }
+    if (!v4_vk_resident(data, (size_t)held * rows)) return NULL;
+    coli_v4_vk_host_ensure(data);
+    if (!d2 && !e && !(e = v4_vk_insert(data, fmt, rows, columns))) return NULL;
+    const unsigned char *src = data;
+    unsigned char *file = NULL;   /* the file's rows of an interleaved matrix */
+    void *conv = NULL;            /* fmt 13's codes or fmt 10's floats */
+    float *sc = NULL;
+    int gs = 0, ok = 1;
+    if (b >= 0) {
+        if (!(file = malloc((size_t)rb * rows))) ok = 0;
+        else { gq_r16_unpack(t, file, data, rows, columns); src = file; }
+    }
+    const void *weights = src;
+    if (ok && fmt == 13) {   /* Q8_0 (a half scale, 32 int8 codes a block): codes and scales apart */
+        const int nb = columns / 32;
+        int8_t *q = malloc((size_t)rows * columns);
+        sc = malloc((size_t)rows * nb * sizeof(float));
+        if (!q || !sc) { free(q); ok = 0; }
+        else {
+            for (int r = 0; r < rows; r++)
+                for (int k = 0; k < nb; k++) {
+                    const unsigned char *blk = src + (size_t)r * rb + (size_t)k * 34;
+                    uint16_t h; memcpy(&h, blk, 2);
+                    sc[(size_t)r * nb + k] = gq_f16(h);
+                    memcpy(q + (size_t)r * columns + (size_t)k * 32, blk + 2, 32);
+                }
+            weights = conv = q; gs = 32;
+        }
+    } else if (ok && fmt == 10 && base != GQ_F32) {   /* the per-head reader's floats */
+        float *f = malloc((size_t)rows * columns * sizeof(float));
+        if (!f) ok = 0;
+        else {
+            for (int r = 0; r < rows; r++) {
+                const unsigned char *row = src + (size_t)r * rb;
+                float *o = f + (size_t)r * columns;
+                if (base == GQ_F16) for (int c = 0; c < columns; c++) { uint16_t h; memcpy(&h, row + 2 * c, 2); o[c] = gq_f16(h); }
+                else if (base == GQ_BF16) for (int c = 0; c < columns; c++) { uint16_t h; memcpy(&h, row + 2 * c, 2); uint32_t u = (uint32_t)h << 16; memcpy(&o[c], &u, 4); }
+                else gq_dequant_row(base, row, o, columns);
+            }
+            weights = conv = f;
+        }
+    }
+    if (ok) ok = d2 ? coli_vk_tensor_ensure2(slot, weights, sc, fmt, columns, rows, gs)
+                    : coli_vk_tensor_ensure(&e->tensor, weights, sc, fmt, columns, rows, gs);
+    free(file); free(conv); free(sc);
+    if (d2) return ok ? *slot : NULL;
+    if (!ok && !e->tensor) e->refused = 1;
+    return ok ? e->tensor : NULL;
+}
+/* an fp8 matrix "<prefix>.weight" with its ".scale", a group of rows of it when rows > 0; a
+ * GGUF's in its own types (v4c_gq_fmt: the group's rows for the per-head reader) */
 static ColiVkTensor *v4c_fp8(const ColiDeepSeekV4LayerWeights *w, const char *prefix, int group, int rows) {
     char name[COLI_V4_MAX_TENSOR_NAME], sname[COLI_V4_MAX_TENSOR_NAME];
     const ColiDeepSeekV4TensorSpec *ws = NULL;
     snprintf(name, sizeof name, "layers.%d.%s.weight", w->plan.layer, prefix);
     snprintf(sname, sizeof sname, "layers.%d.%s.scale", w->plan.layer, prefix);
     const unsigned char *data = coli_v4_layer_data(w, name, &ws);
+    if (data && ws && ws->rank == 2 && st_is_ggml(ws->dtype)) {   /* a GGUF's: no .scale beside it */
+        const int O = (int)ws->shape[0], I = (int)ws->shape[1], f = v4c_gq_fmt(ws->dtype, I, rows > 0);
+        if (f < 0) return NULL;
+        if (rows <= 0) return v4c_gq_tensor(f, ws->dtype, data, O, I);
+        const int t = st_ggml_type(ws->dtype), fl = t == GQ_F32 || t == GQ_F16 || t == GQ_BF16;
+        const int64_t rb = fl ? (int64_t)I * (t == GQ_F32 ? 4 : 2) : gq_row_bytes(t, I);
+        if (rb <= 0 || (int64_t)(group + 1) * rows > O) return NULL;
+        return v4c_gq_tensor(f, ws->dtype, data + (size_t)group * rows * rb, rows, I);
+    }
     const float *scales = coli_v4_layer_data(w, sname, NULL);
     if (!data || !scales || !ws || ws->rank != 2 || ws->dtype != COLI_ST_F8_E4M3) return NULL;
     int O = (int)ws->shape[0], I = (int)ws->shape[1];
@@ -267,6 +360,8 @@ static ColiVkTensor *v4c_plain(const ColiDeepSeekV4LayerWeights *w, const char *
     snprintf(name, sizeof name, "layers.%d.%s", w->plan.layer, suffix);
     const void *data = coli_v4_layer_data(w, name, &ws);
     if (!data || !ws || ws->rank != 2) return NULL;
+    if (st_is_ggml(ws->dtype))   /* a GGUF's, in its own type */
+        return v4c_gq_tensor(v4c_gq_fmt(ws->dtype, (int)ws->shape[1], 0), ws->dtype, data, (int)ws->shape[0], (int)ws->shape[1]);
     return v4c_tensor(fmt, data, NULL, 0, (int)ws->shape[0], (int)ws->shape[1]);
 }
 
@@ -363,12 +458,34 @@ static size_t v4c_layer_bytes(const V4Chain *ch, int i, int rows, size_t *mat) {
     size_t b = 0, m = 0;
     *mat = 0;
     if (coli_v4_layer_plan(&plan, c, i, NULL, 0)) return 0;
+    const ColiSafetensorsIndex *ix = coli_v4_engine_target_index(ch->engine);
+    if (ix && coli_v4_index_gguf(ix)) coli_v4_layer_plan_index(&plan, ix);   /* a GGUF's types */
     for (size_t t = 0; t < plan.tensor_count; t++) {
         const ColiDeepSeekV4TensorSpec *sp = &plan.tensors[t];
         if (sp->rank != 2) continue;
         const char *suf = sp->name;
         if (!strncmp(suf, "layers.", 7)) { const char *d = strchr(suf + 7, '.'); suf = d ? d + 1 : suf; }
-        int O = (int)sp->shape[0], I = (int)sp->shape[1], fmt = 0, parts = 1;
+        int O = (int)sp->shape[0], I = (int)sp->shape[1], fmt = 0, parts = 1, gs = 0;
+        if (st_is_ggml(sp->dtype)) {   /* a GGUF's: the chain's matrices in v4c_gq_fmt's forms */
+            static const char *const mats[] = {
+                "attn.wq_a.weight", "attn.wq_b.weight", "attn.wkv.weight", "attn.wo_a.weight", "attn.wo_b.weight",
+                "ffn.shared_experts.w1.weight", "ffn.shared_experts.w2.weight", "ffn.shared_experts.w3.weight",
+                "attn.compressor.wkv.weight", "attn.compressor.wgate.weight", "attn.indexer.compressor.wkv.weight",
+                "attn.indexer.compressor.wgate.weight", "attn.indexer.weights_proj.weight", "attn.indexer.wq_b.weight",
+                "hc_attn_fn", "hc_ffn_fn"};
+            int chained = 0;
+            for (size_t k = 0; k < sizeof mats / sizeof *mats && !chained; k++) chained = !strcmp(suf, mats[k]);
+            if (!chained) continue;
+            const int hg = !strcmp(suf, "attn.wo_a.weight");
+            if (hg) { parts = ch->og; O = ch->ol; }
+            if ((fmt = v4c_gq_fmt(sp->dtype, I, hg)) < 0) continue;
+            gs = fmt == 13 ? 32 : 0;
+            for (int p = 0; p < parts; p++) {
+                b += vkc_fit_tensor(fmt, I, O, gs);
+                m += coli_vk_tensor_payload(fmt, I, O, gs);
+            }
+            continue;
+        }
         if (sp->dtype == COLI_ST_F8_E4M3) {
             fmt = 12;
             if (!strcmp(suf, "attn.wo_a.weight")) { parts = ch->og; O = ch->ol; }   /* one tensor per output group */
@@ -463,6 +580,8 @@ static int v4c_fit_n(void) { return g_v4c_fit.n; }
 /* 1: something the full chain would place stays on the CPU (the CPU layers, the head):
  * the per-matrix path uploads nothing new. */
 static int v4c_partial(void) { return g_v4c_fit_done && vkc_fit_partial(&g_v4c_fit); }
+/* 1: the chain holds every layer and the head: nothing of the dense part goes up after it */
+static int v4c_whole(void) { return g_v4c_fit_done && g_v4c_fit.n > 0 && !vkc_fit_partial(&g_v4c_fit); }
 
 /* Layer i's matrices (the per-matrix path's device copies, one per matrix) and its state
  * on the device. 0 with *why set: something did not reach it (v4c_layer_free undoes it). */
@@ -1362,11 +1481,6 @@ static int v4c_decide(const ColiV4Engine *engine) {
     if (!g_v4_vk_ready || !engine) return 0;
     int tier_on = vkt_wanted() && !(engine->experts && engine->experts->gpu) && engine->config.n_routed_experts > 0;
     g_v4c_decision = coli_vk_chain_decide("deepseek_v4", tier_on, COLI_VK_CHAIN_UNMEASURED);
-    if (g_v4c_decision && coli_v4_index_gguf(engine->target_index)) {
-        g_v4c_decision = 0;
-        fprintf(stderr, "[VK] deepseek_v4: the dense chain is off for a GGUF (its dense matrices are ggml blocks, kept on the CPU); "
-                        "the expert tier runs\n");
-    }
     if (g_v4c_decision && g_v4_mux_slots > 1) {
         g_v4c_decision = 0;
         fprintf(stderr, "[VK] deepseek_v4: KV_SLOTS=%d: the dense chain is off (it keeps one conversation's state on the device); "
