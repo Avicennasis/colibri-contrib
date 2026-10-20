@@ -38,6 +38,7 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
 struct CcBuf { int kind, dev; size_t bytes; float *d; void *h; };
 
 namespace {
+#define CC_UP_MARKS 1024   /* host_up's marks in flight (three a promoted expert) */
 struct CcCtx {
     int device, up, lost, in_frame;
     int major;   /* the device's compute capability: cc_attn_fk's tensor cores from 7 */
@@ -45,6 +46,8 @@ struct CcCtx {
     cudaEvent_t ev; int ev_ok, ev_pending;
     /* staging (cc_fetch): the copy stream, its copies' event and the buffer's last reader's */
     cudaStream_t cs; cudaEvent_t ev_fetched, ev_free; int cs_ok;
+    /* host_up: the copies' marks, a ring of CC_UP_MARKS events on the copy stream */
+    cudaEvent_t up_ev[CC_UP_MARKS]; unsigned up_seq, up_made; cudaEvent_t up_after;
     float *adec; size_t adec_bytes;   /* cc_attn_dec_k's blocks */
 };
 CcCtx g_cc[COLI_CUDA_MAX_DEVICES];
@@ -854,6 +857,8 @@ static void cc_shutdown(void) {
                 if (!c->lost) cudaStreamSynchronize(c->cs);
                 cudaEventDestroy(c->ev_fetched); cudaEventDestroy(c->ev_free); cudaStreamDestroy(c->cs);
             }
+            if (c->up_made) { for (int i = 0; i < CC_UP_MARKS; i++) cudaEventDestroy(c->up_ev[i]); cudaEventDestroy(c->up_after); }
+            c->up_made = 0; c->up_seq = 0;
             if (c->adec) cudaFree(c->adec);
         }
         c->adec = nullptr; c->adec_bytes = 0;
@@ -1379,6 +1384,39 @@ static int cc_fetch_done(void) {
     if (!c || !c->cs_ok) return 0;
     return cc_ok(c, cudaEventRecord(c->ev_free, c->stream), "fetch done");
 }
+static int cc_host_up(void *dst, const void *src, size_t bytes, unsigned *ticket) {
+    CcCtx *c = live();
+    if (!c || !dst || !src || !ticket) return 0;
+    if (!cc_copy_stream(c)) return 0;
+    if (!c->up_made) {
+        if (cudaEventCreateWithFlags(&c->up_after, cudaEventDisableTiming) != cudaSuccess) return cc_ok(c, cudaErrorMemoryAllocation, "host up event");
+        for (int i = 0; i < CC_UP_MARKS; i++)
+            if (cudaEventCreateWithFlags(&c->up_ev[i], cudaEventDisableTiming) != cudaSuccess) {
+                for (int j = 0; j < i; j++) (void)cudaEventDestroy(c->up_ev[j]);
+                (void)cudaEventDestroy(c->up_after);
+                return cc_ok(c, cudaErrorMemoryAllocation, "host up event");
+            }
+        c->up_made = 1;
+    }
+    unsigned t = ++c->up_seq;
+    cudaEvent_t ev = c->up_ev[t % CC_UP_MARKS];
+    if (t > CC_UP_MARKS && !cc_ok(c, cudaEventSynchronize(ev), "host up ring")) return 0;   /* the mark it reuses landed */
+    if (!cc_ok(c, cudaEventRecord(c->up_after, c->stream), "host up after") ||
+        !cc_ok(c, cudaStreamWaitEvent(c->cs, c->up_after, 0), "host up wait") ||
+        !cc_ok(c, cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, c->cs), "host up") ||
+        !cc_ok(c, cudaEventRecord(ev, c->cs), "host up mark")) return 0;
+    g_st.bytes_up += bytes;
+    *ticket = t;
+    return 1;
+}
+static int cc_host_up_done(unsigned ticket) {
+    CcCtx *c = live();
+    if (!c || !c->up_made || !ticket || ticket > c->up_seq) return 0;
+    if (c->up_seq - ticket >= CC_UP_MARKS) return 1;   /* its mark reused: waited for then */
+    cudaError_t e = cudaEventQuery(c->up_ev[ticket % CC_UP_MARKS]);
+    if (e == cudaErrorNotReady) { (void)cudaGetLastError(); return 0; }
+    return cc_ok(c, e, "host up done");
+}
 static const void *cc_dev_addr(const CcBuf *b) { return b ? (const void *)b->d : nullptr; }   /* a mapped UP/DOWN buffer's: where the device reads it */
 
 static const ColiCudaChainOps g_cc_ops = {
@@ -1392,6 +1430,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_qsa, cc_ple,
     cc_route, cc_moe, cc_signal, cc_wait_host, coli_cuda_tensor_dev,
     cc_fetch, cc_fetch_wait, cc_fetch_done, cc_dev_addr,
-    cc_moe_stage_op,
+    cc_moe_stage_op, cc_host_up, cc_host_up_done,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

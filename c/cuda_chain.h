@@ -233,6 +233,11 @@ typedef struct ColiCudaChainOps {
      * 256-byte map; NULL: none (they read the host's memory where it is). A GGUF's experts
      * (fmt >= 100) only. */
     int  (*moe_stage)(CcBuf *b, size_t slot_bytes, int slots);
+    /* host_up: bytes of page-locked host memory at src to the device address dst on the copy
+     * stream, once the frame's ops recorded so far are done; *ticket marks it. host_up_done:
+     * 1 once the copies up to ticket landed (an engine's experts moved into its slots) */
+    int  (*host_up)(void *dst, const void *src, size_t bytes, unsigned *ticket);
+    int  (*host_up_done)(unsigned ticket);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -290,6 +295,9 @@ static inline int cc_fetch(CcBuf *dst, const CcFetch *r, int n) { return cc_fetc
 static inline int cc_fetch_wait(void) { return cc_fetch_ready() ? cc_ops()->fetch_wait() : 0; }
 static inline int cc_fetch_done(void) { return cc_fetch_ready() ? cc_ops()->fetch_done() : 0; }
 static inline const void *cc_dev_addr(const CcBuf *b) { return cc_fetch_ready() ? cc_ops()->dev_addr(b) : NULL; }
+static inline int cc_host_up_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, host_up_done) + sizeof t->host_up_done; }
+static inline int cc_host_up(void *dst, const void *src, size_t bytes, unsigned *ticket) { return cc_host_up_ready() ? cc_ops()->host_up(dst, src, bytes, ticket) : 0; }
+static inline int cc_host_up_done(unsigned ticket) { return cc_host_up_ready() ? cc_ops()->host_up_done(ticket) : 0; }
 static inline int cc_moe_stage_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, moe_stage) + sizeof t->moe_stage; }
 static inline int cc_moe_stage(CcBuf *b, size_t slot_bytes, int slots) { return cc_moe_stage_ready() ? cc_ops()->moe_stage(b, slot_bytes, slots) : 0; }
 #endif

@@ -85,6 +85,46 @@ static void run(int arena) {
     free(g); free(u); free(d); free(counts);
 }
 
+/* A dense chain takes the arena (qt_chain_own): the tier tells it the slots and their residents,
+ * then places, swaps and computes none, whatever it is handed */
+static void run_own(void) {
+    printf("the chain takes the arena:\n");
+    fake_alloc_fail = 0;
+    if (!qt_init_gguf(NL, NE, D, IH, NE, TOPK, tg, td, gb, db, 0)) { printf("  FAIL: the tier refused a GGUF's experts\n"); fails++; return; }
+    unsigned char *g = malloc(gb[2]), *u = malloc(gb[2]), *d = malloc(db[2]);
+    memset(g, 0x31, gb[2]); memset(u, 0x32, gb[2]); memset(d, 0x33, db[2]);
+    int layers[NL * NE], eids[NL * NE];
+    int planned = qt_plan_fill(layers, eids, NL * NE), before = fake_uploads;
+    for (int i = 0; i < planned; i++) qt_note_planned(layers[i], eids[i], g, u, d, NULL, NULL, NULL);
+    drain(before + 3 * planned);
+    qt_fill_wait();
+    void *base; size_t slot, ou, od; int n;
+    check(qt_chain_arena(&base, &slot, &ou, &od, &n) && base == G_arena[0] && slot == G_aslot && ou == G_aoff_u && od == G_aoff_d &&
+          n == G_aslots[0], "the arena's base, slot and offsets");
+    int same = 1;
+    for (int l = 0; l < NL; l++) for (int e = 0; e < NE; e++) same &= qt_chain_slot(l, e) == qs(l, e)->aslot - 1;
+    check(same, "each resident's slot");
+    qt_chain_own();
+    ColiCudaTensor *tg_, *tu_, *td_;
+    check(!qt_chain_resident(0, 0, 0, &tg_, &tu_, &td_), "no resident answers once the chain moves them");
+    check(qt_chain_slot(0, 0) >= 0, "the slots it took still answer");
+    int at = fake_uploads;
+    pthread_mutex_lock(&G.mx);
+    res_set(qs(1, 2), 0);   /* a resident gone, as the chain's eviction leaves the tier's books */
+    pthread_mutex_unlock(&G.mx);
+    qt_note(1, 2, g, u, d, NULL, NULL, NULL); qt_note_planned(1, 2, g, u, d, NULL, NULL, NULL);
+    check(!qt_note_wanted(1, 2), "no note wanted");
+    int ids[TOPK] = {0, 1};
+    float x[D]; memset(x, 0, sizeof x);
+    check(qt_issue(0, ids, TOPK, x) == 0, "no group issued");
+    for (int t = 0; t < 40; t++) qt_chain_count(0, ids, TOPK);   /* ticks: the tier's own swaps would come now */
+    qt_fill_wait();
+    check(fake_uploads == at, "nothing uploaded");
+    qt_shutdown();
+    check(!G_chain_own, "the next tier starts the tier's own");
+    free(g); free(u); free(d);
+}
+
 int main(void) {
     setenv("COLI_CUDA", "1", 1);
     setenv("COLI_GPUS", "0", 1);
@@ -94,6 +134,7 @@ int main(void) {
     fake_block_elems = 256;
     run(1);
     run(0);
+    run_own();
     printf(fails ? "qwen36 tier gguf: %d FAIL\n" : "qwen36 tier gguf: ok\n", fails);
     return fails != 0;
 }

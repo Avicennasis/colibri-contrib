@@ -81,6 +81,16 @@ typedef struct {
     /* a prompt chunk's: a layer's pooled experts copied to dm_stage (cc_fetch) while the layers before it run */
     CcBuf *dm_stage, *dm_tabb; CcExpert *dm_hostb; CcFetch *dm_fr; int *dm_fro, *dm_frn, dm_stage_cap;
     unsigned long long dm_staged; double dm_stage_bytes;
+    /* adaptive promotion (q38cc_promote_*): the tier's arena is the chain's (own) */
+    int own, promo_rate, stage_dirty;
+    char *ar_base; size_t ar_slot, ar_off_u, ar_off_d; int ar_n;
+    int32_t *vslot, *owner;              /* [L*E] an expert's slot (-1), [ar_n] a slot's expert (-1) */
+    uint8_t *busy;                       /* [ar_n] a newcomer's bytes on their way */
+    uint32_t *heat; uint32_t heat_tick;  /* [L*E] this conversation's routes, halved every Q38CC_DECAY rows */
+    struct Q38CCPend { int k, slot; unsigned ticket; } *pend; int npend, cpend;
+    int32_t *chg; int nchg;              /* table entries rewritten since the last write ([L*E] at most) */
+    unsigned rng;
+    unsigned long long promos, promo_victims;
     unsigned long long pool_reads;   /* slots a step's table read from the pool */
 } Q38CChain;
 static Q38CChain *q38cc_of(Model *m) { return (Q38CChain *)m->cchain; }
@@ -843,6 +853,145 @@ static int q38cc_pool_entry(Q38CChain *ch, Model *m, int i, int k, CcExpert *x) 
     x->g = g; x->u = g + Q38CC_PAD(gb); x->d = g + 2 * Q38CC_PAD(gb); x->host = 1;
     return 1;
 }
+/* ---- adaptive promotion: the chain moves experts between the card and the host pool ------
+ * With the host pool holding every expert, the card's too, the tier's arena is the chain's
+ * (qt_chain_own). After a frame, the routed experts the pool served promote into a free slot
+ * or the coldest resident's (the least of 64 drawn) by this conversation's routes (halved
+ * every Q38CC_DECAY rows), then the history's, up to the rate a forward. A victim reads from
+ * the pool from the next frame on (its table entry rewritten before it); the newcomer's bytes
+ * go over the bus on the copy stream (cc_host_up) while that frame runs, into a slot no entry
+ * points to, and its entry turns to the slot once they landed. The warm start's set comes
+ * from the history: a conversation on another topic found 69.5% of its experts there
+ * (Qwen3.8-Flash-Next IQ2_XS on a 24 GB card, a story; simulated over its routes, 32 a
+ * forward: 95%). COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set, =n sets the rate. */
+#define Q38CC_PROMOTE 32
+#define Q38CC_DECAY 1024
+static int q38cc_promote_rate(void) { const char *e = getenv("COLI_CUDA_CHAIN_PROMOTE"); return e && *e ? atoi(e) : Q38CC_PROMOTE; }
+static void q38cc_vram_entry(Q38CChain *ch, int slot, CcExpert *x) {
+    const char *g = ch->ar_base + (size_t)slot * ch->ar_slot;
+    memset(x, 0, sizeof *x);
+    x->g = g; x->u = g + ch->ar_off_u; x->d = g + ch->ar_off_d;
+}
+static int q38cc_pool_entry(Q38CChain *ch, Model *m, int i, int k, CcExpert *x);
+static int q38cc_promote_init(Q38CChain *ch, Model *m) {
+    Cfg *c = &m->c; int L = c->layers, E = c->experts;
+    size_t ne = (size_t)L * E, slot, ou, od;
+    void *base; int n;
+    if (!qt_chain_arena(&base, &slot, &ou, &od, &n) || n < 1) return 0;
+    for (int i = 0; i < L; i++) {
+        int64_t gb, db;
+        if (!q38cc_pool_types(m, i, &gb, &db) || (size_t)gb > ou || (size_t)gb > od - ou || (size_t)db > slot - od) return 0;
+    }
+    ch->vslot = (int32_t *)malloc(ne * sizeof(int32_t)); ch->owner = (int32_t *)malloc((size_t)n * sizeof(int32_t));
+    ch->busy = (uint8_t *)calloc((size_t)n, 1); ch->heat = (uint32_t *)calloc(ne, sizeof(uint32_t)); ch->chg = (int32_t *)malloc(ne * sizeof(int32_t));
+    if (!ch->vslot || !ch->owner || !ch->busy || !ch->heat || !ch->chg) {
+        free(ch->vslot); free(ch->owner); free(ch->busy); free(ch->heat); free(ch->chg);
+        ch->vslot = ch->owner = ch->chg = NULL; ch->busy = NULL; ch->heat = NULL;
+        return 0;
+    }
+    for (size_t j = 0; j < ne; j++) ch->vslot[j] = -1;
+    for (int k = 0; k < n; k++) ch->owner[k] = -1;
+    int held = 0;
+    for (int i = 0; i < L; i++) for (int e = 0; e < E; e++) {
+        int k = qt_chain_slot(i, e);
+        if (k >= 0 && k < n && ch->owner[k] < 0) { ch->vslot[(size_t)i * E + e] = k; ch->owner[k] = i * E + e; held++; }
+    }
+    qt_chain_own();
+    ch->own = 1; ch->ar_base = (char *)base; ch->ar_slot = slot; ch->ar_off_u = ou; ch->ar_off_d = od; ch->ar_n = n;
+    ch->promo_rate = q38cc_promote_rate(); ch->rng = 0x9e3779b9u; ch->dm_read = 0; ch->stage_dirty = 1;
+    fprintf(stderr, "[chain] qwen38: the card's %d slots are the chain's to fill (%d held): up to %d experts a forward promoted from the "
+                    "pool by this conversation's routes (COLI_CUDA_CHAIN_PROMOTE=0 keeps the warm start's set)\n", n, held, ch->promo_rate);
+    return 1;
+}
+static const char *q38cc_pool_host(Q38CChain *ch, int k) {
+    int ps = ch->pool_of[k];
+    return ps < 0 ? NULL : (const char *)cc_ptr(ch->pool_buf[ps / ch->pool_per]) + (size_t)(ps % ch->pool_per) * ch->pool_stride;
+}
+/* before a frame: the newcomers whose bytes landed take their slots; the entries rewritten
+ * since the last frame to the device's table */
+static int q38cc_promote_settle(Q38CChain *ch, Model *m) {
+    int E = m->c.experts, w = 0;
+    for (int p = 0; p < ch->npend; p++) {
+        struct Q38CCPend *q = &ch->pend[p];
+        if (!cc_host_up_done(q->ticket)) { ch->pend[w++] = *q; continue; }
+        ch->vslot[q->k] = q->slot; ch->busy[q->slot] = 0; ch->dm_res[q->k] = 1;
+        q38cc_vram_entry(ch, q->slot, &ch->dm_host[q->k]);
+        ch->chg[ch->nchg++] = q->k;
+    }
+    ch->npend = w;
+    if (!ch->nchg) return 1;
+    int ok = cc_begin();
+    for (int j = 0; j < ch->nchg && ok; j++)
+        ok = cc_write(ch->dm_tab, (size_t)ch->chg[j] * (sizeof(CcExpert) / 4), &ch->dm_host[ch->chg[j]], sizeof(CcExpert));   /* offsets in floats */
+    ok = ok && cc_submit(1);
+    ch->nchg = 0; ch->stage_dirty = 1;
+    (void)E;
+    return ok;
+}
+/* after a frame: this conversation's routes, and the promotions they earn */
+static void q38cc_promote_books(Q38CChain *ch, Model *m, int n) {
+    Cfg *c = &m->c; int L = c->layers, E = c->experts, K = c->topk;
+    uint32_t **hist = rt_counts_all();
+    #define Q38CC_HIST(j) (hist && hist[(j) / E] ? hist[(j) / E][(j) % E] : 0u)
+    for (int i = 0; i < L; i++) {
+        if (!ch->dm_ran[i]) continue;
+        const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
+        for (int a = 0; a < n * K; a++) if (ids[a] >= 0 && ids[a] < E && ch->heat[(size_t)i * E + ids[a]] < 0xFFFFFFFFu) ch->heat[(size_t)i * E + ids[a]]++;
+    }
+    if ((ch->heat_tick += (uint32_t)n) >= Q38CC_DECAY) {
+        ch->heat_tick = 0;
+        for (size_t j = 0; j < (size_t)L * E; j++) ch->heat[j] >>= 1;
+    }
+    int done = 0;
+    for (int i = 0; i < L && done < ch->promo_rate; i++) {
+        if (!ch->dm_ran[i]) continue;
+        const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
+        for (int a = 0; a < n * K && done < ch->promo_rate; a++) {
+            int e = ids[a];
+            if (e < 0 || e >= E) continue;
+            int k = i * E + e;
+            if (ch->dm_res[k] != 2) continue;   /* on the card, or on its way */
+            /* a free slot, else the coldest of 64 drawn (none on its way) */
+            int s = -1, v = -1;
+            for (int t = 0; t < 64; t++) {
+                ch->rng = ch->rng * 1664525u + 1013904223u;
+                int r = (int)((ch->rng >> 8) % (unsigned)ch->ar_n);
+                if (ch->busy[r]) continue;
+                if (ch->owner[r] < 0) { s = r; v = -1; break; }
+                int o = ch->owner[r];
+                if (v < 0 || ch->heat[o] < ch->heat[v] || (ch->heat[o] == ch->heat[v] && Q38CC_HIST(o) < Q38CC_HIST(v))) { v = o; s = r; }
+            }
+            if (s < 0) continue;
+            if (v >= 0 && !(ch->heat[k] > ch->heat[v] || (ch->heat[k] == ch->heat[v] && Q38CC_HIST(k) > Q38CC_HIST(v)))) continue;
+            int64_t gb, db;
+            const char *src = q38cc_pool_host(ch, k);
+            if (!src || !q38cc_pool_types(m, i, &gb, &db)) continue;
+            if (ch->npend == ch->cpend) {
+                int cap = ch->cpend ? 2 * ch->cpend : 64;
+                struct Q38CCPend *np = (struct Q38CCPend *)realloc(ch->pend, (size_t)cap * sizeof *np);
+                if (!np) return;
+                ch->pend = np; ch->cpend = cap;
+            }
+            if (v >= 0) {   /* the victim to the pool, its entry rewritten before the next frame */
+                ch->vslot[v] = -1; ch->dm_res[v] = 2;
+                if (!q38cc_pool_entry(ch, m, v / E, ch->pool_of[v], &ch->dm_host[v])) memset(&ch->dm_host[v], 0, sizeof(CcExpert));
+                ch->chg[ch->nchg++] = v;
+                ch->promo_victims++;
+            }
+            char *dst = ch->ar_base + (size_t)s * ch->ar_slot;
+            unsigned tk = 0;
+            if (!cc_host_up(dst, src, (size_t)gb, &tk) || !cc_host_up(dst + ch->ar_off_u, src + Q38CC_PAD(gb), (size_t)gb, &tk) ||
+                !cc_host_up(dst + ch->ar_off_d, src + 2 * Q38CC_PAD(gb), (size_t)db, &tk)) {
+                ch->owner[s] = -1;   /* the slot's bytes undefined now: nobody's */
+                return;
+            }
+            ch->owner[s] = k; ch->busy[s] = 1; ch->dm_res[k] = 3;
+            ch->pend[ch->npend++] = (struct Q38CCPend){k, s, tk};
+            ch->promos++; done++;
+        }
+    }
+    #undef Q38CC_HIST
+}
 typedef struct { int i, e; uint32_t n; } Q38CCHot;
 static int q38cc_hot_cmp(const void *a, const void *b) {
     const Q38CCHot *x = (const Q38CCHot *)a, *y = (const Q38CCHot *)b;
@@ -865,15 +1014,20 @@ static void q38cc_pool_init(Model *m) {
         size_t b = 2 * Q38CC_PAD(gb) + Q38CC_PAD(db);
         if (b > stride) stride = b;
     }
-    /* the experts the card leaves, the history's most used first */
+    /* the experts the card leaves, the history's most used first, then the card's own (the pool
+     * takes those too where RAM holds every expert: the chain then moves them, below) */
     Q38CCHot *hot = (Q38CCHot *)malloc((size_t)L * E * sizeof *hot);
     if (!hot) return;
     uint32_t **hist = rt_counts_all();
-    int left = 0;
+    int left = 0, all = L * E, on_card = 0;
     for (int i = 0; i < L; i++) for (int e = 0; e < E; e++) {
         ColiCudaTensor *g, *u, *d;
         if (qt_chain_resident(i, e, ch->dev, &g, &u, &d)) continue;
         hot[left++] = (Q38CCHot){i, e, hist && hist[i] ? hist[i][e] : 0};
+    }
+    for (int i = 0; i < L; i++) for (int e = 0; e < E; e++) {
+        ColiCudaTensor *g, *u, *d;
+        if (qt_chain_resident(i, e, ch->dev, &g, &u, &d)) hot[left + on_card++] = (Q38CCHot){i, e, hist && hist[i] ? hist[i][e] : 0};
     }
     if (!left) { free(hot); return; }
     qsort(hot, (size_t)left, sizeof *hot, q38cc_hot_cmp);   /* the hottest first; those the pool takes then by layer (below) */
@@ -889,6 +1043,13 @@ static void q38cc_pool_init(Model *m) {
     int per = (int)(blk / stride);
     long long fit = want > 0 ? (long long)(want / (double)stride) : 0;
     if (fit > left) fit = left;
+    /* every expert, where RAM holds them (the CPU then computes none: no RAM cache to come) and
+     * the chain may take the arena: an eviction then copies nothing back */
+    int full = 0;
+    {   void *ab; size_t as, au, ad; int an;
+        if (!(gbs && *gbs) && q38cc_promote_rate() > 0 && left + on_card == all &&
+            compat_mem_available_gb() * 1e9 - 4.0 * GiB >= (double)all * stride && qt_chain_arena(&ab, &as, &au, &ad, &an)) { full = 1; fit = all; }
+    }
     if (per < 1 || fit < 1) {
         fprintf(stderr, "[chain] qwen38: no RAM for a host pool (%.1f GiB free less 4 GiB and the RAM cache's %.1f GiB to come; "
                         "COLI_CUDA_CHAIN_POOL_GB sets it)\n", compat_mem_available_gb() * 1e9 / GiB, grow / GiB);
@@ -934,16 +1095,22 @@ static void q38cc_pool_init(Model *m) {
     int nst = pst && *pst == '0' ? 0 : Q38CC_STAGE;
     if (nst && cc_moe_stage_ready() && (ch->pool_stage = cc_buf(CC_MOE_STAGE_MAP + (size_t)nst * stride, CC_DEV)) &&
         !cc_moe_stage(ch->pool_stage, stride, nst)) { cc_free(ch->pool_stage); ch->pool_stage = NULL; }
-    fprintf(stderr, "[chain] qwen38: host pool, %d of the %d experts the card leaves in %.2f GiB of page-locked RAM the device "
-                    "reads over the bus, the history's most used first (%.1f s to allocate, %.1f s to read; COLI_CUDA_CHAIN_POOL=0 off, "
-                    "COLI_CUDA_CHAIN_POOL_GB sets it)\n",
-            ch->pool_n, left, (double)fit * stride / GiB, ta - t0, now_s() - ta);
+    if (ch->pool_n == all && full)
+        fprintf(stderr, "[chain] qwen38: host pool, every expert (the %d the card leaves and its own %d) in %.2f GiB of page-locked RAM "
+                        "the device reads over the bus (%.1f s to allocate, %.1f s to read; COLI_CUDA_CHAIN_POOL=0 off)\n",
+                left, on_card, (double)fit * stride / GiB, ta - t0, now_s() - ta);
+    else
+        fprintf(stderr, "[chain] qwen38: host pool, %d of the %d experts the card leaves in %.2f GiB of page-locked RAM the device "
+                        "reads over the bus, the history's most used first (%.1f s to allocate, %.1f s to read; COLI_CUDA_CHAIN_POOL=0 off, "
+                        "COLI_CUDA_CHAIN_POOL_GB sets it)\n",
+                ch->pool_n, left, (double)fit * stride / GiB, ta - t0, now_s() - ta);
     if (ch->pool_stage) fprintf(stderr, "[chain] qwen38: a step's pooled experts copied to the device first (%d places, %.1f MiB)\n",
                                 nst, (double)nst * stride / 1048576.0);
     if (ch->dm_stage) fprintf(stderr, "[chain] qwen38: a prompt chunk's layer's pooled experts copied to the device while the layers "
                                       "before it run (%d places, %.1f MiB; the most a layer has: %d)\n",
                               ch->dm_stage_cap, (double)ch->dm_stage_cap * stride / 1048576.0, hmax);
     free(hot);
+    if (ch->pool_n == all && full) q38cc_promote_init(ch, m);
 }
 static int q38cc_dm_wanted(void) {
     static int on = -1;
@@ -968,7 +1135,7 @@ static int q38cc_dm_able(Q38CChain *ch, Model *m) {
 }
 static int q38cc_stage_table(Q38CChain *ch, Model *m);
 /* the step's buffers, and the table when the tier's residents moved (the tier held) */
-static int q38cc_dm_begin(Q38CChain *ch, Model *m) {
+static int q38cc_dm_begin(Q38CChain *ch, Model *m, int n) {
     Cfg *c = &m->c; int L = c->layers, E = c->experts, K = c->topk, D = c->hidden, I = c->inter;
     size_t r = (size_t)ch->rows, ne = (size_t)L * E, F = sizeof(float);
     if (!ch->dm_host) {
@@ -982,6 +1149,14 @@ static int q38cc_dm_begin(Q38CChain *ch, Model *m) {
         !cc_reserve(&ch->dm_hy, r * D * F, CC_UP) || !cc_reserve(&ch->dm_dfl, 64, CC_DOWN) || !cc_reserve(&ch->dm_hfl, 64, CC_UP) ||
         !cc_reserve(&ch->dm_tab, ne * sizeof(CcExpert), CC_DEV)) return 0;
     if (!ch->dm_held) { qt_chain_hold(1); ch->dm_held = 1; }
+    if (ch->own && ch->dm_read) {   /* the chain's slots: the newcomers landed, the entries rewritten, then the frame */
+        if (!q38cc_promote_settle(ch, m)) return 0;
+        if (n > Q38CC_DM_ROWS && ch->stage_dirty && ch->dm_stage && cc_fetch_ready()) {
+            if (!q38cc_stage_table(ch, m)) return 0;
+            ch->stage_dirty = 0;
+        }
+        return 1;
+    }
     unsigned ep = qt_chain_epoch();
     if (ch->dm_read && ep == ch->dm_epoch) return 1;
     for (int i = 0; i < L; i++) {
@@ -990,8 +1165,10 @@ static int q38cc_dm_begin(Q38CChain *ch, Model *m) {
             CcExpert *x = &ch->dm_host[(size_t)i * E + e];
             ColiCudaTensor *g, *u, *d;
             memset(x, 0, sizeof *x);
-            int on = qt_chain_resident(i, e, ch->dev, &g, &u, &d) && cc_tensor_dev(g, &x->g, &x->gs, NULL) &&
-                     cc_tensor_dev(u, &x->u, &x->us, NULL) && cc_tensor_dev(d, &x->d, &x->ds, NULL);
+            int on = 0;
+            if (ch->own) { if (ch->vslot[(size_t)i * E + e] >= 0) { q38cc_vram_entry(ch, ch->vslot[(size_t)i * E + e], x); on = 1; } }
+            else on = qt_chain_resident(i, e, ch->dev, &g, &u, &d) && cc_tensor_dev(g, &x->g, &x->gs, NULL) &&
+                      cc_tensor_dev(u, &x->u, &x->us, NULL) && cc_tensor_dev(d, &x->d, &x->ds, NULL);
             if (!on) memset(x, 0, sizeof *x);
             if (!on && ch->pool_of && ch->pool_of[(size_t)i * E + e] >= 0 && q38cc_pool_entry(ch, m, i, ch->pool_of[(size_t)i * E + e], x))
                 on = 2;   /* the host pool's: the device reads it over the bus */
@@ -1005,7 +1182,7 @@ static int q38cc_dm_begin(Q38CChain *ch, Model *m) {
         fprintf(stderr, "[chain] qwen38: no room for a prompt chunk's staging table; its pooled experts are read where they are\n");
         cc_free(ch->dm_stage); ch->dm_stage = NULL;
     }
-    ch->dm_epoch = ep; ch->dm_read = 1;
+    ch->dm_epoch = ep; ch->dm_read = 1; ch->stage_dirty = 0; ch->nchg = 0;
     return 1;
 }
 /* A prompt chunk's table: each layer's pooled experts (up to dm_stage_cap) at their places in
@@ -1031,7 +1208,7 @@ static int q38cc_stage_table(Q38CChain *ch, Model *m) {
             size_t j = (size_t)i * E + e;
             CcExpert *x = &ch->dm_hostb[j];
             *x = ch->dm_host[j];
-            if (ch->dm_res[j] != 2 || h >= ch->dm_stage_cap || !typed) continue;
+            if (ch->dm_res[j] < 2 || h >= ch->dm_stage_cap || !typed) continue;
             int ps = ch->pool_of[j];
             const char *src = (const char *)cc_ptr(ch->pool_buf[ps / ch->pool_per]) + (size_t)(ps % ch->pool_per) * st;
             size_t dst = (size_t)h * st, span = 2 * Q38CC_PAD(gb) + (size_t)db;
@@ -1120,12 +1297,13 @@ static void q38cc_dm_books(Q38CChain *ch, Model *m, int n, int pb) {
         if (!ch->dm_ran[i]) continue;
         q38cc_kv_down(ch, m, i, n, pb);
         const int *ids = (const int *)cc_ptr(ch->dm_idsd) + (size_t)i * ch->rows * K;
-        for (int s = 0; s < n; s++) { rt_count(i, ids + s * K, K); qt_chain_count(i, ids + s * K, K); }
+        for (int s = 0; s < n; s++) { rt_count(i, ids + s * K, K); if (!ch->own) qt_chain_count(i, ids + s * K, K); }
         for (int j = 0; j < n * K; j++) if (ids[j] >= 0) {
             q38_ehit_mark(m, i, ids[j]);
-            if (ch->dm_res[(size_t)i * c->experts + ids[j]] == 2) ch->pool_reads++;
+            if (ch->dm_res[(size_t)i * c->experts + ids[j]] >= 2) ch->pool_reads++;
         }
     }
+    if (ch->own && ch->promo_rate > 0) q38cc_promote_books(ch, m, n);
 }
 static int q38cc_frame_begin(Q38CChain *ch) {
     ch->frames++;
@@ -1175,7 +1353,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
          * layer, a prompt chunk's layers whose experts are all on the device or in the host pool (a
          * layer with some on the host keeps the host's step there) */
         int dm = E > 0 && ch->dm_on;
-        if (dm && !q38cc_dm_begin(ch, m)) {
+        if (dm && !q38cc_dm_begin(ch, m, n)) {
             if (cc_lost()) goto lost;
             fprintf(stderr, "[chain] qwen38: the routed experts' buffers or table refused; the host's step from here on\n");
             q38cc_dm_end(ch); ch->dm_on = dm = 0;
@@ -1269,4 +1447,7 @@ static void q38cc_report(Model *m) {
     if (ch->dm_staged)
         fprintf(stderr, "[chain] qwen38: %llu prompt layer steps staged the host pool's experts (%.2f GB copied over the bus)\n",
                 ch->dm_staged, ch->dm_stage_bytes / 1073741824.0);
+    if (ch->own)
+        fprintf(stderr, "[chain] qwen38: %llu experts promoted to the card (%llu residents back to the pool), %d on their way\n",
+                ch->promos, ch->promo_victims, ch->npend);
 }
