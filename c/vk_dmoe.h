@@ -267,9 +267,9 @@ static void vkc_keep_entry(VkcDmoe *d, size_t j);
  * the tier changed since it was read (vkt_dev_changes), each read again, the hybrid steps'
  * and the kept experts' with it; the frame writes those (vkc_dmoe_upload). The tier moves a
  * few experts a token (vk_tier.c's promotions), and reading every layer's table whole for
- * them took about a third of a decode step (Qwen3.8 IQ2_XS on an RTX PRO 4000: 24 against
- * 35 tok/s). 0 = read it whole: a layer that loses an expert or gains its last, an error,
- * or more changes than the tier logged. */
+ * them cost a fifth of the decode (Qwen3.8 IQ2_XS on an RTX PRO 4000, a code prompt: 37.5 to
+ * 40.3 against 46.4 to 48.0 tok/s). 0 = read it whole: a layer that loses an expert or gains
+ * its last, an error, or more changes than the tier logged. */
 static int vkc_dmoe_patch(VkcDmoe *d) {
     if (d->big_step || d->stg_big || d->stg_on) return 0;
     int L = d->L, E = d->E;

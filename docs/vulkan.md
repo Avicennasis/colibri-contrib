@@ -433,7 +433,8 @@ of them on the device the way a GPU-equipped PC should use its card:
   (`coli_vk_tensor_copy`: no byte through the CPU) while the engine goes on, and takes
   its place in the tables at the next frame's start (`vkt_settle`). The tier logs which
   entries each change touched (`vkt_dev_changes`), and the dense chain rewrites those
-  entries only: read whole at every change, the tables cost Qwen3.8's decode a third.
+  entries only: read whole at every change, the tables cost Qwen3.8's decode a fifth
+  (the code prompt below: 37.5-40.3 tok/s).
   Measured on an RTX PRO 4000 with Qwen3.8-Flash-Next IQ2_XS (34.6 GiB of experts in
   the pool, 10443 places on the card), each server on a copy of one history, three
   runs:
