@@ -260,6 +260,7 @@ jobs:
           # ops, and the same under ASan and UBSan
           - family: glm-chain
             req: c/tools/requirements-glm53-tiny.txt
+            extra: gguf>=0.19   # the GGUF chain gates write their tiny model with gguf-py
           - family: glm-chain-sanitize
             req: c/tools/requirements-glm53-tiny.txt
           # the dense chain (COLI_VK_CHAIN=1) of deepseek_v41 and deepseek_v4, and the same
