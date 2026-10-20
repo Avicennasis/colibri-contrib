@@ -155,6 +155,8 @@ static struct {
      * instead of the device reading them over PCIe; hy_of[i] pair i's place among them (-1
      * none), hy_v their rows, hy_x their input rows, hy_out their outputs */
     int hybrid, hy_n, chy, cho; int *hy_of;
+    int hy_big;                          /* a prompt step's host pool experts of at most hy_big rows on the CPU too (0: none) */
+    unsigned long long hyb_steps, hyb_pairs;
     VktHostExpert *hy_v; const VktHostExpert **hy_hx; const float **hy_x;
     float *hy_gu, *hy_hh, *hy_out;
     unsigned long long hy_steps, hy_pairs; double hy_ms;
@@ -1261,6 +1263,8 @@ static int d2_issue_big(int layer, const float *x, int K, const float *w, const 
     T.d2_served += (unsigned long long)j; T.d2_steps++; T.d2_big++;
     return j;
 }
+static int host_view_share(int layer, int e, VktHostExpert *hx, int share);   /* below, with the hybrid steps */
+static int grow_hy(int n, int np);
 static int issue_big(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken) {
     const int E = T.c.experts, H = T.c.hidden, n = S * K;
     int *cnt = T.bcnt, *ofs = T.bofs, *cls = T.bcls;
@@ -1301,6 +1305,26 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         for (int e = 0; e < E; e++) T.pred[(size_t)layer * E + e] = (uint32_t)cnt[e];
         T.pred_ok[layer] = 1;
     }
+    /* A host pool expert of block types with at most hy_big rows: the CPU computes its pairs in
+     * place at the join (vkt_host_pairs), while it waits for the device anyway, instead of its
+     * bytes crossing the bus for a row or two (the device's alternative is a copy, so the
+     * decode's PCIe share does not apply) */
+    T.hy_n = 0;
+    int nhy = 0;
+    if (T.hybrid && T.hy_big > 0 && grow_hy(n, 0)) {
+        for (int i = 0; i < n; i++) T.hy_of[i] = -1;
+        for (int e = 0; e < E; e++) {
+            if (cnt[e] < 1 || cnt[e] > T.hy_big || (cls[e] != BC_DEV && cls[e] != BC_STREAM) || !slot(layer, e)->host) continue;
+            VktHostExpert hv;
+            if (!host_view_share(layer, e, &hv, 0) || !grow_hy(n, T.hy_n + cnt[e])) continue;
+            for (int r = 0; r < cnt[e]; r++) {
+                const int i = T.blist[ofs[e] + r];
+                T.hy_v[T.hy_n] = hv; T.hy_x[T.hy_n] = x + (size_t)(i / K) * H; T.hy_of[i] = T.hy_n++;
+            }
+            if (T.bpool && T.bpool[e]) { T.bpool[e] = 0; npool--; }
+            cls[e] = BC_NONE; nhy++;   /* none of the device's */
+        }
+    }
     int ndev = 0, nst = 0, nkept = 0, kept_rows = 0, nd2 = 0;
     for (int e = 0; e < E; e++) {
         ndev += cls[e] == BC_DEV; nst += cls[e] == BC_STREAM; nd2 += cls[e] == BC_DEV2;
@@ -1330,11 +1354,12 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         else fprintf(stderr, "the GEMM's %d rows: the upload and the CPU's rows not measured yet", T.gemm_rows);
         fprintf(stderr, "); layer %d: %d resident, %d streamed (%d of them copied from the host pool), %d kept on the CPU (%d rows)",
                 layer, ndev, nst, npool, nkept, kept_rows);
+        if (nhy) fprintf(stderr, ", %d of the host pool on the CPU in place (%d rows or fewer)", nhy, T.hy_big);
         if (T.d2) fprintf(stderr, ", %d on the second device", nd2);
         fprintf(stderr, "\n");
     }
     T.st_kept += (unsigned long long)nkept; T.st_kept_rows += (unsigned long long)kept_rows;
-    if (!ndev && !nst && !nd2) return 0;
+    if (!ndev && !nst && !nd2 && !T.hy_n) return 0;
     /* The backend counts both halves, activation buffers, descriptor windows and
      * growth before allocating. Leave half of available RAM for CPU work too. */
     int half = T.st_half < n ? T.st_half : n;
@@ -1489,6 +1514,11 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     free(order); free(bex); free(brows); free(bx); free(bw); free(bidx); free(eslot);
     total += d2_taken;
     T.big_taken = total;
+    if (T.hy_n) {   /* the join computes them */
+        for (int i = 0; i < n; i++) if (T.hy_of[i] >= 0) taken[i] = 1;
+        for (int p = 0; p < T.hy_n; p++) T.hy_hx[p] = &T.hy_v[p];
+        T.inflight = 1;
+    }
     if (!total && !T.inflight) {   /* nothing went (or everything failed before a submit) */
         T.big = 0;
         if (T.sy_step) { coli_vk_xb_step_end(); T.sy_step = NULL; }
@@ -1501,11 +1531,20 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     T.steps++; T.served += (unsigned long long)total; T.st_steps++;
     T.S = S; T.K = K;
     T.t_issued = vkt_now_ms();
-    return total;
+    return total + T.hy_n;
 }
 static int join_big(const float **rows) {
     double t0 = vkt_now_ms(), tc = t0 - T.t_issued;
     T.cpu_ms += tc;
+    /* the host pool's pairs of few rows, while the device computes its batches */
+    const int hn = T.hy_n;
+    int hok = 1;
+    if (hn) {
+        hok = vkt_host_pairs(T.hy_hx, T.hy_x, hn, T.c.hidden, T.c.inter, T.c.act_limit, 0, T.hy_gu, T.hy_hh, T.hy_out);
+        double th = vkt_now_ms() - t0;
+        T.hy_ms += th; T.cpu_ms += th; T.hyb_steps++; T.hyb_pairs += (unsigned long long)hn;
+        T.hy_n = 0;
+    }
     /* the oldest first */
     int a = (int)(T.sk % 2), b = !a;
     st_join_half(a); st_join_half(b);
@@ -1517,7 +1556,7 @@ static int join_big(const float **rows) {
         if (ok1) for (int q = 0; q < T.nd2; q++) memcpy((T.sy_step ? T.sy_step : T.sy) + (size_t)T.d2_idx[q] * T.c.hidden, T.d2_y[q], (size_t)T.c.hidden * sizeof(float));
         T.d2_inflight = 0;
     }
-    int cpu_pairs = T.big_n - T.big_taken;
+    int cpu_pairs = T.big_n - T.big_taken - hn;   /* the engine's own */
     if (cpu_pairs >= 32 && tc > 0) {
         double r = tc / cpu_pairs;
         T.cpu_row_ms = T.cpu_row_ms > 0 ? 0.8 * T.cpu_row_ms + 0.2 * r : r;
@@ -1525,7 +1564,9 @@ static int join_big(const float **rows) {
     T.inflight = 0; T.big = 0;
     int ok = !T.big_fail;
     const float *SY = T.sy_step ? T.sy_step : T.sy;
-    for (int i = 0; i < T.big_n; i++) rows[i] = ok && ok1 && T.map[i] >= 0 ? SY + (size_t)i * T.c.hidden : NULL;
+    for (int i = 0; i < T.big_n; i++)
+        rows[i] = !(ok && ok1 && hok) ? NULL : T.map[i] >= 0 ? SY + (size_t)i * T.c.hidden
+                : hn && T.hy_of[i] >= 0 ? T.hy_out + (size_t)T.hy_of[i] * T.c.hidden : NULL;
     for (int i = 0; T.st && i < T.st_n; i++) if (T.st[i].state == SS_BUSY) { T.st[i].state = SS_FREE; T.st[i].pending = 0; }
     if (!ok) {
         fprintf(stderr, "[VK] tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
@@ -1537,6 +1578,10 @@ static int join_big(const float **rows) {
         return 0;
     }
     quiesce();
+    if (!hok) {   /* the CPU computes the step's pairs from its own copies */
+        fprintf(stderr, "[VK] tier %s: a prompt step's host pool pairs could not be computed in place, the step goes to the CPU\n", T.engine);
+        return 0;
+    }
     return 1;
 }
 
@@ -1600,12 +1645,12 @@ static double hybrid_pcie_share(void) {
  * device's share (by a hash of (layer, expert): the same split at every step and every read
  * of a table, the CPU's share spread over the experts), its three tensors block types the
  * CPU has rows of (a GGUF's, as the file has them), gate and up of one type. *hx its rows. */
-static int host_view(int layer, int e, VktHostExpert *hx) {
+static int host_view_share(int layer, int e, VktHostExpert *hx, int share) {
     VSlot *v = slot(layer, e);
     if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex || !v->host) return 0;
     uint32_t hsh = (uint32_t)(layer * 2654435761u) ^ (uint32_t)(e * 2246822519u);
     hsh ^= hsh >> 15; hsh *= 2654435761u; hsh ^= hsh >> 13;
-    if ((double)(hsh & 0xffff) / 65536.0 < hybrid_pcie_share()) return 0;
+    if (share && (double)(hsh & 0xffff) / 65536.0 < hybrid_pcie_share()) return 0;
     ColiVkTensor *t[3]; ColiVkTensorInfo ti[3]; const void *r[3]; int ok = 1;
     coli_vk_xb_expert_tensors(v->ex, &t[0], &t[1], &t[2]);
     for (int k = 0; k < 3 && ok; k++)
@@ -1616,6 +1661,7 @@ static int host_view(int layer, int e, VktHostExpert *hx) {
                           (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4};
     return 1;
 }
+static int host_view(int layer, int e, VktHostExpert *hx) { return host_view_share(layer, e, hx, 1); }
 
 static int hy_threads(void) {   /* the CPU's team: COLI_VK_HYBRID_THREADS, else OpenMP's */
     static int n = -1;
@@ -1626,61 +1672,98 @@ static int hy_threads(void) {   /* the CPU's team: COLI_VK_HYBRID_THREADS, else 
     return 1;
 #endif
 }
-/* a row of type t (I inputs) against act a's one row: the CPU's integer form, or with
- * GQ_EXACT=1 its float reference (gq_dequant_row), as its own matmuls would take it */
-static inline void host_row(float *y, const gq_act *a, const float *xf, const uint8_t *row, int t, int I, float *tmp) {
-    if (!gq_exact_mode()) { gq_row_all(y, 1, a, row, t, I); return; }
-    double acc = 0; gq_dequant_row(t, row, tmp, I);
-    for (int i = 0; i < I; i++) acc += (double)tmp[i] * xf[i];
-    *y = (float)acc;
+/* a row of type t (I inputs) against act a's rows (xf[s] their floats): the CPU's integer
+ * form, or with GQ_EXACT=1 its float reference (gq_dequant_row), as its own matmuls would
+ * take it. Each activation row its own dot, the same bits whatever rows share the call. */
+static inline void host_rows(float *y, int ys, const gq_act *a, const float *const *xf, const uint8_t *row, int t, int I, float *tmp) {
+    if (!gq_exact_mode()) { gq_row_all(y, ys, a, row, t, I); return; }
+    gq_dequant_row(t, row, tmp, I);
+    for (int s = 0; s < a->S; s++) {
+        double acc = 0; const float *x = xf[s];
+        for (int i = 0; i < I; i++) acc += (double)tmp[i] * x[i];
+        y[(size_t)s * ys] = (float)acc;
+    }
+}
+typedef struct { const uint8_t *g; int p; } HyKey;
+static int hy_key_cmp(const void *a, const void *b) {
+    const HyKey *x = a, *y = b;
+    if (x->g != y->g) return (uintptr_t)x->g < (uintptr_t)y->g ? -1 : 1;
+    return x->p - y->p;
 }
 int vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
                    float limit, int nt, float *gu, float *hh, float *dn) {
     if (np < 1) return 1;
-    int err = 0, nx = 0, *xa = malloc((size_t)np * sizeof(int));
-    gq_act *ax = calloc((size_t)np, sizeof(gq_act)), *ah = calloc((size_t)np, sizeof(gq_act));
-    if (!xa || !ax || !ah) { free(xa); free(ax); free(ah); return 0; }
-    for (int p = 0; p < np; p++) {   /* a row's activation once: the pairs of a row share it */
-        int q = 0;
-        while (q < p && xr[q] != xr[p]) q++;
-        if (q < p) { xa[p] = xa[q]; continue; }
-        xa[p] = nx;
-        if (gq_act_set(&ax[nx++], xr[p], 1, D)) err = 1;
+    /* The pairs of one expert side by side (q: their place in ord), a group reading the
+     * expert's rows once for all of its pairs: a prompt step's experts of a few rows, or the
+     * rows of a decode step's draft that share one. gu and hh go in that order, dn in p's. */
+    int err = 0, nx = 0, ng = 0, ident = 1;
+    int *xa = malloc((size_t)np * sizeof(int)), *ord = malloc((size_t)np * sizeof(int)), *gs = malloc((size_t)(np + 1) * sizeof(int)),
+        *gx = malloc((size_t)np * sizeof(int));
+    HyKey *key = malloc((size_t)np * sizeof(HyKey));
+    const float **xo = malloc((size_t)np * sizeof(float *)), **ho = malloc((size_t)np * sizeof(float *));
+    gq_act ax = {0}, *ag = calloc((size_t)np, sizeof(gq_act)), *ah = calloc((size_t)np, sizeof(gq_act));
+    float *xb = NULL, *dq = NULL;
+    if (!xa || !ord || !gs || !gx || !key || !xo || !ho || !ag || !ah) { err = 2; goto out; }
+    for (int p = 0; p < np; p++) key[p] = (HyKey){hx[p]->g, p};
+    qsort(key, (size_t)np, sizeof(HyKey), hy_key_cmp);
+    for (int q = 0; q < np; q++) {
+        ord[q] = key[q].p; ident &= ord[q] == q;
+        if (!q || key[q].g != key[q - 1].g) gs[ng++] = q;
+        xo[q] = xr[ord[q]]; ho[q] = hh + (size_t)q * I;
     }
-    /* gate and up of every pair, the activation, then down: one parallel region, the
+    gs[ng] = np;
+    for (int p = 0; p < np; p++) {   /* a row's activation once: the pairs of a row share it */
+        int r = 0;
+        while (r < p && xr[r] != xr[p]) r++;
+        xa[p] = r < p ? xa[r] : nx++;
+    }
+    if (!(xb = malloc((size_t)nx * D * sizeof(float))) || (!ident && !(dq = malloc((size_t)np * D * sizeof(float))))) { err = 2; goto out; }
+    for (int p = 0; p < np; p++) memcpy(xb + (size_t)xa[p] * D, xr[p], (size_t)D * sizeof(float));
+    if (gq_act_set(&ax, xb, nx, D)) { err = 1; goto out; }
+    for (int g = 0; g < ng && !err; g++) {   /* each group's rows of ax */
+        for (int q = gs[g]; q < gs[g + 1]; q++) gx[q - gs[g]] = xa[ord[q]];
+        if (gq_act_gather(&ag[g], &ax, gx, gs[g + 1] - gs[g])) err = 2;
+    }
+    if (err) goto out;
+    float *dy = dq ? dq : dn;
+    /* gate and up of every group, the activation, then down: one parallel region, the
      * rows handed out in chunks (the cores of a hybrid CPU do not run at one speed) */
     #pragma omp parallel num_threads(nt > 0 ? nt : hy_threads())
     {
         float *tmp = gq_exact_mode() ? malloc((size_t)(D > I ? D : I) * sizeof(float)) : NULL;
         #pragma omp for schedule(dynamic, 32)
-        for (int r = 0; r < np * 2 * I; r++) {
-            int p = r / (2 * I), o = r % (2 * I); const VktHostExpert *h = hx[p];
+        for (int64_t r = 0; r < (int64_t)ng * 2 * I; r++) {
+            const int g = (int)(r / (2 * I)), o = (int)(r % (2 * I)), q0 = gs[g]; const VktHostExpert *h = hx[ord[q0]];
             const uint8_t *row = o < I ? h->g + (size_t)o * h->rgu : h->u + (size_t)(o - I) * h->rgu;
-            host_row(gu + (size_t)p * 2 * I + o, &ax[xa[p]], xr[p], row, h->tg, D, tmp);
+            host_rows(gu + (size_t)q0 * 2 * I + o, 2 * I, &ag[g], xo + q0, row, h->tg, D, tmp);
         }
         #pragma omp for schedule(static)
-        for (int p = 0; p < np; p++) {
-            const float *g = gu + (size_t)p * 2 * I, *u = g + I; float *h = hh + (size_t)p * I;
+        for (int q = 0; q < np; q++) {
+            const float *g = gu + (size_t)q * 2 * I, *u = g + I; float *h = hh + (size_t)q * I;
             for (int o = 0; o < I; o++) {
                 float gv = g[o], uv = u[o];
                 if (limit > 0.f) { gv = gv < limit ? gv : limit; uv = uv < -limit ? -limit : uv > limit ? limit : uv; }
                 h[o] = gv / (1.f + expf(-gv)) * uv;
             }
-            if (gq_act_set(&ah[p], h, 1, I)) {
+        }
+        #pragma omp for schedule(static)
+        for (int g = 0; g < ng; g++)
+            if (gq_act_set(&ah[g], hh + (size_t)gs[g] * I, gs[g + 1] - gs[g], I)) {
                 #pragma omp atomic write
                 err = 1;
             }
-        }
         #pragma omp for schedule(dynamic, 64)
-        for (int r = 0; r < np * D; r++) {
-            int p = r / D, o = r % D; const VktHostExpert *h = hx[p];
-            host_row(dn + (size_t)p * D + o, &ah[p], hh + (size_t)p * I, h->d + (size_t)o * h->rd, h->td, I, tmp);
+        for (int64_t r = 0; r < (int64_t)ng * D; r++) {
+            const int g = (int)(r / D), o = (int)(r % D), q0 = gs[g]; const VktHostExpert *h = hx[ord[q0]];
+            host_rows(dy + (size_t)q0 * D + o, D, &ah[g], ho + q0, h->d + (size_t)o * h->rd, h->td, I, tmp);
         }
         free(tmp);
     }
-    for (int k = 0; k < nx; k++) gq_act_free(&ax[k]);
-    for (int p = 0; p < np; p++) gq_act_free(&ah[p]);
-    free(xa); free(ax); free(ah);
+    if (dq && !err) for (int q = 0; q < np; q++) memcpy(dn + (size_t)ord[q] * D, dq + (size_t)q * D, (size_t)D * sizeof(float));
+out:
+    gq_act_free(&ax);
+    for (int g = 0; ag && ah && g < np; g++) { gq_act_free(&ag[g]); gq_act_free(&ah[g]); }
+    free(xa); free(ord); free(gs); free(gx); free(key); free(xo); free(ho); free(ag); free(ah); free(xb); free(dq);
     return !err;
 }
 /* room for n pairs of the step (hy_of) and for np of them on the CPU */
@@ -2438,6 +2521,9 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
      * reads them over PCIe). SwiGLU only: DeepSeek V4's expert rounds as its own kernel does. */
     const char *hy = getenv("COLI_VK_HYBRID");
     T.hybrid = T.dmax[2] > 0 && T.c.act == VKT_ACT_SWIGLU && !(hy && *hy == '0');
+    /* and a prompt step's host pool experts of at most COLI_VK_HYBRID_BIG_ROWS rows */
+    const char *hbr = getenv("COLI_VK_HYBRID_BIG_ROWS");
+    T.hy_big = hbr && *hbr ? atoi(hbr) : 2;
     /* a prompt step's host pool experts of block types copied into the streaming's slots by
      * the copy engine (12.6 GB/s on a PCIe 4.0 x8 card), where the grouped GEMMs read them
      * in place at about 4 (COLI_VK_TIER_POOL_COPY=0: in place) */
@@ -2468,9 +2554,11 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
                 T.f_pool, T.f_copy, T.f_sets);
     if (T.balance) fprintf(stderr, " | balance: device share %.2f, %llu rows handed to the CPU", T.share, T.handed);
     if (T.chain_served) fprintf(stderr, " | in the dense chain: %llu routed experts with no host step", T.chain_served);
-    if (T.hy_steps)
+    if (T.hy_steps || T.hyb_steps) {
         fprintf(stderr, " | hybrid: %llu steps, %llu host pool pairs computed by the CPU in place (%.1f ms, %.0f us a pair)",
-                T.hy_steps, T.hy_pairs, T.hy_ms, T.hy_ms * 1e3 / (double)T.hy_pairs);
+                T.hy_steps, T.hy_pairs, T.hy_ms, T.hy_ms * 1e3 / (double)(T.hy_pairs + T.hyb_pairs));
+        if (T.hyb_steps) fprintf(stderr, ", and %llu prompt steps' %llu pairs", T.hyb_steps, T.hyb_pairs);
+    }
     if (T.c.extra_layers)
         fprintf(stderr, " | extra layers (%d): %llu of %llu routed experts on the device, resident %d (budget %d)",
                 T.c.extra_layers, T.extra_served, T.extra_routed, T.xres, T.xmax);

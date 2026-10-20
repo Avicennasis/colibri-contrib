@@ -341,8 +341,10 @@ int  vkt_dev_entry(int layer, int eid, uint32_t *ent, uint32_t *ent_hybrid, VktH
  * out + p * D. SwiGLU, the gate clamped from above at limit and up to [-limit, limit] first
  * when limit > 0; every matmul as the CPU computes a GGUF's (ggml_quants.h: int8 activations
  * and integer dots, with GQ_EXACT=1 the float reference), each output its own dot, so how the
- * nt threads split them moves no bit (nt 0: COLI_VK_HYBRID_THREADS, else OpenMP's). gu
- * (np * 2 * I floats) and hh (np * I) its scratch.
+ * nt threads split them moves no bit (nt 0: COLI_VK_HYBRID_THREADS, else OpenMP's). The pairs
+ * of one expert (the same hx[p]->g) go together, its rows read once for all of them, and a
+ * pair's bits are the same as on its own (ggml_quants.h's kernels take each activation row
+ * apart). gu (np * 2 * I floats) and hh (np * I) its scratch.
  * 0 = a row it could not quantize, or no memory. */
 int  vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
                     float limit, int nt, float *gu, float *hh, float *out);

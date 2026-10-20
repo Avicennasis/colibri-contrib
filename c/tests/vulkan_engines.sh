@@ -97,6 +97,8 @@ shader_formats() {
   tail -1 vk_test.log | grep -qx PASS || fail "qmatmul format cases"
   ./tests/test_vk_tier shaders/qmatmul.spv | tee vk_tier.log
   tail -1 vk_tier.log | grep -qx PASS || fail "routed-expert tier"
+  ./tests/test_vk_tier shaders/qmatmul.spv host-pairs | tee vk_tier_hp.log
+  tail -1 vk_tier_hp.log | grep -qx PASS || fail "routed-expert tier, the CPU's host pool pairs in the integer form"
   ./tests/test_glm53_vk_f32
   COLI_VK_GEMM_MIN_S=0 ./tests/test_glm53_vk_f32
 }
