@@ -14710,7 +14710,9 @@ static int target_batch_impl(ColiV4Engine *engine, float **state_ptr, float **ne
     {   /* the dense chain runs its layers on the device (every layer, or a partial chain's
          * first ones, the CPU the rest from their streams); 0: the CPU runs them all */
         int chained = v4c_forward(engine, state_ptr, next_ptr, attention, config, experts, tokens,
-                                  start, batch, pool_experts, error, error_size);
+                                  start, batch, pool_experts,
+                                  use_prefill_pool,   /* prompts only: a verify's rows keep the GEMV's bits */
+                                  error, error_size);
         if (chained < 0) return -1;
         if (!chained) v4c_cpu_step(start);
         else { first_layer = chained; state = *state_ptr; next = *next_ptr; }
@@ -14817,7 +14819,7 @@ static int target_token_impl(ColiV4Engine *engine, float **state_ptr, float **ne
 #ifdef COLI_VULKAN
     {   /* the dense chain, as in target_batch */
         int chained = v4c_forward(engine, state_ptr, next_ptr, attention, config, experts, &token,
-                                  position, 1, 0, error, error_size);
+                                  position, 1, 0, 0, error, error_size);   /* a decode step: always the GEMV */
         if (chained < 0) return -1;
         if (!chained) v4c_cpu_step(position);
         else { first_layer = chained; state = *state_ptr; next = *next_ptr; }
