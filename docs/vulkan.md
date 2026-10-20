@@ -1436,7 +1436,15 @@ turns it on) and on a CPU device:
 ### OLMoE and Inkling
 
 olmoe (`olmoe_chain.h`) and inkling (`inkling_chain.h`) run the chain too, with the same
-knobs, default rule and `[VK] <engine> chain: ...` line as qwen36.
+knobs, default rule and `[VK] <engine> chain: ...` line as qwen36. A GGUF's matrices go up
+as the file's blocks (`olc_gq_tensor`, `inkc_tensor`: 100 + the ggml type, rows the
+loader interleaved by 16 back to the file's first, whole groups of them for Inkling's
+head, whose unpadded vocabulary stops inside the last one), OLMoE's experts in the frame
+with their block decoders; outside the chain (the per-matrix path, the dense weights on
+the device only) a GGUF's dense part stays on the CPU. Before, both chains were off for a
+GGUF. On an RTX PRO 4000: OLMoE-1B-7B Q4_K_M decode 71-73 -> 210 tok/s and a 176-token
+prompt 549 -> 2454 tok/s (the CPU's greedy text); Inkling-Small UD-IQ2_XXS (77 GB, 62 GB
+of RAM) decode 6.9-7.1 -> 9.4-10.4 tok/s and a 173-token prompt 22.2-22.7 -> 17.6-29.2.
 
 | | olmoe | inkling |
 |---|---|---|
