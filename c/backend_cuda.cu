@@ -3560,6 +3560,34 @@ __global__ static void __launch_bounds__(256) f32_gemm_k(float *__restrict__ y, 
         if (r < S && o < O) y[(size_t)r * O + o] = acc[i][j];
     }
 }
+/* A decode step's rows (up to GEMV_I8_MAX_S) of an f32 matrix of few outputs and long rows
+ * (Qwen3.8's hyper-connection injection, 4 x 10240; DeltaNet's b and a rows, 48 x 2560):
+ * quant_matmul took the injection 18.8 us on an RTX PRO 4000, four blocks with one load at a
+ * time in flight a thread (its loop reads through weight_at's format switch). This is its
+ * arithmetic for fmt 0 in its order (each thread's fused multiply-adds at a stride of 256,
+ * then the same tree), the bits it gives, with eight loads in flight a thread. */
+__global__ static void __launch_bounds__(256) f32_gemv_k(float *__restrict__ y, const float *__restrict__ x,
+                                                          const float *__restrict__ w, int I, int O) {
+    __shared__ float partial[256];
+    int o = (int)blockIdx.x, s = (int)blockIdx.y, i = threadIdx.x;
+    const float *wr = w + (size_t)o * I, *xr = x + (size_t)s * I;
+    float sum = 0.f;
+    for (; i + 7 * 256 < I; i += 8 * 256) {
+        float a[8], b[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) { a[k] = xr[i + k * 256]; b[k] = wr[i + k * 256]; }
+        #pragma unroll
+        for (int k = 0; k < 8; k++) sum = fmaf(a[k], b[k], sum);
+    }
+    for (; i < I; i += 256) sum = fmaf(xr[i], wr[i], sum);
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int n = 128; n; n >>= 1) {
+        if (threadIdx.x < n) partial[threadIdx.x] += partial[threadIdx.x + n];
+        __syncthreads();
+    }
+    if (!threadIdx.x) y[(size_t)s * O + o] = partial[0];
+}
 static int f32_gemm_launch(DeviceContext *ctx, float *y, const float *x, const float *w, int S, int I, int O, cudaStream_t st) {
     unsigned gx = (unsigned)((O + F32G_N - 1) / F32G_N), big = (unsigned)((S + 63) / 64);
     if ((long)gx * big >= 2L * (ctx->sms > 0 ? ctx->sms : 1)) f32_gemm_k<64><<<dim3(gx, big), 256, 0, st>>>(y, x, w, S, I, O);
@@ -3614,6 +3642,10 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
     }
     if (t->fmt == 0 && S > GEMV_I8_MAX_S && t->O >= 16)   /* a decode step's rows keep quant_matmul's bits, as a single gate row does */
         return f32_gemm_launch(ctx, y_dev, x_dev, (const float *)t->weights, S, t->I, t->O, st);
+    if (t->fmt == 0 && S <= GEMV_I8_MAX_S && t->O <= 256 && t->I >= 1024) {   /* few outputs, long rows: quant_matmul's bits */
+        f32_gemv_k<<<dim3((unsigned)t->O, (unsigned)S), 256, 0, st>>>(y_dev, x_dev, (const float *)t->weights, t->I, t->O);
+        return cuda_ok(cudaGetLastError(), "chain f32 gemv launch");
+    }
     dim3 grid((unsigned)t->O, (unsigned)S);
     if (t->fmt == 8 && f8_warp_mode())
         quant_matmul_f8w<<<grid, 256, 0, st>>>(y_dev, x_dev, t->weights, t->scales, S, t->I, t->O);
