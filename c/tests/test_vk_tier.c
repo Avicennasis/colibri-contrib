@@ -1310,11 +1310,15 @@ static void promote_case(void) {
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
+    /* a device that shares the host's RAM (Lavapipe) has a type for the host pool only with
+     * COLI_VK_TIER_HOST=1 at the device's start (backend_vulkan.c): promote_case's pool */
+    int host_set = getenv("COLI_VK_TIER_HOST") != NULL;
+    if (!host_set) setenv("COLI_VK_TIER_HOST", "1", 1);
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
     setenv("COLI_VK_TIER_RESERVE_GB", "0", 1);
     /* the budgets, evictions and promotions below are the device's: the host pool (a
      * discrete card's system RAM) would take what the device leaves */
-    setenv("COLI_VK_TIER_HOST", "0", 0);
+    if (!host_set) setenv("COLI_VK_TIER_HOST", "0", 1);
     scratch_budget();
     printf("formats:\n"); formats();
     printf("blocks:\n"); blocks();
