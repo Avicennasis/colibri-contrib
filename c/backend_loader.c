@@ -106,6 +106,7 @@ typedef int            (*fn_host_register)(void *p, size_t bytes);
 typedef void           (*fn_host_unregister)(void *p);
 typedef int            (*fn_planar_rows)(int device, int D, int I);
 typedef int            (*fn_block_elems)(int fmt);
+typedef int            (*fn_tensor_upload_at)(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights, int fmt, int I, int O, int device);
 typedef const ColiCudaChainOps *(*fn_chain_ops)(void);
 typedef int            (*fn_e8_set_grid)(const void *grid);
 typedef int            (*fn_fp8_set_lut)(const float *lut);
@@ -196,6 +197,7 @@ static struct {
     fn_tensor_overwrite tensor_overwrite;   /* optional: DLLs before it leave it NULL */
     fn_host_register host_register; fn_host_unregister host_unregister; fn_planar_rows planar_rows;   /* optional: the tier's RAM staged for a prompt chunk */
     fn_block_elems block_elems;   /* optional: a GGUF's block formats on the device */
+    fn_tensor_upload_at tensor_upload_at;   /* optional: a block-format tensor in an arena's slot */
     fn_chain_ops chain_ops;                 /* optional: the dense chain (cuda_chain.h); NULL = none */
     fn_e8_set_grid     e8_set_grid;
     fn_fp8_set_lut     fp8_set_lut;
@@ -1459,6 +1461,7 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(host_unregister, fn_host_unregister)
     RESOLVE_OPT(planar_rows, fn_planar_rows)
     RESOLVE_OPT(block_elems, fn_block_elems)
+    RESOLVE_OPT(tensor_upload_at, fn_tensor_upload_at)
     RESOLVE_OPT(chain_ops, fn_chain_ops)
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
     RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
@@ -1695,6 +1698,9 @@ void coli_cuda_host_unregister(void *p){
 }
 int coli_cuda_planar_rows(int device, int D, int I){
     return g_cuda.available && g_cuda.planar_rows ? g_cuda.planar_rows(device, D, I) : 0;
+}
+int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights, int fmt, int I, int O, int device){
+    return g_cuda.available && g_cuda.tensor_upload_at ? g_cuda.tensor_upload_at(tensor, dev, cap, weights, fmt, I, O, device) : 0;
 }
 int coli_cuda_block_elems(int fmt){
     return g_cuda.available && g_cuda.block_elems ? g_cuda.block_elems(fmt) : 0;   /* older DLL: no block formats */

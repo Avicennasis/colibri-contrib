@@ -30,6 +30,7 @@ typedef struct {
     const uint8_t *g4,*u4,*d4; const float *gs,*us,*ds;
     /* the host pool (qt_note_host): g4 and gs page-locked for the device's copies */
     uint8_t hreg;
+    int aslot;   /* a GGUF's arena slot on its device, plus one (0: none) */
 } QSlot;
 
 static struct {
@@ -119,12 +120,23 @@ static int G_src_planar;
 #define QT_GGUF 100
 static int *G_gtg, *G_gtd, G_gguf_init;
 static size_t *G_gmb, *G_gmbd;          /* a gate (or up) matrix's bytes and a down's, per layer */
+/* A GGUF's experts in one arena a device: slots of G_aslot bytes, an expert's gate, up and
+ * down rows (padded to words) at 0, G_aoff_u, G_aoff_d, any layer's types in any slot. A
+ * cudaMalloc a matrix rounded each up to the allocator's granularity (Qwen3.6 Q4_K's 576 KiB
+ * gate took 1 MiB: 3 MiB an expert for 2.0 of bytes, a third fewer experts held), and a swap
+ * into another layer's types freed and allocated, synchronising the device; a slot does
+ * neither. Off when the backend lacks coli_cuda_tensor_upload_at or the arena is refused. */
+static void *G_arena[QT_MAX_DEV];
+static int *G_afree[QT_MAX_DEV], G_anfree[QT_MAX_DEV], G_aslots[QT_MAX_DEV], G_arena_on;
+static size_t G_aslot, G_aoff_u, G_aoff_d;
+static size_t qt_pad256(size_t b){ return (b + 255) / 256 * 256; }
 /* A swap writes the newcomer into the victim's device buffers: a GGUF's layers of other types
  * have buffers of other sizes, and freeing them for a new upload synchronises the device,
  * which a dense chain's hybrid layer (the device waiting for the host's word, the host's next
- * launch waiting for the free) turns into a deadlock. So a GGUF's swaps pair same-typed layers. */
+ * launch waiting for the free) turns into a deadlock. So without the arena (whose slots take
+ * any layer's types in place) a GGUF's swaps pair same-typed layers. */
 static int swap_ok(int cand_layer, int victim_layer){
-    return G.wfmt!=QT_GGUF || (G_gtg[cand_layer]==G_gtg[victim_layer] && G_gtd[cand_layer]==G_gtd[victim_layer]);
+    return G.wfmt!=QT_GGUF || G_arena_on || (G_gtg[cand_layer]==G_gtg[victim_layer] && G_gtd[cand_layer]==G_gtd[victim_layer]);
 }
 /* bytes of one gate (or up) matrix and of one down matrix as the staging holds them */
 static size_t qt_mb_gu(int layer){ return G.wfmt==QT_GGUF ? G_gmb[layer] : (size_t)G.D*G.Ih/(G.wfmt==4?2:1); }
@@ -247,7 +259,11 @@ static void *uploader(void *arg){
         if(G.wfmt==8||G.egs){ su=sc+G.sc_gu; sd=sc+2*G.sc_gu; } else { su=sc+G.Ih; sd=sc+2*G.Ih; }
         int dv = G.dev[home2(layer,eid)];
         ColiCudaTensor *tg=NULL,*tu=NULL,*td=NULL;
-        int ok=0, inplace=0;
+        int ok=0, inplace=0, aslot=-1;   /* a GGUF's arena slot: the victim's, or a free one */
+        if(G_arena_on){
+            if(ve>=0){ QSlot *v=qs(vl,ve); aslot=v->aslot-1; v->aslot=0; }
+            else { int hi=home2(layer,eid); if(G_anfree[hi]>0) aslot=G_afree[hi][--G_anfree[hi]]; }
+        }
         if(ve>=0){
             /* LFRU swap: touch the victim only when no group and no chain forward is in flight */
             while((G.issue_open||G.chain_hold) && !G.th_stop) wait_take_locked();
@@ -261,6 +277,7 @@ static void *uploader(void *arg){
                  * restore it to keep the flag consistent with the tensor it
                  * still holds. */
                 res_set(v,1); qs(layer,eid)->queued=0; G.inflight--;
+                if(aslot>=0) v->aslot=aslot+1;   /* the victim keeps its slot */
                 pthread_cond_broadcast(&G.cv_take);
                 pthread_mutex_unlock(&G.mx); free(w); free(sc); continue;
             }
@@ -273,7 +290,7 @@ static void *uploader(void *arg){
              * re-plan of 1,500 swaps cost 1.3 s of prefill that way). A
              * backend without the entry point, or a failure half-way, falls
              * back to the old free-then-upload. */
-            int same=G.wfmt!=QT_GGUF || (G_gtg[vl]==G_gtg[layer] && G_gtd[vl]==G_gtd[layer]);   /* a GGUF's layers differ */
+            int same=G.wfmt!=QT_GGUF || (G_gtg[vl]==G_gtg[layer] && G_gtd[vl]==G_gtd[layer]);   /* a GGUF's layers differ: the arena re-uploads */
             if(a&&b&&ct && same && coli_cuda_tensor_overwrite(a,w,sg) && coli_cuda_tensor_overwrite(b,w+mb,su)
                         && coli_cuda_tensor_overwrite(ct,w+2*mb,sd)){
                 tg=a; tu=b; td=ct; ok=1; inplace=1;
@@ -283,7 +300,13 @@ static void *uploader(void *arg){
         } else pthread_mutex_unlock(&G.mx);
 
         if(!inplace){
-            if(G.wfmt==QT_GGUF){
+            if(G.wfmt==QT_GGUF && G_arena_on){
+                char *b=(char *)G_arena[home2(layer,eid)] + (size_t)(aslot<0?0:aslot)*G_aslot;
+                ok = aslot>=0
+                  && coli_cuda_tensor_upload_at(&tg, b,            G_aoff_u,            w,      100+G_gtg[layer], G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_upload_at(&tu, b + G_aoff_u, G_aoff_d - G_aoff_u, w+mb,   100+G_gtg[layer], G.D,  G.Ih, dv)
+                  && coli_cuda_tensor_upload_at(&td, b + G_aoff_d, G_aslot - G_aoff_d,  w+2*mb, 100+G_gtd[layer], G.Ih, G.D,  dv);
+            } else if(G.wfmt==QT_GGUF){
                 ok = coli_cuda_tensor_upload(&tg, w,      NULL, 100+G_gtg[layer], G.D,  G.Ih, dv)
                   && coli_cuda_tensor_upload(&tu, w+mb,   NULL, 100+G_gtg[layer], G.D,  G.Ih, dv)
                   && coli_cuda_tensor_upload(&td, w+2*mb, NULL, 100+G_gtd[layer], G.Ih, G.D,  dv);
@@ -318,6 +341,10 @@ static void *uploader(void *arg){
         }
         pthread_mutex_lock(&G.mx);
         QSlot *s=qs(layer,eid);
+        if(G_arena_on && aslot>=0){
+            if(ok) s->aslot=aslot+1;
+            else { int hi=home2(layer,eid); G_afree[hi][G_anfree[hi]++]=aslot; }   /* the slot back */
+        }
         if(ok){ s->tg=tg; s->tu=tu; s->td=td; res_set(s,1); G.uploads++; if(inplace) G.inplace++; }
         else  { int hd=home2(layer,eid); G.used[hd]-=G.exp_bytes;
                 G.budget[hd]=G.used[hd];   /* device genuinely full: stop trying */ }
@@ -640,6 +667,28 @@ int qt_init_fp8(int nl, int ne, int D, int Ih, int cap, int topk, const float *e
     return ok;
 }
 
+/* each device's arena: as many slots as its budget holds and its homed experts need */
+static int qt_arena_up(void){
+    for(int i=0;i<G.ndev;i++){
+        size_t homed=0;
+        for(int l=0;l<G.nl;l++) for(int e=0;e<G.ne;e++) if(home2(l,e)==i) homed++;
+        size_t n=G.budget[i]/G_aslot; if(n>homed) n=homed;
+        G_aslots[i]=(int)n; G_anfree[i]=0;
+        if(!n) continue;
+        G_arena[i]=coli_cuda_pipe_alloc(G.dev[i], n*G_aslot);
+        G_afree[i]=malloc(n*sizeof(int));
+        if(!G_arena[i] || !G_afree[i]){
+            for(int j=0;j<=i;j++){ if(G_arena[j]) coli_cuda_pipe_free(G.dev[j],G_arena[j]); G_arena[j]=NULL; free(G_afree[j]); G_afree[j]=NULL; G_aslots[j]=G_anfree[j]=0; }
+            return 0;
+        }
+        for(size_t k=0;k<n;k++) G_afree[i][k]=(int)(n-1-k);
+        G_anfree[i]=(int)n;
+        fprintf(stderr,"[qtier] dev %d: the GGUF experts' arena, %zu slots of %.2f MB (%.2f GB)\n",
+                G.dev[i], n, G_aslot/1048576.0, n*G_aslot/1073741824.0);
+    }
+    G_arena_on=1;
+    return 1;
+}
 int qt_init_gguf(int nl, int ne, int D, int Ih, int cap, int topk, const int *tg, const int *td,
                  const size_t *gu_bytes, const size_t *d_bytes){
     if(G.on || nl<1 || !tg || !td || !gu_bytes || !d_bytes) return 0;
@@ -780,11 +829,17 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
                 + 2*dev_alloc_footprint(G.sc_gu*sizeof(float))
                 + dev_alloc_footprint(G.sc_d*sizeof(float));
     if(G.wfmt==QT_GGUF){   /* the biggest layer's (a slot takes any layer's expert); padded rows, no scales */
-        G.exp_bytes = 0;
+        G.exp_bytes = 0; size_t mg=0, md=0;
         for(int l=0;l<nl;l++){
-            size_t e = 2*dev_alloc_footprint((G_gmb[l]+3*(size_t)Ih)/4*4) + dev_alloc_footprint((G_gmbd[l]+3*(size_t)D)/4*4);
+            size_t pg=(G_gmb[l]+3*(size_t)Ih)/4*4, pd=(G_gmbd[l]+3*(size_t)D)/4*4;
+            size_t e = 2*dev_alloc_footprint(pg) + dev_alloc_footprint(pd);
             if(e>G.exp_bytes) G.exp_bytes=e;
+            if(pg>mg) mg=pg; if(pd>md) md=pd;
         }
+        /* the arena's slot (qt_arena_up below): the matrices back to back, 256-byte aligned */
+        G_aoff_u=qt_pad256(mg); G_aoff_d=2*G_aoff_u; G_aslot=G_aoff_d+qt_pad256(md);
+        G_arena_on=0;
+        { const char *ae=getenv("QT_GGUF_ARENA"); if(!(ae && *ae=='0')) G.exp_bytes=G_aslot; }   /* 0: a cudaMalloc a matrix (tests) */
     }
 
     /* Per-device allowance for tier + trunk: CUDA_EXPERT_GB when numeric,
@@ -971,6 +1026,16 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         fprintf(stderr,"[qtier] dev %d: budget %.2f GB for experts (~%zu experts)%s\n",
                 G.dev[i], G.budget[i]/1073741824.0, G.budget[i]/G.exp_bytes,
                 trunk ? " after trunk" : "");
+    }
+    if(G.wfmt==QT_GGUF && G.exp_bytes==G_aslot && !G_trunk_only && !qt_arena_up()){
+        /* no arena: an expert costs what three cudaMallocs take */
+        G.exp_bytes=0;
+        for(int l=0;l<nl;l++){
+            size_t e = 2*dev_alloc_footprint((G_gmb[l]+3*(size_t)Ih)/4*4) + dev_alloc_footprint((G_gmbd[l]+3*(size_t)D)/4*4);
+            if(e>G.exp_bytes) G.exp_bytes=e;
+        }
+        fprintf(stderr,"[qtier] the GGUF experts' arena was refused: a device allocation an expert matrix (%.2f MB an expert)\n",
+                G.exp_bytes/1048576.0);
     }
     /* qt_issue strides each device's block by QT_MAX_ROWS*D floats (its max
      * row count), not 8*D: a device other than 0 with a full 32-row issue
@@ -1799,7 +1864,13 @@ void qt_shutdown(void){
         if(s->tg) coli_cuda_tensor_free(s->tg);
         if(s->tu) coli_cuda_tensor_free(s->tu);
         if(s->td) coli_cuda_tensor_free(s->td);
+        s->aslot=0;
     }
+    for(int i=0;i<QT_MAX_DEV;i++){   /* the arenas, once no tensor points into them */
+        if(G_arena[i]) coli_cuda_pipe_free(G.dev[i],G_arena[i]);
+        G_arena[i]=NULL; free(G_afree[i]); G_afree[i]=NULL; G_aslots[i]=G_anfree[i]=0;
+    }
+    G_arena_on=0;
     free(G.slot); G.slot=NULL;
     free(G.is_x); G.is_x=NULL; G.is_x_floats=0;
     free(G.fill_order); G.fill_order=NULL;

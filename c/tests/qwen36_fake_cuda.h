@@ -92,6 +92,16 @@ int coli_cuda_planar_rows(int device, int D, int I) { (void)device; (void)D; (vo
 /* a GGUF's block formats: fake_block_elems for every fmt >= 100 (0: the backend takes none) */
 static int fake_block_elems;
 int coli_cuda_block_elems(int fmt) { return fmt >= 100 ? fake_block_elems : 0; }
+/* device memory (the tier's arena): host memory here; fake_alloc_fail refuses it */
+static int fake_alloc_fail;
+void *coli_cuda_pipe_alloc(int device, size_t bytes) { (void)device; return fake_alloc_fail ? NULL : calloc(1, bytes ? bytes : 1); }
+void coli_cuda_pipe_free(int device, void *p) { (void)device; free(p); }
+/* an arena's slot: the fake keeps the host bytes as an upload would */
+static int fake_upload_at;
+int coli_cuda_tensor_upload_at(ColiCudaTensor **t, void *dev, size_t cap, const void *w, int fmt, int I, int O, int device) {
+    (void)dev; (void)cap; fake_upload_at++;
+    return upload_common(t, w, NULL, fmt, I, O, device, 0);
+}
 size_t coli_cuda_tensor_bytes(const ColiCudaTensor *t) { return t ? (size_t)t->I * (size_t)t->O : 0; }
 int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *w, const float *sc) {
     if (!t || !w || fake_overwrite_fail) return 0;

@@ -1549,6 +1549,25 @@ static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const
     if (!bd_gemv_launch(y, x, (const bd_u32 *)t->weights, tab, t->fmt, t->I, t->O, t->row_words, S, ctx->smem_optin, e && *e == '1', st)) return 0;
     return cuda_ok(cudaGetLastError(), "block gemv launch");
 }
+/* a block-format tensor in device memory the caller owns (an arena's slot of cap bytes):
+ * coli_cuda_tensor_free leaves the memory, and its bytes are counted where it was allocated */
+extern "C" int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights,
+                                          int fmt, int I, int O, int device) {
+    if (!tensor || *tensor || !dev) return 0;
+    DeviceContext *ctx = find_ctx(device);
+    size_t rb = bd_file_row_bytes(fmt, I);
+    if (!weights || !rb || O < 1 || !select_ctx(ctx) || !bd_table(ctx)) return 0;
+    size_t rw = (rb + 3) / 4;
+    if (rw * 4 * (size_t)O > cap) return 0;
+    ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
+    if (!t) return 0;
+    t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->ng = 1;
+    t->row_words = (int)rw; t->weight_bytes = rw * 4 * (size_t)O;
+    t->weights = dev; t->weights_owned = 0;
+    if (!bd_rows_copy(t, weights, 1)) { std::free(t); return 0; }
+    *tensor = t;
+    return 1;
+}
 extern "C" int coli_cuda_block_elems(int fmt) { return bd_file_row_bytes(fmt, 256) && fmt >= 100 ? (int)BD_BLK[fmt - 100] : 0; }
 
 /* group size for the NEXT upload on this thread (fmt=4): routed through a
@@ -1635,11 +1654,12 @@ extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
 }
 
 extern "C" int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *weights, const float *scales) {
+    /* a block-format tensor: its own buffer or an arena's slot (coli_cuda_tensor_upload_at) */
+    if (t && weights && t->weights && t->fmt >= 100) { DeviceContext *c = find_ctx(t->device); return select_ctx(c) && bd_rows_copy(t, weights, 0); }
     if (!t || !weights || !t->weights || !t->weights_owned) return 0;
 #ifdef COLI_ANS
     if (t->compressed) return 0;            /* archive bytes, not a weight buffer of this size */
 #endif
-    if (t->fmt >= 100) { DeviceContext *c = find_ctx(t->device); return select_ctx(c) && bd_rows_copy(t, weights, 0); }
     if (t->fmt && t->fmt != 6 && (!scales || !t->scales)) return 0;
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
