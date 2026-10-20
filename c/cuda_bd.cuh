@@ -613,6 +613,158 @@ __device__ __forceinline__ void bdf_decode(int fmt, const bd_u32 *__restrict__ W
     }
     #undef BD_U8
 }
+/* 16 consecutive weights e0 .. e0 + 15 (e0 a multiple of 16) of the row W, ggml type t, as
+ * floats with their scales (weight = s * code - m): the f16 tiles' fill (backend_cuda.cu,
+ * hcg_fetch_w<100>), word loads, only the 16. 0 for a type without one here (then
+ * bdf_decode's general path). The same weights as bdf_decode's. */
+__device__ __forceinline__ void bd_bytes16(const bd_u32 *__restrict__ W, bd_u32 off, bd_u32 *b) {   /* off even */
+    b[0] = bd_ldu(W, off); b[1] = bd_ldu(W, off + 4u); b[2] = bd_ldu(W, off + 8u); b[3] = bd_ldu(W, off + 12u);
+}
+__device__ __forceinline__ bd_u32 bd_byte_of(const bd_u32 *b, int j) { return (b[j >> 2] >> (8 * (j & 3))) & 0xffu; }
+__device__ __forceinline__ bool bd_dec16(int t, const bd_u32 *__restrict__ W, bd_u32 e0, const bd_u32 *__restrict__ tab, float *out) {
+    if (t == 12 || t == 13) {   /* Q4_K, Q5_K: groups of 32, a 6-bit scale and min each */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, c = e >> 6, pos = e & 63u, hi = pos >= 32u, g = 2u * c + hi, p = pos & 31u;
+        bd_u32 base = b * (t == 12 ? 144u : 176u);
+        uint4 hd = bd_w4(W, base >> 4);
+        uint2 sm = bdi_k4sm(hd, g);
+        float d = bd_h2f(hd.x) * (float)sm.x, m = bd_h2f(hd.x >> 16) * (float)sm.y;
+        uint4 q = bd_w4(W, (base + (t == 12 ? 16u : 48u) + 32u * c + p) >> 4);
+        uint4 h = t == 13 ? bd_w4(W, (base + 16u + p) >> 4) : make_uint4(0u, 0u, 0u, 0u);
+        bd_u32 qw[4] = {q.x, q.y, q.z, q.w}, hw[4] = {h.x, h.y, h.z, h.w}, sh = hi ? 4u : 0u;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            bd_u32 v = (qw[j >> 2] >> (8 * (j & 3) + sh)) & 15u;
+            if (t == 13) v |= ((hw[j >> 2] >> (8 * (j & 3) + g)) & 1u) << 4;
+            out[j] = d * (float)v - m;
+        }
+        return true;
+    }
+    if (t == 14) {   /* Q6_K: (6-bit code - 32), a signed scale per 16 */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, n = e >> 7, r = e & 127u, base = b * 210u;
+        bd_u32 ql[4], qh[4];
+        bd_bytes16(W, base + 64u * n + (r & 63u), ql); bd_bytes16(W, base + 128u + 32u * n + (r & 31u), qh);
+        bd_u32 ns = 4u * (r >> 6), hs = 2u * (r >> 5);
+        float d = bd_f16at(W, base + 208u) * (float)(int)(signed char)bd_u8at(W, base + 192u + (e >> 4));
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            int v = (int)(((ql[j >> 2] >> (8 * (j & 3) + ns)) & 15u) | (((qh[j >> 2] >> (8 * (j & 3) + hs)) & 3u) << 4)) - 32;
+            out[j] = d * (float)v;
+        }
+        return true;
+    }
+    if (t == 8) {   /* Q8_0: blocks of 32 */
+        bd_u32 b = e0 >> 5, base = b * 34u, w[4];
+        bd_bytes16(W, base + 2u + 16u * ((e0 >> 4) & 1u), w);
+        float d = bd_f16at(W, base);
+        #pragma unroll
+        for (int j = 0; j < 16; j++) out[j] = d * (float)(int)(signed char)bd_byte_of(w, j);
+        return true;
+    }
+    if (t == 20 || t == 23) {   /* IQ4_NL (blocks of 32), IQ4_XS (256): kvalues of the nibbles, low for 0..15, high for 16..31 */
+        bd_u32 w[4], hs = 4u * ((e0 >> 4) & 1u);
+        float d;
+        if (t == 20) { bd_u32 base = (e0 >> 5) * 18u; d = bd_f16at(W, base); bd_bytes16(W, base + 2u, w); }
+        else {
+            bd_u32 b = e0 >> 8, ib = (e0 & 255u) >> 5, base = b * 136u;
+            bd_u32 w0 = bd_w(W, base >> 2), w2 = bd_w(W, (base >> 2) + 1u);
+            bd_u32 ls = ((w2 >> (8u * (ib >> 1) + 4u * (ib & 1u))) & 15u) | (((w0 >> (16u + 2u * ib)) & 3u) << 4);
+            d = bd_h2f(w0) * (float)((int)ls - 32);
+            bd_u32 qa = (base + 8u + 16u * ib) >> 2;
+            w[0] = bd_w(W, qa); w[1] = bd_w(W, qa + 1u); w[2] = bd_w(W, qa + 2u); w[3] = bd_w(W, qa + 3u);
+        }
+        #pragma unroll
+        for (int j = 0; j < 16; j++) out[j] = d * (float)(int)__ldg(tab + BDT_IQ4NL + ((bd_byte_of(w, j) >> hs) & 15u));
+        return true;
+    }
+    if (t == 16 || t == 18) {   /* IQ2_XXS, IQ3_XXS: a sub-block of 32, its grid indices, ksigns and a 4-bit scale */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, ib = e >> 5, l0 = ((e & 31u) >> 3), base = b * (t == 16 ? 66u : 98u);
+        float d = bd_f16at(W, base);
+        if (t == 16) {
+            bd_u32 a0 = bd_ldu(W, base + 2u + 8u * ib), a1 = bd_ldu(W, base + 6u + 8u * ib);
+            float s = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
+            #pragma unroll
+            for (int ll = 0; ll < 2; ll++) {
+                bd_u32 l = l0 + (bd_u32)ll, idx = (a0 >> (8u * l)) & 255u, sg = __ldg(tab + BDT_KSIGNS + ((a1 >> (7u * l)) & 127u));
+                bd_u32 g0 = __ldg(tab + BDT_IQ2XXS + 2u * idx), g1 = __ldg(tab + BDT_IQ2XXS + 2u * idx + 1u);
+                #pragma unroll
+                for (int j = 0; j < 8; j++) { float v = (float)(((j < 4 ? g0 : g1) >> (8 * (j & 3))) & 255u); out[8 * ll + j] = (sg >> j) & 1u ? -s * v : s * v; }
+            }
+        } else {
+            bd_u32 a = bd_ldu(W, base + 66u + 4u * ib), qw = bd_ldu(W, base + 2u + 8u * ib + 2u * l0);
+            float s = d * (0.5f + (float)(a >> 28)) * 0.5f;
+            #pragma unroll
+            for (int ll = 0; ll < 2; ll++) {
+                bd_u32 l = l0 + (bd_u32)ll, sg = __ldg(tab + BDT_KSIGNS + ((a >> (7u * l)) & 127u));
+                bd_u32 g0 = __ldg(tab + BDT_IQ3XXS + ((qw >> (16 * ll)) & 255u)), g1 = __ldg(tab + BDT_IQ3XXS + ((qw >> (16 * ll + 8)) & 255u));
+                #pragma unroll
+                for (int j = 0; j < 8; j++) { float v = (float)(((j < 4 ? g0 : g1) >> (8 * (j & 3))) & 255u); out[8 * ll + j] = (sg >> j) & 1u ? -s * v : s * v; }
+            }
+        }
+        return true;
+    }
+    if (t == 17 || t == 22) {   /* IQ2_XS, IQ2_S: two chunks of 8, a grid row each, a 4-bit scale per 16 */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, k0 = e >> 3, base = b * (t == 17 ? 74u : 82u);
+        float d = bd_f16at(W, base);
+        bd_u32 si = e >> 4, scb = bd_u8at(W, base + (t == 17 ? 66u : 74u) + (si >> 1));
+        float s = d * (0.5f + (float)((scb >> (4u * (si & 1u))) & 15u)) * 0.25f;
+        #pragma unroll
+        for (int ll = 0; ll < 2; ll++) {
+            bd_u32 k = k0 + (bd_u32)ll, g0, g1, sg;
+            if (t == 17) {
+                bd_u32 qv = bd_u16at(W, base + 2u + 2u * k);
+                g0 = __ldg(tab + BDT_IQ2XS + 2u * (qv & 511u)); g1 = __ldg(tab + BDT_IQ2XS + 2u * (qv & 511u) + 1u);
+                sg = __ldg(tab + BDT_KSIGNS + (qv >> 9));
+            } else {
+                bd_u32 idx = bd_u8at(W, base + 2u + k) | (((bd_u8at(W, base + 66u + (k >> 2)) >> (2u * (k & 3u))) & 3u) << 8);
+                g0 = __ldg(tab + BDT_IQ2S + 2u * idx); g1 = __ldg(tab + BDT_IQ2S + 2u * idx + 1u);
+                sg = bd_u8at(W, base + 34u + k);
+            }
+            #pragma unroll
+            for (int j = 0; j < 8; j++) { float v = (float)(((j < 4 ? g0 : g1) >> (8 * (j & 3))) & 255u); out[8 * ll + j] = (sg >> j) & 1u ? -s * v : s * v; }
+        }
+        return true;
+    }
+    if (t == 21) {   /* IQ3_S: four chunks of 4, a 9-bit grid index each, sign bits, a scale per 32 */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, ib = e >> 5, base = b * 110u, k0 = e >> 2;
+        float s = bd_f16at(W, base) * (float)(1u + 2u * ((bd_u8at(W, base + 106u + (ib >> 1)) >> (4u * (ib & 1u))) & 15u));
+        bd_u32 sgw = bd_u16at(W, base + 74u + (e >> 3));   /* the 16 weights' sign bits */
+        bd_u32 i4 = bd_ldu(W, base + 2u + k0);   /* k0 a multiple of 4: even */
+        bd_u32 hb = (bd_u8at(W, base + 66u + (k0 >> 3)) >> (k0 & 7u)) & 15u;
+        #pragma unroll
+        for (int l = 0; l < 4; l++) {
+            bd_u32 idx = ((i4 >> (8 * l)) & 255u) | (((hb >> l) & 1u) << 8), gr = __ldg(tab + BDT_IQ3S + idx);
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { float v = (float)((gr >> (8 * j)) & 255u); out[4 * l + j] = (sgw >> (4 * l + j)) & 1u ? -s * v : s * v; }
+        }
+        return true;
+    }
+    if (t == 10 || t == 11) {   /* Q2_K, Q3_K: 2-bit codes (Q3_K: the hmask bit), a scale per 16 */
+        bd_u32 b = e0 >> 8, e = e0 & 255u, c = e >> 7, sh = 2u * ((e >> 5) & 3u), p = e & 31u, k = e >> 4;
+        bd_u32 base = b * (t == 10 ? 84u : 110u), q[4];
+        bd_bytes16(W, base + (t == 10 ? 16u : 32u) + 32u * c + p, q);
+        float s, m = 0.f;
+        bd_u32 hm[4] = {0u, 0u, 0u, 0u};
+        if (t == 10) {
+            bd_u32 sc = bd_u8at(W, base + k), dm = bd_ldu(W, base + 80u);
+            s = bd_h2f(dm) * (float)(sc & 15u); m = bd_h2f(dm >> 16) * (float)(sc >> 4);
+        } else {
+            bd_u32 l = k < 8u ? (bd_u8at(W, base + 96u + k) & 15u) : (bd_u8at(W, base + 88u + k) >> 4);
+            bd_u32 h = (bd_u8at(W, base + 104u + (k & 3u)) >> (2u * (k >> 2))) & 3u;
+            s = bd_f16at(W, base + 108u) * (float)((int)(l | (h << 4)) - 32);
+            bd_bytes16(W, base + p, hm);
+        }
+        bd_u32 hs = e >> 5;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            int v = (int)((q[j >> 2] >> (8 * (j & 3) + sh)) & 3u);
+            if (t == 11) v -= ((hm[j >> 2] >> (8 * (j & 3) + hs)) & 1u) ? 0 : 4;
+            out[j] = s * (float)v - m;
+        }
+        return true;
+    }
+    return false;
+}
+
 #if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
 #define bd_shfl_xor(v, o) __shfl_xor((v), (o), 32)
 #else

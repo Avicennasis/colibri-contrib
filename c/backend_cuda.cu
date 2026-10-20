@@ -3268,6 +3268,7 @@ __device__ __forceinline__ void hcg_fetch_w<100>(HcgW<100> &r, const uint8_t *__
     bd_u32 B = __ldg(tab + BDT_BLK + t), T = __ldg(tab + BDT_BYTES + t);
     size_t rw = ((size_t)K / B * T + 3) / 4;
     const bd_u32 *Wr = reinterpret_cast<const bd_u32 *>(W) + (size_t)n * rw;
+    if (bd_dec16(t, Wr, (bd_u32)(k0 + kq), tab, r.f)) return;   /* the common types: their 16, word loads */
     int wv[32]; float sA, mA, sB, mB;
     bdf_decode(gs, Wr, (bd_u32)((k0 + kq) >> 5), tab, wv, sA, mA, sB, mB);
     if ((kq >> 4) & 1) {
