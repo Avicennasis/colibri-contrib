@@ -48,7 +48,11 @@
  *            four: in steps of up to 8 rows the pool's experts outside the device's share are
  *            computed by the CPU at the join (vkt_host_pairs, GQ_EXACT=1's float form) and
  *            the rest by the device, every row the reference's; a prompt step (20 rows) and
- *            COLI_VK_HYBRID=0 leave them all to the device.
+ *            COLI_VK_HYBRID=0 leave them all to the device;
+ *   pool copy the same experts and the streaming's slots: a prompt step's host pool experts
+ *            are copied into the slots on the device (coli_vk_tensor_copy_as: the copy engine
+ *            with staged uploads, the CPU through the mapping otherwise) and computed there,
+ *            every row the reference's; COLI_VK_TIER_POOL_COPY=0 reads them in place.
  *
  *   make tests/test_vk_tier VK=1 && VK_ICD_FILENAMES=.../lvp_icd.json ./tests/test_vk_tier */
 #include <stdio.h>
@@ -1377,6 +1381,72 @@ static void hybrid_case(void) {
     H = H0; F = F0;
 }
 
+/* the report's "N host pool experts copied into the slots": N, 0 without the part */
+static unsigned long long pc_count(const char *line) {
+    const char *p = strstr(line, " host pool experts copied into the slots");
+    if (!p) return 0;
+    while (p > line && p[-1] >= '0' && p[-1] <= '9') p--;
+    return strtoull(p, NULL, 10);
+}
+static void pool_copy_case(void) {
+    const int H0 = H, F0 = F;
+    H = 512; F = 256;   /* whole blocks of 256 */
+    VktFmt gu = {(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}, dn = {(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0};
+    for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) {
+        mat_make_block(&ex[l][e].g, gu, H, F); mat_make_block(&ex[l][e].u, gu, H, F); mat_make_block(&ex[l][e].d, dn, F, H);
+    }
+    g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    const double eb = (double)vkt_expert_bytes(H, F, gu, dn) / 1073741824.0;
+    char gb[64];
+    setenv("COLI_VK_TIER_HOST", "1", 1);
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_PROMOTE", "0", 1);
+    setenv("COLI_VK_TIER_RATE", "0", 1);
+    setenv("COLI_VK_TIER_STREAM_SLOTS", "4", 1);
+    setenv("COLI_VK_TIER_STREAM_HALF", "40", 1);   /* sub-batches of 40 rows: the slots refilled within a step */
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 : 1; }
+    for (int c = 0; c < 2; c++) {   /* the copies on, then COLI_VK_TIER_POOL_COPY=0 */
+        if (c) setenv("COLI_VK_TIER_POOL_COPY", "0", 1);
+        set_budget(8, gu, dn);
+        snprintf(gb, sizeof gb, "%.12f", (L * E + 0.5) * eb);
+        setenv("COLI_VK_TIER_HOST_GB", gb, 1);
+        VktConfig vc = cfg_of(gu, dn, VKT_ACT_SWIGLU, 0);
+        vc.load = load_cb; vc.release = release_cb;
+        int on = vkt_init(&vc, rows);
+        CHECK(on, "pool copy: the tier did not start");
+        if (!on) break;
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < n; i++) { VktExpertSrc src = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &src); }
+        vkt_put_done();
+        Books bk = {0, 0}; unsigned long long streamed = 0, kept = 0; double worst = 0;
+        static const int Ss[] = {20, 33, 48, 20};
+        int idx[48 * K]; float w[48 * K];
+        for (int t = 0; t < 4; t++)
+            for (int l = 0; l < L; l++) {
+                route(Ss[t], 0, E, idx, w);
+                vkt_begin_forward();
+                double r = stream_step(l, Ss[t], idx, w, 0, &bk, &streamed, &kept, 0);
+                if (r > worst) worst = r;
+            }
+        char line[4096]; report_line(line, sizeof line);
+        unsigned long long copies = pc_count(line);
+        printf("  Q4_K/Q6_K experts in the host pool, %s: %llu copied into the slots, %llu of %llu assignments on the device, "
+               "worst relative error %.2e\n", c ? "COLI_VK_TIER_POOL_COPY=0" : "the copies on", copies, bk.dev, bk.routed, worst);
+        CHECK(worst < 2e-3, "pool copy: relative error %.3g", worst);
+        CHECK(bk.dev == bk.routed, "pool copy: the device took %llu of %llu", bk.dev, bk.routed);
+        if (!c) CHECK(copies > 0, "pool copy: no host pool expert was copied into a slot");
+        else CHECK(copies == 0, "pool copy: COLI_VK_TIER_POOL_COPY=0 copied %llu", copies);
+        vkt_shutdown();
+    }
+    unsetenv("COLI_VK_TIER_POOL_COPY"); unsetenv("COLI_VK_TIER_PROMOTE"); unsetenv("COLI_VK_TIER_RATE");
+    unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_HALF");
+    unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_SYNC");
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    model_free();
+    H = H0; F = F0;
+}
+
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
@@ -1404,6 +1474,7 @@ int main(int argc, char **argv) {
     printf("layers:\n"); layers();
     printf("promote:\n"); promote_case();
     printf("hybrid:\n"); hybrid_case();
+    printf("pool copy:\n"); pool_copy_case();
     ColiVkPoolStats ps, px; coli_vk_pool_stats(1, &ps); coli_vk_pool_stats(4, &px);
     CHECK(ps.live == 0 && px.live == 0, "%d + %d tier ranges still live after every shutdown", ps.live, px.live);
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */
