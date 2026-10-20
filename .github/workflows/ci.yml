@@ -268,7 +268,7 @@ jobs:
           # under ASan and UBSan
           - family: deepseek-chain
             req: c/tools/requirements-deepseek-v4-tiny.txt
-            extra: sympy pillow
+            extra: sympy pillow gguf>=0.19
           - family: deepseek-chain-sanitize
             req: c/tools/requirements-deepseek-v4-tiny.txt
             extra: sympy pillow

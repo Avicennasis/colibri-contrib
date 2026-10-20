@@ -2807,6 +2807,27 @@ v41_chain_fixtures() {
   $PY tools/make_dsv41_tiny.py --out dsv41_tiny --emit-ref dsv41_tiny/ref.json > /dev/null
   $PY tools/make_dsv41_tiny.py --out dsv41_long --emit-ref dsv41_long/ref.json --prompt-len 40 --max-new 6 > /dev/null
 }
+# A published deepseek41 GGUF (tests/test_gguf_import.py write_deepseek41: IQ1_S experts
+# with IQ2_XXS, Q4_K and Q5_K in other layers, a Q5_K, Q6_K and Q8_0 trunk, BF16
+# compressors and indexers, every engram table in one IQ4_NL tensor), imported, with the
+# CPU's own 8 tokens in the float form (GQ_EXACT=1) as its reference: no oracle reads
+# these weights. The gates take the float forms, as mimo_gguf_gate does.
+v41_gguf_tiny() {
+  $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the GGUF gates"
+import sys
+sys.path.insert(0, "tests")
+import numpy as np
+from test_gguf_import import write_deepseek41
+write_deepseek41("ds41_gguf_tiny.gguf", np.random.default_rng(3))
+PY
+  rm -rf ds41_gguf_tiny
+  $PY tools/gguf_import.py ds41_gguf_tiny.gguf ds41_gguf_tiny > /dev/null
+  local ids="5, 6, 7, 8, 20, 21, 22, 23, 30, 31, 32, 33" out
+  echo "{\"prompt_ids\": [$ids], \"output_ids\": [0, 0, 0, 0, 0, 0, 0, 0]}" > ds41_gguf_tiny/ref.json
+  out=$(GQ_EXACT=1 SNAP=ds41_gguf_tiny ./deepseek_v41 8 ds41_gguf_tiny/ref.json 2> /dev/null) || true
+  [ -n "$out" ] || fail "deepseek_v41 GGUF: the CPU printed no tokens"
+  echo "{\"prompt_ids\": [$ids], \"output_ids\": [${out// /, }]}" > ds41_gguf_tiny/ref.json
+}
 
 # DeepSeek V4 (deepseek_v4) on the dense chain: the deepseek-chain family's V4 half. The
 # functions use $PY, fail and chain_count from tests/vulkan_engines.sh and run from c/.
@@ -3175,6 +3196,14 @@ family_deepseek_chain() {
   FAULT_BACK=5 v41_gate "chain deepseek_v41 device lost mid-decode" SNAP=dsv41_long -- 8 dsv41_long/ref.json
   FAULT_BACK=100 v41_gate "chain deepseek_v41 device lost in the prompt" SNAP=dsv41_long COLI_VK_CHAIN_ROWS=7 -- 8 dsv41_long/ref.json
   FAULT_BACK=8 v41_gate "chain deepseek_v41 device lost between drafts" SNAP=dsv41_tiny V41_DSPARK=1 V41_SPEC_FORCE=5 -- 8 dsv41_tiny/ref.json
+  # a GGUF's block types: the trunk on the chain, the experts in the tier, as the file has them
+  v41_gguf_tiny
+  local fl=(GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0 SNAP=ds41_gguf_tiny)
+  v41_gate "chain deepseek_v41 GGUF" "${fl[@]}" -- 8 ds41_gguf_tiny/ref.json
+  grep -q "tier deepseek_v41: the GGUF experts' blocks go to the device" vk.log && [ "$(tier_count deepseek_v41 vk.log)" -gt 0 ] ||
+    { cat vk.log; fail "chain deepseek_v41 GGUF: the tier took no expert as the file has it"; }
+  v41_gate "chain deepseek_v41 GGUF, prompt in chunks of 3" "${fl[@]}" COLI_VK_CHAIN_ROWS=3 -- 8 ds41_gguf_tiny/ref.json
+  v41_gate "chain deepseek_v41 GGUF, the experts on the CPU" "${fl[@]}" COLI_VK_TIER=0 -- 8 ds41_gguf_tiny/ref.json
   $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=0
   $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1
   COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./deepseek_v41 dsv41_tiny V41_DSPARK=1 COLI_VK_CHAIN_ROWS=3

@@ -210,6 +210,110 @@ def write_glmdsa(path, rng):
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
 
 
+def write_deepseek41(path, rng):
+    """A published deepseek41 GGUF (DeepSeek V4.1 Flash), small: no deepseek41.config, the
+    config as keys; the compressors (KV sources 1 and 3, a gate where the ratio is 2) and
+    the indexer (1, 3 and 4) in BF16; the experts in IQ1_S as the UD-IQ1_S file has them,
+    with IQ2_XXS, Q4_K and Q5_K in other layers; the trunk in Q5_K, Q6_K and Q8_0; every
+    engram table in one IQ4_NL per_layer_token_embd under global head offsets, and each
+    engram layer's gate as one engram_gate (deepseek_v41's GGUF gates)."""
+    w = gguf.GGUFWriter(str(path), "deepseek41")
+    p = "deepseek41."
+    VT = gguf.GGUFValueType
+    layers, h, mi, e, k, heads, hd, rope, ql, ol, og = 6, 256, 256, 8, 2, 4, 64, 16, 64, 32, 2
+    hc, ih, ihd, ngram, eh, ehd, evocab = 4, 4, 32, 4, 2, 32, 97
+    ratios, kv_src, idx_src, eng = [0, 2, 2, 1, 1, 0], [1, 3], [1, 3, 4], [1, 4]
+    for key, v in (("block_count", layers), ("context_length", 4096), ("embedding_length", h),
+                   ("attention.head_count", heads), ("attention.head_count_kv", 1), ("expert_count", e),
+                   ("expert_used_count", k), ("expert_gating_func", 4), ("attention.key_length", hd),
+                   ("attention.value_length", hd), ("rope.dimension_count", rope), ("attention.q_lora_rank", ql),
+                   ("attention.sliding_window", 8), ("expert_feed_forward_length", mi), ("expert_shared_count", 1),
+                   ("attention.indexer.head_count", ih), ("attention.indexer.key_length", ihd),
+                   ("attention.indexer.top_k", 4), ("attention.output_group_count", og),
+                   ("attention.output_lora_rank", ol), ("hyper_connection.count", hc),
+                   ("hyper_connection.sinkhorn_iterations", 20), ("attention.indexer.candidate_source_layer", 3),
+                   ("attention.indexer.candidate_top_k_blocks", 2), ("attention.indexer.candidate_block_size", 2),
+                   ("rope.scaling.original_context_length", 32), ("ple.ngram_size", ngram),
+                   ("ple.heads_per_ngram", eh), ("embedding_length_per_layer_input", ehd),
+                   ("engram.vocab_size", evocab), ("engram.pad_token_id", 2), ("engram.compressed_vocab_size", 64)):
+        w.add_uint32(p + key, v)
+    for key, v in (("rope.freq_base", 10000.0), ("rope.scaling.factor", 16.0), ("attention.layer_norm_rms_epsilon", 1e-20),
+                   ("expert_weights_scale", 1.5), ("attention.compress_rope_freq_base", 40000.0),
+                   ("hyper_connection.epsilon", 1e-6), ("rope.scaling.yarn_beta_fast", 32.0),
+                   ("rope.scaling.yarn_beta_slow", 1.0)):
+        w.add_float32(p + key, v)
+    w.add_string(p + "rope.scaling.type", "yarn"); w.add_bool(p + "expert_weights_norm", True)
+    w.add_array(p + "swiglu_clamp_exp", [10.0] * layers); w.add_array(p + "swiglu_clamp_shexp", [10.0] * layers)
+    w.add_array(p + "attention.compress_ratios", ratios); w.add_array(p + "attention.kv_source_layers", kv_src)
+    w.add_array(p + "attention.indexer.source_layers", idx_src); w.add_array(p + "ple.layers", eng)
+    # The engram: per layer, (ngram - 1) * heads buckets of distinct primes above the
+    # engram vocabulary, their offsets running over every layer's (one tensor holds all),
+    # and a layer's ngram odd hash multipliers, past 32 bits as the file's are.
+    primes, c = [], evocab - 1
+    while len(primes) < len(eng) * (ngram - 1) * eh:
+        c += 1
+        if all(c % d for d in range(2, int(c ** 0.5) + 1)):
+            primes.append(c)
+    offsets = [sum(primes[:i]) for i in range(len(primes))]
+    mult = [int(x) * 2 + 1 for x in rng.integers(1 << 40, 1 << 50, size=len(eng) * ngram)]
+    w.add_key_value(p + "ple.head_vocab_sizes", primes, VT.ARRAY, sub_type=VT.UINT32)
+    w.add_key_value(p + "ple.head_offsets", offsets, VT.ARRAY, sub_type=VT.UINT64)
+    w.add_key_value(p + "ple.layer_multipliers", mult, VT.ARRAY, sub_type=VT.UINT64)
+    w.add_array(p + "engram.token_map", [i % 64 for i in range(VOCAB)])
+    toks = [f"<0x{b:02X}>" if b < 256 else f"t{b}" for b in range(VOCAB - 3)] + ["<|begin_of_sentence|>", "<|end_of_sentence|>", "<|pad|>"]
+    w.add_tokenizer_model("gpt2"); w.add_token_list(toks)
+    w.add_token_types([1] * (VOCAB - 3) + [3, 3, 3]); w.add_token_merges([])
+    w.add_bos_token_id(VOCAB - 3); w.add_eos_token_id(VOCAB - 2)
+
+    def f32(name, shape, std=0.02, base=0.0):
+        w.add_tensor(name, (base + rng.standard_normal(shape) * std).astype(np.float32))
+    def bf16(name, shape, std=0.02, base=0.0):
+        v = (base + rng.standard_normal(shape) * std).astype(np.float32)
+        raw = (v.view(np.uint32) >> 16).astype(np.uint16).view(np.uint8).reshape(*shape[:-1], shape[-1] * 2)
+        w.add_tensor(name, raw, raw_dtype=QT.BF16)
+    def q(name, shape, t): w.add_tensor(name, blocks(t, shape, rng), raw_dtype=QT[t])
+    q("token_embd.weight", (VOCAB, h), "Q8_0"); q("output.weight", (VOCAB, h), "Q6_K")
+    w.add_tensor("output_norm.weight", np.ones(h, np.float32))
+    q("per_layer_token_embd.weight", (sum(primes), ehd), "IQ4_NL")
+    mix = (2 + hc) * hc
+    for L in range(layers):
+        b = f"blk.{L}."
+        f32(b + "attn_norm.weight", (h,), 0.01, 1.0); f32(b + "ffn_norm.weight", (h,), 0.01, 1.0)
+        for which in ("attn", "ffn"):
+            f32(b + f"hc_{which}_fn.weight", (mix, hc * h), 0.01); f32(b + f"hc_{which}_base.weight", (mix,), 0.1)
+            w.add_tensor(b + f"hc_{which}_scale.weight", np.full(3, 0.5, np.float32))
+        f32(b + "attn_sinks.weight", (heads,), 0.1)
+        q(b + "attn_q_a.weight", (ql, h), "Q5_K" if L % 2 else "Q6_K")
+        w.add_tensor(b + "attn_q_a_norm.weight", np.ones(ql, np.float32))
+        q(b + "attn_q_b.weight", (heads * hd, ql), "Q8_0")
+        q(b + "attn_kv.weight", (hd, h), "Q6_K")
+        w.add_tensor(b + "attn_kv_a_norm.weight", np.ones(hd, np.float32))
+        q(b + "attn_output_a.weight", (og * ol, heads * hd // og), "Q8_0")
+        q(b + "attn_output_b.weight", (h, og * ol), "Q8_0")
+        if L in kv_src:
+            bf16(b + "attn_compressor_kv.weight", (hd, h))
+            w.add_tensor(b + "attn_compressor_norm.weight", np.ones(hd, np.float32))
+            if ratios[L] > 1:
+                bf16(b + "attn_compressor_gate.weight", (hd, h))
+        if L in idx_src:
+            bf16(b + "indexer.attn_q_b.weight", (ih * ihd, ql)); bf16(b + "indexer.proj.weight", (ih, h))
+            if L in kv_src:
+                bf16(b + "indexer.attn_k.weight", (ihd, hd))
+                w.add_tensor(b + "indexer.k_norm.weight", np.ones(ihd, np.float32))
+        f32(b + "ffn_gate_inp.weight", (e, h), 0.05)
+        f32(b + "exp_probs_b.bias", (e,), 0.1); f32(b + "exp_probs_b_vl.bias", (e,), 0.1)
+        q(b + "ffn_gate_shexp.weight", (mi, h), "Q6_K" if L % 2 else "Q8_0")
+        q(b + "ffn_up_shexp.weight", (mi, h), "Q6_K" if L % 2 else "Q8_0")
+        q(b + "ffn_down_shexp.weight", (h, mi), "Q6_K")
+        gu = {0: "IQ2_XXS", 5: "Q4_K"}.get(L, "IQ1_S")
+        q(b + "ffn_gate_exps.weight", (e, mi, h), gu); q(b + "ffn_up_exps.weight", (e, mi, h), gu)
+        q(b + "ffn_down_exps.weight", (e, h, mi), {0: "IQ2_XXS", 5: "Q5_K"}.get(L, "IQ1_S"))
+        if L in eng:
+            f32(b + "engram_gate.weight", (hc, h), 0.05, 1.0)
+            q(b + "engram_kv.weight", (h * (hc + 1), (ngram - 1) * eh * ehd), "Q8_0")
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+
+
 def engine_tokens(snap, ref, env=None):
     p = subprocess.run([str(ENGINE), "2", "8", str(ref)], env=dict(os.environ, SNAP=str(snap), OMP_NUM_THREADS="2",
                        COLI_NO_OMP_TUNE="1", **(env or {})), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
