@@ -1875,10 +1875,10 @@ static void host_init(long long all) {
     T.promote_rate = T.full ? rate : 0;
     char hb[32];
     if (T.full)
-        fprintf(stderr, "[VK] tier %s: host pool on, every expert of the model in %s of system RAM the device reads over PCIe: "
-                        "the %lld its memory leaves, and a copy of its own that the routed ones move up to, up to %d a "
-                        "forward (COLI_VK_TIER_PROMOTE; COLI_VK_TIER_HOST=0 off)\n",
-                T.engine, human((double)lim, hb, sizeof hb), left, T.promote_rate);
+        fprintf(stderr, "[VK] tier %s: host pool on, %lld experts in %s of system RAM the device reads over PCIe (every expert "
+                        "of the model: the %lld its memory leaves and a copy of its own, from which the routed ones move up, up "
+                        "to %d a forward; COLI_VK_TIER_PROMOTE sets it, COLI_VK_TIER_HOST=0 off)\n",
+                T.engine, held, human((double)lim, hb, sizeof hb), left, T.promote_rate);
     else
         fprintf(stderr, "[VK] tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
                         "(the %lld its memory leaves%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it)\n",
