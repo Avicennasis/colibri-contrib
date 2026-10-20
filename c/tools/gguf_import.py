@@ -513,7 +513,8 @@ def mimo2_config(meta, tensors, overrides=None):
 def deepseek41_meta_config(meta, tensors):
     """The published deepseek41 GGUFs (K-quant and IQ types) carry no config.json:
     the checkpoint's text_config from its keys (conversion writes each from one of them).
-    No DSpark head and no vision tower in these files: their own GGUFs hold them."""
+    No DSpark head and no vision tower in these files: their own GGUFs hold them (the
+    DSpark head's keys come from dspark_head, when main finds one)."""
     p = "deepseek41."
     need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
     gating = int(meta.get(p + "expert_gating_func", 4))
@@ -820,6 +821,66 @@ def mtp_head_ok(path, meta, layers):
         r.close()
 
 
+DSPARK_PREFERENCE = ("Q8_0", "BF16")
+
+
+def dspark_candidates(src):
+    """dspark-*.gguf next to the model: its folder, the parent, a dspark/ folder in either; Q8_0 first."""
+    seen, found = set(), []
+    for d in (src.parent, src.parent / "dspark", src.parent.parent, src.parent.parent / "dspark"):
+        for f in sorted(d.glob("dspark-*.gguf")) if d.is_dir() else ():
+            if f.resolve() not in seen:
+                seen.add(f.resolve()); found.append(f)
+    rank = lambda f: next((i for i, tag in enumerate(DSPARK_PREFERENCE) if f.name.endswith(f"-{tag}.gguf")), len(DSPARK_PREFERENCE))
+    return sorted(found, key=rank)
+
+
+def dspark_head(path, meta):
+    """(the text_config keys of DeepSeek V4.1's DSpark head, '') when path is one for this
+    deepseek41 model (arch dflash: its stages as blk.<s>, its own tensors beside them), else
+    (None, why not). The draft's noise token and Markov rank are the model's keys."""
+    try:
+        r = GGUFReader(str(path))
+    except (GGUFError, OSError) as e:
+        return None, str(e)
+    try:
+        hm, t = r.metadata, {x["name"]: x for x in r.tensors}
+        if hm.get("general.architecture") != "dflash":
+            return None, f"architecture {hm.get('general.architecture')!r}, not dflash"
+        p, q = "dflash.", "deepseek41."
+        for k in ("embedding_length", "attention.head_count", "attention.key_length", "attention.q_lora_rank",
+                  "attention.output_lora_rank", "attention.output_group_count", "attention.sliding_window",
+                  "expert_feed_forward_length", "hyper_connection.count"):
+            if int(hm.get(p + k, -1)) != int(meta.get(q + k, -2)):
+                return None, f"{k} {hm.get(p + k)} does not match the model's {meta.get(q + k)}"
+        for k, mk in (("expert_count", "dspark.expert_count"), ("expert_used_count", "dspark.expert_used_count"),
+                      ("block_size", "dspark.block_size")):
+            if mk and q + mk in meta and int(hm.get(p + k, -1)) != int(meta[q + mk]):
+                return None, f"{k} {hm.get(p + k)} does not match the model's dspark.{k.split('.')[-1]} {meta[q + mk]}"
+        targets = [int(x) for x in hm.get(p + "target_layers") or []]
+        if q + "dspark.target_layers" in meta and targets != [int(x) for x in meta[q + "dspark.target_layers"]]:
+            return None, "its target layers are not the model's"
+        stages = int(hm.get(p + "block_count", 0))
+        if stages < 1 or not targets or (q + "dspark.noise_token_id") not in meta:
+            return None, "no stages, no target layers, or the model has no dspark.noise_token_id"
+        need = ["fc.weight", "enc.output_norm.weight", "output_norm.weight", "conf_proj.weight",
+                "markov_w1.weight", "markov_w2.weight"] + [f"blk.{s}.ffn_gate_exps.weight" for s in range(stages)]
+        if any(n not in t for n in need):
+            return None, f"no {next(n for n in need if n not in t)}"
+        if int(t["fc.weight"]["dims"][0]) != len(targets) * int(meta[q + "embedding_length"]):
+            return None, "fc.weight does not read its target layers"
+        rank = int(t["markov_w1.weight"]["dims"][0])
+        if q + "dspark.markov_rank" in meta and rank != int(meta[q + "dspark.markov_rank"]):
+            return None, f"a Markov rank of {rank}, the model's {meta[q + 'dspark.markov_rank']}"
+        return {"n_mtp_layers": stages, "dspark_block_size": int(hm[p + "block_size"]),
+                "dspark_noise_token_id": int(meta[q + "dspark.noise_token_id"]),
+                "dspark_target_layer_ids": targets, "dspark_markov_rank": rank,
+                "dspark_n_routed_experts": int(hm[p + "expert_count"]),
+                "dspark_n_activated_experts": int(hm[p + "expert_used_count"])}, ""
+    finally:
+        r.close()
+
+
 # ------------------------------------------------------------- tokenizer
 # The pre-tokenizer of a GGUF tokenizer, by llama.cpp's name for it (tokenizer.ggml.pre ->
 # llama-vocab.cpp's regex_exprs), in the shape the checkpoint's tokenizer.json gives it.
@@ -1026,9 +1087,10 @@ def main():
     ap.add_argument("out", type=Path)
     ap.add_argument("--mode", choices=("link", "copy"), default="link")
     ap.add_argument("--mtp", type=Path, default=None,
-                    help="qwen4exp: the MTP head's GGUF (unsloth's mtp-*.gguf); unset, one next to the model "
-                         "is used (its folder, the parent, an MTP/ folder in either; shared-Q8_0 first)")
-    ap.add_argument("--no-mtp", action="store_true", help="qwen4exp: no MTP head, plain decoding")
+                    help="qwen4exp: the MTP head's GGUF (mtp-*.gguf); deepseek41: the DSpark head's (dspark-*.gguf, "
+                         "arch dflash). Unset, one next to the model is used (its folder, the parent, an MTP/ or "
+                         "dspark/ folder in either; Q8_0 first)")
+    ap.add_argument("--no-mtp", action="store_true", help="qwen4exp, deepseek41: no draft head, plain decoding")
     ap.add_argument("--indexer-compress-ratio", type=int, default=0,
                     help="qwen4exp: when the GGUF's attention.compress_ratios are all 0 (a converter "
                          "that read the layers as qwen_sparse_attention)")
@@ -1059,6 +1121,18 @@ def main():
             cfg["mtp_num_hidden_layers"] = 1
             cfg["mtp"] = {"layer_types": ["full_attention"], "rope_theta": cfg["rope_parameters"]["rope_theta"]}
             cfg["mtp_use_dedicated_embeddings"] = False
+    dspark_file = None
+    if arch == "deepseek41" and not args.no_mtp and not any(n.startswith("mtp.") for n in tensors):
+        text = cfg.get("text_config", cfg)
+        for cand in ([args.mtp] if args.mtp else dspark_candidates(src)):
+            keys, why = dspark_head(cand, meta)
+            if keys:
+                dspark_file = cand.resolve(); mtp_where = str(dspark_file)
+                text.update(keys)
+                break
+            if args.mtp:
+                sys.exit(f"--mtp {cand}: {why}")
+            print(f"  {cand.name}: not this model's DSpark head ({why})")
     tok, tcfg, gen = tokenizer_files(meta)
     args.out.mkdir(parents=True, exist_ok=True)
     cfg["colibri_gguf"] = {"arch": arch, "mode": args.mode, "source": str(src), **model_name(meta)}
@@ -1078,12 +1152,15 @@ def main():
             "size": sum(p.stat().st_size for p in parts) if args.mode == "link" else target.stat().st_size}
     if mtp_file:
         link["mtp"] = str(mtp_file)
+    if dspark_file:
+        link["dspark"] = str(dspark_file)
     (args.out / "gguf.json").write_text(json.dumps(link, indent=1), encoding="utf-8")
     for r in readers:
         r.close()
     print(f"colibri model directory ready: {args.out}  ({arch}, {layers} layers, mode {args.mode})")
-    if arch == "qwen4exp":
-        print(f"  MTP head: {mtp_where or ('off (--no-mtp)' if args.no_mtp else 'none found: decoding without drafts (--mtp names one)')}")
+    if arch in ("qwen4exp", "deepseek41"):
+        head = "MTP head" if arch == "qwen4exp" else "DSpark head"
+        print(f"  {head}: {mtp_where or ('off (--no-mtp)' if args.no_mtp else 'none found: decoding without drafts (--mtp names one)')}")
 
 
 if __name__ == "__main__":

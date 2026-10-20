@@ -1636,6 +1636,32 @@ def _gguf_tensor_sizes(parts, layers=None):
             reader.close()
 
 
+def _gguf_head(model_dir):
+    """gguf.json's "dspark": the path of a draft head's own GGUF (DeepSeek V4.1's DSpark), or None."""
+    link = Path(model_dir) / "gguf.json"
+    try:
+        head = json.loads(link.read_text(encoding="utf-8")).get("dspark")
+    except (OSError, ValueError):
+        return None
+    if not head:
+        return None
+    path = Path(head)
+    return path if path.is_absolute() else Path(model_dir) / path
+
+
+def _gguf_head_sizes(path, layers):
+    """(name, bytes, dtype, shape) for a draft head's own GGUF: its stages' routed experts
+    filed after the model's `layers` (the engine gives a stage an expert cache as it does a
+    layer, and _dsv41_expert_inventory files a checkpoint's mtp.* experts there too), the
+    rest under the head's names."""
+    for name, size, dtype, shape in _gguf_tensor_sizes([path], layers=1 << 30):
+        m = re.match(r"^model\.layers\.(\d+)\.mlp\.experts\.(.*)$", name)
+        if m:
+            yield f"model.layers.{layers + int(m.group(1))}.mlp.experts.{m.group(2)}", size, dtype, shape
+        else:
+            yield f"dspark.{name}", size, dtype, shape
+
+
 def analyze_model(model):
     resolved = resolve_model(model)
     model = Path(resolved.model_dir)
@@ -1700,6 +1726,9 @@ def analyze_model(model):
         try:
             sizes = (list(_gguf_tensor_sizes(shards, own_layers if isinstance(own_layers, int) else None)) if gguf
                      else list(_tensor_sizes(shard, with_shape=True)))
+            head = _gguf_head(model) if gguf and isinstance(own_layers, int) else None
+            if head is not None:
+                sizes += list(_gguf_head_sizes(head, own_layers))
         except OSError as error:
             # Name the file. An OSError raised by read() on an already-open
             # stream carries no filename, so `coli doctor` reported bare
