@@ -451,6 +451,20 @@ of them on the device the way a GPU-equipped PC should use its card:
   `COLI_VK_TIER_GB=8`, where the second took 8.6 s against 11.1 s for 400 tokens).
   Without the RAM for every expert, or beside a second device, the tier keeps the warm
   start's set as before.
+- **The host pool and the engine's RAM cache share the RAM.** When the pool cannot hold
+  every expert the device leaves (a model bigger than RAM and VRAM together), the CPU
+  computes the others from the engine's own RAM cache, which the engine sized from the
+  same free RAM before the tier started. The pool now takes that cache's least
+  (`VktConfig.ram_floor`, top-k slots a layer) out of its room, and once sized hands the
+  engine its bytes (`VktConfig.ram_given`): every engine but DeepSeek V4 lowers its cache
+  by as much, to no less than top-k slots a layer; one without the callback keeps its
+  `ram_reserve` and the pool takes what is left. On GLM-5.3 Flash UD-IQ2_XXS (95 GB) with
+  62 GB of RAM the two had asked for 52.8 and 48 GB, and a 711-token prompt was killed by
+  the OOM killer; the pool now takes 45 GiB and the cache 10 slots a layer instead of 127,
+  and the same prompt runs at 11.2 tok/s with the process at 58 GB. The pool beats the
+  cache there: with `COLI_VK_TIER_HOST=0` (every free byte the cache's) the decode ran at
+  0.7-1.4 tok/s against 3.2-3.3. `COLI_VK_TIER_HOST_GB` sizes the pool and leaves the
+  cache as it was.
 - **A fresh install starts warm.** A model downloaded a minute ago has no history,
   so its first runs would fill the tier one routing at a time. `coli setup` copies a
   starting history into the model folder when it has none, for the catalog models
@@ -527,6 +541,8 @@ the device, since no Vulkan tier runs.
 | `COLI_VK_TIER_GB` | measured | The tier's budget in GiB, within what the device can hold. Unset: below. |
 | `COLI_VK_TIER_RESERVE_GB` | `1` | Device memory left to everything else (scratch, KV mirrors, the driver) on top of the dense weights the engine still has to place and, on qwen38, the chain's KV mirror and a prompt chunk. |
 | `COLI_VK_TIER_RATE` | `16` | Promotions per token at most (a prompt's forward gets this many per prompt token): each copies one expert on the engine thread. |
+| `COLI_VK_TIER_HOST` | on (a discrete GPU) | `0`: no host pool. The pool shares system RAM with the engine's RAM expert cache (below). |
+| `COLI_VK_TIER_HOST_GB` | from free RAM | The host pool's size in GiB; the engine's cache keeps its size then. |
 | `COLI_VK_TIER_PROMOTE` | `32` | With a host pool that holds every expert: the most routed experts that move up from it to the device a forward (below). `0`: the warm start's set. |
 | `COLI_VK_TIER_BALANCE` | on | `0`: the device takes every resident expert of a step even when it is the slower side (see below). |
 | `COLI_VK_TIER_WARM` | on | `0`: no warm start; the tier fills as experts pass by. |
@@ -1604,6 +1620,20 @@ layer:
 | host | moe() on the normalized rows without the shared expert: the f32 router with every routing option, the routed experts (the tier's batch and the CPU's share); the new KV rows copied into the host's cache | the router and the routed experts (the tier's batch and the CPU's share); the new MLA rows copied into the host's cache |
 | device, frame A2 (not waited for) | the shared expert | the shared expert (clamped SwiGLU) |
 | after the last layer | the final rows back to the host, which runs the final norm and lm_head as before | the final streams back to the host, which collapses them and runs the final norm and the head as before |
+
+**A GGUF (glm53).** GLM-5.3 Flash's matrices from a GGUF go up as the file's blocks
+(100 + the ggml type, the device's block formats; rows the CPU keeps interleaved by 16
+go back to the file's first), as qwen36's and qwen38's chains take them. The MLA's
+per-head `k_b` and `v_b`, which the absorbed core reads a head at a time
+(`vkc_mla_hgemv`, no block form), go up dequantized as floats. Before, a GGUF's chain
+stopped at "a matrix with no device form" and the whole trunk ran on the CPU (UD-IQ2_XXS
+on an RTX PRO 4000: 63% of the CPU's time in its Q5_K/Q6_K rows). Now every layer is on
+the device (5.96 GiB): decode 0.8-1.1 -> 2.8-3.2 tok/s, a 171-token prompt 2.2 -> 4.8-6.3
+tok/s, with 62 GB of RAM and two NVMe drives for the 95 GB the RAM and VRAM do not hold.
+This model's greedy text forks at near ties where the CPU's own two forms fork too: on
+an 8-token prompt the CPU's integer and float sums (`GQ_EXACT=1`) put the logits 28 to
+37% apart, and the chain against the CPU's float sums 2e-3 on the first row and up to 8%
+after it.
 
 **The state.** The KV caches (GLM-5.2's latent, rope keys and index keys; GLM-5.3's
 latent, index keys and pool gates) stay the host's: each step copies its new rows back,
@@ -2899,8 +2929,10 @@ in short:
    pairs signed or `v+8`, `expert_ffn.h`'s planar int4-g64, int3-g64, MXFP4 with f32
    or ue8m0 scales, fp8 per group or in square blocks, bf16, f32), the activation
    (`VKT_ACT_SWIGLU` with an optional clamp, `VKT_ACT_SITU`, `VKT_ACT_SWIGLU_V4`), the most assignments a
-   step carries, the RAM the expert cache may still take and the dense bytes still to
-   come to the device; optionally `.max_experts`, a count the engine's users already
+   step carries, the RAM the expert cache may still take (and, so the host pool can
+   share that RAM, the least the cache needs and a callback that lowers it:
+   `.ram_floor`, `.ram_given`) and the dense bytes still to come to the device;
+   optionally `.max_experts`, a count the engine's users already
    size its device tier in (GLM-5.2's `COLI_VK_EXPERTS`), and `.extra_layers` with
    their own `VktFmt` for layers past the model's whose experts RAM holds in another
    form (an MTP head's: [above](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)). `atexit(coli_vk_shutdown)`,
