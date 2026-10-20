@@ -1641,6 +1641,17 @@ static double hybrid_pcie_share(void) {
     if (f < 0) { const char *e = getenv("COLI_VK_HYBRID_PCIE"); f = e && *e ? atof(e) : 0.3; if (f < 0) f = 0; if (f > 1) f = 1; }
     return f;
 }
+/* The device formats the CPU computes from the host pool's rows: a GGUF's block types, and
+ * colibri's int8 (fmt 1 a row's scale, 13 a group's) and int4 pairs (fmt 2, 4), whose groups
+ * are whole blocks of 32 of the activations */
+static int host_fmt_ok(const ColiVkTensorInfo *ti) {
+    if (ti->fmt >= 100 && ti->fmt < 164) return 1;
+    if (ti->I % 32) return 0;
+    if (ti->fmt == 1 || ti->fmt == 2) return 1;
+    return (ti->fmt == 4 || ti->fmt == 13) && ti->gs >= 32 && ti->gs % 32 == 0;
+}
+static int host_type(const ColiVkTensorInfo *ti) { return ti->fmt >= 100 ? ti->fmt - 100 : -ti->fmt; }
+static int host_gs(const ColiVkTensorInfo *ti) { return ti->fmt == 4 || ti->fmt == 13 ? ti->gs : 0; }
 /* A resident expert of the host pool the CPU computes in place in a hybrid step: outside the
  * device's share (by a hash of (layer, expert): the same split at every step and every read
  * of a table, the CPU's share spread over the experts), its three tensors block types the
@@ -1652,13 +1663,15 @@ static int host_view_share(int layer, int e, VktHostExpert *hx, int share) {
     hsh ^= hsh >> 15; hsh *= 2654435761u; hsh ^= hsh >> 13;
     if (share && (double)(hsh & 0xffff) / 65536.0 < hybrid_pcie_share()) return 0;
     ColiVkTensor *t[3]; ColiVkTensorInfo ti[3]; const void *r[3]; int ok = 1;
+    const void *sc[3] = {NULL, NULL, NULL};
     coli_vk_xb_expert_tensors(v->ex, &t[0], &t[1], &t[2]);
     for (int k = 0; k < 3 && ok; k++)
-        ok = t[k] && coli_vk_tensor_info(t[k], &ti[k]) && ti[k].fmt >= 100 && ti[k].fmt < 164 &&
-             (r[k] = coli_vk_tensor_host_rows(t[k], NULL)) != NULL;
-    if (!ok || ti[0].fmt != ti[1].fmt) return 0;
-    *hx = (VktHostExpert){r[0], r[1], r[2], ti[0].fmt - 100, ti[2].fmt - 100,
-                          (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4};
+        ok = t[k] && coli_vk_tensor_info(t[k], &ti[k]) && host_fmt_ok(&ti[k]) &&
+             (r[k] = coli_vk_tensor_host_rows(t[k], &sc[k])) != NULL && (ti[k].fmt >= 100 || sc[k]);
+    if (!ok || ti[0].fmt != ti[1].fmt || ti[0].gs != ti[1].gs) return 0;
+    *hx = (VktHostExpert){r[0], r[1], r[2], host_type(&ti[0]), host_type(&ti[2]),
+                          (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4,
+                          sc[0], sc[1], sc[2], host_gs(&ti[0]), host_gs(&ti[2])};
     return 1;
 }
 static int host_view(int layer, int e, VktHostExpert *hx) { return host_view_share(layer, e, hx, 1); }
@@ -1672,12 +1685,85 @@ static int hy_threads(void) {   /* the CPU's team: COLI_VK_HYBRID_THREADS, else 
     return 1;
 #endif
 }
-/* a row of type t (I inputs) against act a's rows (xf[s] their floats): the CPU's integer
- * form, or with GQ_EXACT=1 its float reference (gq_dequant_row), as its own matmuls would
- * take it. Each activation row its own dot, the same bits whatever rows share the call. */
-static inline void host_rows(float *y, int ys, const gq_act *a, const float *const *xf, const uint8_t *row, int t, int I, float *tmp) {
+/* colibri's int8 (fmt 1, 13) and int4 (fmt 2, 4) rows. dev_codes: an int4 row's codes in
+ * element order (the pairs' low nibble first), 0..15 (the value + 8), into u (I bytes). */
+static void dev_codes(uint8_t *u, const uint8_t *row, int I) {
+    int j = 0;
+#if defined(__AVX2__)
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    for (; j + 16 <= I / 2; j += 16) {
+        const __m128i b = _mm_loadu_si128((const __m128i *)(row + j));
+        const __m128i lo = _mm_and_si128(b, m4), hi = _mm_and_si128(_mm_srli_epi16(b, 4), m4);
+        _mm_storeu_si128((__m128i *)(u + 2 * j), _mm_unpacklo_epi8(lo, hi));
+        _mm_storeu_si128((__m128i *)(u + 2 * j + 16), _mm_unpackhi_epi8(lo, hi));
+    }
+#endif
+    for (; j < I / 2; j++) { u[2 * j] = row[j] & 15; u[2 * j + 1] = row[j] >> 4; }
+}
+/* Activation row q (int8 per 32, dx its scales, xs its sums per 16) against a row's codes:
+ * int8 w8, or int4 u4 (0..15, the value + 8: the bias comes back with the activation's
+ * sums). rs: the row's scale (gs 0) or its groups' of gs columns. Integer sums a block, then
+ * the block's scale: dx times the group's (the row's at the end). */
+static float dev_dot(const int8_t *w8, const uint8_t *u4, const float *rs, int gs, const int8_t *q, const float *dx,
+                     const int32_t *xs, int I) {
+    float bias = 0.f;
+#if defined(__AVX2__)
+    const __m256i one16 = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps();
+    for (int b = 0; b < I / 32; b++) {
+        const float sc = dx[b] * (gs ? rs[b * 32 / gs] : 1.f);
+        const __m256i x = _mm256_loadu_si256((const __m256i *)(q + b * 32));
+        __m256i p;
+        if (u4) {
+            p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i *)(u4 + b * 32)), x), one16);
+            bias += sc * (float)(xs[2 * b] + xs[2 * b + 1]);
+        } else {
+            const __m256i w = _mm256_loadu_si256((const __m256i *)(w8 + b * 32));
+            p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(x, w)), one16);
+        }
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(sc), acc);
+    }
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h)); h = _mm_add_ss(h, _mm_movehdup_ps(h));
+    float r = _mm_cvtss_f32(h);
+#else
+    float r = 0.f;
+    for (int b = 0; b < I / 32; b++) {
+        const float sc = dx[b] * (gs ? rs[b * 32 / gs] : 1.f);
+        int32_t p = 0;
+        for (int i = 0; i < 32; i++) p += (u4 ? (int32_t)u4[b * 32 + i] : (int32_t)w8[b * 32 + i]) * q[b * 32 + i];
+        if (u4) bias += sc * (float)(xs[2 * b] + xs[2 * b + 1]);
+        r += (float)p * sc;
+    }
+#endif
+    r -= 8.f * bias;
+    return gs ? r : r * rs[0];
+}
+/* the float reference: the row dequantized (its codes times their scale) */
+static void dev_dequant(float *o, const uint8_t *row, int fmt, const float *rs, int gs, int I) {
+    for (int i = 0; i < I; i++) {
+        const float w = fmt == 1 || fmt == 13 ? (float)((const int8_t *)row)[i] : (float)(((i & 1) ? row[i >> 1] >> 4 : row[i >> 1] & 15) - 8);
+        o[i] = w * (gs ? rs[i / gs] : rs[0]);
+    }
+}
+/* a row of type t (I inputs; rs its scales, gs their group for colibri's formats) against
+ * act a's rows (xf[s] their floats): the CPU's integer form, or with GQ_EXACT=1 its float
+ * reference, as its own matmuls would take it. Each activation row its own dot, the same
+ * bits whatever rows share the call. tmp: I floats, and for an int4 row I bytes after them. */
+static inline void host_rows(float *y, int ys, const gq_act *a, const float *const *xf, const uint8_t *row, int t, int I,
+                             float *tmp, const float *rs, int gs) {
+    if (t < 0 && !gq_exact_mode()) {
+        const int fmt = -t, i4 = fmt == 2 || fmt == 4;
+        uint8_t *u = i4 ? (uint8_t *)(tmp + I) : NULL;
+        if (i4) dev_codes(u, row, I);
+        for (int s = 0; s < a->S; s++)
+            y[(size_t)s * ys] = dev_dot((const int8_t *)row, u, rs, gs, a->q + (size_t)s * I, a->d + (size_t)s * (I / 32),
+                                        a->s + (size_t)s * (I / 16), I);
+        return;
+    }
     if (!gq_exact_mode()) { gq_row_all(y, ys, a, row, t, I); return; }
-    gq_dequant_row(t, row, tmp, I);
+    if (t < 0) dev_dequant(tmp, row, -t, rs, gs, I);
+    else gq_dequant_row(t, row, tmp, I);
     for (int s = 0; s < a->S; s++) {
         double acc = 0; const float *x = xf[s];
         for (int i = 0; i < I; i++) acc += (double)tmp[i] * x[i];
@@ -1730,12 +1816,20 @@ int vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int n
      * rows handed out in chunks (the cores of a hybrid CPU do not run at one speed) */
     #pragma omp parallel num_threads(nt > 0 ? nt : hy_threads())
     {
-        float *tmp = gq_exact_mode() ? malloc((size_t)(D > I ? D : I) * sizeof(float)) : NULL;
+        const int W = D > I ? D : I;   /* the float reference's row, an int4 row's codes after it */
+        float *tmp = malloc((size_t)W * sizeof(float) + (size_t)W);
+        if (!tmp) {
+            #pragma omp atomic write
+            err = 2;
+        }
         #pragma omp for schedule(dynamic, 32)
         for (int64_t r = 0; r < (int64_t)ng * 2 * I; r++) {
+            if (!tmp) continue;
             const int g = (int)(r / (2 * I)), o = (int)(r % (2 * I)), q0 = gs[g]; const VktHostExpert *h = hx[ord[q0]];
-            const uint8_t *row = o < I ? h->g + (size_t)o * h->rgu : h->u + (size_t)(o - I) * h->rgu;
-            host_rows(gu + (size_t)q0 * 2 * I + o, 2 * I, &ag[g], xo + q0, row, h->tg, D, tmp);
+            const int oo = o < I ? o : o - I;
+            const uint8_t *row = (o < I ? h->g : h->u) + (size_t)oo * h->rgu;
+            const float *rs = h->tg < 0 ? (o < I ? h->sg : h->su) + (size_t)oo * (h->gsgu ? (D + h->gsgu - 1) / h->gsgu : 1) : NULL;
+            host_rows(gu + (size_t)q0 * 2 * I + o, 2 * I, &ag[g], xo + q0, row, h->tg, D, tmp, rs, h->gsgu);
         }
         #pragma omp for schedule(static)
         for (int q = 0; q < np; q++) {
@@ -1754,8 +1848,10 @@ int vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int n
             }
         #pragma omp for schedule(dynamic, 64)
         for (int64_t r = 0; r < (int64_t)ng * D; r++) {
+            if (!tmp) continue;
             const int g = (int)(r / D), o = (int)(r % D), q0 = gs[g]; const VktHostExpert *h = hx[ord[q0]];
-            host_rows(dy + (size_t)q0 * D + o, D, &ah[g], ho + q0, h->d + (size_t)o * h->rd, h->td, I, tmp);
+            const float *rs = h->td < 0 ? h->sd + (size_t)o * (h->gsd ? (I + h->gsd - 1) / h->gsd : 1) : NULL;
+            host_rows(dy + (size_t)q0 * D + o, D, &ah[g], ho + q0, h->d + (size_t)o * h->rd, h->td, I, tmp, rs, h->gsd);
         }
         free(tmp);
     }
