@@ -3289,28 +3289,70 @@ static int tcg_ok(const DeviceContext *ctx) {
  * (about 1.9 GB of rows on Qwen3.6-35B). The same sums as quant_matmul up to the
  * order of the float additions. */
 #define GEMV_I8_ROWS 8   /* warps, and output rows, per block */
-#define GEMV_I8_MAX_S 8  /* activation rows it takes, each on its own (blockIdx.y): a verify's
-                            rows get a decode step's bits, as the engines ask (q36_spec_step) */
+#define GEMV_I8_MAX_S 8  /* activation rows it takes: a verify's rows get a decode step's bits, as
+                            the engines ask (q36_spec_step) */
+#define GEMV_I8_NR 4     /* a verify's rows a block takes, every weight load shared among them */
+/* NR 1: a decode step's row, a block a row as ever. NR GEMV_I8_NR: nr rows of x a block (from
+ * the host: what 48 KiB of shared memory holds, up to NR), every 16-byte load of the weight
+ * row shared among them; each row's sum is the NR 1 kernel's operations in their order, so
+ * its bits are a decode step's (tests/test_gemv_rows_cuda.cu). Before, a verify's rows were
+ * a block each and read every weight once a row. */
+/* x in shared memory as float4s with one of padding after every eight (gx4): a lane's 16
+ * values are four float4s and the next lane's start 72 bytes on, where 16 floats a lane apart
+ * put the lanes of a load on the same banks. The values and the order of the sums are those
+ * of plain floats: the layout moves no bit. A row past what 48 KiB holds padded keeps them
+ * unpadded (PAD 0). */
+__host__ __device__ static inline int gx4(int k) { return k + (k >> 3); }
+template <int NR, int PAD>
 __global__ static void __launch_bounds__(256) gemv_i8_rows(float *__restrict__ y, const float *__restrict__ x,
-        const int8_t *__restrict__ w, const float *__restrict__ sc, int I, int O) {
-    extern __shared__ float xs[];
-    x += (size_t)blockIdx.y * I; y += (size_t)blockIdx.y * O;
-    for (int i = threadIdx.x; i < I; i += 256) xs[i] = x[i];
+        const int8_t *__restrict__ w, const float *__restrict__ sc, int I, int O, int S, int nr) {
+    extern __shared__ float4 xs4[];
+    int s0 = NR == 1 ? (int)blockIdx.y : (int)blockIdx.y * nr, nrow = NR == 1 ? 1 : min(nr, S - s0);
+    int I4 = I / 4, XR = PAD ? gx4(I4) + 1 : I4;
+    x += (size_t)s0 * I; y += (size_t)s0 * O;
+    const float4 *x4 = reinterpret_cast<const float4 *>(x);
+    for (int k = threadIdx.x; k < nrow * I4; k += 256) {
+        int r = NR == 1 ? 0 : k / I4, kk = NR == 1 ? k : k - r * I4;
+        xs4[r * XR + (PAD ? gx4(kk) : kk)] = x4[(size_t)r * I4 + kk];
+    }
     __syncthreads();
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     int o = blockIdx.x * GEMV_I8_ROWS + warp;
     if (o >= O) return;
     const int8_t *row = w + (size_t)o * I;
-    float acc = 0.f;
+    float acc[NR];
+    #pragma unroll
+    for (int r = 0; r < NR; r++) acc[r] = 0.f;
     for (int i0 = lane * 16; i0 < I; i0 += 32 * 16) {
         int4 v = *reinterpret_cast<const int4 *>(row + i0);
         const int8_t *b = reinterpret_cast<const int8_t *>(&v);
-        const float *xv = xs + i0;
+        float wf[16];
         #pragma unroll
-        for (int k = 0; k < 16; k++) acc += xv[k] * (float)b[k];
+        for (int k = 0; k < 16; k++) wf[k] = (float)b[k];
+        int k4 = i0 / 4;
+        #pragma unroll
+        for (int r = 0; r < NR; r++) if (r < nrow) {
+            const float4 *xr = xs4 + r * XR;
+            float4 q[4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) q[j] = xr[PAD ? gx4(k4 + j) : k4 + j];
+            const float *xv = reinterpret_cast<const float *>(q);
+            #pragma unroll
+            for (int k = 0; k < 16; k++) acc[r] += xv[k] * wf[k];
+        }
     }
-    for (int off = 16; off > 0; off >>= 1) acc += f8_shfl_down(acc, off);
-    if (lane == 0) y[o] = acc * sc[o];
+    #pragma unroll
+    for (int r = 0; r < NR; r++) if (r < nrow) {
+        float a = acc[r];
+        for (int off = 16; off > 0; off >>= 1) a += f8_shfl_down(a, off);
+        if (lane == 0) y[(size_t)r * O + o] = a * sc[o];
+    }
+}
+/* COLI_CUDA_GEMV_NR=1: a verify's rows a block each, as before */
+static int gemv_i8_nr_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("COLI_CUDA_GEMV_NR"); on = !(e && *e == '1'); }
+    return on;
 }
 
 /* The dense chain's matmul (cuda_chain.cu): the resident tensor's kernel on the
@@ -3323,8 +3365,21 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
     if (!select_ctx(ctx)) return 0;
     cudaStream_t st = (cudaStream_t)stream;
     if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288) {
-        dim3 blocks((unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS), (unsigned)S);
-        gemv_i8_rows<<<blocks, 256, (size_t)t->I * sizeof(float), st>>>(y_dev, x_dev, (const int8_t *)t->weights, t->scales, t->I, t->O);
+        unsigned bx = (unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS);
+        const int8_t *w = (const int8_t *)t->weights;
+        size_t prow = (size_t)(gx4(t->I / 4) + 1) * 16;   /* a padded row's bytes */
+        /* a verify's rows share each weight load where the matrix has the blocks to fill the
+         * device without its rows and shared memory holds them padded */
+        int nr = S > 1 && bx >= 64 && gemv_i8_nr_on() ? (S < GEMV_I8_NR ? S : GEMV_I8_NR) : 1;
+        while (nr > 1 && nr * prow > 48 * 1024) nr--;
+        if (nr > 1)
+            gemv_i8_rows<GEMV_I8_NR, 1><<<dim3(bx, (unsigned)((S + nr - 1) / nr)), 256, nr * prow, st>>>(
+                y_dev, x_dev, w, t->scales, t->I, t->O, S, nr);
+        else if (prow <= 48 * 1024)
+            gemv_i8_rows<1, 1><<<dim3(bx, (unsigned)S), 256, prow, st>>>(y_dev, x_dev, w, t->scales, t->I, t->O, S, 1);
+        else
+            gemv_i8_rows<1, 0><<<dim3(bx, (unsigned)S), 256, (size_t)t->I * sizeof(float), st>>>(
+                y_dev, x_dev, w, t->scales, t->I, t->O, S, 1);
         return cuda_ok(cudaGetLastError(), "chain gemv launch");
     }
     /* a prompt chunk's rows: the tensor cores, f16 (sm_70 and later), int8 and int4 rows */

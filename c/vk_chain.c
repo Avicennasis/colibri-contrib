@@ -140,6 +140,7 @@ typedef struct {
     VkPipeline dnrr[VKC_DNREC_MAX]; int dnrr_kd[VKC_DNREC_MAX], ndnrr;
     VkShaderModule mod_gemv4; VkPipeline gemv4; int gemv4_xs;   /* chain_gemv.comp: the vectorized decode GEMV */
     VkPipeline gemv4x;                /* chain_gemv.comp with x read from its buffer (a row past the staging) */
+    VkPipeline gemv4n, gemv4xn;       /* the same taking up to 4 rows of x a workgroup (a verify's), NR 4 */
     VkShaderModule mod_adec; VkPipeline adec; int adec_tried; VkcBuf *adec_x;   /* chain_attn_dec.comp and its scratch */
     VkShaderModule mod_mdec; VkPipeline mdec; int mdec_tried;   /* chain_mla_dec.comp (the same scratch) */
     /* chain_gemm.comp: int8/int4 prompt GEMMs, x rounded to f16 once (COLI_VK_CHAIN_GEMM) */
@@ -524,15 +525,22 @@ int vkc_init(void) {
     {
         const char *e = getenv("COLI_VK_CHAIN_GEMV");
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties((VkPhysicalDevice)KC.core.phys, &pp);
-        int xs = (int)((pp.limits.maxComputeSharedMemorySize - 128) / 16);   /* past the subgroups' 32 sums */
+        int xs = (int)((pp.limits.maxComputeSharedMemorySize - 512) / 16);   /* past the subgroups' 32 vec4 sums */
         if (xs > 4096) xs = 4096;
         if (!(e && *e == '0') && xs >= 256 && (KC.mod_gemv4 = load_module(KC.core.spv_path, "chain_gemv.spv"))) {
             /* and its variant for a row past the staging, x read from its buffer */
-            VkSpecializationMapEntry me[2] = {{0, 0, 4}, {1, 4, 4}};
-            int32_t v[2] = {xs, 0}, vx[2] = {xs, 1};
-            VkSpecializationInfo si = {2, me, sizeof v, v}, six = {2, me, sizeof vx, vx};
+            VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+            int32_t v[3] = {xs, 0, 1}, vx[3] = {xs, 1, 1}, vn[3] = {xs, 0, 4}, vxn[3] = {xs, 1, 4};
+            VkSpecializationInfo si = {3, me, sizeof v, v}, six = {3, me, sizeof vx, vx},
+                                 sin = {3, me, sizeof vn, vn}, sixn = {3, me, sizeof vxn, vxn};
             if ((KC.gemv4 = make_pipe(KC.mod_gemv4, &si))) KC.gemv4_xs = xs;
             KC.gemv4x = KC.gemv4 ? make_pipe(KC.mod_gemv4, &six) : VK_NULL_HANDLE;
+            /* a verify's rows: COLI_VK_CHAIN_GEMV_NR=1 keeps them a workgroup each */
+            const char *nr = getenv("COLI_VK_CHAIN_GEMV_NR");
+            if (!(nr && *nr == '1')) {
+                KC.gemv4n = KC.gemv4 ? make_pipe(KC.mod_gemv4, &sin) : VK_NULL_HANDLE;
+                KC.gemv4xn = KC.gemv4x ? make_pipe(KC.mod_gemv4, &sixn) : VK_NULL_HANDLE;
+            }
         }
     }
     /* the int8/int4 decode GEMV with lanes per row and rows per workgroup chosen per
@@ -1336,15 +1344,25 @@ static int matmul_aligned(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcB
         int nq = ti->rowWords / 4, lpr = 4;
         if (e && *e) lpr = atoi(e); else while (lpr < 64 && lpr * 16 < nq) lpr *= 2;
         if (lpr < 1) lpr = 1;
-        struct { int fmt, S, I, O, rowWords, gs, lpr; } pc7 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, lpr};
+        struct { int fmt, S, I, O, rowWords, gs, lpr, nr; } pc7 = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs, lpr, 1};
         int rows_wg = 256 / lpr;   /* at least, at subgroups of 64 */
         int wg = (ti->O + rows_wg - 1) / rows_wg; if (wg > 1024) wg = 1024;
         /* a few long rows: a row a workgroup, every lane on it (lpr 0), where the rows would
          * leave the device short of workgroups: a decode's or a verify's rows (a prompt's
          * would stage x once a row of W) */
         if (!(e && *e) && S <= 4 && wg < 128 && nq >= 256) { pc7.lpr = 0; wg = ti->O; }
+        /* a verify's rows (S <= 4) in one workgroup, every weight load shared, as many as the
+         * staging holds (x read from its buffer: all of them), where the matrix has the
+         * workgroups to fill the device without its rows (512 x 2048 int8, 16 workgroups:
+         * 9 us -> 11 to 15 sharing) */
+        int xrow = (ti->rowWords / 4) * per / 4, nr = S <= 4 && wg >= 64 ? S : 1;
+        xrow += xrow / 8 + 1;
+        while (nr > 1 && !xg && nr * xrow > KC.gemv4_xs) nr--;
+        if (!(xg ? KC.gemv4xn : KC.gemv4n)) nr = 1;
+        pc7.nr = nr;
         KC.st.gemv_xg += xg;
-        ok = record(xg ? KC.gemv4x : KC.gemv4, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)S, 1);
+        VkPipeline gp = nr > 1 ? (xg ? KC.gemv4xn : KC.gemv4n) : xg ? KC.gemv4x : KC.gemv4;
+        ok = record(gp, bd, 4, &pc7, sizeof pc7, (uint32_t)wg, (uint32_t)((S + nr - 1) / nr), 1);
     }
     else if (path >= 0 && KC.tg && (ti->fmt == 1 || ti->fmt == 2 || (ti->fmt == 4 && ti->gs >= 8 && ti->gs % 8 == 0)) &&
              ti->I % 64 == 0 && ti->O % 128 == 0 && ti->rowWords % 4 == 0) {
@@ -3105,6 +3123,8 @@ void vkc_shutdown(void) {
     if (KC.mod_dnrr) vkDestroyShaderModule(KC.dev, KC.mod_dnrr, NULL);
     if (KC.gemv4) vkDestroyPipeline(KC.dev, KC.gemv4, NULL);
     if (KC.gemv4x) vkDestroyPipeline(KC.dev, KC.gemv4x, NULL);
+    if (KC.gemv4n) vkDestroyPipeline(KC.dev, KC.gemv4n, NULL);
+    if (KC.gemv4xn) vkDestroyPipeline(KC.dev, KC.gemv4xn, NULL);
     if (KC.adec) vkDestroyPipeline(KC.dev, KC.adec, NULL);
     if (KC.mdec) vkDestroyPipeline(KC.dev, KC.mdec, NULL);
     if (KC.mod_mdec) vkDestroyShaderModule(KC.dev, KC.mod_mdec, NULL);
