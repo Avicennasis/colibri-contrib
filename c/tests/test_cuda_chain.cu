@@ -400,6 +400,19 @@ int main(void) {
         ColiCudaTensor *t0 = NULL;
         ck(coli_cuda_tensor_upload(&t0, w.data(), ones.data(), 0, I, O, 0), "an f32 tensor resident");
         ck(T->begin() && T->matmul(t0, xb, 7, yb, 0, 1) && T->submit(1) && maxdiff(down(yb, O).data(), ref0.data(), O) < 1e-4, "f32 rows: the CPU's dot");
+        {   /* a prompt chunk's rows of an f32 matrix (the tiled GEMM): widths that are no tile's multiple */
+            const int S3 = 70, I3 = 200, O3 = 100;
+            std::vector<float> x3 = rnd((size_t)S3 * I3, 12), w3 = rnd((size_t)I3 * O3, 13), one3(O3, 1.f), r3((size_t)S3 * O3);
+            for (int s = 0; s < S3; s++) for (int o = 0; o < O3; o++) {
+                double a = 0; for (int i = 0; i < I3; i++) a += (double)x3[(size_t)s * I3 + i] * w3[(size_t)o * I3 + i]; r3[(size_t)s * O3 + o] = (float)a;
+            }
+            ColiCudaTensor *t3 = NULL;
+            CcBuf *xb3 = T->buf((size_t)S3 * I3 * 4, CC_DEV), *yb3 = T->buf((size_t)S3 * O3 * 4, CC_DOWN);
+            int ok3 = xb3 && yb3 && coli_cuda_tensor_upload(&t3, w3.data(), one3.data(), 0, I3, O3, 0) && T->begin() &&
+                      T->write(xb3, 0, x3.data(), x3.size() * 4) && T->matmul(t3, xb3, 0, yb3, 0, S3) && T->submit(1);
+            ck(ok3 && maxdiff((const float *)T->ptr(yb3), r3.data(), r3.size()) < 1e-4, "f32 rows, a prompt chunk's 70 (the tiled GEMM)");
+            coli_cuda_tensor_free(t3); T->free(xb3); T->free(yb3);
+        }
         coli_cuda_tensor_free(t); coli_cuda_tensor_free(t0); T->free(xb); T->free(yb);
     }
     printf("norm\n");
@@ -794,7 +807,7 @@ int main(void) {
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 10, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 11, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;
