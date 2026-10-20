@@ -3254,6 +3254,12 @@ CHAT_CONTEXT_STEPS = (16384, 32768, 65536, 131072, 262144)
 CHAT_CONTEXT_SHARE = 0.10
 CHAT_CONTEXT_AGENT = 65536
 CHAT_CONTEXT_AGENT_SHARE = 0.25
+# The engines that size their expert cache from the plan and cannot start without a
+# slot a layer (cap_for_arch): the plan reserves their workspace at the full context,
+# so the step counts it beside the state. DeepSeek V4.1 prefills a prompt in one
+# forward, about 200 KB a token: on a 64 GB box the 262144 the state alone allowed
+# took 53.7 GB of workspace, left the cache no slot, and `coli serve` did not start.
+CHAT_CONTEXT_WORKSPACE = ("deepseek_v41", "mimo")
 
 
 def chat_context(model, env=None, kv_slots=1, available=None):
@@ -3288,18 +3294,22 @@ def chat_context(model, env=None, kv_slots=1, available=None):
         if step <= chosen or step > limits.max_context:
             continue
         try:
-            state = planner_geometry(resolved, step).context_state_bytes
+            geometry = planner_geometry(resolved, step)
         except ValueError:
             break
+        workspace = geometry.workspace_bytes if family.id in CHAT_CONTEXT_WORKSPACE else 0
         share = CHAT_CONTEXT_AGENT_SHARE if step <= CHAT_CONTEXT_AGENT else CHAT_CONTEXT_SHARE
-        if state * kv_slots > share * budget:
+        if geometry.context_state_bytes * kv_slots + workspace > share * budget:
             break
         chosen = step
     if chosen == base:
         return None, f"{base} tokens is what {budget / GB:.1f} GB allows"
-    state = planner_geometry(resolved, chosen).context_state_bytes * kv_slots
-    return chosen, (f"{chosen} tokens of context ({state / GB:.1f} GB of conversation state "
-                    f"of {budget / GB:.1f} GB); --ctx sets it")
+    geometry = planner_geometry(resolved, chosen)
+    state = geometry.context_state_bytes * kv_slots
+    workspace = (f" and {geometry.workspace_bytes / GB:.1f} GB of prompt workspace"
+                 if family.id in CHAT_CONTEXT_WORKSPACE else "")
+    return chosen, (f"{chosen} tokens of context ({state / GB:.1f} GB of conversation state"
+                    f"{workspace} of {budget / GB:.1f} GB); --ctx sets it")
 
 
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
