@@ -30,6 +30,10 @@
 #include "vk_tier.h"
 #include "backend_vulkan.h"
 #include "tier.h"
+#include "ggml_quants.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #define VKT_QCAP 32                 /* promotions staged and waiting for the uploader */
 #define VKT_CAND 64                 /* victim candidates kept per refresh */
@@ -145,6 +149,15 @@ static struct {
     ColiVkExpert **bex; int *brows; int *bfirst; int cb;
     const float **bx, **by; int *rowsrc; int cbx;
     float *bw;                           /* the rows' route weights (vkt_issue_w), beside bx */
+    /* hybrid steps (hybrid: COLI_VK_HYBRID, SwiGLU, a host pool): in a step of up to
+     * VKT_UP_ROWS rows, the pairs of the host pool's experts of block types the CPU computes
+     * in place at the join (vkt_host_pairs) while the device computes the ones it holds,
+     * instead of the device reading them over PCIe; hy_of[i] pair i's place among them (-1
+     * none), hy_v their rows, hy_x their input rows, hy_out their outputs */
+    int hybrid, hy_n, chy, cho; int *hy_of;
+    VktHostExpert *hy_v; const VktHostExpert **hy_hx; const float **hy_x;
+    float *hy_gu, *hy_hh, *hy_out;
+    unsigned long long hy_steps, hy_pairs; double hy_ms;
     int max_dev_rows;
     double t_issued;
     /* the balance: the share of a step's resident experts the device takes, moved by
@@ -1506,6 +1519,125 @@ int vkt_stream_prefetch(int layer, int S) {
     return got;
 }
 
+/* the share of the host pool's experts the device keeps reading over PCIe in a hybrid
+ * step (COLI_VK_HYBRID_PCIE, 0..1): a step with several such pairs splits them, so the two
+ * sides finish closer together. A pair costs the CPU about 140 us and the device about 150
+ * over PCIe (an RTX PRO 4000 and an i5-13500, Qwen3.8 IQ2_XS); decode with the share at 0,
+ * 0.3, 0.5, 0.7: 45.3, 46.3, 46.1, 46.0 tok/s, with the MTP head's 3-row verifies 43.8,
+ * 45.9, 45.0, 43.9. */
+static double hybrid_pcie_share(void) {
+    static double f = -1;
+    if (f < 0) { const char *e = getenv("COLI_VK_HYBRID_PCIE"); f = e && *e ? atof(e) : 0.3; if (f < 0) f = 0; if (f > 1) f = 1; }
+    return f;
+}
+/* A resident expert of the host pool the CPU computes in place in a hybrid step: outside the
+ * device's share (by a hash of (layer, expert): the same split at every step and every read
+ * of a table, the CPU's share spread over the experts), its three tensors block types the
+ * CPU has rows of (a GGUF's, as the file has them), gate and up of one type. *hx its rows. */
+static int host_view(int layer, int e, VktHostExpert *hx) {
+    VSlot *v = slot(layer, e);
+    if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex || !v->host) return 0;
+    uint32_t hsh = (uint32_t)(layer * 2654435761u) ^ (uint32_t)(e * 2246822519u);
+    hsh ^= hsh >> 15; hsh *= 2654435761u; hsh ^= hsh >> 13;
+    if ((double)(hsh & 0xffff) / 65536.0 < hybrid_pcie_share()) return 0;
+    ColiVkTensor *t[3]; ColiVkTensorInfo ti[3]; const void *r[3]; int ok = 1;
+    coli_vk_xb_expert_tensors(v->ex, &t[0], &t[1], &t[2]);
+    for (int k = 0; k < 3 && ok; k++)
+        ok = t[k] && coli_vk_tensor_info(t[k], &ti[k]) && ti[k].fmt >= 100 && ti[k].fmt < 164 &&
+             (r[k] = coli_vk_tensor_host_rows(t[k], NULL)) != NULL;
+    if (!ok || ti[0].fmt != ti[1].fmt) return 0;
+    *hx = (VktHostExpert){r[0], r[1], r[2], ti[0].fmt - 100, ti[2].fmt - 100,
+                          (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4};
+    return 1;
+}
+
+static int hy_threads(void) {   /* the CPU's team: COLI_VK_HYBRID_THREADS, else OpenMP's */
+    static int n = -1;
+    if (n < 0) { const char *e = getenv("COLI_VK_HYBRID_THREADS"); n = e && atoi(e) > 0 ? atoi(e) : 0; }
+#ifdef _OPENMP
+    return n > 0 ? n : omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+/* a row of type t (I inputs) against act a's one row: the CPU's integer form, or with
+ * GQ_EXACT=1 its float reference (gq_dequant_row), as its own matmuls would take it */
+static inline void host_row(float *y, const gq_act *a, const float *xf, const uint8_t *row, int t, int I, float *tmp) {
+    if (!gq_exact_mode()) { gq_row_all(y, 1, a, row, t, I); return; }
+    double acc = 0; gq_dequant_row(t, row, tmp, I);
+    for (int i = 0; i < I; i++) acc += (double)tmp[i] * xf[i];
+    *y = (float)acc;
+}
+int vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
+                   float limit, int nt, float *gu, float *hh, float *dn) {
+    if (np < 1) return 1;
+    int err = 0, nx = 0, *xa = malloc((size_t)np * sizeof(int));
+    gq_act *ax = calloc((size_t)np, sizeof(gq_act)), *ah = calloc((size_t)np, sizeof(gq_act));
+    if (!xa || !ax || !ah) { free(xa); free(ax); free(ah); return 0; }
+    for (int p = 0; p < np; p++) {   /* a row's activation once: the pairs of a row share it */
+        int q = 0;
+        while (q < p && xr[q] != xr[p]) q++;
+        if (q < p) { xa[p] = xa[q]; continue; }
+        xa[p] = nx;
+        if (gq_act_set(&ax[nx++], xr[p], 1, D)) err = 1;
+    }
+    /* gate and up of every pair, the activation, then down: one parallel region, the
+     * rows handed out in chunks (the cores of a hybrid CPU do not run at one speed) */
+    #pragma omp parallel num_threads(nt > 0 ? nt : hy_threads())
+    {
+        float *tmp = gq_exact_mode() ? malloc((size_t)(D > I ? D : I) * sizeof(float)) : NULL;
+        #pragma omp for schedule(dynamic, 32)
+        for (int r = 0; r < np * 2 * I; r++) {
+            int p = r / (2 * I), o = r % (2 * I); const VktHostExpert *h = hx[p];
+            const uint8_t *row = o < I ? h->g + (size_t)o * h->rgu : h->u + (size_t)(o - I) * h->rgu;
+            host_row(gu + (size_t)p * 2 * I + o, &ax[xa[p]], xr[p], row, h->tg, D, tmp);
+        }
+        #pragma omp for schedule(static)
+        for (int p = 0; p < np; p++) {
+            const float *g = gu + (size_t)p * 2 * I, *u = g + I; float *h = hh + (size_t)p * I;
+            for (int o = 0; o < I; o++) {
+                float gv = g[o], uv = u[o];
+                if (limit > 0.f) { gv = gv < limit ? gv : limit; uv = uv < -limit ? -limit : uv > limit ? limit : uv; }
+                h[o] = gv / (1.f + expf(-gv)) * uv;
+            }
+            if (gq_act_set(&ah[p], h, 1, I)) {
+                #pragma omp atomic write
+                err = 1;
+            }
+        }
+        #pragma omp for schedule(dynamic, 64)
+        for (int r = 0; r < np * D; r++) {
+            int p = r / D, o = r % D; const VktHostExpert *h = hx[p];
+            host_row(dn + (size_t)p * D + o, &ah[p], hh + (size_t)p * I, h->d + (size_t)o * h->rd, h->td, I, tmp);
+        }
+        free(tmp);
+    }
+    for (int k = 0; k < nx; k++) gq_act_free(&ax[k]);
+    for (int p = 0; p < np; p++) gq_act_free(&ah[p]);
+    free(xa); free(ax); free(ah);
+    return !err;
+}
+/* room for n pairs of the step (hy_of) and for np of them on the CPU */
+static int grow_hy(int n, int np) {
+    if (n > T.chy) {
+        int nc = grow_to(n, &T.chy), *a = realloc(T.hy_of, (size_t)nc * sizeof(int));
+        if (!a) return 0;
+        T.hy_of = a; T.chy = nc;
+    }
+    if (np > T.cho) {
+        int nc = grow_to(np, &T.cho), H = T.c.hidden, I = T.c.inter;
+        VktHostExpert *v = realloc(T.hy_v, (size_t)nc * sizeof(*v)); if (v) T.hy_v = v;
+        const VktHostExpert **h = realloc(T.hy_hx, (size_t)nc * sizeof(*h)); if (h) T.hy_hx = h;
+        const float **x = realloc(T.hy_x, (size_t)nc * sizeof(*x)); if (x) T.hy_x = x;
+        float *g = realloc(T.hy_gu, (size_t)nc * 2 * I * sizeof(float)); if (g) T.hy_gu = g;
+        float *u = realloc(T.hy_hh, (size_t)nc * I * sizeof(float)); if (u) T.hy_hh = u;
+        float *o = realloc(T.hy_out, (size_t)nc * H * sizeof(float)); if (o) T.hy_out = o;
+        if (!v || !h || !x || !g || !u || !o) return 0;
+        T.cho = nc;
+    }
+    return 1;
+}
+
 static int issue(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken) {
     if (S > 0 && K > 0) memset(taken, 0, (size_t)S * K);
     if (!T.on || T.inflight || layer < 0 || layer >= T.c.layers || S < 1 || K < 1) return 0;
@@ -1531,10 +1663,14 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     if (T.st_ok && S >= T.gemm_rows && layer < T.main_layers) return issue_big(layer, x, S, K, idx, w, taken);
     int E = T.c.experts, H = T.c.hidden, n = S * K;
     if (!grow_map(n)) return 0;
+    /* a hybrid step: the host pool's experts the CPU can compute in place are its, at the join */
+    const int hyb = T.hybrid && S <= VKT_UP_ROWS && layer < T.main_layers && grow_hy(n, 0);
+    T.hy_n = 0;
     /* heat for every routed expert, groups for the resident ones (first seen first) */
     int ng = 0, total = 0, rows1 = 0;
     for (int i = 0; i < n; i++) {
         T.map[i] = -1;
+        if (hyb) T.hy_of[i] = -1;
         int e = idx[i];
         if (e < 0 || e >= E) continue;
         T.routed++;
@@ -1543,6 +1679,11 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
         if (v->heat < 0xFFFFFFFFu) v->heat++;
         v->last = T.tick;
         if (v->state != VS_RESIDENT) continue;
+        if (hyb && v->host && grow_hy(n, T.hy_n + 1) && host_view(layer, e, &T.hy_v[T.hy_n])) {
+            T.hy_x[T.hy_n] = x + (size_t)(i / K) * H;
+            T.hy_of[i] = T.hy_n++;
+            continue;
+        }
         if (v->dev && rows1 >= T.d2_rows) continue;    /* the second device's batch is as large as it gets */
         int g = T.grp[e];
         if (g < 0) {
@@ -1552,7 +1693,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
         T.brows[g]++; total++; rows1 += v->dev;
         T.map[i] = g;                                   /* group for now, row index below */
     }
-    if (!ng) return 0;
+    if (!ng && !T.hy_n) return 0;
     /* The balance: when the device has been the slower side, the experts the CPU
      * also holds in RAM beyond the device's share of the step's rows go back to the
      * CPU, whole experts (the CPU reads one once for all its rows); the ones only
@@ -1584,7 +1725,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
             }
             free(gone);
         }
-        if (!ng) return 0;
+        if (!ng && !T.hy_n) return 0;
     }
     /* With a second device: the primary device's groups first, then the second's, so each
      * device's batch is a contiguous run of groups and of rows (rows0 rows on the first). */
@@ -1640,8 +1781,14 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
         if (j < rows0 ? !T.d0_inflight : !T.d2_inflight) { T.map[i] = -1; continue; }   /* not submitted: the CPU's */
         taken[i] = 1; took++;
     }
+    T.served += (unsigned long long)took;
+    if (T.hy_n) {   /* the join computes them */
+        for (int i = 0; i < n; i++) if (T.hy_of[i] >= 0) taken[i] = 1;
+        for (int p = 0; p < T.hy_n; p++) T.hy_hx[p] = &T.hy_v[p];
+        took += T.hy_n;
+    }
     if (!took) return 0;
-    T.inflight = 1; T.S = S; T.K = K; T.steps++; T.served += (unsigned long long)took;
+    T.inflight = 1; T.S = S; T.K = K; T.steps++;
     /* T.full: the batch is in flight with the experts it took: a victim's device copy is
      * freed at its join */
     for (int i = 0; T.full && S <= VKT_UP_ROWS && i < n; i++)
@@ -1666,6 +1813,17 @@ int vkt_join(const float **rows) {
         return ok;
     }
     double t0 = vkt_now_ms(), dms = 0, dms1 = 0, tc = t0 - T.t_issued;
+    /* a hybrid step's host pool pairs, while the device computes its own */
+    const int hn = T.hy_n;
+    int hok = 1;
+    if (hn) {
+        hok = vkt_host_pairs(T.hy_hx, T.hy_x, hn, T.c.hidden, T.c.inter, T.c.act_limit, 0,
+                             T.hy_gu, T.hy_hh, T.hy_out);
+        double th = vkt_now_ms() - t0;
+        T.hy_ms += th; T.hy_steps++; T.hy_pairs += (unsigned long long)hn;
+        tc += th; t0 += th;
+        T.hy_n = 0;
+    }
     T.cpu_ms += tc;
     int ok = !T.d0_inflight || coli_vk_xb_join(T.by, &dms);
     int ok1 = !T.d2_inflight || coli_vk_xb_join_dev(1, T.by + T.d2_rows0, &dms1);
@@ -1685,7 +1843,9 @@ int vkt_join(const float **rows) {
     }
     T.inflight = 0;
     int n = T.S * T.K;
-    for (int i = 0; i < n; i++) rows[i] = ok && ok1 && T.map[i] >= 0 ? T.by[T.map[i]] : NULL;
+    for (int i = 0; i < n; i++)
+        rows[i] = !(ok && ok1 && hok) ? NULL : T.map[i] >= 0 ? T.by[T.map[i]]
+                : hn && T.hy_of[i] >= 0 ? T.hy_out + (size_t)T.hy_of[i] * T.c.hidden : NULL;
     if (!ok) {
         fprintf(stderr, "[VK] tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
         T.on = 0;
@@ -1696,6 +1856,10 @@ int vkt_join(const float **rows) {
         return 0;
     }
     quiesce();
+    if (!hok) {   /* the same: the CPU computes the step's pairs from its own copies */
+        fprintf(stderr, "[VK] tier %s: a hybrid step's host pool pairs could not be computed in place, the step goes to the CPU\n", T.engine);
+        return 0;
+    }
     return 1;
 }
 
@@ -2203,6 +2367,11 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     fprintf(stderr, "\n");
     d2_init(fit, all, act);   /* COLI_VK_DEV2: the experts after these on a second device */
     host_init(all);           /* and the rest in system RAM the device reads */
+    /* hybrid steps: a decode step's or a verify's host pool experts of block types on the CPU,
+     * in place, while the device computes the ones it holds (COLI_VK_HYBRID=0: the device
+     * reads them over PCIe). SwiGLU only: DeepSeek V4's expert rounds as its own kernel does. */
+    const char *hy = getenv("COLI_VK_HYBRID");
+    T.hybrid = T.dmax[2] > 0 && T.c.act == VKT_ACT_SWIGLU && !(hy && *hy == '0');
     return 1;
 }
 
@@ -2227,6 +2396,9 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
                 T.f_pool, T.f_copy, T.f_sets);
     if (T.balance) fprintf(stderr, " | balance: device share %.2f, %llu rows handed to the CPU", T.share, T.handed);
     if (T.chain_served) fprintf(stderr, " | in the dense chain: %llu routed experts with no host step", T.chain_served);
+    if (T.hy_steps)
+        fprintf(stderr, " | hybrid: %llu steps, %llu host pool pairs computed by the CPU in place (%.1f ms, %.0f us a pair)",
+                T.hy_steps, T.hy_pairs, T.hy_ms, T.hy_ms * 1e3 / (double)T.hy_pairs);
     if (T.c.extra_layers)
         fprintf(stderr, " | extra layers (%d): %llu of %llu routed experts on the device, resident %d (budget %d)",
                 T.c.extra_layers, T.extra_served, T.extra_routed, T.xres, T.xmax);
@@ -2304,17 +2476,6 @@ int vkt_score(int layer, uint64_t *sc) {
     for (int e = 0; e < T.c.experts; e++) sc[e] = score(slot(layer, e));
     return 0;
 }
-/* the share of the host pool's experts the device keeps reading over PCIe in a hybrid
- * step (COLI_VK_HYBRID_PCIE, 0..1): a step with several such pairs splits them, so the two
- * sides finish closer together. A pair costs the CPU about 140 us and the device about 150
- * over PCIe (an RTX PRO 4000 and an i5-13500, Qwen3.8 IQ2_XS); decode with the share at 0,
- * 0.3, 0.5, 0.7: 45.3, 46.3, 46.1, 46.0 tok/s, with the MTP head's 3-row verifies 43.8,
- * 45.9, 45.0, 43.9. */
-static double hybrid_pcie_share(void) {
-    static double f = -1;
-    if (f < 0) { const char *e = getenv("COLI_VK_HYBRID_PCIE"); f = e && *e ? atof(e) : 0.3; if (f < 0) f = 0; if (f > 1) f = 1; }
-    return f;
-}
 static int dev_entry_hybrid(int layer, int e, uint32_t *o, VktHostExpert *hx);
 int vkt_dev_table_hybrid(int layer, uint32_t *ent, VktHostExpert *hx) {
     if (!T.on || layer < 0 || layer >= T.c.layers || !ent || !hx) return -1;
@@ -2353,22 +2514,7 @@ static int dev_entry_hybrid(int layer, int e, uint32_t *o, VktHostExpert *hx) {
     memset(o, 0, COLI_VK_XB_ENTRY * sizeof *o);
     memset(hx, 0, sizeof *hx);
     if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex) return 0;
-    /* the device's share of the host pool by a hash of (layer, expert): the same split at
-     * every read of the table, the CPU's share spread over the experts */
-    uint32_t hsh = (uint32_t)(layer * 2654435761u) ^ (uint32_t)(e * 2246822519u);
-    hsh ^= hsh >> 15; hsh *= 2654435761u; hsh ^= hsh >> 13;
-    if (v->host && (double)(hsh & 0xffff) / 65536.0 >= hybrid_pcie_share()) {   /* the CPU's, where its three tensors are block types it has rows of */
-        ColiVkTensor *t[3]; ColiVkTensorInfo ti[3]; const void *r[3]; int ok = 1;
-        coli_vk_xb_expert_tensors(v->ex, &t[0], &t[1], &t[2]);
-        for (int k = 0; k < 3 && ok; k++)
-            ok = t[k] && coli_vk_tensor_info(t[k], &ti[k]) && ti[k].fmt >= 100 && ti[k].fmt < 164 &&
-                 (r[k] = coli_vk_tensor_host_rows(t[k], NULL)) != NULL;
-        if (ok && ti[0].fmt == ti[1].fmt) {
-            *hx = (VktHostExpert){r[0], r[1], r[2], ti[0].fmt - 100, ti[2].fmt - 100,
-                                  (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4};
-            return 1;
-        }
-    }
+    if (host_view(layer, e, hx)) return 1;
     return coli_vk_xb_expert_entry(v->ex, o) ? 1 : -1;
 }
 /* issue()'s books for pairs it never saw: a forward's start, the tick, heat, routed and
@@ -2462,6 +2608,7 @@ void vkt_shutdown(void) {
     free(T.st); free(T.sy); free(T.bcnt); free(T.bofs); free(T.bcls); free(T.blist); free(T.pred); free(T.pred_ok);
     for (int h = 0; h < 2; h++) { free(T.hf[h].slot); free(T.hf[h].yout); }
     free(T.d2_idx); free(T.d2_y); free(T.d2_bex); free(T.d2_brows); free(T.d2_bx); free(T.d2_bw);
+    free(T.hy_of); free(T.hy_v); free(T.hy_hx); free(T.hy_x); free(T.hy_gu); free(T.hy_hh); free(T.hy_out);
     memset(&T, 0, sizeof T);
 }
 #endif /* COLI_VULKAN */

@@ -43,7 +43,12 @@
  *            resident throughout, every device row the reference's, from either place);
  *            the dense chain's books (vkt_dev_count, then vkt_settle at a frame's start)
  *            move them the same way, the table whole at every read; with a pool short of
- *            one expert the device keeps the warm start's set.
+ *            one expert the device keeps the warm start's set;
+ *   hybrid   GGUF block types (Q4_K, Q6_K down), every expert in the host pool, the device
+ *            four: in steps of up to 8 rows the pool's experts outside the device's share are
+ *            computed by the CPU at the join (vkt_host_pairs, GQ_EXACT=1's float form) and
+ *            the rest by the device, every row the reference's; a prompt step (20 rows) and
+ *            COLI_VK_HYBRID=0 leave them all to the device.
  *
  *   make tests/test_vk_tier VK=1 && VK_ICD_FILENAMES=.../lvp_icd.json ./tests/test_vk_tier */
 #include <stdio.h>
@@ -1308,6 +1313,70 @@ static void promote_case(void) {
     model_free();
 }
 
+/* the report's "hybrid: N steps, P host pool pairs": P, ~0 without the part */
+static unsigned long long hy_pairs(const char *line) {
+    const char *p = strstr(line, "| hybrid: ");
+    if (!p) return ~0ull;
+    p = strstr(p, "steps, ");
+    return p ? strtoull(p + 7, NULL, 10) : ~0ull;
+}
+static void hybrid_case(void) {
+    const int H0 = H, F0 = F;
+    H = 512; F = 256;   /* whole blocks of 256 */
+    VktFmt gu = {(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}, dn = {(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0};
+    for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) {
+        mat_make_block(&ex[l][e].g, gu, H, F); mat_make_block(&ex[l][e].u, gu, H, F); mat_make_block(&ex[l][e].d, dn, F, H);
+    }
+    g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    const double eb = (double)vkt_expert_bytes(H, F, gu, dn) / 1073741824.0;
+    char gb[64];
+    setenv("COLI_VK_TIER_HOST", "1", 1);
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_PROMOTE", "0", 1);   /* the device keeps its four: the pool's experts stay there */
+    setenv("GQ_EXACT", "1", 1);               /* the CPU's float form, against the float reference */
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 : 1; }
+    for (int c = 0; c < 2; c++) {   /* the hybrid on, then COLI_VK_HYBRID=0 */
+        if (c) setenv("COLI_VK_HYBRID", "0", 1);
+        set_budget(4, gu, dn);
+        snprintf(gb, sizeof gb, "%.12f", (L * E + 0.5) * eb);
+        setenv("COLI_VK_TIER_HOST_GB", gb, 1);
+        VktConfig vc = cfg_of(gu, dn, VKT_ACT_SWIGLU, 0);
+        int on = vkt_init(&vc, rows);
+        CHECK(on, "hybrid: the tier did not start");
+        if (!on) break;
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < n; i++) { VktExpertSrc src = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &src); }
+        vkt_put_done();
+        Books bk = {0, 0}; double worst = 0;
+        static const int Ss[] = {1, 3, 8, 1, 2, 8};
+        int idx[20 * K]; float w[20 * K];
+        for (int t = 0; t < 6; t++)
+            for (int l = 0; l < L; l++) { route(Ss[t], 0, E, idx, w); double r = step(l, Ss[t], idx, w, &bk); if (r > worst) worst = r; }
+        char line[4096]; report_line(line, sizeof line);
+        unsigned long long pairs = hy_pairs(line);
+        for (int l = 0; l < L; l++) { route(20, 0, E, idx, w); double r = step(l, 20, idx, w, &bk); if (r > worst) worst = r; }
+        char line2[4096]; report_line(line2, sizeof line2);
+        unsigned long long pairs2 = hy_pairs(line2);
+        printf("  Q4_K/Q6_K experts in the host pool, the hybrid %s: %llu pairs computed by the CPU, %llu after a 20-row step; "
+               "%llu of %llu assignments taken, worst relative error %.2e\n", c ? "off" : "on",
+               pairs == ~0ull ? 0 : pairs, pairs2 == ~0ull ? 0 : pairs2, bk.dev, bk.routed, worst);
+        CHECK(worst < 2e-3, "hybrid: relative error %.3g", worst);
+        CHECK(bk.dev == bk.routed, "hybrid: the tier took %llu of %llu", bk.dev, bk.routed);
+        if (!c) {
+            CHECK(pairs != ~0ull && pairs > 0, "hybrid: no host pool pair computed by the CPU");
+            CHECK(pairs2 == pairs, "hybrid: a 20-row step computed %llu pairs on the CPU", pairs2 - pairs);
+        } else
+            CHECK(pairs == ~0ull, "hybrid: COLI_VK_HYBRID=0 computed %llu pairs on the CPU", pairs);
+        vkt_shutdown();
+    }
+    unsetenv("COLI_VK_HYBRID"); unsetenv("GQ_EXACT"); unsetenv("COLI_VK_TIER_PROMOTE");
+    unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_SYNC");
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    model_free();
+    H = H0; F = F0;
+}
+
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
@@ -1334,6 +1403,7 @@ int main(int argc, char **argv) {
     printf("stream:\n"); stream();
     printf("layers:\n"); layers();
     printf("promote:\n"); promote_case();
+    printf("hybrid:\n"); hybrid_case();
     ColiVkPoolStats ps, px; coli_vk_pool_stats(1, &ps); coli_vk_pool_stats(4, &px);
     CHECK(ps.live == 0 && px.live == 0, "%d + %d tier ranges still live after every shutdown", ps.live, px.live);
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */
