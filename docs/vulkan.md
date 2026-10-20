@@ -2274,8 +2274,12 @@ computes the ones it holds:
 A round trip of the two timelines measured 7 us on the card. The host pool is cached
 system RAM (it was write-combined, which made the CPU's reads 25 times slower; the
 device reads both at the same speed). A prompt chunk keeps the full table and reads the
-host pool over PCIe. Only a GGUF's block types take it (colibri's formats keep the
-device's reads); `COLI_VK_HYBRID=0` turns it off, `COLI_VK_HYBRID_THREADS` sizes the
+host pool over PCIe. A GGUF's block types take it, and colibri's int8 (a scale per row
+or per group), int4 pairs (per row or per group), int3-g64, MXFP4 and FP8 formats, with
+the CPU's kernels for them in `vk_tier.c` (int8 activations per 32 and integer dots, as
+`ggml_quants.h`'s; FP8, and MXFP4 past 2048 groups a row, against the float row; the
+float reference of every one with `GQ_EXACT=1`). The low-bit formats (fmt 200 to 203)
+keep the device's reads. `COLI_VK_HYBRID=0` turns it off, `COLI_VK_HYBRID_THREADS` sizes the
 worker's team (OpenMP's by default). The chain's line says how many steps and pairs it
 took and the CPU's time. A share of the host pool's experts (`COLI_VK_HYBRID_PCIE`, 0.3,
 by a hash of layer and expert) stays with the device over PCIe, so a step with several
@@ -2293,7 +2297,7 @@ Q2_0 down 28 us): the device's own experts take less, so a step waits for the CP
 (GLM-5.3, Inkling), a layer's routed experts run in the tier's batch, outside the chain's
 frame, and the device read the host pool's experts of that batch over the bus: 8 GB/s for GLM-5.3's (7.5 ms a layer of 8 against 0.25 ms from
 VRAM, `COLI_VK_CHAIN_BENCH=xb` with `COLI_VK_BENCH_HOST=1`). In a step of up to 8 rows the
-tier now leaves those of a GGUF's block types out of the device's batch and the CPU computes
+tier now leaves those of a GGUF's block types or of colibri's formats above out of the device's batch and the CPU computes
 them in place at the join (`vkt_host_pairs`, the same code as the chain's worker), while the
 device computes the ones it holds; the join hands their rows back as the device's, so no
 engine changes. The same share stays with the device over PCIe, a prompt step keeps them
