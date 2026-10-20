@@ -72,13 +72,16 @@ static struct {
      * layers', [1] the extra layers' (VktConfig.extra_layers, an MTP head's), from
      * main_layers on; [2..nform) the main layers' other forms when their formats differ
      * by layer (VktConfig.layer_gate_up/layer_down), lform[l] naming each layer's. Then
-     * every main tensor takes the room of its role's biggest form (pad_w, pad_s: [0]
-     * gate and up, [1] down), so a freed expert's ranges fit any other expert. */
+     * the main layers fall in two classes of rooms (lcls[l]): 0 those of the form most
+     * layers have, their tensors at their own size, 1 the others, each tensor in the room
+     * of its role's biggest form among them (pad_w, pad_s [class][role]: [0] gate and up,
+     * [1] down). A newcomer displaces a resident of its own class (vcls_of), so a freed
+     * expert's ranges fit the one that takes its place. */
     int main_layers;
     struct { VktFmt gu, dn; int gu_fmt, gu_gs, dn_fmt, dn_gs; size_t gu_codes, gu_scales, d_codes, d_scales, stage_bytes; } form[VKT_FORMS];
     int nform, per_layer;
-    uint8_t lform[VKT_MAX_LAYERS];
-    size_t pad_w[2], pad_s[2];
+    uint8_t lform[VKT_MAX_LAYERS], lcls[VKT_MAX_LAYERS];
+    size_t pad_w[2][2], pad_s[2][2];
     /* the extra layers' experts: on the primary device, in a pool of their own (another
      * size than the main ones', so neither leaves holes the other cannot use), at most
      * xmax of x_bytes each in x_budget */
@@ -134,7 +137,7 @@ static struct {
     /* evicted, freed at the next quiescent point */
     int *evict; int nevict, cevict;
     /* the coldest residents, refreshed once per forward */
-    int cand[2][VKT_CAND]; uint64_t cand_score[2][VKT_CAND]; int ncand[2];   /* per kind: main, extra */
+    int cand[3][VKT_CAND]; uint64_t cand_score[3][VKT_CAND]; int ncand[3];   /* per class (vcls_of): main, extra, the main layers' other forms */
     /* the step in flight */
     int inflight, S, K;
     int *map; int cmap;
@@ -192,6 +195,15 @@ static int kind_of(int layer) { return layer >= T.main_layers; }   /* main (0) o
 static int place_of(const VSlot *v) { return v->host ? 2 : v->dev; }
 static void set_place(VSlot *v, int pl) { v->dev = (uint8_t)(pl == 2 ? 0 : pl); v->host = (uint8_t)(pl == 2); }
 static int form_of(int layer) { return T.per_layer && layer < T.main_layers ? T.lform[layer] : kind_of(layer); }
+/* the class of the residents a newcomer of `layer` displaces: 0 the main layers of the most
+ * common form, 2 those of the other forms, 1 the extra layers (each class's rooms alike) */
+static int vcls_of(int layer) { return kind_of(layer) ? 1 : T.per_layer && T.lcls[layer] ? 2 : 0; }
+/* a main tensor's room (forms_per_layer): its class's, 0 with one form (its own size) */
+static size_t pad_w_of(int layer, int down) { return T.per_layer && !kind_of(layer) ? T.pad_w[T.lcls[layer]][down] : 0; }
+static size_t pad_s_of(int layer, int down) { return T.per_layer && !kind_of(layer) ? T.pad_s[T.lcls[layer]][down] : 0; }
+/* the room of any main expert: a staging slot refilled with every form */
+static size_t pad_w_max(int down) { return T.pad_w[0][down] > T.pad_w[1][down] ? T.pad_w[0][down] : T.pad_w[1][down]; }
+static size_t pad_s_max(int down) { return T.pad_s[0][down] > T.pad_s[1][down] ? T.pad_s[0][down] : T.pad_s[1][down]; }
 
 /* ---- source formats ---------------------------------------------------------- */
 static int src_per_row(VktSrc k) {
@@ -341,7 +353,7 @@ static int upload(int dev, int layer, const uint8_t *g, const uint8_t *u, const 
         int I = k < 2 ? H : F, O = k < 2 ? F : H;
         uint8_t *rows; size_t stride; float *scales;
         if (!(kind ? coli_vk_tier_tensor_extra(&t[k], fmt, I, O, fgs, &rows, &stride, &scales)   /* its own pool */
-                   : coli_vk_tier_tensor_pad(dev, &t[k], fmt, I, O, fgs, T.pad_w[k == 2], T.pad_s[k == 2],
+                   : coli_vk_tier_tensor_pad(dev, &t[k], fmt, I, O, fgs, pad_w_of(layer, k == 2), pad_s_of(layer, k == 2),
                                              &rows, &stride, &scales))) {
             for (int j = 0; j < k; j++) { coli_vk_tensor_free(t[j]); t[j] = NULL; }
             return 0;
@@ -384,7 +396,7 @@ static void promote_copy(const VQ *e) {
     int ok = 0, copy_failed = 0;
     for (int frees = 0, waited = 0; ; ) {
         int k = 0;
-        for (; k < 3; k++) if (!src[k] || !coli_vk_tier_tensor_like(0, &t[k], src[k], T.pad_w[k == 2], T.pad_s[k == 2])) break;
+        for (; k < 3; k++) if (!src[k] || !coli_vk_tier_tensor_like(0, &t[k], src[k], pad_w_of(e->layer, k == 2), pad_s_of(e->layer, k == 2))) break;
         if (k == 3) { ok = 1; break; }
         for (int j = 0; j < k; j++) { coli_vk_tensor_free(t[j]); t[j] = NULL; }
         if (!src[k] || frees >= 3 || waited >= 600 || T.sync) break;
@@ -666,12 +678,12 @@ static uint64_t score(const VSlot *v) { return tier_lfru_score(v->heat, v->last,
 /* The coldest residents of each kind, ascending, once per forward (T.full: on the device,
  * the host pool holding every expert anyway). */
 static void refresh_candidates(void) {
-    T.ncand[0] = T.ncand[1] = 0;
+    T.ncand[0] = T.ncand[1] = T.ncand[2] = 0;
     size_t n = (size_t)T.c.layers * T.c.experts;
     for (size_t i = 0; i < n; i++) {
         VSlot *v = &T.s[i];
         if (v->state != VS_RESIDENT || (T.full && (v->host || !v->hex))) continue;
-        int k = kind_of((int)(i / (size_t)T.c.experts)), *c = T.cand[k];
+        int k = vcls_of((int)(i / (size_t)T.c.experts)), *c = T.cand[k];
         uint64_t sc = score(v), *cs = T.cand_score[k];
         if (T.ncand[k] == VKT_CAND && sc >= cs[VKT_CAND - 1]) continue;
         int at = T.ncand[k] < VKT_CAND ? T.ncand[k]++ : VKT_CAND - 1;
@@ -679,8 +691,8 @@ static void refresh_candidates(void) {
         c[at] = (int)i; cs[at] = sc;
     }
 }
-/* The resident a newcomer of kind k and score hs would displace, or -1: the coldest
- * candidate of its kind (each kind has its own pool) still resident, when the newcomer
+/* The resident a newcomer of class k and score hs would displace, or -1: the coldest
+ * candidate of its class (vcls_of: its own pool, or rooms of its size) still resident, when the newcomer
  * beats it by tier.h's LFRU margin (25% + 4 counts). It stays first in the list until
  * drop_victim takes it. */
 static void drop_victim(int k) {
@@ -697,6 +709,25 @@ static int peek_victim(int k, uint64_t hs) {
         return hs > (T.full ? cs + ((uint64_t)VKT_UP_MARGIN << 8) : cs + (cs >> 2) + (4u << 8)) ? i : -1;
     }
     return -1;
+}
+
+/* The resident a newcomer of `layer` with score hs displaces, or -1, and *from its class:
+ * one of its own class first; failing that, with forms by layer, one of the other main
+ * class whose rooms hold its tensors (a smaller form's newcomer in a bigger form's room,
+ * never the other way: the freed ranges would not hold it). */
+static int rooms_hold(int a, int b) {   /* pad class a's rooms hold pad class b's tensors */
+    for (int r = 0; r < 2; r++) if (T.pad_w[a][r] < T.pad_w[b][r] || T.pad_s[a][r] < T.pad_s[b][r]) return 0;
+    return 1;
+}
+static int pick_victim(int layer, uint64_t hs, int *from) {
+    const int k = vcls_of(layer);
+    int v = peek_victim(k, hs);
+    *from = k;
+    if (v >= 0 || k == 1 || !T.per_layer) return v;
+    const int o = k == 0 ? 2 : 0;
+    if (!rooms_hold(o == 2, k == 2)) return -1;
+    *from = o;
+    return peek_victim(o, hs);
 }
 
 /* A forward starts when the layer index goes back (a layer that issues several
@@ -725,9 +756,9 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
     if (T.promos[kd] >= T.promo_cap) { T.rated++; return; }
     const __typeof__(T.form[0]) *fm = &T.form[form_of(layer)];
     if (fm->gu_scales && (!src->gs || !src->us || !src->ds)) return;
-    int victim = -1, dev = room_dev(layer);
+    int victim = -1, dev = room_dev(layer), vc = vcls_of(layer);
     /* T.full: the device's residents give way to promote's, which keeps their host pool copy */
-    if (dev < 0 && (T.full || !v->heat || (victim = peek_victim(kd, score(v))) < 0)) return;
+    if (dev < 0 && (T.full || !v->heat || (victim = pick_victim(layer, score(v), &vc)) < 0)) return;
     if (victim >= 0) dev = place_of(&T.s[victim]);   /* the newcomer takes its place, on its device or in the host pool */
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
@@ -735,7 +766,7 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
     if (qfull) { T.qfull++; return; }
     uint8_t *buf = malloc(fm->stage_bytes);
     if (!buf) return;
-    if (victim >= 0) drop_victim(kd);
+    if (victim >= 0) drop_victim(vc);
     uint8_t *p = buf;
     memcpy(p, src->g, fm->gu_codes); p += fm->gu_codes;
     memcpy(p, src->u, fm->gu_codes); p += fm->gu_codes;
@@ -767,7 +798,8 @@ int vkt_wants(int layer, int eid) {
     if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return 0;
     VSlot *v = slot(layer, eid);
     if (v->state != VS_NONE || T.promos[kind_of(layer)] >= T.promo_cap) return 0;
-    if (room_dev(layer) < 0 && (T.full || !v->heat || peek_victim(kind_of(layer), score(v)) < 0)) return 0;
+    int from;
+    if (room_dev(layer) < 0 && (T.full || !v->heat || pick_victim(layer, score(v), &from) < 0)) return 0;
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
     pthread_mutex_unlock(&T.mx);
@@ -784,8 +816,8 @@ int vkt_wants(int layer, int eid) {
 static void promote(int layer, int e) {
     VSlot *v = slot(layer, e);
     if (!T.full || v->state != VS_RESIDENT || !v->host || v->up || !v->hex || kind_of(layer) || T.upromos >= T.promote_rate) return;
-    int victim = -1;
-    if (T.dres[0] + T.dque[0] >= T.dmax[0] && (victim = peek_victim(0, score(v))) < 0) return;
+    int victim = -1, from = vcls_of(layer);
+    if (T.dres[0] + T.dque[0] >= T.dmax[0] && (victim = pick_victim(layer, score(v), &from)) < 0) return;
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
     pthread_mutex_unlock(&T.mx);
@@ -798,7 +830,7 @@ static void promote(int layer, int e) {
             if (!n) return;
             T.dfree = n; T.cdfree = nc;
         }
-        drop_victim(0);
+        drop_victim(from);
         T.dfree[T.ndfree++] = w->ex;
         w->ex = w->hex; w->host = 1; T.dres[0]--; T.dres[2]++; T.evictions++; T.up_victims++;
         note_change(victim);   /* published at the next quiescent point: a chain's frame start (vkt_settle) */
@@ -997,7 +1029,7 @@ static int st_alloc(void) {
         for (int k = 0; k < 3 && ok; k++) {
             int fmt = k < 2 ? T.form[0].gu_fmt : T.form[0].dn_fmt, gs = k < 2 ? T.form[0].gu_gs : T.form[0].dn_gs;
             uint8_t *rows; size_t stride; float *sc;
-            ok = coli_vk_tier_tensor_pad(0, &v->t[k], fmt, k < 2 ? H : F, k < 2 ? F : H, gs, T.pad_w[k == 2], T.pad_s[k == 2],
+            ok = coli_vk_tier_tensor_pad(0, &v->t[k], fmt, k < 2 ? H : F, k < 2 ? F : H, gs, pad_w_max(k == 2), pad_s_max(k == 2),
                                          &rows, &stride, &sc);
             if (!ok) v->t[k] = NULL;
         }
@@ -1749,27 +1781,37 @@ static int forms_per_layer(void) {
     }
     if (T.nform == 2) return 1;   /* every layer has form 0 */
     T.per_layer = 1;
+    /* the form most layers have: class 0, its rooms its own size; the others class 1 */
+    int count[VKT_FORMS] = {0}, major = 0;
+    for (int l = 0; l < T.main_layers; l++) count[T.lform[l]]++;
+    for (int j = 0; j < T.nform; j++) if (j != 1 && count[j] > count[major]) major = j;
+    for (int l = 0; l < T.main_layers; l++) T.lcls[l] = (uint8_t)(T.lform[l] != major);
     for (int j = 0; j < T.nform; j++) {
-        if (j == 1) continue;
+        if (j == 1 || !count[j]) continue;
+        const int c = j != major;
         size_t sg, sd, wg = coli_vk_tensor_alloc_bytes(T.form[j].gu_fmt, H, F, T.form[j].gu_gs, &sg),
                wd = coli_vk_tensor_alloc_bytes(T.form[j].dn_fmt, F, H, T.form[j].dn_gs, &sd);
-        if (wg > T.pad_w[0]) T.pad_w[0] = wg;
-        if (sg > T.pad_s[0]) T.pad_s[0] = sg;
-        if (wd > T.pad_w[1]) T.pad_w[1] = wd;
-        if (sd > T.pad_s[1]) T.pad_s[1] = sd;
+        if (wg > T.pad_w[c][0]) T.pad_w[c][0] = wg;
+        if (sg > T.pad_s[c][0]) T.pad_s[c][0] = sg;
+        if (wd > T.pad_w[c][1]) T.pad_w[c][1] = wd;
+        if (sd > T.pad_s[c][1]) T.pad_s[c][1] = sd;
     }
     return 1;
 }
 /* One main expert's bytes on a device whose ranges start at `a`: its form's, or with
- * forms by layer the padded room of every one. */
+ * forms by layer its class's room, on average over the layers (the budget's count; a pool
+ * that fills before it refuses the rest, and the count comes down to what it holds). */
 static size_t tier_expert_bytes_at(size_t a) {
     if (!T.per_layer) return expert_bytes_at(T.c.hidden, T.c.inter, T.c.gate_up, T.c.down, a);
-    size_t b = 0;
-    for (int k = 0; k < 3; k++) {
-        size_t w = T.pad_w[k == 2], sc = T.pad_s[k == 2];
-        b += (w + a - 1) / a * a + (sc + a - 1) / a * a;
-    }
-    return b;
+    size_t room[2] = {0, 0}; long long n[2] = {0, 0};
+    for (int c = 0; c < 2; c++)
+        for (int k = 0; k < 3; k++) {
+            size_t w = T.pad_w[c][k == 2], sc = T.pad_s[c][k == 2];
+            room[c] += (w + a - 1) / a * a + (sc + a - 1) / a * a;
+        }
+    for (int l = 0; l < T.main_layers; l++) n[T.lcls[l]]++;
+    return n[0] + n[1] ? (size_t)((room[0] * (unsigned long long)n[0] + room[1] * (unsigned long long)n[1] + n[0] + n[1] - 1) /
+                                  (unsigned long long)(n[0] + n[1])) : room[0];
 }
 
 /* COLI_VK_DEV2: the second device's share. Its budget is what it has free less
@@ -2135,10 +2177,15 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     fprintf(stderr, ", down fmt %d", T.form[0].dn_fmt);
     if (T.form[0].dn_gs) fprintf(stderr, " gs %d", T.form[0].dn_gs);
     if (T.per_layer) {
-        int other = 0;
-        for (int l = 0; l < T.main_layers; l++) other += T.lform[l] != 0;
-        fprintf(stderr, "; %d layer%s in %d other form%s, each expert in the room of the biggest",
-                other, other == 1 ? "" : "s", T.nform - 2, T.nform == 3 ? "" : "s");
+        int other = 0, forms = 0;
+        for (int l = 0; l < T.main_layers; l++) other += T.lcls[l];
+        for (int j = 0; j < T.nform; j++) {
+            int used = 0;
+            for (int l = 0; l < T.main_layers && !used; l++) used = j != 1 && T.lform[l] == j && T.lcls[l];
+            forms += used;
+        }
+        fprintf(stderr, "; %d layer%s in %d form%s other than most layers', their experts in the room of the biggest of those, the rest at their own size",
+                other, other == 1 ? "" : "s", forms, forms == 1 ? "" : "s");
     }
     if (T.c.chain_bytes) fprintf(stderr, "; %s left for the dense chain's KV mirror and a prompt chunk",
                                  human((double)T.c.chain_bytes, hb, sizeof hb));
