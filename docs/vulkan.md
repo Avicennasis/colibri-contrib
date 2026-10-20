@@ -1899,11 +1899,32 @@ engram layer's projection, its state) before its host pages are given back, so a
 that does not reach the device reads nothing back from disk. DSpark's stages take the
 means of their target layers from whichever side ran them.
 
+**A GGUF.** The published deepseek41 GGUFs' matrices go up as the file's blocks (100 +
+the ggml type), rows the CPU keeps interleaved by 16 back to the file's first
+(`v41c_gq`), and their BF16 compressors and indexers as bf16 (fmt 11). The grouped
+output projection `wo_a` runs on `vkc_mla_hgemv`, which reads no blocks: it goes up as
+int8 with a scale per 32 inputs (fmt 13) from Q8_0 and as floats (fmt 10) from the other
+types. Before, the chain refused a GGUF and every layer stayed on the CPU. UD-IQ1_S (233
+GB) on an RTX PRO 4000 (24 GB) with 62 GB of RAM, a 163-token prompt and 128 tokens, a
+warm-up and three runs, each server on a copy of one expert history:
+
+| | prompt | decode |
+|---|---|---|
+| the CPU | 6.0-6.7 tok/s | 2.21-2.23 tok/s |
+| the chain off (the per-matrix path holds 60 matrices, the rest of the trunk on the CPU), the tier on the card (2893 experts) | 16.6-16.9 tok/s | 2.91-3.16 tok/s |
+| the chain (40 layers, 9.5 GiB), the tier on the rest (1631 experts) | 17.3-18.6 tok/s | 5.00-5.23 tok/s |
+
+The greedy text is the CPU's for 40 tokens in both forms: the integer forms, and the
+device's float form (`GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0`) against the CPU's.
+`tests/vulkan_engines.sh deepseek-chain` runs a small file of the same types and shapes
+(`tests/test_gguf_import.py` `write_deepseek41`) against the CPU's float form: the logits
+within 1.4e-6 of the largest on the 780M.
+
 **The default**: `COLI_VK_CHAIN_UNMEASURED`, so the chain is off on an integrated GPU
 (`COLI_VK_CHAIN=1` turns it on, `2` for prompts only) and on a discrete GPU follows the
-rule above. No DeepSeek checkpoint was run on the chain: none is on the 780M box, and
-V4.1 Flash is 510 GB. Speed is not measured; the tests prove the tokens on the tiny
-fixtures, on Lavapipe, the 780M and the Iris Xe:
+rule above. No DeepSeek checkpoint fits the 780M box (V4.1 Flash is 510 GB, the
+published UD-IQ1_S 233 GB): there the tests prove the tokens on the tiny fixtures, on
+Lavapipe, the 780M and the Iris Xe:
 
 ```
 [VK] deepseek_v41: dense chain off (an integrated GPU with the expert tier: not measured; COLI_VK_CHAIN=0 off, 1 on, 2 prompts only)
