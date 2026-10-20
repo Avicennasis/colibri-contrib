@@ -3943,9 +3943,12 @@ typedef struct XbCtx {
     VkDescriptorPool v4_pool; VkDescriptorSet v4_set;
     /* sub-batches (coli_vk_xb_sub_*, the tier's big prefill steps): two halves of the
      * scratch, each with its own command buffer, fence and timestamps, up to two in flight */
-    struct { VkCommandBuffer cmd; VkFence fence; VkQueryPool qp; int inflight, nrows, cyoff; size_t *yoff; } sub[2];
+    /* cp: copies recorded at the head of a half's next submit (coli_vk_xb_sub_copy: the host
+     * pool's experts into the streaming's slots), ncp of them */
+    struct { VkCommandBuffer cmd; VkFence fence; VkQueryPool qp; int inflight, nrows, cyoff; size_t *yoff;
+             struct { VkBuffer s, d; VkDeviceSize n; } *cp; int ncp, ccp; } sub[2];
     size_t sub_x, sub_i, sub_y;           /* a half's bytes of each scratch (0: not reserved) */
-    unsigned long long sub_batches, sub_experts, sub_rows, sub_gemm;
+    unsigned long long sub_batches, sub_experts, sub_rows, sub_gemm, sub_copies;
     double sub_ms;
     /* The grouped GEMM (qmatmul_grp.comp, [0] down, [1] gate+up+SwiGLU): every expert of
      * a batch in one dispatch per phase, the weights read through an address table. The
@@ -5029,6 +5032,15 @@ static int xb_record_submit(XbCtx *X, VkCommandBuffer cmd, VkFence fence, VkQuer
         vkCmdResetQueryPool(cmd, qp, 0, 2);
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
     }
+    if (slot >= 1 && slot <= 2 && X->sub[slot - 1].ncp) {   /* a sub-batch's host pool experts into their slots first */
+        __typeof__(X->sub[0]) *b = &X->sub[slot - 1];
+        for (int i = 0; i < b->ncp; i++) { VkBufferCopy r = {0, 0, b->cp[i].n}; vkCmdCopyBuffer(cmd, b->cp[i].s, b->cp[i].d, 1, &r); }
+        VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                              .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        X->sub_copies += (unsigned long long)b->ncp;
+        b->ncp = 0;
+    }
     /* the route of each expert: its GEMM slot, or -1 for the GEMVs */
     int *route = malloc((size_t)count * sizeof(int));
     if (!route) { vkEndCommandBuffer(cmd); return 0; }
@@ -5556,7 +5568,7 @@ static void xb_shutdown(XbCtx *X) {
         if (X->sub[h].inflight) { vk_fence_wait(X->dev, X->sub[h].fence); X->sub[h].inflight = 0; async_end(X->d); }
         if (X->sub[h].fence) vkDestroyFence(X->dev, X->sub[h].fence, NULL);
         if (X->sub[h].qp) vkDestroyQueryPool(X->dev, X->sub[h].qp, NULL);
-        free(X->sub[h].yoff);
+        free(X->sub[h].yoff); free(X->sub[h].cp);
     }
     while (X->live) coli_vk_xb_expert_free(X->live);
     XbBuf *bufs[17] = {&X->x, &X->g, &X->u, &X->h, &X->y};
@@ -5744,6 +5756,56 @@ int coli_vk_tensor_copy(ColiVkTensor *const *dst, ColiVkTensor *const *src, int 
     pthread_mutex_unlock(&u->mx);
     return ok;
 }
+/* coli_vk_tensor_copy into tier tensors whose ranges hold their sources' (the streaming's
+ * slots, made by coli_vk_tier_tensor_pad with the room of every form): each takes its
+ * source's format and shape first, as coli_vk_tensor_refill_as does, then the copy engine
+ * fills it (staged uploads), or the CPU through the mapping (mapped memory). All n before
+ * this returns. 0 = a source not in the host pool, no room, or the copy failed. */
+/* coli_vk_tensor_copy_as' and coli_vk_xb_sub_copy's first part: each dst takes its source's
+ * format and shape; mapped memory copies here, through the CPU. 0 = not a host pool source,
+ * or no room. */
+static int copy_as_prep(ColiVkTensor *const *dst, ColiVkTensor *const *src, int n) {
+    if (!G.ready || n < 1) return 0;
+    for (int k = 0; k < n; k++) {
+        ColiVkTensor *t = dst[k]; const ColiVkTensor *f = src[k];
+        if (!t || !f || t->pool != &g_tpool || f->pool != &g_hpool || !f->wmap || !f->smap) return 0;
+        if (t->fmt != f->fmt || t->I != f->I || t->O != f->O || t->gs != f->gs) {
+            size_t sb = scale_floats(f->fmt, f->I, f->O, f->gs) * sizeof(float);
+            if (bd_fmt(f->fmt) != bd_fmt(t->fmt) || f->wbytes > t->wcap || sb > t->scap) return 0;   /* its sets name the table or its scales */
+            t->fmt = f->fmt; t->I = f->I; t->O = f->O; t->gs = f->gs; t->rowWords = f->rowWords; t->wbytes = f->wbytes;
+        }
+        if (!pool_staged(t->pool)) {   /* mapped: the rows and scales through the CPU */
+            if (!t->wmap || !t->smap) return 0;
+            memcpy(t->wmap, f->wmap, f->wbytes);
+            memcpy(t->smap, f->smap, scale_floats(f->fmt, f->I, f->O, f->gs) * sizeof(float));
+        }
+    }
+    return 1;
+}
+int coli_vk_tensor_copy_as(ColiVkTensor *const *dst, ColiVkTensor *const *src, int n) {
+    return copy_as_prep(dst, src, n) && coli_vk_tensor_copy(dst, src, n);
+}
+int coli_vk_xb_sub_copy(int h, ColiVkTensor *const *dst, ColiVkTensor *const *src, int n) {
+    XbCtx *X = &g_xb[0];
+    if (!X->ready || h < 0 || h > 1 || !copy_as_prep(dst, src, n)) return 0;
+    if (!pool_staged(dst[0]->pool)) return 1;   /* copied already */
+    __typeof__(X->sub[0]) *b = &X->sub[h];
+    if (b->ncp + 2 * n > b->ccp) {
+        int nc = b->ccp ? b->ccp : 64;
+        while (nc < b->ncp + 2 * n) nc *= 2;
+        void *p = realloc(b->cp, (size_t)nc * sizeof *b->cp);
+        if (!p) return 0;
+        b->cp = p; b->ccp = nc;
+    }
+    for (int k = 0; k < n; k++) {
+        const ColiVkTensor *f = src[k]; ColiVkTensor *t = dst[k];
+        size_t sb = scale_floats(f->fmt, f->I, f->O, f->gs) * sizeof(float);
+        b->cp[b->ncp].s = f->wbuf; b->cp[b->ncp].d = t->wbuf; b->cp[b->ncp++].n = f->wbytes;
+        if (sb) { b->cp[b->ncp].s = f->sbuf; b->cp[b->ncp].d = t->sbuf; b->cp[b->ncp++].n = sb; }
+    }
+    return 1;
+}
+void coli_vk_xb_sub_copy_drop(void) { g_xb[0].sub[0].ncp = g_xb[0].sub[1].ncp = 0; }
 /* A tier tensor filled again in place (a staging slot of the tier's streaming): mapped
  * memory hands its mapping back (the padding past each row is still the zeros of its
  * allocation, and the caller writes the rows only), staged uploads a fresh zeroed host

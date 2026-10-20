@@ -552,7 +552,7 @@ order its CPU-only run does, and keeps a history for the warm start where it has
 | inkling | int4 container `I4U_PAIRS_ROW` (fmt 2); int8 container `I8_ROW` (fmt 1); runtime int8 rows, `I8_AS_I4_ROW` at 2 to 4 bits (fmt 2) and `I8_ROW` above; `F32` at `bits=0` (fmt 10). Gate and up come from the fused `gate_up` tensor, up I rows in | SwiGLU | `<snap>/.coli_usage` or `PIN=<path>`, in the generate and serve modes; the ref.json oracle reads none | [Inkling and OLMoE](#inkling-and-olmoe) |
 | olmoe | int8 rows `I8_ROW` (fmt 1), gate, up and down as the merged container holds them | SwiGLU | `COLI_USAGE` only | [Inkling and OLMoE](#inkling-and-olmoe) |
 | kimi_k3 (Kimi K3) | the checkpoint's MXFP4 with ue8m0 scales `MXFP4_E8M0` 32 (fmt 7): gate `w1`, up `w3`, down `w2`, in the latent space | SiTU-GLU (`VKT_ACT_SITU`) | `COLI_USAGE` (default `<snap>/.coli_usage`) | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
-| mimo (MiMo-V2.6 Flash and Pro) | the release's MXFP4 `MXFP4_E8M0` 32 (fmt 7) | SwiGLU | none: the tier fills as experts pass by | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
+| mimo (MiMo-V2.6 Flash and Pro) | the release's MXFP4 `MXFP4_E8M0` 32 (fmt 7); a GGUF's other block types as the file has them (100 + the ggml type), each layer its own | SwiGLU | `COLI_USAGE` (default `<snap>/.coli_usage`) | [Kimi K3 and MiMo](#kimi-k3-and-mimo) |
 | deepseek_v41 (DeepSeek V4.1 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7), as the checkpoint stores it | SwiGLU with `swiglu_limit` | `COLI_USAGE` (default `<snap>/.coli_usage`), kept only while the tier is on | the backbone's layers; the DSpark stages, with caches of their own, are extra layers ([below](#the-mtp-heads-layer-on-the-tier-coli_vk_tier_mtp)) |
 | deepseek_v4 (DeepSeek V4 Flash) | MXFP4 `MXFP4_E8M0` 32 (fmt 7); pinned experts unpacked from rows16 | `VKT_ACT_SWIGLU_V4` | the store's own `<model>/.coli_usage` | [DeepSeek V4's activation](#deepseek-v4s-activation) |
 | colibri (GLM-5.2) | `F32` (fmt 10), int8 `I8_ROW` (fmt 1), int4 per row `I4U_PAIRS_ROW` (fmt 2), int4-gs `I4U_PAIRS_GS` (fmt 4), int3-g64 `I3_G64` (fmt 5); down may have its own | SwiGLU | `<snap>/.coli_usage` | [GLM-5.2 and GLM-5.3 Flash](#glm-52-and-glm-53-flash-on-the-tier) |
@@ -1396,6 +1396,31 @@ caches only when the step's last frame has completed: a device lost in the middl
 step loses nothing the host holds, and the CPU runs the step's remaining rows from where
 the caches end. Nothing is rebuilt, and a turn with a picture recovers too. The line is
 `[VK] mimo chain: the device was lost at position P; ...`.
+
+**A GGUF of block types** (ggml-org's MiMo-V2.6-Flash Q2_K_S, say: K-quant experts and
+trunk). The engine used to take a GGUF only with MXFP4 experts and a BF16 trunk. A trunk
+matrix of a ggml block type now stays the file's rows (`DW_GQ`): the CPU multiplies it in
+its integer form (`ggml_quants.h`), the chain uploads it as the device's block format, and
+the per-matrix path leaves it to the CPU. The experts are read as the file has them (a slot
+`[down | gate | up]`, each layer its types), computed on the CPU with the same kernels and
+taken by the tier as their blocks, the commonest pair of types as the main form. A block
+embedding becomes the bf16 rows the engine keeps.
+
+**The expert history.** mimo now counts its routing (`route_trace.h`) and keeps it in
+`COLI_USAGE` (default `<model>/.coli_usage`), and the tier starts warm from it
+(`vkt_plan`, `vkt_put`). Before, every start had the tier empty, filling as experts passed
+by. On MiMo-V2.6-Flash Q2_K_S (106 GB) with an RTX PRO 4000 and 62 GB of RAM, three
+120-word prompts of 128 tokens on one server: decode 2.0, 2.9, 3.8 tok/s cold, then 7.8 from
+the first request once a run had written the history (85% of the routed experts on the
+device, about 1230 disk loads a turn instead of about 21500).
+
+**A prompt chunk's scratch.** The chain reserved its scratch for each prompt's rows, so a
+longer prompt than the first had to grow it after the tier's promotions had filled the
+budget: on the server above the second request's 172 rows were refused and the chain was
+off for the rest of the session (decode 7.9 then 3.4-3.9 tok/s, prefill 7.9 then 6.0 and 3.9). The
+first prompt now reserves the whole chunk (`mc_chunk_rows`, sized from the room free at
+the first forward), and a refused growth runs the prompt in chunks of the rows the chain
+holds instead of turning it off: prefill 8.1-8.2 and decode 7.8-7.9 tok/s on every request.
 
 **What stays off the device.** The router's top-k and the routed experts the tier does
 not hold, the embedding gather, the vision tower (on the device only with
@@ -2690,6 +2715,33 @@ engine has them. For a step of at least `COLI_VK_TIER_GEMM_ROWS` rows (16),
   tier's own byte work (`convert`). A group the engine loaded together converts in
   parallel, one expert per thread; a lone one converts with its rows split over the
   threads (`COLI_VK_TIER_STREAM_PAR=0` keeps it on the engine thread).
+- **The host pool's experts through the slots too.** A resident of the host pool is not
+  cold, so a big step's GEMMs read it in place over PCIe, a GGUF's block types at about 4
+  GB/s; on GLM-5.3, where a layer's step routes 100 to 140 of them, those reads were most
+  of the device's 115.7 s over three prompts. With the host pool on, a big step's host pool experts of
+  block types now go through the slots like the streamed ones: each is copied from the
+  pool into a slot at the head of the batch that first reads it, a barrier between the
+  copies and its dispatches (`coli_vk_xb_sub_copy`: the slot takes the expert's format
+  first; with mapped memory the CPU copies through the mapping), so the bytes cross the
+  bus once, at its rate, and the engine thread goes on to the step's cold experts. A slot
+  that does not take one leaves it to be read in place, never to the CPU. `COLI_VK_TIER_POOL_COPY=0` reads them in place.
+  Measured on the RTX PRO 4000 (PCIe 4.0 x8), a 700-token prompt, a warm-up and a run,
+  each server on a copy of one history:
+
+  | model | prefill, `COLI_VK_TIER_POOL_COPY=0` | prefill, the default | the copies |
+  |---|---|---|---|
+  | GLM-5.3 Flash UD-IQ2_XXS (95 GB) | 11.9, 12.3 tok/s | 17.9, 18.2 tok/s | 110 GiB a prompt |
+  | Inkling-Small UD-IQ2_XXS (77 GB) | 65.9, 70.2 tok/s | 97.2, 111.1 tok/s | 17 GiB a prompt |
+  | DeepSeek V4 Flash 0731 UD-IQ2_XXS (85 GB) | 19.5, 23.4 tok/s | 22.4, 23.3 tok/s | 4.5 GiB a prompt |
+
+  Copied by the copy engine and waited for, before each batch, the same bytes moved at 12.3
+  to 12.5 GB/s and GLM-5.3's prompt ran at 15.2 and 17.4 tok/s, Inkling's at 94.0 and 107.6:
+  the engine thread then waited for the copies instead of reading the step's cold experts.
+  On GLM-5.3 the bus is now the floor (a layer step copies about 0.94 GB); DeepSeek V4's CPU share
+  of a step (the cold experts its store reads) was the longer side already. GLM-5.3's greedy text after a long prompt is the same with and without (40 tokens in 39.3 s against 46.9);
+  Inkling's forks at a near tie after 36 words ("beautification" against "initiatives"):
+  a pool expert's rows now run in the slots' batches, where the backend may pick another
+  of its GEMM routes for them than in the residents' batch, as for a streamed expert.
 - **Nothing pollutes the resident set.** A streamed expert is not offered for promotion:
   a prompt's whole working set passes through the slots and would otherwise flush the
   residents. Its routings count as heat, as every routing does, and the slots are free
@@ -2730,6 +2782,10 @@ The run's line counts what streamed:
 [VK] tier qwen36 run: ... | stream: 40 steps, 2188 cold experts (3.61 GiB, 10.72 GB/s) and 796154 rows streamed in 742 sub-batches, prefetched 0 (0 used), 929 cold experts (5548 rows) kept on the CPU
 ```
 
+and, with the host pool's experts copied into the slots, `, N host pool experts copied into
+the slots (S, R GB/s)` after it. The forward's stream line says how many of a layer's streamed
+experts came from the host pool (`135 streamed (135 of them copied from the host pool)`).
+
 | Engine | Its loads (`load` / `load_batch`) | The step the tier sees |
 |---|---|---|
 | qwen36 | `expert_hold` (and the int8 copy for the int8-slot kernel), one at a time | `moe_vk_run`'s block becomes the chunk |
@@ -2755,6 +2811,7 @@ The run's line counts what streamed:
 | `COLI_VK_TIER_STREAM_ROWS` | the rule | Fix R, the rows from which a cold expert streams (tests). |
 | `COLI_VK_TIER_STREAM_HALF` | x rows within 32 MiB | Rows of a sub-batch (tests: small ones cut experts into parts). |
 | `COLI_VK_TIER_STREAM_PAR` | on | `0`: a streamed expert's conversion on the engine thread alone. |
+| `COLI_VK_TIER_POOL_COPY` | on with the host pool and streaming | `0`: a big step's host pool experts of block types are read in place over PCIe again, not copied into the slots. |
 
 ### Validation and timing
 

@@ -847,9 +847,11 @@ family_mimo_qwenimage() {
     echo "OK mimo MIMO_DENSE_BITS=$bits: the CPU's tokens, text and image, experts on the CPU and on the tier, trunk on the device and on the CPU"
   done
   # MIMO_VK_EXPERTS=N sizes the tier at N experts: at 2 it must evict as the routing
-  # moves, and still give the CPU's tokens
+  # moves, and still give the CPU's tokens. A fresh history and no fill, as tier_gate's
+  # EVICT: the runs above wrote mimo_tiny's, whose hottest two the warm start would keep.
   MIMO_DENSE_BITS=32 COLI_TEMP=0 ./mimo mimo_tiny --ids "$(ids long)" --ngen 6 > mimo-cpu.txt 2>/dev/null
-  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 MIMO_VK_EXPERTS=2 MIMO_DENSE_BITS=32 COLI_TEMP=0 \
+  rm -f mimo-evict.usage
+  COLI_USAGE=mimo-evict.usage COLI_VK_TIER_FILL=0 COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 MIMO_VK_EXPERTS=2 MIMO_DENSE_BITS=32 COLI_TEMP=0 \
     ./mimo mimo_tiny --ids "$(ids long)" --ngen 6 > mimo-vk.txt 2> mimo-vk.err
   cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2 differs from the CPU"; }
   grep -q 'budget [0-9.]* KiB = 2 experts' mimo-vk.err || { grep '\[VK\]' mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2: not a budget of two experts"; }
@@ -1318,6 +1320,38 @@ mimo_chain_gate() {  # <tag> <case> <env...>   (CHAINMODE: COLI_VK_CHAIN's value
   lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag $c: logits"; }
   echo "OK $tag $c: tokens = CPU, $lg, $fw chain forwards"
 }
+# A GGUF's block types (tests/test_gguf_import.py write_mimo2: Q4_K and IQ2_XXS experts with
+# Q5_K and Q6_K down, a Q8_0 and Q4_K trunk, a Q6_K head): the dense chain's block GEMVs and
+# GEMMs and the tier's experts as the file has them, against the CPU's float form
+# (GQ_EXACT=1). COLI_VK_IDOT=0 keeps the device's float form where it has the integer one
+# too: the integer forms' codes move at a tie when their inputs are an ulp apart, and a bf16
+# embedding's rows are full of ties. COLI_VK_CHAIN_GEMM=0 keeps the prompt's GEMM in fp32.
+mimo_gguf_tiny() {   # mimo_gguf_tiny/, imported
+  $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the GGUF gates"
+import sys
+sys.path.insert(0, "tests")
+import numpy as np
+from test_gguf_import import write_mimo2
+write_mimo2("mimo_gguf_tiny.gguf", np.random.default_rng(5))
+PY
+  rm -rf mimo_gguf_tiny
+  $PY tools/gguf_import.py mimo_gguf_tiny.gguf mimo_gguf_tiny > /dev/null
+}
+mimo_gguf_gate() {  # <tag> <env...>
+  local tag=$1 lg fw ids="5 6 7 8 20 21 22 23" full="5 6 7 8 20 21 22 23 30 31 32 33"; shift
+  local vk=(GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1)
+  env "$@" GQ_EXACT=1 COLI_TEMP=0 ./mimo mimo_gguf_tiny --ids "$ids" --ngen 6 > mimo-cpu.txt 2>/dev/null
+  env "$@" "${vk[@]}" COLI_TEMP=0 ./mimo mimo_gguf_tiny --ids "$ids" --ngen 6 > mimo-vk.txt 2> mimo-vk.err
+  [ -s mimo-cpu.txt ] && cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-cpu.txt mimo-vk.txt mimo-vk.err; fail "$tag: the tokens differ from the CPU"; }
+  fw=$(chain_count mimo mimo-vk.err)
+  [ "$fw" -gt 0 ] || { cat mimo-vk.err; fail "$tag: the chain never ran"; }
+  cp mimo-vk.err mimo-gguf-vk.err
+  rm -f cpu.f32 vk.f32
+  env "$@" GQ_EXACT=1 MIMO_LOGITS=cpu.f32 ./mimo mimo_gguf_tiny --ids "$full" --ngen 0 > /dev/null 2>&1
+  env "$@" "${vk[@]}" MIMO_LOGITS=vk.f32 ./mimo mimo_gguf_tiny --ids "$full" --ngen 0 > /dev/null 2> mimo-vk.err
+  lg=$(logits_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }
+  echo "OK $tag: tokens = CPU, $lg, $fw chain forwards"
+}
 # mimo_lost_gate <tag> <case> <back> <env...>: the device "lost" (COLI_VK_CHAIN_FAULT) at
 # the chain frame <back> frames before the end of the same run without a fault (the
 # frames a device spends setting up differ: on Lavapipe its memory needs no zeroing
@@ -1390,6 +1424,14 @@ family_mimo_chain() {
   done
   # COLI_VK_CHAIN=2: prompts on the device, decode on the CPU, the caches moving between them
   for c in short long image; do CHAINMODE=2 mimo_chain_gate "chain mimo prompts only" $c MIMO_DENSE_BITS=32; done
+  # a GGUF's block types: the trunk on the chain, the experts in the tier, as the file has them
+  mimo_gguf_tiny
+  mimo_gguf_gate "chain mimo GGUF"
+  grep -q "tier mimo: the GGUF experts' blocks go to the device" mimo-gguf-vk.err && [ "$(tier_count mimo mimo-gguf-vk.err)" -gt 0 ] ||
+    { cat mimo-gguf-vk.err; fail "chain mimo GGUF: the tier took no expert as the file has it"; }
+  mimo_gguf_gate "chain mimo GGUF, one token at a time" MIMO_CHUNK=1
+  mimo_gguf_gate "chain mimo GGUF, the experts on the CPU" MIMO_VK_EXPERTS=0
+  mimo_gguf_gate "chain mimo GGUF, a budget of two experts" MIMO_VK_EXPERTS=2
   # the device lost (frames counted back from the end of the run: 5 decode steps of 6
   # frames follow the prompt): inside the last decode step; inside the first block of
   # a prompt split in chunks of 3 rows (the CPU takes the step's remaining rows); inside
