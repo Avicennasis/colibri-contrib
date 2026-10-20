@@ -116,6 +116,10 @@ typedef struct VkcDmoe_ {
      * them, kmax the widest, keep_valid whether stg has them, keep_fetch: copy them */
     int64_t *koff; uint32_t *frk; int nkr, nkeep, keep_valid, keep_fetch; uint32_t kmax;
     unsigned long long keep_fills;
+    /* a decode step's table patched with the tier's changes (vkc_dmoe_patch): chg the slots
+     * they name, wr the entries to write, nwr of them; reads whole, patches, entries patched */
+    int *chg, *wr; int nwr;
+    unsigned long long reads, patches, patched;
 } VkcDmoe;
 
 static int vkc_dmoe_wanted(void) {
@@ -258,8 +262,47 @@ static int vkc_hyb_post(const VkcHybJob *j) {
 /* The tier's table for layers lo..lo+L-1, read again when its residents changed since. */
 static int vkc_dmoe_stage_read(VkcDmoe *d);   /* below: the prompt chunks' staging of the host pool */
 static void vkc_dmoe_keep(VkcDmoe *d);         /* and what stg holds between them */
+static void vkc_keep_entry(VkcDmoe *d, size_t j);
+/* A decode step's table after a decode step's (not a prompt chunk's staging): the entries
+ * the tier changed since it was read (vkt_dev_changes), each read again, the hybrid steps'
+ * and the kept experts' with it; the frame writes those (vkc_dmoe_upload). The tier moves a
+ * few experts a token (vk_tier.c's promotions), and reading every layer's table whole for
+ * them cost a fifth of the decode (Qwen3.8 IQ2_XS on an RTX PRO 4000, a code prompt: 37.5 to
+ * 40.3 against 46.4 to 48.0 tok/s). 0 = read it whole: a layer that loses an expert or gains
+ * its last, an error, or more changes than the tier logged. */
+static int vkc_dmoe_patch(VkcDmoe *d) {
+    if (d->big_step || d->stg_big || d->stg_on) return 0;
+    int L = d->L, E = d->E;
+    const size_t ent = COLI_VK_XB_ENTRY;
+    if (!d->chg) d->chg = malloc((size_t)L * E * sizeof(int));
+    if (!d->wr) d->wr = malloc((size_t)L * E * sizeof(int));
+    if (!d->chg || !d->wr) return 0;
+    int n = vkt_dev_changes(d->epoch, d->chg, L * E);
+    if (n < 0) return 0;
+    vkc_hyb_drain();   /* the worker reads the host pool's rows of the table it had */
+    for (int k = 0; k < n; k++) {
+        int l = d->chg[k] / E, e = d->chg[k] % E;
+        if (l < d->lo || l >= d->lo + L) continue;
+        int i = l - d->lo;
+        if (!d->on[i]) return 0;   /* a layer the host steps through: whole when it may gain its last */
+        size_t j = (size_t)i * E + e;
+        int had = d->hybrid && d->hx && d->hx[j].g;
+        uint8_t host = 0;
+        int r = vkt_dev_entry(l, e, d->tabh + j * ent, d->hybrid ? d->tabhh + j * ent : NULL, d->hybrid ? d->hx + j : NULL, &host);
+        if (r <= 0) return 0;
+        if (d->hybrid && d->hx_n) d->hx_n[i] += (d->hx[j].g != NULL) - had;
+        if (d->hostm) d->hostm[j] = host;
+        if (d->keep_valid) vkc_keep_entry(d, j);
+        if (d->nwr < L * E) d->wr[d->nwr++] = (int)j;
+    }
+    d->patches++; d->patched += (unsigned long long)n;
+    d->epoch = vkt_epoch();
+    return 1;
+}
 static int vkc_dmoe_read(VkcDmoe *d) {
     if (d->read && d->epoch == vkt_epoch()) return 1;
+    if (d->read && vkc_dmoe_patch(d)) return 1;
+    d->reads++; d->nwr = 0;
     int L = d->L, E = d->E;
     if (!d->on) d->on = calloc((size_t)L, 1);
     if (!d->tabh) d->tabh = malloc((size_t)L * E * COLI_VK_XB_ENTRY * sizeof(uint32_t));
@@ -422,6 +465,27 @@ static int vkc_keep_cmp(const void *a, const void *b) {
     uint64_t x = ((const uint64_t *)a)[0], y = ((const uint64_t *)b)[0];
     return x < y ? 1 : x > y ? -1 : 0;
 }
+/* entry j (layer * E + expert) of the tables, a kept expert still in the host pool: stg's */
+static void vkc_keep_entry(VkcDmoe *d, size_t j) {
+    const size_t ent = COLI_VK_XB_ENTRY;
+    int E = d->E, D = d->D, I = d->I;
+    if (!d->koff || !d->hostm || d->koff[j] < 0 || !d->hostm[j]) return;
+    uint32_t *o = d->tabh + j * ent;
+    if (!o[18]) return;
+    size_t w[3], s0, off = (size_t)d->koff[j];
+    vkc_stage_sizes(o[12], o[13], o[14], I, D, &w[0], &s0);
+    vkc_stage_sizes(o[15], o[16], o[17], D, I, &w[2], &s0);
+    w[1] = w[0];
+    for (int m = 0; m < 3; m++) {
+        uint64_t dst = d->stg_addr + off;
+        o[4 * m] = (uint32_t)dst; o[4 * m + 1] = (uint32_t)(dst >> 32);
+        off += vkc_stage_up(w[m]);
+    }
+    if (d->hybrid && d->tabhh && d->hx) {   /* the device's in the hybrid steps, not the CPU's */
+        memcpy(d->tabhh + j * ent, o, ent * sizeof(uint32_t));
+        if (d->hx[j].g) { d->hx_n[j / E]--; memset(&d->hx[j], 0, sizeof d->hx[j]); }
+    }
+}
 static void vkc_dmoe_keep(VkcDmoe *d) {
     int L = d->L, E = d->E, D = d->D, I = d->I;
     const size_t ent = COLI_VK_XB_ENTRY;
@@ -478,24 +542,7 @@ static void vkc_dmoe_keep(VkcDmoe *d) {
     }
     /* the tables: a kept expert still in the host pool reads stg (one the tier moved
      * onto the device keeps its own entry) */
-    for (size_t j = 0; j < (size_t)L * E; j++) {
-        if (d->koff[j] < 0 || !d->hostm[j]) continue;
-        uint32_t *o = d->tabh + j * ent;
-        if (!o[18]) continue;
-        size_t w[3], s0, off = (size_t)d->koff[j];
-        vkc_stage_sizes(o[12], o[13], o[14], I, D, &w[0], &s0);
-        vkc_stage_sizes(o[15], o[16], o[17], D, I, &w[2], &s0);
-        w[1] = w[0];
-        for (int m = 0; m < 3; m++) {
-            uint64_t dst = d->stg_addr + off;
-            o[4 * m] = (uint32_t)dst; o[4 * m + 1] = (uint32_t)(dst >> 32);
-            off += vkc_stage_up(w[m]);
-        }
-        if (d->hybrid && d->tabhh && d->hx) {   /* the device's in the hybrid steps, not the CPU's */
-            memcpy(d->tabhh + j * ent, o, ent * sizeof(uint32_t));
-            if (d->hx[j].g) { d->hx_n[j / E]--; memset(&d->hx[j], 0, sizeof d->hx[j]); }
-        }
-    }
+    for (size_t j = 0; j < (size_t)L * E; j++) vkc_keep_entry(d, j);
 }
 /* For a step of `rows` rows on the primary device: whether any of layers lo..lo+L-1 takes
  * it; reads the tier's table again when its residents changed. 0 for good when the
@@ -552,8 +599,19 @@ static int vkc_dmoe_prepare(VkcDmoe *d, int lo, int L, int E, int K, int D, int 
  * 0 only when the write fails; a table that cannot be read turns the layers down. */
 static int vkc_dmoe_upload(VkcDmoe *d) {
     if (d->off || !d->tab) return 1;
+    vkt_settle();   /* the experts that moved up to the device since the last frame */
     if (!vkc_dmoe_read(d)) return 1;   /* d->off: every layer takes the host's step from here */
-    if (!d->dirty) return 1;
+    if (!d->dirty) {   /* the entries vkc_dmoe_patch read again */
+        const size_t ent = COLI_VK_XB_ENTRY;
+        for (int k = 0; k < d->nwr; k++) {
+            size_t o = (size_t)d->wr[k] * ent;
+            if (!vkc_write(d->tab, o, d->tabh + o, ent * sizeof(uint32_t)) ||
+                (d->hybrid && !vkc_write(d->tabhyb, o, d->tabhh + o, ent * sizeof(uint32_t)))) return 0;
+        }
+        d->nwr = 0;
+        return 1;
+    }
+    d->nwr = 0;
     if (!vkc_write(d->tab, 0, d->tabh, (size_t)d->L * d->E * COLI_VK_XB_ENTRY * sizeof(uint32_t))) return 0;
     if (d->stg_on && (!vkc_write(d->tabs, 0, d->tabsh, (size_t)d->L * d->E * COLI_VK_XB_ENTRY * sizeof(uint32_t)) ||
                       !vkc_write(d->fr, 0, d->frh, (size_t)d->nfr * 4 * sizeof(uint32_t)))) return 0;
@@ -635,6 +693,7 @@ static void vkc_dmoe_free(VkcDmoe *d) {
     vkc_moe_rows_free(&d->rows);
     free(d->on); free(d->tabh); free(d->rows_off); free(d->tabhh); free(d->hx); free(d->hx_n);
     free(d->tabsh); free(d->frh); free(d->fro); free(d->frn); free(d->frmax); free(d->full); free(d->hostm);
+    free(d->chg); free(d->wr);
     memset(d, 0, sizeof *d);
 }
 /* the hybrid steps' line: steps, pairs the CPU computed, its time */
@@ -647,6 +706,9 @@ static void vkc_dmoe_hyb_report(const char *engine, const VkcDmoe *d) {
     if (d->keep_fills)
         fprintf(stderr, "[VK] %s chain: between prompt chunks the staging held the host pool's hottest %d experts (%llu fills)\n",
                 engine, d->nkeep, d->keep_fills);
+    if (d->patches)
+        fprintf(stderr, "[VK] %s chain: the experts' table read whole %llu times, patched %llu times (%llu entries the tier changed)\n",
+                engine, d->reads, d->patches, d->patched);
     if (!d->hyb_steps) return;
     fprintf(stderr, "[VK] %s chain: %llu hybrid layer steps, %llu host pool pairs on the CPU in %.1f ms (%.1f us a step)%s\n",
             engine, d->hyb_steps, w->pairs, w->cpu_ms, w->steps ? w->cpu_ms * 1e3 / (double)w->steps : 0.0,
