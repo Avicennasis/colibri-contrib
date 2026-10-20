@@ -237,6 +237,10 @@ void qt_chain_hold(int on);
 void qt_chain_count(int layer, const int *eids, int K);
 int  qt_chain_format(int *fmt, int *gs);
 int  qt_chain_layer_format(int layer, int *fmt, int *fmt_d);
+/* a GGUF's arena for a chain that moves the experts itself (qwen36_tier.c's comment) */
+int  qt_chain_arena(void **base, size_t *slot, size_t *off_u, size_t *off_d, int *nslots);
+int  qt_chain_slot(int layer, int eid);
+void qt_chain_own(void);
 /* copy mode: 1 when a qt_note of the expert now would copy it (convert the bytes only then);
  * qt_note_heat counts a pass of one the engine does not hand over */
 /* the warm start's order from an engine's expert history (counts[l][e], nl x ne) */
@@ -294,6 +298,9 @@ static inline void qt_chain_hold(int a){(void)a;}
 static inline void qt_chain_count(int a,const int*b,int c){(void)a;(void)b;(void)c;}
 static inline int  qt_chain_format(int*a,int*b){(void)a;(void)b;return 0;}
 static inline int  qt_chain_layer_format(int a,int*b,int*c){(void)a;(void)b;(void)c;return 0;}
+static inline int  qt_chain_arena(void**a,size_t*b,size_t*c,size_t*d,int*e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
+static inline int  qt_chain_slot(int a,int b){(void)a;(void)b;return -1;}
+static inline void qt_chain_own(void){}
 static inline void qt_heat_order(uint32_t*const*a,int b,int c){(void)a;(void)b;(void)c;}
 static inline int  qt_note_wanted(int a,int b){(void)a;(void)b;return 0;}
 static inline void qt_note_heat(int a,int b){(void)a;(void)b;}

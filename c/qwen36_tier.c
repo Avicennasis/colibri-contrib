@@ -111,6 +111,7 @@ static uint32_t G_cold_heat[QT_MAX_DEV];   /* copy mode: the coldest resident's 
  * experts=cpu): the devices still take the dense trunk, which is read on every
  * token. Before, each of these switched the trunk off as well. */
 static int G_trunk_only;
+static int G_chain_own;   /* qt_chain_own: the arena's experts are the dense chain's to move */
 /* Where the engine's int4 bytes come from (qt_source_planar): 0 = the
  * container's signed pairs, 1 = expert_ffn.h's planar blocks, the layout the
  * engine keeps in RAM when its shared kernel computes the CPU's experts. */
@@ -1319,7 +1320,7 @@ unsigned qt_chain_epoch(void){
 }
 int qt_chain_devices(void){ return G.on ? G.ndev : 0; }
 int qt_chain_resident(int layer,int eid,int device,ColiCudaTensor **g,ColiCudaTensor **u,ColiCudaTensor **d){
-    if(!G.on || G_trunk_only || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
+    if(!G.on || G_trunk_only || G_chain_own || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
     pthread_mutex_lock(&G.mx);
     QSlot *s=qs(layer,eid);
     int r=s->resident && s->tg && s->tu && s->td && G.dev[home2(layer,eid)]==device;
@@ -1345,6 +1346,32 @@ void qt_chain_count(int layer,const int *eids,int K){
         if(s->resident){ if(s->heat<0xFFFFFFFFu) s->heat++; G.hits[home2(layer,eids[k])]++; }
         else G.miss++;
     }
+    pthread_mutex_unlock(&G.mx);
+}
+/* The arena of a GGUF's experts on the tier's one device, for a chain that takes it over
+ * (qt_chain_own): its base, a slot's bytes, the up and down rows' offsets in a slot (gate at
+ * 0), its slots; 0 without an arena. qt_chain_slot: the slot expert eid of layer holds, -1
+ * none. qt_chain_own: from now on the chain moves experts in and out of the slots itself;
+ * the tier places, swaps and computes none (qt_note*, qt_issue and qt_chain_resident answer
+ * nothing), its uploads in flight done first. */
+int qt_chain_arena(void **base,size_t *slot,size_t *off_u,size_t *off_d,int *nslots){
+    if(!G.on || G.ndev!=1 || G.wfmt!=QT_GGUF || !G_arena_on || !G_arena[0]) return 0;
+    *base=G_arena[0]; *slot=G_aslot; *off_u=G_aoff_u; *off_d=G_aoff_d; *nslots=G_aslots[0];
+    return 1;
+}
+int qt_chain_slot(int layer,int eid){
+    if(!G.on || !G_arena_on || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return -1;
+    pthread_mutex_lock(&G.mx);
+    QSlot *s=qs(layer,eid);
+    int r=s->resident && s->aslot>0 ? s->aslot-1 : -1;
+    pthread_mutex_unlock(&G.mx);
+    return r;
+}
+void qt_chain_own(void){
+    if(!G.on) return;
+    qt_fill_wait();
+    pthread_mutex_lock(&G.mx);
+    G_chain_own=1;
     pthread_mutex_unlock(&G.mx);
 }
 int qt_chain_format(int *fmt,int *gs){
@@ -1428,7 +1455,7 @@ static void stream_promote_locked(int layer,int eid){
 void qt_note(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on || !g4 || G_trunk_only) return;
+    if(!G.on || !g4 || G_trunk_only || G_chain_own) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
     if(G_stream){
@@ -1461,7 +1488,7 @@ void qt_heat_order(uint32_t *const *counts, int nl, int ne){
  * and room on its device or a resident colder than it, as of the last tick), so an engine
  * converts the bytes only then; qt_note_heat counts a pass of one it does not hand over. */
 int qt_note_wanted(int layer,int eid){
-    if(!G.on || G_trunk_only || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
+    if(!G.on || G_trunk_only || G_chain_own || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
     if(!G_stream) return 1;
     QSlot *s=qs(layer,eid);
     if(s->resident || s->queued) return 0;
@@ -1479,7 +1506,7 @@ void qt_note_heat(int layer,int eid){
 void qt_note_block(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on || !g4 || G_trunk_only) return;
+    if(!G.on || !g4 || G_trunk_only || G_chain_own) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
     if(G_stream) stream_point(s,g4,u4,d4,gs,us,ds);
@@ -1562,7 +1589,7 @@ int qt_plan_fill(int *layers,int *eids,int max){
 void qt_note_planned(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
              const float *gs,const float *us,const float *ds){
-    if(!G.on) return;
+    if(!G.on || G_chain_own) return;
     QSlot *s=qs(layer,eid);
     pthread_mutex_lock(&G.mx);
     if(!g4){
@@ -1714,6 +1741,7 @@ void qt_stats_mark(void){
 }
 
 static void qt_lfru_tick_locked(void){
+    if(G_chain_own) return;   /* the chain's to move */
     size_t n=(size_t)G.nl*G.ne;
     G.tick++;
     if(G_stream){   /* copy mode: qt_note_wanted's bar */
@@ -1752,7 +1780,7 @@ static void qt_lfru_tick_locked(void){
 }
 
 uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
-    if(!G.on||K>QT_MAX_ROWS) return 0;
+    if(!G.on||K>QT_MAX_ROWS||G_chain_own) return 0;
     uint32_t mask=0;
     ColiCudaTensor *tg[QT_MAX_DEV][QT_MAX_ROWS],*tu[QT_MAX_DEV][QT_MAX_ROWS],*td[QT_MAX_DEV][QT_MAX_ROWS];
     static int rows[QT_MAX_ROWS]={0};
@@ -1914,7 +1942,7 @@ void qt_shutdown(void){
         if(G_arena[i]) coli_cuda_pipe_free(G.dev[i],G_arena[i]);
         G_arena[i]=NULL; free(G_afree[i]); G_afree[i]=NULL; G_aslots[i]=G_anfree[i]=0;
     }
-    G_arena_on=0;
+    G_arena_on=0; G_chain_own=0;
     free(G.slot); G.slot=NULL;
     free(G.is_x); G.is_x=NULL; G.is_x_floats=0;
     free(G.fill_order); G.fill_order=NULL;
