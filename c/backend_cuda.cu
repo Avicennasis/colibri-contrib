@@ -2288,7 +2288,12 @@ static int group_moe_ok(const GroupDesc *host, int count, int total, int D, int 
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_GROUP_MOE"); on = !(e && *e == '0'); }
     if (!on || count < 1 || D < 32 || I < 32 || D % 32 || I % 32 || D > CC_MOE_DIM_MAX || I > CC_MOE_DIM_MAX) return 0;
-    int f = host[0].gf, gs = host[0].ggs;
+    int f = host[0].gf, gs = host[0].ggs, fd = host[0].df;
+    if (f >= 100) {   /* a GGUF's blocks: gate and up of one type, down of one, both with an integer step */
+        if (fd < 100 || f >= 143 || fd >= 143 || !bdi_has(f - 100) || !bdi_has(fd - 100)) return 0;
+        for (int c = 0; c < count; c++) if (host[c].gf != f || host[c].uf != f || host[c].df != fd) return 0;
+        return 1;
+    }
     if (!(f == 1 || f == 2 || (f == 4 && gs >= 16 && gs % 16 == 0))) return 0;
     for (int c = 0; c < count; c++)
         if (host[c].gf != f || host[c].uf != f || host[c].df != f ||
@@ -2316,6 +2321,7 @@ static int group_moe_launch(DeviceContext *ctx, int device, const GroupDesc *hos
     if (!cuda_ok(cudaMemcpyAsync(ctx->moe_tab, ctx->moe_host, nb, cudaMemcpyHostToDevice, ctx->stream), "expert group table")) return 0;
     CcMoe mp; std::memset(&mp, 0, sizeof mp);
     mp.S = total; mp.K = 1; mp.D = D; mp.I = I; mp.fmt = host[0].gf; mp.gs = host[0].gf == 4 ? host[0].ggs : 0;
+    if (host[0].gf >= 100) mp.fmt_d = host[0].df;   /* a GGUF's down: its own type */
     /* pin (a speculation's verify, coli_cuda_expert_group_pinned): the warp kernels at any rows
      * (E 0), whose rows are a decode step's bits; else past CC_MOE_FRAME_ROWS the tensor cores */
     mp.parts = 3; mp.x_row = D; mp.i_row = 1; mp.w_row = 1; mp.y_row = D; mp.h_off = -1; mp.E = pin ? 0 : count;
@@ -2562,8 +2568,6 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
     if (!gates || !ups || !downs || !rows || !x || count < 1 || count > 64) return 0;
     ColiCudaTensor *first=gates[0];
     if (!first) return 0;
-    for (int i = 0; i < count; i++)   /* the block formats: the chain's GEMVs only */
-        if ((gates[i] && gates[i]->fmt >= 100) || (ups[i] && ups[i]->fmt >= 100) || (downs[i] && downs[i]->fmt >= 100)) return 0;
     int device=first->device,D=first->I,I=first->O,total=0,max_rows=0,all_s4=1,any_e8=0,all_e8=1,
         all_q4=1,any_g4=0,any_f8=0,all_f8=1;
     GroupDesc host[64];

@@ -295,6 +295,37 @@ static void check_moe(int tg, int td, int S, int K, int E, int D, int I) {
         free(xq); free(dxs); free(xss); free(h);
     }
     double tol = S > 8 ? 1e-2 : 2e-3;   /* past 8 rows the f16 tiles */
+    /* the tier's expert groups (coli_cuda_expert_group: the frame's kernels, a row a slot, K 1)
+     * on row 0's experts, each expert's down output against the CPU's integer form */
+    if (ok && S == 1) {
+        ColiCudaTensor *gg[32], *uu[32], *dd[32]; int rr[32], cnt = 0;
+        for (int k = 0; k < K; k++) { int e = ids[k]; if (e < 0) continue; gg[cnt] = tt[3 * e]; uu[cnt] = tt[3 * e + 1]; dd[cnt] = tt[3 * e + 2]; rr[cnt++] = 1; }
+        float *xr = (float *)malloc((size_t)cnt * D * 4), *yr = (float *)malloc((size_t)cnt * D * 4);
+        for (int c = 0; c < cnt; c++) memcpy(xr + (size_t)c * D, x, (size_t)D * 4);
+        int okg = coli_cuda_expert_group(gg, uu, dd, rr, cnt, yr, xr);
+        int8_t *xq = (int8_t *)malloc(16384); float *dxs = (float *)malloc(4096), *h = (float *)malloc((size_t)I * 4); int32_t *xss = (int32_t *)malloc(4096);
+        double gw = 0;
+        for (int c = 0, k = 0; okg && k < K; k++) {
+            int e = ids[k]; if (e < 0) continue;
+            ref_quant(x, D, xq, dxs, xss);
+            for (int o = 0; o < I; o++) {
+                double g = ref_dot(tg, G + e * gb + o * rg, D, xq, dxs, xss), u = ref_dot(tg, U + e * gb + o * rg, D, xq, dxs, xss);
+                h[o] = (float)(g / (1 + exp(-g)) * u);
+            }
+            ref_quant(h, I, xq, dxs, xss);
+            double vmax = 1e-6, emax = 0;   /* to the expert's largest output */
+            for (int o = 0; o < D; o++) {
+                double v = ref_dot(td, Dn + e * db + o * rd, I, xq, dxs, xss), er = fabs(yr[(size_t)c * D + o] - v);
+                if (fabs(v) > vmax) vmax = fabs(v);
+                if (!(er <= emax)) emax = er;
+            }
+            if (!(emax / vmax <= gw)) gw = emax / vmax;
+            c++;
+        }
+        if (!okg || !(gw <= 1e-5)) { printf("FAIL moe group %s/%s: %s %.3g\n", ref_name(tg), ref_name(td), okg ? "off by" : "the group failed", gw); fails++; }
+        else printf("moe group %-7s/%-7s %d experts: within %.2g of the CPU's integer form\n", ref_name(tg), ref_name(td), cnt, gw);
+        free(xr); free(yr); free(xq); free(dxs); free(h); free(xss);
+    }
     if (!ok || !(worst <= tol)) { printf("FAIL moe %s/%s S %d K %d E %d [%d x %d]: %s %.3g\n", ref_name(tg), ref_name(td), S, K, E, D, I, ok ? "off by" : "the call failed", worst); fails++; }
     else printf("moe %-7s/%-7s S %d K %d E %d [%d x %d]: within %.2g of the %s\n", ref_name(tg), ref_name(td), S, K, E, D, I, worst,
                 S > 8 ? "dequantized rows (f16 tiles)" : "CPU's integer form");
