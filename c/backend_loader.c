@@ -1703,7 +1703,8 @@ int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, size_t cap, c
     return g_cuda.available && g_cuda.tensor_upload_at ? g_cuda.tensor_upload_at(tensor, dev, cap, weights, fmt, I, O, device) : 0;
 }
 int coli_cuda_block_elems(int fmt){
-    return g_cuda.available && g_cuda.block_elems ? g_cuda.block_elems(fmt) : 0;   /* older DLL: no block formats */
+    if(!coli_cuda_load()) return 0;   /* asked before any device: the engine decides where a GGUF runs */
+    return g_cuda.block_elems ? g_cuda.block_elems(fmt) : 0;   /* older DLL: no block formats */
 }
 
 const ColiCudaChainOps *coli_cuda_chain_ops(void){

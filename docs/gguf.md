@@ -61,8 +61,19 @@ Both are lossless: the same blocks, the same tokens.
 - **DeepSeek V4.1's engram tables** are read a row at a time, as from the checkpoint: a `deepseek41` file holds each row's e4m3 values and their scales together. These files carry no DSpark head, so nothing drafts.
 - **GLM's MLA**: `k_b` / `v_b` (llama.cpp splits `kv_b_proj`) stay the file's blocks.
 - **The Vulkan dense chain** (qwen36, qwen38) takes a GGUF's dense matrices as the file has them too. Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_S, IQ3_S, IQ4_NL and IQ4_XS run on a GEMV with one decoder per type (`shaders/chain_gemv_bd.comp`), and the other types on the general block decoder. The routed experts run inside the same frame when the tier holds every expert of a layer. A decode step or a verify of up to 16 rows runs there; a prompt's longer chunks go through the CPU and the expert tier.
-- **The other engines' dense matrices stay on the CPU**, and CUDA takes none of a GGUF's ggml matrices.
-- **A GGUF on an NVIDIA card runs on Vulkan** (qwen36, qwen38, colibri for GLM-5.2, whose CUDA path keeps a GGUF's matrices and experts on the CPU, and deepseek_v4, whose CUDA tier mirrors native FP4 experts only). Their CUDA tier takes no ggml block types, so a CUDA run of a GGUF computed every routed expert on the CPU (Qwen3.8 IQ2_S/Q2_0 on an RTX PRO 4000: 28 tok/s of prompt, 9 of decode). A build with both backends switches such a run to Vulkan on the same card when CUDA was asked for and `COLI_VULKAN` was not set (114-118 and 46-49 tok/s); `COLI_VULKAN=0` keeps CUDA. `coli setup` builds these engines' CUDA engine with Vulkan too where the Vulkan toolchain is there (on Linux; the Windows CUDA package has both).
+- **The CUDA backend takes a GGUF's blocks too** (`cuda_bd.cuh`): every ggml block type of 32 weights or more, each row as the file has it. A decode step and a speculative verify (up to 8 rows, sharing each weight load, each row with a decode step's bits) run in the CPU's integer form on Q8_0, Q2_K to Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and Q2_0 (the CPU's codes, scales and integer sums: the two differ only in the order of the float sums), the other types in floats. A prompt chunk goes through the f16 tensor-core tiles (`COLI_CUDA_BD_TILES`).
+- **qwen36's CUDA chain runs a GGUF whole on the card**: its experts in the CUDA tier as the file has them (gate/up and down types by layer, one arena a device: `QT_GGUF_ARENA`), computed in the chain's frame, and its dense matrices, lm_head and DeltaNet projections as their blocks. Qwen3.6-35B-A3B on an RTX PRO 4000 (24 GB), every expert on the card:
+
+  | | CUDA chain | Vulkan chain |
+  |---|---|---|
+  | UD-IQ2_XXS: decode, prefill of 467 tokens | 118 tok/s, 1356 tok/s | 100 tok/s, 1600 tok/s |
+  | UD-IQ2_XXS: a code edit of 400 tokens (prompt lookup) | 2.38 s | 3.3 s |
+  | UD-Q4_K_M: decode, prefill | 96 tok/s, 1388 tok/s | 75 tok/s, 1450 tok/s |
+  | UD-Q4_K_M: the code edit | 2.67 s | 3.1-3.7 s |
+
+  The greedy text is the CPU's (the same integers). Before, a CUDA run of a GGUF computed every routed expert on the CPU (UD-IQ2_XXS: 13.7 tok/s of decode).
+- **The other engines' dense matrices stay on the CPU** on CUDA, and their CUDA tiers take no ggml block types yet.
+- **A GGUF those engines' CUDA path does not take runs on Vulkan on an NVIDIA card** (qwen38, colibri for GLM-5.2, whose CUDA path keeps a GGUF's matrices and experts on the CPU, deepseek_v4, whose CUDA tier mirrors native FP4 experts only, and qwen36 for a file whose expert types the CUDA chain's frame lacks). A CUDA run of such a GGUF computed every routed expert on the CPU (Qwen3.8 IQ2_S/Q2_0 on an RTX PRO 4000: 28 tok/s of prompt, 9 of decode). A build with both backends switches such a run to Vulkan on the same card when CUDA was asked for and `COLI_VULKAN` was not set (114-118 and 46-49 tok/s); `COLI_VULKAN=0` keeps CUDA. `coli setup` builds these engines' CUDA engine with Vulkan too where the Vulkan toolchain is there (on Linux; the Windows CUDA package has both).
 
 ## Checking a GGUF before downloading it
 

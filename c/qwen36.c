@@ -7760,13 +7760,26 @@ int main(int argc, char **argv) {
         g_gguf = 1; g_ssm_a_direct = 1; g_dn_tiled = 1;
         fprintf(stderr, "[gguf] %s: %d file(s), %d tensors, read in place (native ggml types, no conversion)\n",
                 gp, g_gg.n_files, g_gg.n_tensors);
-        /* The CUDA tier and the CUDA chain take no ggml block types (int8, int4, fp8): a
-         * CUDA run of a GGUF computed every routed expert on the CPU (Qwen3.6-35B-A3B
-         * UD-IQ2_XXS, RTX PRO 4000: 13.7 tok/s of decode, 87 on the Vulkan chain). A build
-         * with both backends (the Windows CUDA package's) runs a GGUF on Vulkan when CUDA
-         * was asked for and COLI_VULKAN was not set; COLI_VULKAN=0 keeps CUDA. */
+        /* The CUDA tier and chain take a GGUF's blocks (cuda_bd.cuh) when the backend has the
+         * types of every routed expert (the chain's frame computes them: cc_moe_block_type):
+         * Qwen3.6-35B-A3B on an RTX PRO 4000, UD-IQ2_XXS 118 tok/s of decode against 100 on
+         * the Vulkan chain, UD-Q4_K_M 96 against 75. A file with another expert type (or a
+         * backend without the block formats: 13.7 tok/s, the experts on the CPU) runs on
+         * Vulkan in a build with both backends when CUDA was asked for and COLI_VULKAN was not
+         * set; COLI_VULKAN=0 keeps CUDA. */
+        int cuda_blocks = 1;
+#ifdef COLI_CUDA
+        for (int i = 0; i < g_gg.n_tensors && cuda_blocks; i++) {
+            const char *nm = g_gg.t[i].name;
+            if (!strstr(nm, "_exps.weight")) continue;
+            const int t = g_gg.t[i].type;
+            cuda_blocks = cc_moe_block_type(t) && coli_cuda_block_elems(100 + t) > 0;
+        }
+#else
+        cuda_blocks = 0;
+#endif
         {   const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
-            if (cu && *cu == '1' && !(vk && *vk)) {
+            if (cu && *cu == '1' && !(vk && *vk) && !cuda_blocks) {
 #if defined(COLI_CUDA) && defined(COLI_VULKAN)
                 setenv("COLI_VULKAN", "1", 1); setenv("COLI_CUDA", "0", 1);
                 fprintf(stderr, "[gguf] the CUDA backend has no ggml block types: this GGUF runs on Vulkan, the same card "
@@ -8027,7 +8040,7 @@ int main(int argc, char **argv) {
     /* Una riga, sempre: e' l'unico modo di verificare il probe dall'esterno
      * (CI sul container tiny int8, #1331) senza una scheda. */
     fprintf(stderr, "[qwen36] expert format on disk: %s\n",
-            g_gguf ? "GGUF native ggml types (the Vulkan tier holds them as int8, one scale per 32)"
+            g_gguf ? "GGUF native ggml types (the CUDA and Vulkan tiers hold the file's blocks)"
             : m.c.n_experts == 0 ? "none (dense model: every layer's MLP is resident)"
             : expert_mixed ? "int4 gate/up + int8 down (mixed; experts on the CPU, the VRAM tier takes the trunk only)"
                          : expert_is_int4 ? "int4 packed (tier fmt=4)" : "int8 (tier fmt=1)");
