@@ -184,6 +184,14 @@ typedef struct {
     int act; float act_limit, act_a, act_b;
     int max_rows;                  /* most (row, expert) assignments one vkt_issue carries */
     size_t ram_reserve;            /* bytes the engine's RAM caches may still grow by */
+    /* Optional: the host pool (system RAM the device reads) comes out of the RAM those caches
+     * were sized from. When the pool cannot hold every expert the device leaves, the CPU still
+     * computes the others from the caches, and the two would ask the same RAM twice (an OOM
+     * kill on a model bigger than RAM). ram_given: once the pool is sized, the engine lowers
+     * its caches by the bytes it is given, to no less than ram_floor (what a step needs).
+     * Without it the pool leaves ram_reserve to the caches and takes what is left. */
+    size_t ram_floor;
+    void (*ram_given)(void *ctx, size_t bytes);   /* with ram_ctx */
     size_t dense_bytes;            /* dense weights the engine puts on the device after vkt_init */
     size_t chain_bytes;            /* what the dense chain allocates at its first forward, after the
                                       tier has filled the device (its KV mirror, a prompt chunk): left free */

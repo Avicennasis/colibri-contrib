@@ -1863,6 +1863,18 @@ static void host_init(long long all) {
     const char *pe = getenv("COLI_VK_TIER_PROMOTE");
     int rate = pe && *pe ? atoi(pe) : 32;
     T.full = rate > 0 && !T.d2 && fit >= all;
+    /* Short of every expert the device leaves: the CPU computes the rest from the engine's
+     * RAM caches, which were sized from the same free RAM. Their least (ram_floor) comes out of
+     * the pool's room and the pool's bytes out of them (ram_given); an engine that cannot lower
+     * them keeps ram_reserve, and the pool takes what is left. */
+    size_t given = 0;
+    if (fit < left && !(g && *g)) {
+        want -= T.c.ram_given ? (double)T.c.ram_floor : (double)T.c.ram_reserve;
+        if (want < (double)T.exp_bytes) return;
+        full = (size_t)want / blk; rest = (size_t)want - full * blk;
+        fit = (long long)full * (long long)(blk / T.exp_bytes) + (long long)(rest / T.exp_bytes);
+        given = T.c.ram_given ? 1 : 0;
+    }
     long long held = T.full ? all : fit < left ? fit : left;
     if (held < 1) { T.full = 0; return; }
     if (fit > left) fit = left;
@@ -1873,6 +1885,7 @@ static void host_init(long long all) {
     coli_vk_tier_pool_limit_dev(2, lim);
     T.dmax[2] = (int)fit; T.max_resident += (int)fit; T.h_budget = lim;
     T.promote_rate = T.full ? rate : 0;
+    if (given) T.c.ram_given(T.c.ram_ctx, lim);
     char hb[32];
     if (T.full)
         fprintf(stderr, "[VK] tier %s: host pool on, %lld experts in %s of system RAM the device reads over PCIe (every expert "
