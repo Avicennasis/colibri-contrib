@@ -13479,6 +13479,7 @@ typedef struct {
 static V4VkEntry *g_v4_vk_map;
 static size_t g_v4_vk_cap, g_v4_vk_used;
 static int v4c_partial(void);   /* deepseek_v4_chain.h: a partial chain keeps the rest on the CPU */
+static int v4c_whole(void);     /* and a whole one placed everything dense */
 
 static size_t v4_vk_hash(const void *data, size_t cap) {
     uint64_t h = (uint64_t)(uintptr_t)data * 0x9E3779B97F4A7C15ull;
@@ -13528,10 +13529,18 @@ static void v4_vk_forget(ColiVkTensor *t) {
     coli_vk_tensor_free(t);
 }
 
-/* Bytes a resident layer tensor occupies (E8M0 scales are held as f32). */
+/* Bytes a resident layer tensor occupies (E8M0 scales are held as f32; a GGUF's float view
+ * as that float, its blocks as the file or the loader's interleave has them). */
 static size_t v4_vk_spec_bytes(const ColiDeepSeekV4TensorSpec *spec) {
     size_t count = 1;
     for (int axis = 0; axis < spec->rank; axis++) count *= (size_t)spec->shape[axis];
+    if (st_is_ggml(spec->dtype) && spec->rank >= 1) {
+        const int t = st_ggml_type(spec->dtype);
+        if (t == GQ_F32) return count * 4;
+        if (t == GQ_F16 || t == GQ_BF16) return count * 2;
+        const int64_t cols = spec->shape[spec->rank - 1], rb = gq_row_bytes(t, cols);
+        return rb > 0 ? (size_t)rb * (count / (size_t)cols) : 0;
+    }
     switch (spec->dtype) {
     case COLI_ST_BF16: return count * 2;
     case COLI_ST_F8_E4M3: return count;
@@ -13810,7 +13819,7 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                         ? (size_t)(st.capacity_bytes - st.resident_bytes) : 0,
                     /* what the device has still to take: matrices placed already
                      * (the dense weights on the device only) are in its usage */
-                    .dense_bytes = coli_vk_dense() && !v4c_partial()   /* a partial chain placed all it places */
+                    .dense_bytes = coli_vk_dense() && !v4c_partial() && !v4c_whole()   /* a chain placed all it places */
                         ? (size_t)(engine->dense_resident.total_bytes - engine->dense_resident.dropped_bytes + engine->head_cache.bytes) : 0,
                     .in_ram = v4_vkt_in_ram, .ram_ctx = store,
                     .load = v4_vkt_load, .release = v4_vkt_unhold, .load_ctx = store};
