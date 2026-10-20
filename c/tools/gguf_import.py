@@ -24,8 +24,8 @@ dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engin
 Qwen3 -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
 Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
 glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine),
-deepseek41 (DeepSeek V4.1 Flash in antirez's format -> deepseek_v41 engine), olmoe (OLMoE ->
-olmoe engine).
+deepseek41 (DeepSeek V4.1 Flash, antirez's format and the published K-quant and IQ files ->
+deepseek_v41 engine), olmoe (OLMoE -> olmoe engine).
 
 Usage:
   python3 tools/gguf_import.py MODEL.gguf OUT_DIR [--mode link|copy]
@@ -510,12 +510,87 @@ def mimo2_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
+def deepseek41_meta_config(meta, tensors):
+    """The published deepseek41 GGUFs (K-quant and IQ types) carry no config.json:
+    the checkpoint's text_config from its keys (conversion writes each from one of them).
+    No DSpark head and no vision tower in these files: their own GGUFs hold them."""
+    p = "deepseek41."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    gating = int(meta.get(p + "expert_gating_func", 4))
+    if gating != 4:
+        sys.exit(f"{p}expert_gating_func {gating}: the engine routes with sqrt(softplus) (4) only")
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    clamp = meta.get(p + "swiglu_clamp_exp") or [10.0]
+    text = {
+        "model_type": "deepseek_v41_text",
+        "vocab_size": int(emb["dims"][1]),
+        "hidden_size": int(need("embedding_length")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "num_hidden_layers": int(need("block_count")),
+        "num_attention_heads": int(need("attention.head_count")),
+        "num_key_value_heads": int(meta.get(p + "attention.head_count_kv", 1)),
+        "head_dim": int(need("attention.key_length")),
+        "qk_rope_head_dim": int(need("rope.dimension_count")),
+        "q_lora_rank": int(need("attention.q_lora_rank")),
+        "o_lora_rank": int(need("attention.output_lora_rank")),
+        "o_groups": int(need("attention.output_group_count")),
+        "hidden_act": "silu",
+        "swiglu_limit": float(clamp[0]),
+        "rms_norm_eps": float(need("attention.layer_norm_rms_epsilon")),
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "max_position_embeddings": int(meta.get(p + "context_length", 1048576)),
+        "rope_theta": float(meta.get(p + "rope.freq_base", 10000.0)),
+        "rope_scaling": {
+            "rope_type": meta.get(p + "rope.scaling.type", "yarn"),
+            "factor": float(meta.get(p + "rope.scaling.factor", 1.0)),
+            "beta_fast": int(meta.get(p + "rope.scaling.yarn_beta_fast", 32)),
+            "beta_slow": int(meta.get(p + "rope.scaling.yarn_beta_slow", 1)),
+            "original_max_position_embeddings": int(meta.get(p + "rope.scaling.original_context_length",
+                                                             meta.get(p + "context_length", 65536))),
+        },
+        "n_routed_experts": int(need("expert_count")),
+        "n_shared_experts": int(meta.get(p + "expert_shared_count", 1)),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc",
+        "norm_topk_prob": bool(meta.get(p + "expert_weights_norm", True)),
+        "routed_scaling_factor": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "sliding_window": int(need("attention.sliding_window")),
+        "compress_ratios": [int(r) for r in need("attention.compress_ratios")],
+        "compress_rope_theta": float(need("attention.compress_rope_freq_base")),
+        "kv_source_layer_ids": [int(x) for x in need("attention.kv_source_layers")],
+        "index_source_layer_ids": [int(x) for x in need("attention.indexer.source_layers")],
+        "index_n_heads": int(need("attention.indexer.head_count")),
+        "index_head_dim": int(need("attention.indexer.key_length")),
+        "index_topk": int(need("attention.indexer.top_k")),
+        "candidate_source_layer_id": int(need("attention.indexer.candidate_source_layer")),
+        "candidate_topk_blocks": int(need("attention.indexer.candidate_top_k_blocks")),
+        "candidate_block_size": int(need("attention.indexer.candidate_block_size")),
+        "hc_mult": int(need("hyper_connection.count")),
+        "hc_sinkhorn_iters": int(need("hyper_connection.sinkhorn_iterations")),
+        "hc_eps": float(meta.get(p + "hyper_connection.epsilon", 1e-6)),
+        "num_nextn_predict_layers": 0,
+    }
+    if p + "ple.layers" in meta:   # the engram: dsv41_engram.json carries its tables (deepseek41_engram)
+        text.update({"engram_layer_ids": [int(x) for x in need("ple.layers")],
+                     "engram_max_ngram_size": int(need("ple.ngram_size")),
+                     "engram_n_heads": int(need("ple.heads_per_ngram")),
+                     "engram_head_dim": int(need("embedding_length_per_layer_input")),
+                     "engram_pad_token_id": int(meta.get(p + "engram.pad_token_id", 2)),
+                     "engram_vocab_size": int(meta.get(p + "engram.vocab_size", 0)),
+                     "engram_compressed_vocab_size": int(meta.get(p + "engram.compressed_vocab_size", 0))})
+    return {"architectures": ["DeepseekV41ForConditionalGeneration"], "model_type": "deepseek_v41",
+            "bos_token_id": int(meta.get("tokenizer.ggml.bos_token_id", 0)),
+            "eos_token_id": int(meta.get("tokenizer.ggml.eos_token_id", 1)), "text_config": text}
+
+
 def deepseek41_config(meta, tensors, overrides=None):
-    """DeepSeek V4.1 (antirez's deepseek41): the file carries the checkpoint's config.json
-    whole (deepseek41.config), and the engine reads it as it is. The model's layers are
-    the blocks with attention (no MTP block in these files)."""
-    raw = meta.get("deepseek41.config") or sys.exit("GGUF metadata lacks deepseek41.config")
-    cfg = json.loads(raw)
+    """DeepSeek V4.1: antirez's deepseek41 carries the checkpoint's config.json whole
+    (deepseek41.config), and the engine reads it as it is; the published K-quant and IQ files have its keys
+    (deepseek41_meta_config). The model's layers are the blocks with attention (no MTP
+    block in these files)."""
+    raw = meta.get("deepseek41.config")
+    cfg = json.loads(raw) if raw else deepseek41_meta_config(meta, tensors)
     text = cfg.get("text_config", cfg)
     layers = int(text["num_hidden_layers"])
     present = sum(1 for b in range(layers + 8) if f"blk.{b}.attn_q_a.weight" in tensors)
@@ -533,6 +608,8 @@ def deepseek41_engram(meta, cfg):
     ids = list(t.get("engram_layer_ids") or [])
     if not ids:
         return None
+    if "deepseek41.engram.primes" not in meta and "deepseek41.ple.layers" in meta:
+        return deepseek41_ple_engram(meta, t, ids)
     p = "deepseek41.engram."
     need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
     if list(need("layer_ids")) != ids:
@@ -559,6 +636,33 @@ def deepseek41_engram(meta, cfg):
             "pad_id": token_map[int(t.get("engram_pad_token_id", 2))], "layer_ids": ids,
             "num_embeddings": [int(x) for x in need("rows")], "primes": primes, "offsets": offsets,
             "multipliers": [[str(v) for v in mult_flat[i * n:(i + 1) * n]] for i in range(len(ids))],
+            "token_map": token_map}
+
+
+def deepseek41_ple_engram(meta, t, ids):
+    """The sidecar from the published deepseek41 GGUFs' keys: every table in one tensor
+    (per_layer_token_embd, the engine's engram.embed.weight) whose head_offsets run over all
+    of them, so a table's offsets are the file's and each layer reads the whole tensor."""
+    p = "deepseek41."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    n, heads = int(t["engram_max_ngram_size"]), int(t["engram_n_heads"])
+    per = (n - 1) * heads
+    sizes, offs = [int(x) for x in need("ple.head_vocab_sizes")], [int(x) for x in need("ple.head_offsets")]
+    mult = [int(x) for x in need("ple.layer_multipliers")]
+    if len(sizes) != len(ids) * per or len(offs) != len(sizes) or len(mult) != len(ids) * n:
+        sys.exit("deepseek41: the engram's head sizes, offsets and multipliers are not one set per table")
+    acc = 0
+    for k, (sz, off) in enumerate(zip(sizes, offs)):
+        if off != acc:
+            sys.exit(f"deepseek41: engram head {k} starts at row {off}, the heads before it end at {acc}")
+        acc += sz
+    token_map = [int(x) for x in need("engram.token_map")]
+    return {"max_ngram_size": n, "n_heads": heads, "head_dim": int(t["engram_head_dim"]),
+            "pad_id": token_map[int(t.get("engram_pad_token_id", 2))], "layer_ids": ids,
+            "num_embeddings": [sum(sizes[i * per:(i + 1) * per]) for i in range(len(ids))],
+            "primes": [[sizes[i * per + k * heads:i * per + (k + 1) * heads] for k in range(n - 1)] for i in range(len(ids))],
+            "offsets": [offs[i * per:(i + 1) * per] for i in range(len(ids))],
+            "multipliers": [[str(v) for v in mult[i * n:(i + 1) * n]] for i in range(len(ids))],
             "token_map": token_map}
 
 

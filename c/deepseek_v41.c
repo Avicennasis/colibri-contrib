@@ -906,6 +906,8 @@ typedef struct {
     int fd_w, fd_s;
     int64_t off_w, off_s, rows;
     int inline_scales;   /* a GGUF's table: each row its head_dim e4m3 then its scales, one read */
+    int gt;              /* a published GGUF's table: rows of this ggml type, rb bytes each (-1: e4m3) */
+    int64_t rb;
     /* row cache: open addressing on the row id, LRU by a clock */
     int cap, mask;
     int64_t *key;      /* row id, -1 for empty */
@@ -1020,6 +1022,23 @@ static void engram_table_open(EngramTable *t, shards *S, int layer, int head_dim
     st_tensor *w = st_find(S, name);
     snprintf(name, sizeof(name), "layers.%d.engram.embed.scale", layer);
     st_tensor *s = st_find(S, name);
+    t->gt = -1; t->rb = 0;
+    st_tensor *g = w ? NULL : st_find(S, "engram.embed.weight");
+    if (g && st_is_ggml(g->dtype)) {
+        /* the published deepseek41 GGUFs (per_layer_token_embd): one table of every layer's heads,
+         * its rows a ggml type; the sidecar's offsets index it whole, so each layer opens
+         * all of it */
+        t->gt = st_ggml_type(g->dtype); t->rb = gq_row_bytes(t->gt, head_dim);
+        if (head_dim <= 0 || t->rb <= 0 || t->rb > 4 * head_dim + 64 || g->nbytes % t->rb) {
+            fprintf(stderr, "[engram] the %s table of %lld bytes is not whole rows of %d\n",
+                    gq_type_name(t->gt), (long long)g->nbytes, head_dim);
+            exit(1);
+        }
+        t->fd_w = t->fd_s = g->fd; t->off_w = t->off_s = g->off;
+        t->rows = g->nbytes / t->rb; t->inline_scales = 0;
+        if (g_v41_dry) { v41_used(S, g); cache_rows = 1; }
+        goto cache;
+    }
     t->inline_scales = w && !s;   /* a GGUF (st_gguf.h): the scales at the end of each row */
     if (!w || (!s && !t->inline_scales)) { fprintf(stderr, "[engram] layer %d has no table\n", layer); exit(1); }
     /* SEC: engram_row() reads row `id` at id * head_dim bytes into the table and at
@@ -1052,6 +1071,7 @@ static void engram_table_open(EngramTable *t, shards *S, int layer, int head_dim
         t->rows = w->nbytes / head_dim;
     }
     if (g_v41_dry) { v41_used(S, w); v41_used(S, s); cache_rows = 1; }
+cache:;
     int cap = 1;
     while (cap < cache_rows) cap <<= 1;
     t->cap = cap; t->mask = cap - 1;
@@ -1088,9 +1108,17 @@ static const float *engram_row(EngramTable *t, int64_t id, int head_dim) {
 fill:
     t->misses++;
     {
-        uint8_t row[512 + 64], *bytes = row, *scales = row + 512;
+        uint8_t row[2048 + 128], *bytes = row, *scales = row + 512;
         if (head_dim > 512 || groups > 64) {
             fprintf(stderr, "[engram] head_dim %d exceeds the row buffer\n", head_dim); exit(1); }
+        if (t->gt >= 0) {   /* a ggml row (the open checked rb against the buffer) */
+            float *out = t->value + (size_t)victim * head_dim;
+            st_pread_full(t->fd_w, row, (size_t)t->rb, t->off_w + id * t->rb, "engram row");
+            if (gq_dequant_row(t->gt, row, out, head_dim)) {
+                fprintf(stderr, "[engram] no row reader for ggml type %s\n", gq_type_name(t->gt)); exit(1); }
+            t->key[victim] = id; t->used[victim] = ++t->clock;
+            return out;
+        }
         if (t->inline_scales) {
             st_pread_full(t->fd_w, row, head_dim + groups, t->off_w + id * (head_dim + groups), "engram row");
             scales = row + head_dim;
@@ -2352,8 +2380,18 @@ static void model_load(Model *m, const char *snap, int ecap, int engram_cache_ro
             engram_table_open(&e->table[t], &m->S, layer, e->head_dim, engram_cache_rows);
             wf_load(&m->S, &m->L[layer].eng_q, NAME("layers.%d.engram.q_weight", layer),
                     (int64_t)hc * dim);
-            wf_load(&m->S, &m->L[layer].eng_k, NAME("layers.%d.engram.k_weight", layer),
-                    (int64_t)hc * dim);
+            /* the published deepseek41 GGUFs keep q_weight * k_weight as one (engram_gate, also named
+             * engram.gate here): the gate reads them only as that product, so k is ones there */
+            st_tensor *gate = st_find(&m->S, NAME("layers.%d.engram.gate", layer));
+            if (st_find(&m->S, NAME("layers.%d.engram.k_weight", layer)) || !gate)
+                wf_load(&m->S, &m->L[layer].eng_k, NAME("layers.%d.engram.k_weight", layer),
+                        (int64_t)hc * dim);
+            else {
+                WF *k = &m->L[layer].eng_k;
+                if (g_v41_dry) v41_used(&m->S, gate);   /* read as q_weight */
+                k->n = (int64_t)hc * dim; k->w = xmalloc((size_t)k->n * sizeof(float), "engram k ones");
+                for (int64_t i = 0; i < k->n; i++) k->w[i] = 1.0f;
+            }
         }
     }
 #ifdef COLI_VULKAN

@@ -566,6 +566,75 @@ class DeepSeek41Config(unittest.TestCase):
         self.assertEqual(resident("blk.1.engram_kv.weight", 1000, {}), 1000)             # its projection is resident
 
 
+class DeepSeek41LlamaConfig(unittest.TestCase):
+    """The published deepseek41 GGUFs (K-quant and IQ types): no deepseek41.config, so the
+    checkpoint's text_config from the keys, and the sidecar from the ple keys, whose head offsets
+    run over every table in one tensor (per_layer_token_embd); the planner keeps it on disk."""
+    P = "deepseek41."
+
+    def meta(self, **over):
+        p = self.P
+        m = {p + k: v for k, v in {
+            "block_count": 2, "context_length": 1048576, "embedding_length": 256, "attention.head_count": 4,
+            "attention.head_count_kv": 1, "attention.key_length": 64, "rope.dimension_count": 16,
+            "attention.q_lora_rank": 32, "attention.output_lora_rank": 32, "attention.output_group_count": 2,
+            "attention.layer_norm_rms_epsilon": 1e-20, "expert_count": 8, "expert_used_count": 2,
+            "expert_feed_forward_length": 64, "expert_shared_count": 1, "expert_weights_scale": 1.5,
+            "expert_weights_norm": True, "expert_gating_func": 4, "swiglu_clamp_exp": [10.0, 10.0],
+            "attention.sliding_window": 128, "attention.compress_ratios": [0, 2, 0], "attention.compress_rope_freq_base": 160000.0,
+            "attention.kv_source_layers": [1], "attention.indexer.source_layers": [1],
+            "attention.indexer.head_count": 2, "attention.indexer.key_length": 32, "attention.indexer.top_k": 16,
+            "attention.indexer.candidate_source_layer": 1, "attention.indexer.candidate_top_k_blocks": 4,
+            "attention.indexer.candidate_block_size": 8, "hyper_connection.count": 4,
+            "hyper_connection.sinkhorn_iterations": 20, "hyper_connection.epsilon": 1e-6,
+            "rope.scaling.type": "yarn", "rope.scaling.factor": 16.0, "rope.scaling.original_context_length": 65536,
+            "ple.layers": [0, 1], "ple.ngram_size": 3, "ple.heads_per_ngram": 2, "embedding_length_per_layer_input": 32,
+            "ple.head_vocab_sizes": [97, 101, 103, 107, 109, 113, 127, 131],
+            "ple.head_offsets": [0, 97, 198, 301, 408, 517, 630, 757],
+            "ple.layer_multipliers": [76632096046245, 4839876093313, 35959672319349, 73987337458391, 67716810739261, 51510806800915],
+            "engram.pad_token_id": 2, "engram.token_map": [0, 1, 5, 3]}.items()}
+        m.update({p + k: v for k, v in over.items()})
+        return m
+
+    TENSORS = {"token_embd.weight": {"dims": [256, 1000]}, "output.weight": {"dims": [256, 1000]},
+               **{f"blk.{b}.attn_q_a.weight": {} for b in range(2)}}
+
+    def test_config_and_sidecar(self):
+        import tools.gguf_import as gi
+        cfg, layers = gi.deepseek41_config(self.meta(), self.TENSORS)
+        t = cfg["text_config"]
+        self.assertEqual((layers, cfg["model_type"], t["num_hidden_layers"], t["vocab_size"]), (2, "deepseek_v41", 2, 1000))
+        self.assertEqual((t["hidden_size"], t["head_dim"], t["qk_rope_head_dim"], t["o_groups"], t["o_lora_rank"]), (256, 64, 16, 2, 32))
+        self.assertEqual((t["n_routed_experts"], t["num_experts_per_tok"], t["routed_scaling_factor"], t["swiglu_limit"]), (8, 2, 1.5, 10.0))
+        self.assertEqual((t["kv_source_layer_ids"], t["index_source_layer_ids"], t["candidate_source_layer_id"]), ([1], [1], 1))
+        self.assertEqual((t["rms_norm_eps"], t["hc_mult"], t["compress_ratios"]), (1e-20, 4, [0, 2, 0]))
+        self.assertEqual(t["rope_scaling"]["factor"], 16.0)
+        self.assertEqual((t["engram_layer_ids"], t["engram_max_ngram_size"], t["engram_n_heads"], t["engram_head_dim"]), ([0, 1], 3, 2, 32))
+        e = gi.deepseek41_engram(self.meta(), cfg)
+        self.assertEqual(e["primes"], [[[97, 101], [103, 107]], [[109, 113], [127, 131]]])
+        self.assertEqual(e["offsets"], [[0, 97, 198, 301], [408, 517, 630, 757]])   # the one tensor's rows
+        self.assertEqual(e["num_embeddings"], [408, 480])
+        self.assertEqual(e["multipliers"], [["76632096046245", "4839876093313", "35959672319349"],
+                                            ["73987337458391", "67716810739261", "51510806800915"]])
+        self.assertEqual(e["pad_id"], 5)
+
+    def test_inconsistent_metadata_is_refused(self):
+        import tools.gguf_import as gi
+        cfg, _ = gi.deepseek41_config(self.meta(), self.TENSORS)
+        for over in ({"ple.head_offsets": [0, 97, 198, 301, 408, 517, 630, 758]}, {"ple.head_vocab_sizes": [97, 101, 103]},
+                     {"ple.layer_multipliers": [1, 3, 5]}):
+            with self.assertRaises(SystemExit, msg=over):
+                gi.deepseek41_engram(self.meta(**over), cfg)
+        with self.assertRaises(SystemExit):
+            gi.deepseek41_config(self.meta(expert_gating_func=1), self.TENSORS)
+
+    def test_planner_keeps_the_table_on_disk(self):
+        from family_registry import _dsv41_resident_inventory as resident
+        self.assertEqual(resident("per_layer_token_embd.weight", 10 ** 11, {}), 0)
+        self.assertEqual(resident("engram.embed.weight", 10 ** 11, {}), 0)
+        self.assertEqual(resident("blk.1.engram_gate.weight", 1000, {}), 1000)
+
+
 class OlmoeConfig(unittest.TestCase):
     """llama.cpp's olmoe as the olmoe engine's config.json, from the metadata llama.cpp's
     converter writes for OLMoE-1B-7B: no norm_topk_prob in the file, so false, as the official

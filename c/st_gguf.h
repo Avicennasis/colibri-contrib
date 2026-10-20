@@ -77,10 +77,14 @@ static const st_gg_name st_gg_dsv4_layer[] = {
 /* DeepSeek V4.1 (deepseek41, antirez's format): V4's names plus the engram's and the
  * router's second bias, under the names of DeepSeek's checkpoint, which deepseek_v41.c reads.
  * An engram table comes as one tensor of 264-byte rows (256 e4m3 then 8 e8m0), the
- * checkpoint's embed.weight and embed.scale side by side; the engine reads both forms. */
+ * checkpoint's embed.weight and embed.scale side by side; the engine reads both forms.
+ * The published deepseek41 GGUFs (K-quant and IQ types) have the same names, with
+ * every engram table in one per_layer_token_embd of a ggml type and the engram's
+ * q_weight * k_weight as one engram_gate. */
 static const st_gg_name st_gg_dsv41_glob[] = {
     {"token_embd.weight", "embed.weight"}, {"output_norm.weight", "norm.weight"},
     {"output.weight", "head.weight"},
+    {"per_layer_token_embd.weight", "engram.embed.weight"},   /* the published GGUFs': every engram table in one */
     {NULL, NULL}};
 static const st_gg_name st_gg_dsv41_layer[] = {
     {"hc_attn_fn.weight", "hc_attn_fn"}, {"hc_attn_base.weight", "hc_attn_base"},
@@ -108,6 +112,7 @@ static const st_gg_name st_gg_dsv41_layer[] = {
     {"ffn_up_exps.weight", "ffn.experts.%d.w3.weight"},
     {"engram_q_norm.weight", "engram.q_weight"}, {"engram_k_norm.weight", "engram.k_weight"},
     {"engram_kv.weight", "engram.wkv.weight"}, {"engram_embd.weight", "engram.embed.weight"},
+    {"engram_gate.weight", "engram.q_weight|engram.gate"},   /* the published GGUFs': q_weight * k_weight */
     {NULL, NULL}};
 
 /* Inkling (inkling): conversion/inkling.py of llama.cpp's PR (TML checkpoint names), here
