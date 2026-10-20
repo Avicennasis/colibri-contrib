@@ -123,9 +123,19 @@ static G53Chain *g53c_of(int d) { return d ? g_g53c2 : g_g53c; }
 static const char *g53c_name(const G53Chain *ch) { return ch && ch->d ? "glm53 dev2" : "glm53"; }
 static int g53c_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2"); return !(e && *e == '0'); }
 
+/* A GGUF matrix's device format: its blocks as the file has them (100 + the ggml type; the
+ * CPU's rows interleaved by 16 go back to the file's), where the backend has a block form
+ * for that type; -1 none. */
+static int g53c_gq_fmt(const Mat *w) {
+    if (w->fmt != G53_GGML || !w->q4 || w->rows < 1 || w->columns < 1) return -1;
+    const int b = gq_r16_base(w->gs), t = b >= 0 ? b : w->gs, be = coli_vk_block_elems(100 + t);
+    if (b >= 0 && w->rows % 16) return -1;   /* gq_r16_unpack gives whole groups back */
+    if (w->vk_hgemv) return 10;              /* the MLA's per-head matrices: dequantized, as floats */
+    return be > 0 && w->columns % be == 0 ? 100 + t : -1;
+}
 /* A Mat's device copy (the per-matrix path's own, where it made one); f32 as bf16 or f16 where
- * that holds it exactly, else fmt 10. The second device's layers hold theirs there
- * (g_g53c_dev at setup). */
+ * that holds it exactly, else fmt 10; a GGUF's blocks as the file has them. The second
+ * device's layers hold theirs there (g_g53c_dev at setup). */
 static ColiVkTensor *g53c_tensor(const Mat *wc) {
     Mat *w = (Mat *)wc;
     if (w->vk) return (ColiVkTensor *)w->vk;
@@ -136,6 +146,32 @@ static ColiVkTensor *g53c_tensor(const Mat *wc) {
         return coli_vk_tensor_ensure_f32((ColiVkTensor **)&w->vk, w->f, w->columns, w->rows, g_g53c_dev) ? (ColiVkTensor *)w->vk : NULL;
     case 1: fmt = 1; p = w->q8; break;
     case 4: if (w->gs < 8 || w->gs % 8) return NULL; fmt = 4; p = w->q4; break;
+    case G53_GGML: {
+        int f = g53c_gq_fmt(w);
+        if (f < 0) return NULL;
+        const int b = gq_r16_base(w->gs), t = b >= 0 ? b : w->gs;
+        uint8_t *rows = NULL;   /* rows interleaved by 16 for the CPU: the file's back */
+        if (b >= 0) {
+            if (!(rows = malloc((size_t)gq_row_bytes(t, w->columns) * (size_t)w->rows))) return NULL;
+            gq_r16_unpack(w->gs, rows, w->q4, w->rows, w->columns);
+        }
+        if (f == 10) {   /* dequantized: the floats the CPU's rows hold */
+            const uint8_t *src = rows ? rows : w->q4;
+            const int64_t rb = gq_row_bytes(t, w->columns);
+            float *fl = malloc((size_t)w->rows * (size_t)w->columns * sizeof(float));
+            if (!fl) { free(rows); return NULL; }
+            for (int r = 0; r < w->rows; r++) gq_dequant_row(t, src + (int64_t)r * rb, fl + (size_t)r * w->columns, w->columns);
+            free(rows);
+            int ok = coli_vk_tensor_ensure_f32((ColiVkTensor **)&w->vk, fl, w->columns, w->rows, g_g53c_dev);
+            free(fl);
+            return ok ? (ColiVkTensor *)w->vk : NULL;
+        }
+        const void *src = rows ? (const void *)rows : (const void *)w->q4;
+        int ok = g_g53c_dev ? coli_vk_tensor_ensure2((ColiVkTensor **)&w->vk, src, NULL, f, w->columns, w->rows, 0)
+                            : coli_vk_tensor_ensure((ColiVkTensor **)&w->vk, src, NULL, f, w->columns, w->rows, 0);
+        free(rows);
+        return ok ? (ColiVkTensor *)w->vk : NULL;
+    }
     default: return NULL;
     }
     if (!p || w->rows < 1 || w->columns < 1) return NULL;
@@ -215,6 +251,7 @@ static int g53c_form(const Mat *w, int *gs) {
     case 0: return w->f ? coli_vk_f32_fmt(w->f, (size_t)w->rows * w->columns) : -1;
     case 1: return w->q8 ? 1 : -1;
     case 4: if (w->gs < 8 || w->gs % 8 || !w->q4) return -1; *gs = w->gs; return 4;
+    case G53_GGML: return g53c_gq_fmt(w);
     default: return -1;
     }
 }

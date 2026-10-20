@@ -679,6 +679,8 @@ typedef struct {
      * (g53_dho_reload); vk_gone = 1 while the device holds it alone */
     char *vk_name;
     int vk_kind, vk_gone;
+    int vk_hgemv;                         /* read per head by the chain's MLA (k_b, v_b): a GGUF's goes up
+                                           * dequantized, which that op reads (glm53_chain.h) */
 } Mat;
 
 enum { G53_GGML = 32 };
@@ -924,6 +926,7 @@ static void absorb_kvb(GModel *m, GLayer *l, const char *name) {
             if (st_find(&m->S, kb) && st_find(&m->S, vb)) {
                 l->kvb_kt = load_mat(m, (int64_t)H * L, QK, "%s", kb);
                 l->kvb_v = load_mat(m, (int64_t)H * V, L, "%s", vb);
+                l->kvb_kt.vk_hgemv = l->kvb_v.vk_hgemv = 1;
                 return;
             }
         }
@@ -2172,11 +2175,11 @@ static void expert_mats(const GModel *m, int layer, const Slot *slot, Mat *gate,
     }
     const Mat shape[3] = {
         { 4, NULL, NULL, slot->piece[0], (const float *)slot->piece[1],
-          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0 },
+          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, 0 },
         { 4, NULL, NULL, slot->piece[2], (const float *)slot->piece[3],
-          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0 },
+          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, 0 },
         { 4, NULL, NULL, slot->piece[4], (const float *)slot->piece[5],
-          hidden, inter, 64, NULL, 0, NULL, NULL, 0, 0 },
+          hidden, inter, 64, NULL, 0, NULL, NULL, 0, 0, 0 },
     };
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
