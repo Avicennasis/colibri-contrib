@@ -1672,61 +1672,98 @@ static int hy_threads(void) {   /* the CPU's team: COLI_VK_HYBRID_THREADS, else 
     return 1;
 #endif
 }
-/* a row of type t (I inputs) against act a's one row: the CPU's integer form, or with
- * GQ_EXACT=1 its float reference (gq_dequant_row), as its own matmuls would take it */
-static inline void host_row(float *y, const gq_act *a, const float *xf, const uint8_t *row, int t, int I, float *tmp) {
-    if (!gq_exact_mode()) { gq_row_all(y, 1, a, row, t, I); return; }
-    double acc = 0; gq_dequant_row(t, row, tmp, I);
-    for (int i = 0; i < I; i++) acc += (double)tmp[i] * xf[i];
-    *y = (float)acc;
+/* a row of type t (I inputs) against act a's rows (xf[s] their floats): the CPU's integer
+ * form, or with GQ_EXACT=1 its float reference (gq_dequant_row), as its own matmuls would
+ * take it. Each activation row its own dot, the same bits whatever rows share the call. */
+static inline void host_rows(float *y, int ys, const gq_act *a, const float *const *xf, const uint8_t *row, int t, int I, float *tmp) {
+    if (!gq_exact_mode()) { gq_row_all(y, ys, a, row, t, I); return; }
+    gq_dequant_row(t, row, tmp, I);
+    for (int s = 0; s < a->S; s++) {
+        double acc = 0; const float *x = xf[s];
+        for (int i = 0; i < I; i++) acc += (double)tmp[i] * x[i];
+        y[(size_t)s * ys] = (float)acc;
+    }
+}
+typedef struct { const uint8_t *g; int p; } HyKey;
+static int hy_key_cmp(const void *a, const void *b) {
+    const HyKey *x = a, *y = b;
+    if (x->g != y->g) return (uintptr_t)x->g < (uintptr_t)y->g ? -1 : 1;
+    return x->p - y->p;
 }
 int vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
                    float limit, int nt, float *gu, float *hh, float *dn) {
     if (np < 1) return 1;
-    int err = 0, nx = 0, *xa = malloc((size_t)np * sizeof(int));
-    gq_act *ax = calloc((size_t)np, sizeof(gq_act)), *ah = calloc((size_t)np, sizeof(gq_act));
-    if (!xa || !ax || !ah) { free(xa); free(ax); free(ah); return 0; }
-    for (int p = 0; p < np; p++) {   /* a row's activation once: the pairs of a row share it */
-        int q = 0;
-        while (q < p && xr[q] != xr[p]) q++;
-        if (q < p) { xa[p] = xa[q]; continue; }
-        xa[p] = nx;
-        if (gq_act_set(&ax[nx++], xr[p], 1, D)) err = 1;
+    /* The pairs of one expert side by side (q: their place in ord), a group reading the
+     * expert's rows once for all of its pairs: a prompt step's experts of a few rows, or the
+     * rows of a decode step's draft that share one. gu and hh go in that order, dn in p's. */
+    int err = 0, nx = 0, ng = 0, ident = 1;
+    int *xa = malloc((size_t)np * sizeof(int)), *ord = malloc((size_t)np * sizeof(int)), *gs = malloc((size_t)(np + 1) * sizeof(int)),
+        *gx = malloc((size_t)np * sizeof(int));
+    HyKey *key = malloc((size_t)np * sizeof(HyKey));
+    const float **xo = malloc((size_t)np * sizeof(float *)), **ho = malloc((size_t)np * sizeof(float *));
+    gq_act ax = {0}, *ag = calloc((size_t)np, sizeof(gq_act)), *ah = calloc((size_t)np, sizeof(gq_act));
+    float *xb = NULL, *dq = NULL;
+    if (!xa || !ord || !gs || !gx || !key || !xo || !ho || !ag || !ah) { err = 2; goto out; }
+    for (int p = 0; p < np; p++) key[p] = (HyKey){hx[p]->g, p};
+    qsort(key, (size_t)np, sizeof(HyKey), hy_key_cmp);
+    for (int q = 0; q < np; q++) {
+        ord[q] = key[q].p; ident &= ord[q] == q;
+        if (!q || key[q].g != key[q - 1].g) gs[ng++] = q;
+        xo[q] = xr[ord[q]]; ho[q] = hh + (size_t)q * I;
     }
-    /* gate and up of every pair, the activation, then down: one parallel region, the
+    gs[ng] = np;
+    for (int p = 0; p < np; p++) {   /* a row's activation once: the pairs of a row share it */
+        int r = 0;
+        while (r < p && xr[r] != xr[p]) r++;
+        xa[p] = r < p ? xa[r] : nx++;
+    }
+    if (!(xb = malloc((size_t)nx * D * sizeof(float))) || (!ident && !(dq = malloc((size_t)np * D * sizeof(float))))) { err = 2; goto out; }
+    for (int p = 0; p < np; p++) memcpy(xb + (size_t)xa[p] * D, xr[p], (size_t)D * sizeof(float));
+    if (gq_act_set(&ax, xb, nx, D)) { err = 1; goto out; }
+    for (int g = 0; g < ng && !err; g++) {   /* each group's rows of ax */
+        for (int q = gs[g]; q < gs[g + 1]; q++) gx[q - gs[g]] = xa[ord[q]];
+        if (gq_act_gather(&ag[g], &ax, gx, gs[g + 1] - gs[g])) err = 2;
+    }
+    if (err) goto out;
+    float *dy = dq ? dq : dn;
+    /* gate and up of every group, the activation, then down: one parallel region, the
      * rows handed out in chunks (the cores of a hybrid CPU do not run at one speed) */
     #pragma omp parallel num_threads(nt > 0 ? nt : hy_threads())
     {
         float *tmp = gq_exact_mode() ? malloc((size_t)(D > I ? D : I) * sizeof(float)) : NULL;
         #pragma omp for schedule(dynamic, 32)
-        for (int r = 0; r < np * 2 * I; r++) {
-            int p = r / (2 * I), o = r % (2 * I); const VktHostExpert *h = hx[p];
+        for (int64_t r = 0; r < (int64_t)ng * 2 * I; r++) {
+            const int g = (int)(r / (2 * I)), o = (int)(r % (2 * I)), q0 = gs[g]; const VktHostExpert *h = hx[ord[q0]];
             const uint8_t *row = o < I ? h->g + (size_t)o * h->rgu : h->u + (size_t)(o - I) * h->rgu;
-            host_row(gu + (size_t)p * 2 * I + o, &ax[xa[p]], xr[p], row, h->tg, D, tmp);
+            host_rows(gu + (size_t)q0 * 2 * I + o, 2 * I, &ag[g], xo + q0, row, h->tg, D, tmp);
         }
         #pragma omp for schedule(static)
-        for (int p = 0; p < np; p++) {
-            const float *g = gu + (size_t)p * 2 * I, *u = g + I; float *h = hh + (size_t)p * I;
+        for (int q = 0; q < np; q++) {
+            const float *g = gu + (size_t)q * 2 * I, *u = g + I; float *h = hh + (size_t)q * I;
             for (int o = 0; o < I; o++) {
                 float gv = g[o], uv = u[o];
                 if (limit > 0.f) { gv = gv < limit ? gv : limit; uv = uv < -limit ? -limit : uv > limit ? limit : uv; }
                 h[o] = gv / (1.f + expf(-gv)) * uv;
             }
-            if (gq_act_set(&ah[p], h, 1, I)) {
+        }
+        #pragma omp for schedule(static)
+        for (int g = 0; g < ng; g++)
+            if (gq_act_set(&ah[g], hh + (size_t)gs[g] * I, gs[g + 1] - gs[g], I)) {
                 #pragma omp atomic write
                 err = 1;
             }
-        }
         #pragma omp for schedule(dynamic, 64)
-        for (int r = 0; r < np * D; r++) {
-            int p = r / D, o = r % D; const VktHostExpert *h = hx[p];
-            host_row(dn + (size_t)p * D + o, &ah[p], hh + (size_t)p * I, h->d + (size_t)o * h->rd, h->td, I, tmp);
+        for (int64_t r = 0; r < (int64_t)ng * D; r++) {
+            const int g = (int)(r / D), o = (int)(r % D), q0 = gs[g]; const VktHostExpert *h = hx[ord[q0]];
+            host_rows(dy + (size_t)q0 * D + o, D, &ah[g], ho + q0, h->d + (size_t)o * h->rd, h->td, I, tmp);
         }
         free(tmp);
     }
-    for (int k = 0; k < nx; k++) gq_act_free(&ax[k]);
-    for (int p = 0; p < np; p++) gq_act_free(&ah[p]);
-    free(xa); free(ax); free(ah);
+    if (dq && !err) for (int q = 0; q < np; q++) memcpy(dn + (size_t)ord[q] * D, dq + (size_t)q * D, (size_t)D * sizeof(float));
+out:
+    gq_act_free(&ax);
+    for (int g = 0; ag && ah && g < np; g++) { gq_act_free(&ag[g]); gq_act_free(&ah[g]); }
+    free(xa); free(ord); free(gs); free(gx); free(key); free(xo); free(ho); free(ag); free(ah); free(xb); free(dq);
     return !err;
 }
 /* room for n pairs of the step (hy_of) and for np of them on the CPU */

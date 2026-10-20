@@ -54,7 +54,12 @@
  *            batch with staged uploads, the CPU through the mapping otherwise) and computed
  *            there, those of at most COLI_VK_HYBRID_BIG_ROWS rows (2) by the CPU in place at
  *            the join, every row the reference's; COLI_VK_TIER_POOL_COPY=0 and
- *            COLI_VK_HYBRID_BIG_ROWS=0 read them in place.
+ *            COLI_VK_HYBRID_BIG_ROWS=0 read them in place;
+ *   host pairs vkt_host_pairs on the CPU alone (Q4_K/Q6_K and IQ2_XXS/IQ3_XXS experts): the
+ *            pairs of one expert computed together give the bits of each pair computed on its
+ *            own, and the dequantized reference within the form's error. Here the float form
+ *            (GQ_EXACT=1, which vk_tier.c read once, at hybrid's first pair); with the
+ *            argument host-pairs, alone and before anything reads it, the integer form.
  *
  *   make tests/test_vk_tier VK=1 && VK_ICD_FILENAMES=.../lvp_icd.json ./tests/test_vk_tier */
 #include <stdio.h>
@@ -1326,6 +1331,56 @@ static unsigned long long hy_pairs(const char *line) {
     p = strstr(p, "steps, ");
     return p ? strtoull(p + 7, NULL, 10) : ~0ull;
 }
+/* vkt_host_pairs alone: 12 pairs of three experts over five rows, all at once (an expert's
+ * pairs grouped, its rows read once) and one by one; the same bits, and the float reference
+ * within tol (the float form's or the integer form's error, whichever vk_tier.c computes) */
+static void host_pairs_case(double tol) {
+    enum { HP = 512, FP = 256, NE = 3, NR = 5, NP = 12 };
+    static const int pe[NP] = {0, 1, 2, 0, 1, 0, 2, 1, 0, 2, 2, 1}, pr[NP] = {0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 4, 4};
+    static const int ty[2][2] = {{GQ_Q4_K, GQ_Q6_K}, {GQ_IQ2_XXS, GQ_IQ3_XXS}};
+    static const char *nm[2] = {"Q4_K/Q6_K", "IQ2_XXS/IQ3_XXS"};
+    for (int c = 0; c < 2; c++) {
+        VktFmt gu = {(VktSrc)(VKT_SRC_GGML + ty[c][0]), 0}, dn = {(VktSrc)(VKT_SRC_GGML + ty[c][1]), 0};
+        Ex xe[NE]; VktHostExpert hv[NE], hp[NP]; const VktHostExpert *hx[NP]; const float *xr[NP];
+        for (int e = 0; e < NE; e++) {
+            mat_make_block(&xe[e].g, gu, HP, FP); mat_make_block(&xe[e].u, gu, HP, FP); mat_make_block(&xe[e].d, dn, FP, HP);
+            hv[e] = (VktHostExpert){xe[e].g.codes, xe[e].u.codes, xe[e].d.codes, ty[c][0], ty[c][1],
+                                    gq_row_bytes(ty[c][0], HP), gq_row_bytes(ty[c][1], FP)};
+        }
+        float *x = malloc((size_t)NR * HP * sizeof(float)), *gs = malloc((size_t)NP * 2 * FP * sizeof(float)),
+              *hs = malloc((size_t)NP * FP * sizeof(float)), *all = malloc((size_t)NP * HP * sizeof(float)),
+              *one = malloc((size_t)NP * HP * sizeof(float));
+        for (int i = 0; i < NR * HP; i++) x[i] = frnd();
+        for (int p = 0; p < NP; p++) { hp[p] = hv[pe[p]]; hx[p] = &hp[p]; xr[p] = x + (size_t)pr[p] * HP; }
+        int ok = vkt_host_pairs(hx, xr, NP, HP, FP, 0.f, 3, gs, hs, all);
+        for (int p = 0; p < NP && ok; p++) ok = vkt_host_pairs(&hx[p], &xr[p], 1, HP, FP, 0.f, 2, gs, hs, one + (size_t)p * HP);
+        CHECK(ok, "host pairs %s: vkt_host_pairs failed", nm[c]);
+        int diff = ok ? memcmp(all, one, (size_t)NP * HP * sizeof(float)) != 0 : 1;
+        double worst = 0;
+        float *hr = malloc((size_t)FP * sizeof(float));
+        for (int p = 0; p < NP && ok; p++) {   /* the float reference from the dequantized rows */
+            const Ex *m = &xe[pe[p]]; const float *xi = xr[p]; double mx = 0, er = 0;
+            for (int o = 0; o < FP; o++) {
+                double g = 0, u = 0;
+                for (int i = 0; i < HP; i++) { g += (double)m->g.w[(size_t)o * HP + i] * xi[i]; u += (double)m->u.w[(size_t)o * HP + i] * xi[i]; }
+                hr[o] = (float)(g / (1.0 + exp(-g)) * u);
+            }
+            for (int o = 0; o < HP; o++) {
+                double y = 0;
+                for (int i = 0; i < FP; i++) y += (double)m->d.w[(size_t)o * FP + i] * hr[i];
+                if (fabs(y) > mx) mx = fabs(y);
+                if (fabs(y - all[(size_t)p * HP + o]) > er) er = fabs(y - all[(size_t)p * HP + o]);
+            }
+            if (mx > 0 && er / mx > worst) worst = er / mx;
+        }
+        printf("  %-16s %d pairs of %d experts: grouped %s one by one, worst relative error %.2e against the float reference\n",
+               nm[c], NP, NE, diff ? "DIFFERS from" : "the same bits as", worst);
+        CHECK(!diff, "host pairs %s: the grouped pairs are not the bits of each on its own", nm[c]);
+        CHECK(worst < tol, "host pairs %s: relative error %.3g", nm[c], worst);
+        free(x); free(gs); free(hs); free(all); free(one); free(hr);
+        for (int e = 0; e < NE; e++) { mat_free(&xe[e].g); mat_free(&xe[e].u); mat_free(&xe[e].d); }
+    }
+}
 static void hybrid_case(void) {
     const int H0 = H, F0 = F;
     H = 512; F = 256;   /* whole blocks of 256 */
@@ -1461,6 +1516,12 @@ static void pool_copy_case(void) {
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
+    if (argc > 2 && !strcmp(argv[2], "host-pairs")) {   /* the CPU's integer form: no device, GQ_EXACT unread */
+        unsetenv("GQ_EXACT");
+        printf("host pairs, the integer form:\n"); host_pairs_case(5e-2);
+        printf(fails ? "FAIL (%d)\n" : "PASS\n", fails);
+        return fails != 0;
+    }
     /* a device that shares the host's RAM (Lavapipe) has a type for the host pool only with
      * COLI_VK_TIER_HOST=1 at the device's start (backend_vulkan.c): promote_case's pool */
     int host_set = getenv("COLI_VK_TIER_HOST") != NULL;
@@ -1486,6 +1547,7 @@ int main(int argc, char **argv) {
     printf("promote:\n"); promote_case();
     printf("hybrid:\n"); hybrid_case();
     printf("pool copy:\n"); pool_copy_case();
+    printf("host pairs:\n"); host_pairs_case(2e-3);
     ColiVkPoolStats ps, px; coli_vk_pool_stats(1, &ps); coli_vk_pool_stats(4, &px);
     CHECK(ps.live == 0 && px.live == 0, "%d + %d tier ranges still live after every shutdown", ps.live, px.live);
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */
