@@ -5744,6 +5744,29 @@ int coli_vk_tensor_copy(ColiVkTensor *const *dst, ColiVkTensor *const *src, int 
     pthread_mutex_unlock(&u->mx);
     return ok;
 }
+/* coli_vk_tensor_copy into tier tensors whose ranges hold their sources' (the streaming's
+ * slots, made by coli_vk_tier_tensor_pad with the room of every form): each takes its
+ * source's format and shape first, as coli_vk_tensor_refill_as does, then the copy engine
+ * fills it (staged uploads), or the CPU through the mapping (mapped memory). All n before
+ * this returns. 0 = a source not in the host pool, no room, or the copy failed. */
+int coli_vk_tensor_copy_as(ColiVkTensor *const *dst, ColiVkTensor *const *src, int n) {
+    if (!G.ready || n < 1) return 0;
+    for (int k = 0; k < n; k++) {
+        ColiVkTensor *t = dst[k]; const ColiVkTensor *f = src[k];
+        if (!t || !f || t->pool != &g_tpool || f->pool != &g_hpool || !f->wmap || !f->smap) return 0;
+        if (t->fmt != f->fmt || t->I != f->I || t->O != f->O || t->gs != f->gs) {
+            size_t sb = scale_floats(f->fmt, f->I, f->O, f->gs) * sizeof(float);
+            if (bd_fmt(f->fmt) != bd_fmt(t->fmt) || f->wbytes > t->wcap || sb > t->scap) return 0;   /* its sets name the table or its scales */
+            t->fmt = f->fmt; t->I = f->I; t->O = f->O; t->gs = f->gs; t->rowWords = f->rowWords; t->wbytes = f->wbytes;
+        }
+        if (!pool_staged(t->pool)) {   /* mapped: the rows and scales through the CPU */
+            if (!t->wmap || !t->smap) return 0;
+            memcpy(t->wmap, f->wmap, f->wbytes);
+            memcpy(t->smap, f->smap, scale_floats(f->fmt, f->I, f->O, f->gs) * sizeof(float));
+        }
+    }
+    return coli_vk_tensor_copy(dst, src, n);
+}
 /* A tier tensor filled again in place (a staging slot of the tier's streaming): mapped
  * memory hands its mapping back (the padding past each row is still the zeros of its
  * allocation, and the caller writes the rows only), staged uploads a fresh zeroed host

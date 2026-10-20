@@ -234,6 +234,11 @@ int    coli_vk_tensor_commit(ColiVkTensor *const *t, int n);
  * nothing. 0 = no room, no memory, or (the copy) the device is lost: free them. */
 int    coli_vk_tier_tensor_like(int dev, ColiVkTensor **t, const ColiVkTensor *src, size_t pad_w, size_t pad_s);
 int    coli_vk_tensor_copy(ColiVkTensor *const *dst, ColiVkTensor *const *src, int n);
+/* coli_vk_tensor_copy into tier tensors with room for their sources (the streaming's slots,
+ * coli_vk_tier_tensor_pad's): each takes its source's format and shape first, as
+ * coli_vk_tensor_refill_as does; with mapped memory the CPU copies. All n before it
+ * returns. 0 = a source not in the host pool, no room, or the copy failed. */
+int    coli_vk_tensor_copy_as(ColiVkTensor *const *dst, ColiVkTensor *const *src, int n);
 int    coli_vk_staged(void);   /* 1 = resident data goes to the device through staged uploads */
 size_t coli_vk_tensor_row_bytes(int fmt, int I);
 int coli_vk_block_elems(int fmt);   /* block formats (100 + ggml type, 200-203): elements per block; else 0 */
