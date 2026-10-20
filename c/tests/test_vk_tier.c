@@ -31,9 +31,9 @@
  *            start's before and after (streaming promotes nothing);
  *   layers   formats that change by layer (VktConfig.layer_gate_up/layer_down, a GGUF typed
  *            by layer): every device row equals the reference with the model resident,
- *            with a budget of four (experts of one form evicted for the other's, no
- *            upload refused), and streamed through slots that change format between
- *            the layers' steps;
+ *            with a budget of four (the smaller form's experts take the rooms the bigger
+ *            form's give up, no upload refused), and streamed through slots that change
+ *            format between the layers' steps;
  *   timeout  a batch's wait gives up (COLI_VK_WAIT_FAULT): the tier stops and the experts
  *            that batch names keep their device memory until the device is idle;
  *   promote  a host pool that holds every expert (COLI_VK_TIER_HOST=1), the device four:
@@ -960,9 +960,10 @@ static void layers(void) {
         Books bk = {0, 0}; double worst = 0; unsigned long long streamed = 0, kept = 0;
         int res1 = 0;
         static const int Ss[2][6] = {{1, 3, 20, 1, 2, 24}, {48, 33, 1, 64, 2, 40}};
-        if (mode == 1)   /* layer 0's experts settle, then layer 1's take their room (LFRU: a few hundred steps) */
+        if (mode == 1)   /* layer 1's (the bigger form's) experts settle, then layer 0's take their rooms (LFRU: a few
+                          * hundred steps); a bigger form's never takes a smaller one's room, which would not hold it */
             for (int t = 0; t < 360; t++) {
-                int lay = t < 60 ? 0 : 1, idx[4 * K]; float w[4 * K];
+                int lay = t < 60 ? 1 : 0, idx[4 * K]; float w[4 * K];
                 route(4, 0, 5, idx, w);
                 vkt_begin_forward();
                 double r = step(lay, 4, idx, w, &bk);
@@ -977,18 +978,18 @@ static void layers(void) {
                     double r = mode == 2 ? stream_step(l, S, idx, w, 0, &bk, &streamed, &kept, 0) : step(l, S, idx, w, &bk);
                     if (!(r <= worst)) worst = r;
                 }
-        for (int e = 0; e < E; e++) res1 += vkt_resident(1, e);
+        for (int e = 0; e < E; e++) res1 += vkt_resident(mode == 1 ? 0 : 1, e);   /* the budget of four: layer 0's */
         static const char *mn[3] = {"resident", "budget of four", "streaming"};
-        printf("  Q4_K/Q5_K and Q5_K/Q6_K layers, %-15s device %3llu of %3llu (%llu streamed), %d of layer 1 resident, worst %.2e\n",
-               mn[mode], bk.dev, bk.routed, streamed, res1, worst);
+        printf("  Q4_K/Q5_K and Q5_K/Q6_K layers, %-15s device %3llu of %3llu (%llu streamed), %d of layer %d resident, worst %.2e\n",
+               mn[mode], bk.dev, bk.routed, streamed, res1, mode == 1 ? 0 : 1, worst);
         unsigned long long ev, failed;
         report_counts(&ev, &failed);
         int counted = failed != ~0ull;   /* the report read back (not where stderr cannot be redirected: mingw) */
         CHECK(bk.dev > 0, "layers %s: nothing ran on the device", mn[mode]);
         CHECK(!counted || failed == 0, "layers %s: %llu uploads refused", mn[mode], failed);
         CHECK(worst < 2e-3, "layers %s: device rows off the reference (%.3g)", mn[mode], worst);
-        if (mode == 1) CHECK(res1 > 0 && (!counted || ev > 0), "layers: no expert of the bigger form took a freed one's room "
-                                                "(%d resident, %llu evictions)", res1, ev);
+        if (mode == 1) CHECK(res1 > 0 && (!counted || ev > 0), "layers: no expert of the smaller form took a freed room of the "
+                                                "bigger one (%d resident, %llu evictions)", res1, ev);
         if (mode == 2) CHECK(streamed > 0, "layers: nothing streamed");
         vkt_shutdown(); model_free();
         unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_ROWS");

@@ -55,7 +55,7 @@ Both are lossless: the same blocks, the same tokens.
   | colibri | `GLM_ILV16=0` |
   | olmoe | `OLM_ILV16=0` (dense matrices; its experts keep the file's rows) |
 
-- **The Vulkan expert tier** (`COLI_VULKAN=1`) takes a GGUF's experts as the file has them. Each layer keeps its own types, since published files mix them.
+- **The Vulkan expert tier** (`COLI_VULKAN=1`) takes a GGUF's experts as the file has them. Each layer keeps its own types, since published files mix them. The layers of the types most layers have keep their experts at their own size on the device and in the host pool, and only the few other layers take the room of the biggest of theirs ([vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc): 25-31% more experts held, GLM-5.3 Flash UD-IQ2_XXS from 2.50-3.14 to 2.92-3.40 tok/s of decode, Inkling-Small from 7.87-8.11 to 10.92-11.53).
 - **MXFP4 experts** (DeepSeek V4 and V4.1, MiMo) are laid out as their checkpoints' FP4, so they run on those engines' own kernels and device forms.
 - **OLMoE's experts keep the file's rows**: they fit in RAM, and interleaving one at its read cost more than the 16-row kernels gave back on its matrices. llama.cpp's `olmoe` files carry no `norm_topk_prob`; the import writes false, as the official checkpoints have it and as llama.cpp computes them.
 - **DeepSeek V4.1's engram tables** are read a row at a time, as from the checkpoint: a `deepseek41` file holds each row's e4m3 values and their scales together. These files carry no DSpark head, so nothing drafts.

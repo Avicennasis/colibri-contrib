@@ -469,6 +469,30 @@ of them on the device the way a GPU-equipped PC should use its card:
   slots a layer decoded at 5.5-5.6 tok/s against 5.9-6.2 with the store whole and a pool
   of 5 GiB. `COLI_VK_TIER_HOST_GB` sizes the pool and leaves the
   cache as it was.
+- **A GGUF's few bigger layers keep their own rooms.** Published GGUFs type a few expert
+  layers bigger than the rest, and the tier takes each layer's experts in its own types
+  (`VktConfig.layer_gate_up`, `layer_down`). Every expert used to take the room of the
+  biggest form, so that a freed expert's place held any other: on the files below, 9.4
+  MiB for experts of 7.3 (IQ2_XXS gate and up, IQ3_XXS down in all but two or three
+  layers). Now the layers of the form most layers have keep their experts at their own
+  size, and only the others take the room of the biggest among them. A newcomer
+  displaces a resident of its own class first, and one of the other class only when
+  that one's room holds it: a smaller form's expert in a bigger form's room, never the
+  other way. The device and the host pool hold 25-31% more experts. Measured on an
+  RTX PRO 4000 (24 GB) with 62 GB of RAM, each server on a copy of one history, 128
+  tokens, a warm-up and a run:
+
+  | model | experts in VRAM, in the pool | routed experts on the device | disk loads | decode | prompt |
+  |---|---|---|---|---|---|
+  | GLM-5.3 Flash UD-IQ2_XXS (95 GB), before | 1707, 4808 | 89.4% | 13198 | 2.50, 3.14 tok/s | 8.3, 9.2 tok/s |
+  | the same, now | 2167, 6064 | 95.0% | 6502 | 2.92, 3.40 tok/s | 9.3, 9.3 tok/s |
+  | DeepSeek V4 Flash 0731 UD-IQ2_XXS (85 GB), before | 1721, 465 | 69.4% | 3367 | 5.25, 5.35 tok/s | 9.3, 17.3 tok/s |
+  | the same, now | 2250, 580 | 74.1% | 1469 | 6.18, 6.25 tok/s | 19.7, 20.4 tok/s |
+  | Inkling-Small UD-IQ2_XXS (77 GB), before | 2375, 5431 | 99.8% | 186 | 7.87, 8.11 tok/s | 12.2, 22.8 tok/s |
+  | the same, now | 3098, 7003 | 100.0% | 14 | 11.53, 10.92 tok/s | 15.1, 33.1 tok/s |
+
+  The startup line says `N layers in M forms other than most layers', their experts in
+  the room of the biggest of those, the rest at their own size`.
 - **A fresh install starts warm.** A model downloaded a minute ago has no history,
   so its first runs would fill the tier one routing at a time. `coli setup` copies a
   starting history into the model folder when it has none, for the catalog models
