@@ -24,6 +24,7 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <chrono>
 
 static int fails;
 static void ck(int ok, const char *what) { if (ok) { printf("  ok   %s\n", what); return; } printf("  FAIL %s\n", what); fails++; }
@@ -351,6 +352,28 @@ int main(void) {
                shuffle ? "400 regions off the grid: a copy each" : "400 regions on a grid: one kernel");
             T->free(sb); T->free(db);
         }
+    }
+    if (T->size >= offsetof(ColiCudaChainOps, host_up_done) + sizeof T->host_up_done) {
+        /* host_up: page-locked host bytes to a device address on the copy stream, a ticket each;
+         * many in flight (past the marks' ring), each landing where it was sent */
+        const size_t n = 1 << 18;
+        std::vector<float> b = rnd(n, 42);
+        CcBuf *db = T->buf(n * 4, CC_DEV), *hb2 = T->buf(n * 4, CC_UP);
+        int ok = db && hb2;
+        if (ok) memcpy(T->ptr(hb2), b.data(), n * 4);
+        float *dd = ok ? (float *)T->dev_addr(db) : NULL;
+        unsigned t = 0, first = 0;
+        ok = ok && dd && T->host_up(dd, T->ptr(hb2), n * 4, &first);   /* b everywhere, then its halves again, 1500 times */
+        for (int r = 0; ok && r < 1500; r++) ok = T->host_up(dd + (r & 1) * (n / 2), (const float *)T->ptr(hb2) + (r & 1) * (n / 2), n * 2, &t);
+        ok = ok && T->begin() && T->submit(1);
+        int landed = 0;
+        auto t0 = std::chrono::steady_clock::now();   /* 1501 copies of 0.5 to 1 MiB: tens of ms over the bus */
+        while (ok && !landed && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) landed = T->host_up_done(t);
+        int early = T->host_up_done(first);
+        if (!(ok && landed && early)) printf("  (ok %d landed %d early %d, tickets %u and %u)\n", ok, landed, early, first, t);
+        ck(ok && landed && early, "host_up: 1501 copies on the copy stream, the last ticket landed, an early one too");
+        ck(ok && maxdiff(down(db, n).data(), b.data(), n) == 0, "host_up: the bytes where they were sent");
+        T->free(db); T->free(hb2);
     }
     printf("matmul\n");
     {
