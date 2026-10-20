@@ -2673,6 +2673,33 @@ engine has them. For a step of at least `COLI_VK_TIER_GEMM_ROWS` rows (16),
   tier's own byte work (`convert`). A group the engine loaded together converts in
   parallel, one expert per thread; a lone one converts with its rows split over the
   threads (`COLI_VK_TIER_STREAM_PAR=0` keeps it on the engine thread).
+- **The host pool's experts through the slots too.** A resident of the host pool is not
+  cold, so a big step's GEMMs read it in place over PCIe, a GGUF's block types at about 4
+  GB/s; on GLM-5.3, where a layer's step routes 100 to 140 of them, those reads were most
+  of the device's 115.7 s over three prompts. With the host pool on, a big step's host pool experts of
+  block types now go through the slots like the streamed ones: each is copied from the
+  pool into a slot at the head of the batch that first reads it, a barrier between the
+  copies and its dispatches (`coli_vk_xb_sub_copy`: the slot takes the expert's format
+  first; with mapped memory the CPU copies through the mapping), so the bytes cross the
+  bus once, at its rate, and the engine thread goes on to the step's cold experts. A slot
+  that does not take one leaves it to be read in place, never to the CPU. `COLI_VK_TIER_POOL_COPY=0` reads them in place.
+  Measured on the RTX PRO 4000 (PCIe 4.0 x8), a 700-token prompt, a warm-up and a run,
+  each server on a copy of one history:
+
+  | model | prefill, `COLI_VK_TIER_POOL_COPY=0` | prefill, the default | the copies |
+  |---|---|---|---|
+  | GLM-5.3 Flash UD-IQ2_XXS (95 GB) | 11.9, 12.3 tok/s | 17.9, 18.2 tok/s | 110 GiB a prompt |
+  | Inkling-Small UD-IQ2_XXS (77 GB) | 65.9, 70.2 tok/s | 97.2, 111.1 tok/s | 17 GiB a prompt |
+  | DeepSeek V4 Flash 0731 UD-IQ2_XXS (85 GB) | 19.5, 23.4 tok/s | 22.4, 23.3 tok/s | 4.5 GiB a prompt |
+
+  Copied by the copy engine and waited for, before each batch, the same bytes moved at 12.3
+  to 12.5 GB/s and GLM-5.3's prompt ran at 15.2 and 17.4 tok/s, Inkling's at 94.0 and 107.6:
+  the engine thread then waited for the copies instead of reading the step's cold experts.
+  On GLM-5.3 the bus is now the floor (a layer step copies about 0.94 GB); DeepSeek V4's CPU share
+  of a step (the cold experts its store reads) was the longer side already. GLM-5.3's greedy text after a long prompt is the same with and without (40 tokens in 39.3 s against 46.9);
+  Inkling's forks at a near tie after 36 words ("beautification" against "initiatives"):
+  a pool expert's rows now run in the slots' batches, where the backend may pick another
+  of its GEMM routes for them than in the residents' batch, as for a streamed expert.
 - **Nothing pollutes the resident set.** A streamed expert is not offered for promotion:
   a prompt's whole working set passes through the slots and would otherwise flush the
   residents. Its routings count as heat, as every routing does, and the slots are free
@@ -2713,6 +2740,10 @@ The run's line counts what streamed:
 [VK] tier qwen36 run: ... | stream: 40 steps, 2188 cold experts (3.61 GiB, 10.72 GB/s) and 796154 rows streamed in 742 sub-batches, prefetched 0 (0 used), 929 cold experts (5548 rows) kept on the CPU
 ```
 
+and, with the host pool's experts copied into the slots, `, N host pool experts copied into
+the slots (S, R GB/s)` after it. The forward's stream line says how many of a layer's streamed
+experts came from the host pool (`135 streamed (135 of them copied from the host pool)`).
+
 | Engine | Its loads (`load` / `load_batch`) | The step the tier sees |
 |---|---|---|
 | qwen36 | `expert_hold` (and the int8 copy for the int8-slot kernel), one at a time | `moe_vk_run`'s block becomes the chunk |
@@ -2738,6 +2769,7 @@ The run's line counts what streamed:
 | `COLI_VK_TIER_STREAM_ROWS` | the rule | Fix R, the rows from which a cold expert streams (tests). |
 | `COLI_VK_TIER_STREAM_HALF` | x rows within 32 MiB | Rows of a sub-batch (tests: small ones cut experts into parts). |
 | `COLI_VK_TIER_STREAM_PAR` | on | `0`: a streamed expert's conversion on the engine thread alone. |
+| `COLI_VK_TIER_POOL_COPY` | on with the host pool and streaming | `0`: a big step's host pool experts of block types are read in place over PCIe again, not copied into the slots. |
 
 ### Validation and timing
 

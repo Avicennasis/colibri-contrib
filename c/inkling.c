@@ -1330,6 +1330,15 @@ static void ink_vk_init_model(Model *m, int layer_begin, int layer_end) {
         inkc_place_init(m, NULL);
         return;
     }
+    if (g_inkc_fit.L && ink_is_gguf(m)) {
+        /* a GGUF's whole chain: its layers up now too. ink_vk_dense_bytes' geometry has no
+         * block types, so the tier took their room and the chain went up beside it at its
+         * first forward (Inkling-Small UD-IQ2_XXS: 26.9 GB held on a 24 GB card); lm_head
+         * goes up at the chain's start, counted in ink_vk_dense_bytes */
+        inkc_place_init(m, NULL);
+        if (coli_vk_dense()) ink_vk_mark_dense(m, layer_begin, layer_end, 1);
+        return;
+    }
     if (!coli_vk_dense()) return;   /* nothing marked: the CPU computes the dense matrices */
     ink_vk_mark_dense(m, layer_begin, layer_end, 1);
 }
@@ -2180,6 +2189,8 @@ static size_t ink_vk_dense_bytes(const Model *m) {
     double b = 0;
     if (g_inkc_fit.L && vkc_fit_partial(&g_inkc_fit))   /* a partial chain: its layers placed already */
         return inkc_fit_later(m);
+    if (g_inkc_fit.L && ink_is_gguf(m))   /* a GGUF's whole chain, placed already: its layers' buffers and the head to come */
+        return inkc_fit_later(m) + (g_inkc_fit.tail ? g_inkc_fit.tail_b : 0);
     if (g_ink_dho) return 0;   /* placed already (ink_dho_place): the free memory the tier reads counts them */
     #define INK_VKB(w, n) do { const Wt *w_ = (w); int f_ = w_->vk ? ink_vk_fmt(w_) : 0; \
         b += (double)(n) * (f_ == 1 ? 1.0 : f_ == 4 ? 0.5625 : f_ == 10 ? 4.0 : f_ == 11 ? 2.0 : 0.0); } while (0)
