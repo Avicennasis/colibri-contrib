@@ -847,9 +847,11 @@ family_mimo_qwenimage() {
     echo "OK mimo MIMO_DENSE_BITS=$bits: the CPU's tokens, text and image, experts on the CPU and on the tier, trunk on the device and on the CPU"
   done
   # MIMO_VK_EXPERTS=N sizes the tier at N experts: at 2 it must evict as the routing
-  # moves, and still give the CPU's tokens
+  # moves, and still give the CPU's tokens. A fresh history and no fill, as tier_gate's
+  # EVICT: the runs above wrote mimo_tiny's, whose hottest two the warm start would keep.
   MIMO_DENSE_BITS=32 COLI_TEMP=0 ./mimo mimo_tiny --ids "$(ids long)" --ngen 6 > mimo-cpu.txt 2>/dev/null
-  COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 MIMO_VK_EXPERTS=2 MIMO_DENSE_BITS=32 COLI_TEMP=0 \
+  rm -f mimo-evict.usage
+  COLI_USAGE=mimo-evict.usage COLI_VK_TIER_FILL=0 COLI_VULKAN=1 COLI_VK_TIER_SYNC=1 MIMO_VK_EXPERTS=2 MIMO_DENSE_BITS=32 COLI_TEMP=0 \
     ./mimo mimo_tiny --ids "$(ids long)" --ngen 6 > mimo-vk.txt 2> mimo-vk.err
   cmp -s mimo-cpu.txt mimo-vk.txt || { cat mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2 differs from the CPU"; }
   grep -q 'budget [0-9.]* KiB = 2 experts' mimo-vk.err || { grep '\[VK\]' mimo-vk.err; fail "mimo MIMO_VK_EXPERTS=2: not a budget of two experts"; }
