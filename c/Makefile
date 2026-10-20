@@ -2760,6 +2760,11 @@ tests/test_oracle$(EXE): tests/test_oracle.c
 tests/test_qwen36_tier_int8$(EXE): tests/test_qwen36_tier_int8.c qwen36_tier.c
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
 
+# A GGUF's experts on the same fake backend (qt_init_gguf): the file's rows as the backend's
+# block formats, each layer's own types, and swaps only between same-typed layers.
+tests/test_qwen36_tier_gguf$(EXE): tests/test_qwen36_tier_gguf.c qwen36_tier.c
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< -o $@ $(LDFLAGS)
+
 # Same fake backend (tests/qwen36_fake_cuda.h), two devices: proves the tier's
 # per-device input-replica block (G.is_x) is sized and strided so device 1's
 # block cannot run past the end of the buffer or into device 0's (#1339).

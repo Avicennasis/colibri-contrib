@@ -364,7 +364,7 @@ __global__ static void __launch_bounds__(128) cc_dnrec_k(const float *__restrict
     __shared__ float red2[128];
     int h = blockIdx.x, v = threadIdx.x;
     bool own = v < p.VD;
-    int kh = h / (p.VH / p.KH);
+    int kh = (p.flags & 4) ? h % p.KH : h / (p.VH / p.KH);   /* flags 4: a GGUF's value heads, tiled */
     float col[KD];
     int sb = p.st_off + h * KD * p.VD, nb = p.snap_off + h * KD * p.VD;
     #pragma unroll
@@ -392,7 +392,7 @@ __global__ static void __launch_bounds__(128) cc_dnrec_k(const float *__restrict
         __syncthreads();
         float bv = ab[p.b_off + s * p.b_row + h], av = ab[p.a_off + s * p.a_row + h];
         float beta = 1.f / (1.f + expf(-bv));
-        float decay = expf(-expf(alog) * cc_softplus(av + dtb));
+        float decay = expf(((p.flags & 2) ? alog : -expf(alog)) * cc_softplus(av + dtb));   /* flags 2: a GGUF's A itself */
         float o = 0.f;
         if (own) {
             float vin = cv[cb + 2 * p.Ktot + h * p.VD + v];
@@ -451,7 +451,7 @@ __global__ static void __launch_bounds__(128) cc_dnrec_rows_k(const float *__res
     __shared__ float bs[R], ds[R];
     int h = blockIdx.x, v = threadIdx.x, wp = v >> 5, lane = v & 31;
     bool own = v < p.VD;
-    int kh = h / (p.VH / p.KH);
+    int kh = (p.flags & 4) ? h % p.KH : h / (p.VH / p.KH);   /* flags 4: a GGUF's value heads, tiled */
     float col[KD];
     int sb = p.st_off + h * KD * p.VD, nb = p.snap_off + h * KD * p.VD;
     #pragma unroll
@@ -476,7 +476,7 @@ __global__ static void __launch_bounds__(128) cc_dnrec_rows_k(const float *__res
             int s = s0 + v;
             float bv = ab[p.b_off + s * p.b_row + h], av = ab[p.a_off + s * p.a_row + h];
             bs[v] = 1.f / (1.f + expf(-bv));
-            ds[v] = expf(-expf(alog) * cc_softplus(av + dtb));
+            ds[v] = expf(((p.flags & 2) ? alog : -expf(alog)) * cc_softplus(av + dtb));
         }
         __syncthreads();
         if (own)

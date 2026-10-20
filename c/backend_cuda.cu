@@ -4,6 +4,7 @@
 #include "fp8_format.h"   /* FP8_BLOCK: the shared fmt=8 scale-block edge (see that header) */
 
 #include "backend_gpu_compat.h"
+#include "cuda_bd.cuh"        /* a GGUF's block formats: fmt 100 + ggml type (blockdec_host.h's table) */
 
 static_assert(FP8_BLOCK == 128, "fmt=8 on-disk containers carry ceil(dim/128)-edged scale "
               "grids (mint tool, docs/FORMATS.md); FP8_BLOCK is container format, not a "
@@ -70,6 +71,7 @@ struct ColiCudaTensor {
     int fmt, I, O, device;
     int gs;                    /* quant group size; 0 = per-row scales (#334) */
     int ng;                    /* number of scale groups per row = ceil(I/gs) for fmt=4 */
+    int row_words;             /* fmt >= 100 (a GGUF's blocks): a row's 32-bit words, zero-padded */
     size_t scale_count;        /* scale elements: ue8m0 bytes for fmt=7, floats otherwise */
     int tracked;
     int weights_owned;
@@ -117,6 +119,8 @@ typedef struct {
     size_t tensor_count, tensor_bytes;
     int group_pending; size_t group_pending_bytes;   /* async expert-group in flight (Inc.4) */
     void *moe_tab; size_t moe_tab_cap; float *moe_host; size_t moe_host_cap;   /* group_moe_launch's table and row ids */
+    bd_u32 *bdtab;          /* blockdec_host.h's table, made with the first block-format tensor */
+    size_t smem_optin;      /* shared bytes a block may ask for (the block GEMVs past 48 KiB) */
 #ifdef COLI_ANS
     void *ans_raw; size_t ans_raw_cap;
     void *ans_host; size_t ans_host_cap;
@@ -1330,6 +1334,11 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
         cudaDeviceProp prop{};
         if (!cuda_ok(cudaGetDeviceProperties(&prop, device), "device properties")) { coli_cuda_shutdown(); return 0; }
         ctx->compute_major=prop.major;ctx->compute_minor=prop.minor;
+#if defined(__HIP__) || defined(__HIP_PLATFORM_AMD__)
+        ctx->smem_optin=48*1024;
+#else
+        ctx->smem_optin=prop.sharedMemPerBlockOptin>48*1024?(size_t)prop.sharedMemPerBlockOptin:48*1024;
+#endif
         if(!cuda_ok(cudaStreamCreateWithFlags(&ctx->stream,cudaStreamNonBlocking),"stream creation")){
             coli_cuda_shutdown();return 0;
         }
@@ -1356,6 +1365,7 @@ extern "C" void coli_cuda_shutdown(void) {
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
         if (!select_ctx(ctx)) continue;
+        if (ctx->bdtab) cudaFree(ctx->bdtab);
         if (ctx->mxfp4_weights) cudaFree(ctx->mxfp4_weights);
         if (ctx->mxfp4_scales) cudaFree(ctx->mxfp4_scales);
         if (ctx->mxfp4_expert_weights) cudaFree(ctx->mxfp4_expert_weights);
@@ -1480,6 +1490,86 @@ extern "C" void coli_cuda_group_stats_device(
     if(d2h_ms) *d2h_ms=index<0?0:g_device_group_d2h_ms[index];
 }
 
+/* ---- a GGUF's block formats (cuda_bd.cuh): fmt 100 + ggml type, the rows as the file
+ * stores them, each padded to whole words; no scale array (the scales are in the blocks).
+ * The decoders' table (blockdec_host.h) goes to a device with its first such tensor. */
+static std::mutex g_bdtab_mx;
+static const bd_u32 *bd_table(DeviceContext *ctx) {
+    std::lock_guard<std::mutex> lk(g_bdtab_mx);
+    if (ctx->bdtab) return ctx->bdtab;
+    std::vector<uint32_t> t(BDT_WORDS);
+    bdtab_fill(t.data(), NULL);
+    bd_u32 *d = NULL;
+    if (!cuda_ok(cudaMalloc(&d, (size_t)BDT_WORDS * 4), "block table allocation")) return NULL;
+    if (!cuda_ok(cudaMemcpy(d, t.data(), (size_t)BDT_WORDS * 4, cudaMemcpyHostToDevice), "block table upload")) { cudaFree(d); return NULL; }
+    ctx->bdtab = d;
+    return d;
+}
+/* the file's bytes of a row of I inputs, 0 when the format or the width is not one cuda_bd.cuh takes */
+static size_t bd_file_row_bytes(int fmt, int I) {
+    if (!bd_fmt_ok(fmt) || I < 32 || I % 32 || I % BD_BLK[fmt - 100]) return 0;
+    return (size_t)I / BD_BLK[fmt - 100] * BD_BYTES[fmt - 100];
+}
+/* O rows of rb bytes from the host into rows of row_words words; zero_pad: the padding zeroed
+ * first (a new tensor's; a refill keeps what the upload wrote there) */
+static int bd_rows_copy(ColiCudaTensor *t, const void *weights, int zero_pad) {
+    size_t rb = bd_file_row_bytes(t->fmt, t->I), pitch = (size_t)t->row_words * 4;
+    if (pitch == rb) return cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "block tensor upload");
+    return (!zero_pad || cuda_ok(cudaMemset(t->weights, 0, t->weight_bytes), "block tensor padding")) &&
+           cuda_ok(cudaMemcpy2D(t->weights, pitch, weights, rb, rb, (size_t)t->O, cudaMemcpyHostToDevice), "block tensor upload");
+}
+static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device) {
+    DeviceContext *ctx = find_ctx(device);
+    size_t rb = bd_file_row_bytes(fmt, I);
+    if (!weights || !rb || O < 1 || !select_ctx(ctx) || !bd_table(ctx)) return 0;
+    ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
+    if (!t) return 0;
+    t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->ng = 1;
+    t->row_words = (int)((rb + 3) / 4);
+    t->weight_bytes = (size_t)t->row_words * 4 * (size_t)O;
+    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) { coli_cuda_tensor_free(t); return 0; }
+    t->weights_owned = 1;
+    if (!bd_rows_copy(t, weights, 1)) { coli_cuda_tensor_free(t); return 0; }
+    t->tracked = 1;
+    ctx->tensor_count++;
+    ctx->tensor_bytes += t->weight_bytes;
+    *tensor = t;
+    return 1;
+}
+/* y[S, O] = x[S, I] W^T for a block-format tensor, on stream st (device pointers): up to
+ * BD_GEMV_MAX_S rows (a decode step, a verify's) on the GEMV, each row a decode step's bits;
+ * more (a prompt chunk) through the tensor cores' tiles where the device has them (bd_tensor_gemm) */
+#define BD_GEMV_MAX_S 8
+static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st);
+static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st) {
+    const bd_u32 *tab = bd_table(ctx);
+    if (!tab || ((uintptr_t)x & 15)) return 0;
+    if (S > BD_GEMV_MAX_S && bd_tensor_gemm(ctx, t, y, x, S, st)) return 1;
+    const char *e = std::getenv("COLI_CUDA_BD_FLOAT");   /* 1: the float form for every type (tests) */
+    if (!bd_gemv_launch(y, x, (const bd_u32 *)t->weights, tab, t->fmt, t->I, t->O, t->row_words, S, ctx->smem_optin, e && *e == '1', st)) return 0;
+    return cuda_ok(cudaGetLastError(), "block gemv launch");
+}
+/* a block-format tensor in device memory the caller owns (an arena's slot of cap bytes):
+ * coli_cuda_tensor_free leaves the memory, and its bytes are counted where it was allocated */
+extern "C" int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights,
+                                          int fmt, int I, int O, int device) {
+    if (!tensor || *tensor || !dev) return 0;
+    DeviceContext *ctx = find_ctx(device);
+    size_t rb = bd_file_row_bytes(fmt, I);
+    if (!weights || !rb || O < 1 || !select_ctx(ctx) || !bd_table(ctx)) return 0;
+    size_t rw = (rb + 3) / 4;
+    if (rw * 4 * (size_t)O > cap) return 0;
+    ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
+    if (!t) return 0;
+    t->fmt = fmt; t->I = I; t->O = O; t->device = device; t->ng = 1;
+    t->row_words = (int)rw; t->weight_bytes = rw * 4 * (size_t)O;
+    t->weights = dev; t->weights_owned = 0;
+    if (!bd_rows_copy(t, weights, 1)) { std::free(t); return 0; }
+    *tensor = t;
+    return 1;
+}
+extern "C" int coli_cuda_block_elems(int fmt) { return bd_file_row_bytes(fmt, 256) && fmt >= 100 ? (int)BD_BLK[fmt - 100] : 0; }
+
 /* group size for the NEXT upload on this thread (fmt=4): routed through a
  * thread_local so the widely-wired upload signature (and the Windows DLL ABI)
  * stays untouched. pin_load uploads in parallel, hence thread_local. */
@@ -1501,6 +1591,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         int want_gs = (fmt==4 && g_upload_gs>0) ? g_upload_gs : 0;
         return t->fmt == fmt && t->I == I && t->O == O && t->device == device && t->gs == want_gs;
     }
+    if (fmt >= 100) return bd_tensor_upload(tensor, weights, fmt, I, O, device);
     DeviceContext *ctx = find_ctx(device);
     if (!weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
     size_t rb = row_bytes(fmt, I);
@@ -1563,6 +1654,8 @@ extern "C" int coli_cuda_tensor_upload_g(ColiCudaTensor **tensor,
 }
 
 extern "C" int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *weights, const float *scales) {
+    /* a block-format tensor: its own buffer or an arena's slot (coli_cuda_tensor_upload_at) */
+    if (t && weights && t->weights && t->fmt >= 100) { DeviceContext *c = find_ctx(t->device); return select_ctx(c) && bd_rows_copy(t, weights, 0); }
     if (!t || !weights || !t->weights || !t->weights_owned) return 0;
 #ifdef COLI_ANS
     if (t->compressed) return 0;            /* archive bytes, not a weight buffer of this size */
@@ -1742,6 +1835,7 @@ extern "C" int coli_cuda_tensor_upload_compressed(ColiCudaTensor **tensor,
 extern "C" int coli_cuda_tensor_update(ColiCudaTensor *tensor,
                                           const void *weights,
                                           const float *scales) {
+    if (tensor && weights && tensor->fmt >= 100) { DeviceContext *c = find_ctx(tensor->device); return select_ctx(c) && bd_rows_copy(tensor, weights, 0); }
     if (!tensor || !weights || (tensor->fmt && tensor->fmt != 6 && !scales)) return 0;
 #ifdef COLI_ANS
     if(tensor->compressed) return 0;
@@ -1821,7 +1915,8 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->dx, &ctx->dx_cap, xb) || !reserve(&ctx->dy, &ctx->dy_cap, yb)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->dx, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
-    quant_matmul_launch(ctx->dy, ctx->dx, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
+    if (fmt >= 100) { if (!bd_tensor_gemv(ctx, t, ctx->dy, ctx->dx, S, 0)) return 0; }
+    else quant_matmul_launch(ctx->dy, ctx->dx, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->dy, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
@@ -2089,6 +2184,7 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     if (gate && ((gate->fmt == 4 && gate->gs <= 0) ||
                  (up && up->fmt == 4 && up->gs <= 0) ||
                  (down && down->fmt == 4 && down->gs <= 0))) return 0;
+    if ((gate && gate->fmt >= 100) || (up && up->fmt >= 100) || (down && down->fmt >= 100)) return 0;   /* the block formats: the chain's GEMVs only */
     if (!gate || !up || !down || !x || !y || S < 1 ||
         gate->device != up->device || gate->device != down->device ||
         gate->I != up->I || gate->O != up->O ||
@@ -2192,7 +2288,12 @@ static int group_moe_ok(const GroupDesc *host, int count, int total, int D, int 
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_GROUP_MOE"); on = !(e && *e == '0'); }
     if (!on || count < 1 || D < 32 || I < 32 || D % 32 || I % 32 || D > CC_MOE_DIM_MAX || I > CC_MOE_DIM_MAX) return 0;
-    int f = host[0].gf, gs = host[0].ggs;
+    int f = host[0].gf, gs = host[0].ggs, fd = host[0].df;
+    if (f >= 100) {   /* a GGUF's blocks: gate and up of one type, down of one, both with an integer step */
+        if (fd < 100 || f >= 143 || fd >= 143 || !bdi_has(f - 100) || !bdi_has(fd - 100)) return 0;
+        for (int c = 0; c < count; c++) if (host[c].gf != f || host[c].uf != f || host[c].df != fd) return 0;
+        return 1;
+    }
     if (!(f == 1 || f == 2 || (f == 4 && gs >= 16 && gs % 16 == 0))) return 0;
     for (int c = 0; c < count; c++)
         if (host[c].gf != f || host[c].uf != f || host[c].df != f ||
@@ -2220,6 +2321,7 @@ static int group_moe_launch(DeviceContext *ctx, int device, const GroupDesc *hos
     if (!cuda_ok(cudaMemcpyAsync(ctx->moe_tab, ctx->moe_host, nb, cudaMemcpyHostToDevice, ctx->stream), "expert group table")) return 0;
     CcMoe mp; std::memset(&mp, 0, sizeof mp);
     mp.S = total; mp.K = 1; mp.D = D; mp.I = I; mp.fmt = host[0].gf; mp.gs = host[0].gf == 4 ? host[0].ggs : 0;
+    if (host[0].gf >= 100) mp.fmt_d = host[0].df;   /* a GGUF's down: its own type */
     /* pin (a speculation's verify, coli_cuda_expert_group_pinned): the warp kernels at any rows
      * (E 0), whose rows are a decode step's bits; else past CC_MOE_FRAME_ROWS the tensor cores */
     mp.parts = 3; mp.x_row = D; mp.i_row = 1; mp.w_row = 1; mp.y_row = D; mp.h_off = -1; mp.E = pin ? 0 : count;
@@ -3151,6 +3253,46 @@ __device__ __forceinline__ void hcg_store_x(__half (*Xs)[HCG_LDH], const float4 
     uint4 *dst = reinterpret_cast<uint4 *>(&Xs[row][kq]);
     dst[0] = *reinterpret_cast<const uint4 *>(&v[0]); dst[1] = *reinterpret_cast<const uint4 *>(&v[8]);
 }
+/* WF 100: a GGUF's blocks (cuda_bd.cuh's float form, bdf_decode), the format in gs, the
+ * decoders' table in sc: the thread's 16 weights are half of a 32-weight unit, decoded with
+ * its scales and mins (weight = s * w - m) and rounded to f16, the scales in the weights */
+template<> struct HcgW<100> { float f[16]; };
+template<>
+__device__ __forceinline__ void hcg_fetch_w<100>(HcgW<100> &r, const uint8_t *__restrict__ W, const float *__restrict__ sc,
+                                                 int gs, int ng, int n, int N, int k0, int K, int planar) {
+    (void)ng; (void)planar;
+    int kq = (threadIdx.x & 3) * 16;
+    if (n >= N) {
+        #pragma unroll
+        for (int j = 0; j < 16; j++) r.f[j] = 0.f;
+        return;
+    }
+    const bd_u32 *tab = reinterpret_cast<const bd_u32 *>(sc);
+    int t = gs - 100;
+    bd_u32 B = __ldg(tab + BDT_BLK + t), T = __ldg(tab + BDT_BYTES + t);
+    size_t rw = ((size_t)K / B * T + 3) / 4;
+    const bd_u32 *Wr = reinterpret_cast<const bd_u32 *>(W) + (size_t)n * rw;
+    if (bd_dec16(t, Wr, (bd_u32)(k0 + kq), tab, r.f)) return;   /* the common types: their 16, word loads */
+    int wv[32]; float sA, mA, sB, mB;
+    bdf_decode(gs, Wr, (bd_u32)((k0 + kq) >> 5), tab, wv, sA, mA, sB, mB);
+    if ((kq >> 4) & 1) {
+        #pragma unroll
+        for (int j = 0; j < 16; j++) r.f[j] = sB * (float)wv[16 + j] - mB;
+    } else {
+        #pragma unroll
+        for (int j = 0; j < 16; j++) r.f[j] = sA * (float)wv[j] - mA;
+    }
+}
+template<>
+__device__ __forceinline__ void hcg_store_w<100>(__half (*Ws)[HCG_LDH], const HcgW<100> &r, int planar) {
+    (void)planar;
+    int t = threadIdx.x, row = t >> 2, kq = (t & 3) * 16;
+    __align__(16) __half v[16];
+    #pragma unroll
+    for (int j = 0; j < 16; j++) v[j] = hcg_h(r.f[j]);
+    uint4 *dst = reinterpret_cast<uint4 *>(&Ws[row][kq]);
+    dst[0] = *reinterpret_cast<const uint4 *>(&v[0]); dst[1] = *reinterpret_cast<const uint4 *>(&v[8]);
+}
 #endif
 template<int WF, int NW>
 __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const int *yr, const float *__restrict__ X, int xld, const int *xr,
@@ -3214,10 +3356,10 @@ __device__ __forceinline__ void hcg_tile(float *__restrict__ Y, int yld, const i
         int r = e / TCG_BN, c = e - r * TCG_BN, nn = n0 + c;
         if (r >= M || nn >= N) continue;
         float g = Cs[r * CL + c];
-        if (WF != 4) g *= sc[0][nn];   /* int8 and int4 rows: the codes went in exact, the row's scale here */
+        if (WF != 4 && WF != 100) g *= sc[0][nn];   /* int8 and int4 rows: the codes went in exact, the row's scale here */
         if (NW == 2) {
             float u = Cs[TCG_BM * CL + r * CL + c];
-            if (WF != 4) u *= sc[NW - 1][nn];
+            if (WF != 4 && WF != 100) u *= sc[NW - 1][nn];
             g = (g / (1.f + expf(-g))) * u;
         }
         Y[(size_t)yr[r] * yld + nn] = g;
@@ -3235,6 +3377,18 @@ __global__ static void __launch_bounds__(256) hcg_dense_k(float *__restrict__ y,
     __syncthreads();
     const uint8_t *W[1] = {w}; const float *Sc[1] = {sc};
     hcg_tile<WF, 1>(y, O, rows, x, I, rows, M, W, Sc, gs, O, I, blockIdx.x * TCG_BN);
+}
+static int hcg_ok(const DeviceContext *ctx);
+/* a prompt chunk's rows of a block-format tensor: the f16 tiles (hcg_tile WF 100), I a
+ * multiple of 64; 0 where the device has no f16 fragments (the GEMV takes them) */
+static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st) {
+    const bd_u32 *tab = bd_table(ctx);
+    static int tiles = -1;
+    if (tiles < 0) { const char *e = getenv("COLI_CUDA_BD_TILES"); tiles = !(e && *e == '0'); }   /* 0: a prompt's rows on the GEMV too */
+    if (!tiles || !tab || !hcg_ok(ctx) || t->I % HCG_BK || ((uintptr_t)x & 15)) return 0;
+    dim3 g((unsigned)((t->O + TCG_BN - 1) / TCG_BN), (unsigned)((S + TCG_BM - 1) / TCG_BM));
+    hcg_dense_k<100><<<g, 256, 0, st>>>(y, x, (const uint8_t *)t->weights, reinterpret_cast<const float *>(tab), t->fmt, S, t->I, t->O);
+    return cuda_ok(cudaGetLastError(), "block gemm launch");
 }
 extern "C" int coli_cuda_host_register(void *p, size_t bytes) {
     if (!p || !bytes) return 0;
@@ -3364,6 +3518,7 @@ extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, cons
     DeviceContext *ctx = find_ctx(t->device);
     if (!select_ctx(ctx)) return 0;
     cudaStream_t st = (cudaStream_t)stream;
+    if (t->fmt >= 100) return bd_tensor_gemv(ctx, t, y_dev, x_dev, S, st);   /* a GGUF's blocks: cuda_bd.cuh */
     if (t->fmt == 1 && S <= GEMV_I8_MAX_S && t->I % 16 == 0 && t->I <= 12288) {
         unsigned bx = (unsigned)((t->O + GEMV_I8_ROWS - 1) / GEMV_I8_ROWS);
         const int8_t *w = (const int8_t *)t->weights;
@@ -3655,6 +3810,43 @@ __global__ static void __launch_bounds__(256) hcg_moe_dn_k(const CcExpert *__res
     size_t A = (size_t)p.S * p.K;
     hcg_tile<WF, 1>(hid + A * p.I, p.D, pr, hid, p.I, xr, M, W, Sc, p.gs, p.D, p.I, blockIdx.x * TCG_BN, WF == 4 && ex.planar);
 }
+/* a GGUF's experts (WF 100): gate and up of type fmt, down of fmt_d, the decoders' table btab */
+__global__ static void __launch_bounds__(256) hcg_moe_gu_bd_k(const CcExpert *__restrict__ tab, const float *__restrict__ x, float *__restrict__ hid,
+                                                              MoeSort m, CcMoe p, const bd_u32 *__restrict__ btab) {
+    __shared__ int xr[64], pr[64];
+    if ((int)blockIdx.y >= *m.ntile) return;
+    int e, M = moe_tile_rows(m, p, blockIdx.y, xr, pr, &e, 0);
+    __syncthreads();
+    CcExpert ex = tab[p.t_off + e];
+    const uint8_t *W[2] = {(const uint8_t *)ex.g, (const uint8_t *)ex.u};
+    const float *Sc[2] = {reinterpret_cast<const float *>(btab), reinterpret_cast<const float *>(btab)};
+    hcg_tile<100, 2>(hid, p.I, pr, x + p.x_off, p.x_row, xr, M, W, Sc, p.fmt, p.I, p.D, blockIdx.x * TCG_BN);
+}
+__global__ static void __launch_bounds__(256) hcg_moe_dn_bd_k(const CcExpert *__restrict__ tab, float *__restrict__ hid, MoeSort m, CcMoe p,
+                                                              const bd_u32 *__restrict__ btab) {
+    __shared__ int xr[64], pr[64];
+    if ((int)blockIdx.y >= *m.ntile) return;
+    int e, M = moe_tile_rows(m, p, blockIdx.y, xr, pr, &e, 1);
+    __syncthreads();
+    CcExpert ex = tab[p.t_off + e];
+    const uint8_t *W[1] = {(const uint8_t *)ex.d};
+    const float *Sc[1] = {reinterpret_cast<const float *>(btab)};
+    size_t A = (size_t)p.S * p.K;
+    hcg_tile<100, 1>(hid + A * p.I, p.D, pr, hid, p.I, xr, M, W, Sc, p.fmt_d ? p.fmt_d : p.fmt, p.D, p.I, blockIdx.x * TCG_BN);
+}
+static int moe_rows_bd_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, MoeSort m, const CcMoe *p, const bd_u32 *btab,
+                              cudaStream_t st) {
+    size_t A = (size_t)p->S * p->K;
+    unsigned ga = (unsigned)((A + 255) / 256);
+    if (!cuda_ok(cudaMemsetAsync(m.cnt, 0, (size_t)p->E * sizeof(int), st), "chain moe sort")) return 0;
+    moe_sort_count_k<<<ga, 256, 0, st>>>(tab, ids, m, *p);
+    moe_sort_scan_k<<<1, 32, 0, st>>>(m, *p);
+    moe_sort_place_k<<<ga, 256, 0, st>>>(tab, ids, m, *p);
+    dim3 gg((unsigned)((p->I + TCG_BN - 1) / TCG_BN), (unsigned)m.T), gd((unsigned)((p->D + TCG_BN - 1) / TCG_BN), (unsigned)m.T);
+    hcg_moe_gu_bd_k<<<gg, 256, 0, st>>>(tab, x, hid, m, *p, btab);
+    hcg_moe_dn_bd_k<<<gd, 256, 0, st>>>(tab, hid, m, *p, btab);
+    return cuda_ok(cudaGetLastError(), "chain moe block rows launch");
+}
 template<int WF>
 static int moe_rows_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, MoeSort m, const CcMoe *p, cudaStream_t st, int f16) {
     size_t A = (size_t)p->S * p->K;
@@ -3811,6 +4003,133 @@ static int moe_gv_launch(const CcExpert *tab, const float *x, const int *ids, fl
     moe_gv_dn_k<FMT><<<dim3(gx, gy), 256, moe_gv_smem(p->I), st>>>(tab, ids, hid, *p, l1, tiles);
     return cuda_ok(cudaGetLastError(), "chain moe gv launch");
 }
+/* A GGUF's routed experts (CcMoe.fmt >= 100: gate and up of ggml type TG, down of type TD),
+ * in the CPU's integer form (cuda_bd.cuh): gate and up as moe_gv_gu_k takes them, block
+ * (b, s) quantizing row s of x once and taking units u = k * I + o (slot k's row o) over lpr
+ * lanes; down as moe_gv_dn_k, block (pair j, tile) quantizing pair j's hidden row. A row of
+ * the matrices is rw words (the file's row padded). */
+template<int TG>
+__global__ static void __launch_bounds__(256) moe_bd_gu_k(const CcExpert *__restrict__ tab, const float *__restrict__ x,
+        const int *__restrict__ ids, float *__restrict__ hid, CcMoe p, int lpr, int rw, const bd_u32 *__restrict__ btab) {
+    extern __shared__ uint4 bd_sm4[];
+    __shared__ CcExpert ke[CC_ROUTE_KMAX];
+    __shared__ int kl[CC_ROUTE_KMAX];
+    constexpr int TW = bd_tab_words(TG);
+    BdTabs tb = bd_tables_fill<TG>(reinterpret_cast<bd_u32 *>(bd_sm4), btab);
+    int s = blockIdx.y, tid = threadIdx.x, nb = p.D / 32, qr = bd_xq_row(p.D);
+    uint4 *xq = bd_sm4 + TW / 4;
+    float *dx = reinterpret_cast<float *>(xq + qr);
+    int *xs = reinterpret_cast<int *>(dx + nb);
+    bdx_quant(x + p.x_off + (size_t)s * p.x_row, 1, p.D, xq, dx, xs);
+    if (tid < p.K) {
+        int e = ids[p.i_off + s * p.i_row + tid];
+        int on = e >= 0 && tab[p.t_off + e].g != nullptr;
+        kl[tid] = on;
+        if (on) ke[tid] = tab[p.t_off + e];
+    }
+    __syncthreads();
+    BdX X = {xq, dx, xs, qr, nb};
+    int lane = tid & 31, warp = tid >> 5, rps = 32 / lpr, sub = lane / lpr, ql = lane % lpr, nq = p.D / 32;
+    int NU = p.K * p.I, stride = (int)gridDim.x * 8 * rps;
+    for (int u0 = ((int)blockIdx.x * 8 + warp) * rps; u0 < NU; u0 += stride) {   /* uniform in the warp */
+        int u = min(u0 + sub, NU - 1), k = u / p.I, o = u - k * p.I;
+        bool live = u0 + sub < NU && kl[k];
+        float g = 0.f, uu = 0.f;
+        if (live) {
+            const bd_u32 *wg = (const bd_u32 *)ke[k].g + (size_t)o * rw, *wu = (const bd_u32 *)ke[k].u + (size_t)o * rw;
+            for (int q = ql; q < nq; q += lpr) { bdi_step<TG, 1>(wg, (bd_u32)q, X, 1, tb, &g); bdi_step<TG, 1>(wu, (bd_u32)q, X, 1, tb, &uu); }
+        }
+        g = mg_lanes_sum(g, lpr); uu = mg_lanes_sum(uu, lpr);
+        if (ql == 0 && live) hid[((size_t)s * p.K + k) * p.I + o] = (g / (1.f + expf(-g))) * uu;
+    }
+}
+template<int TD>
+__global__ static void __launch_bounds__(256) moe_bd_dn_k(const CcExpert *__restrict__ tab, const int *__restrict__ ids,
+        float *__restrict__ hid, CcMoe p, int lpr, int tiles, int rw, const bd_u32 *__restrict__ btab) {
+    extern __shared__ uint4 bd_sm4[];
+    int wgi = (int)(blockIdx.x + blockIdx.y * gridDim.x), j = wgi / tiles, tile = wgi - j * tiles;
+    if (j >= p.S * p.K) return;
+    int s = j / p.K, k = j - s * p.K, e = ids[p.i_off + s * p.i_row + k];
+    if (e < 0) return;
+    CcExpert ex = tab[p.t_off + e];
+    if (!ex.g) return;
+    constexpr int TW = bd_tab_words(TD);
+    BdTabs tb = bd_tables_fill<TD>(reinterpret_cast<bd_u32 *>(bd_sm4), btab);
+    int nb = p.I / 32, qr = bd_xq_row(p.I);
+    uint4 *xq = bd_sm4 + TW / 4;
+    float *dx = reinterpret_cast<float *>(xq + qr);
+    int *xs = reinterpret_cast<int *>(dx + nb);
+    bdx_quant(hid + (size_t)j * p.I, 1, p.I, xq, dx, xs);
+    __syncthreads();
+    BdX X = {xq, dx, xs, qr, nb};
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, rps = 32 / lpr, sub = lane / lpr, ql = lane % lpr, nq = p.I / 32;
+    int per_tile = (p.D + tiles - 1) / tiles, lo = tile * per_tile, hi = min(lo + per_tile, p.D);
+    size_t dn = (size_t)p.S * p.K * p.I;
+    for (int o0 = lo + warp * rps; o0 < hi; o0 += 8 * rps) {   /* uniform in the warp */
+        int o = o0 + sub;
+        bool live = o < hi;
+        float v = 0.f;
+        if (live) {
+            const bd_u32 *wd = (const bd_u32 *)ex.d + (size_t)o * rw;
+            for (int q = ql; q < nq; q += lpr) bdi_step<TD, 1>(wd, (bd_u32)q, X, 1, tb, &v);
+        }
+        v = mg_lanes_sum(v, lpr);
+        if (ql == 0 && live) hid[dn + (size_t)j * p.D + o] = v;
+    }
+}
+template<int TG>
+static int moe_bd_gu_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, const CcMoe *p, const bd_u32 *btab,
+                            size_t smem_max, cudaStream_t st) {
+    size_t sm = (size_t)bd_tab_words(TG) * 4 + bd_x_bytes(p->D, 1);
+    if (sm > smem_max) return 0;
+    static unsigned raised;
+    bd_smem_raise((const void *)moe_bd_gu_k<TG>, sm, smem_max, &raised);
+    int lpr = bd_lpr(p->D), upw = 8 * (32 / lpr), nwg = (p->K * p->I + upw - 1) / upw;   /* units a block */
+    if (nwg > 1024) nwg = 1024;
+    int rw = (int)((size_t)p->D / BD_BLK[TG] * BD_BYTES[TG] + 3) / 4;
+    moe_bd_gu_k<TG><<<dim3((unsigned)nwg, (unsigned)p->S), 256, sm, st>>>(tab, x, ids, hid, *p, lpr, rw, btab);
+    return 1;
+}
+template<int TD>
+static int moe_bd_dn_launch(const CcExpert *tab, const int *ids, float *hid, const CcMoe *p, const bd_u32 *btab,
+                            size_t smem_max, cudaStream_t st) {
+    size_t sm = (size_t)bd_tab_words(TD) * 4 + bd_x_bytes(p->I, 1);
+    if (sm > smem_max) return 0;
+    static unsigned raised;
+    bd_smem_raise((const void *)moe_bd_dn_k<TD>, sm, smem_max, &raised);
+    int lpr = bd_lpr(p->I), rpp = 8 * (32 / lpr), tiles = (p->D + rpp - 1) / rpp;   /* a down tile: one pass of the block */
+    uint64_t nb = (uint64_t)p->S * p->K * tiles;
+    unsigned gx = nb < 65535 ? (unsigned)nb : 65535u, gy = (unsigned)((nb + gx - 1) / gx);
+    int rw = (int)((size_t)p->I / BD_BLK[TD] * BD_BYTES[TD] + 3) / 4;
+    moe_bd_dn_k<TD><<<dim3(gx, gy), 256, sm, st>>>(tab, ids, hid, *p, lpr, tiles, rw, btab);
+    return 1;
+}
+#define BD_MOE_TYPES(X) X(8) X(10) X(11) X(12) X(13) X(14) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42)
+/* 1 = both types have an integer step and the widths whole blocks of them */
+static int moe_bd_ok(const CcMoe *p) {
+    int tg = p->fmt - 100, td = (p->fmt_d ? p->fmt_d : p->fmt) - 100;
+    return tg >= 0 && tg < 43 && td >= 0 && td < 43 && bd_fmt_ok(p->fmt) && bd_fmt_ok(td + 100) && bdi_has(tg) && bdi_has(td) &&
+           p->D % BD_BLK[tg] == 0 && p->I % BD_BLK[td] == 0 && p->K <= CC_ROUTE_KMAX && !p->planar;
+}
+static int moe_bd_launch(DeviceContext *ctx, const CcExpert *tab, const float *x, const int *ids, float *hid, const CcMoe *p, cudaStream_t st) {
+    const bd_u32 *btab = bd_table(ctx);
+    if (!btab || ((uintptr_t)(x + p->x_off) & 15) || p->x_row % 4) return 0;
+    int ok = 0;
+    switch (p->fmt - 100) {
+#define BD_GU_CASE(t) case t: ok = moe_bd_gu_launch<t>(tab, x, ids, hid, p, btab, ctx->smem_optin, st); break;
+        BD_MOE_TYPES(BD_GU_CASE)
+#undef BD_GU_CASE
+        default: return 0;
+    }
+    if (!ok) return 0;
+    switch ((p->fmt_d ? p->fmt_d : p->fmt) - 100) {
+#define BD_DN_CASE(t) case t: ok = moe_bd_dn_launch<t>(tab, ids, hid, p, btab, ctx->smem_optin, st); break;
+        BD_MOE_TYPES(BD_DN_CASE)
+#undef BD_DN_CASE
+        default: return 0;
+    }
+    return ok && cuda_ok(cudaGetLastError(), "chain moe block launch");
+}
 static int moe_gv_ok(const CcMoe *p) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_CUDA_MOE_GV"); on = !(e && *e == '0'); }
@@ -3830,6 +4149,28 @@ extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float 
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream) {
     if (fault_injected()) return 0;
     if (!tab || !ids || !hid || !p || p->S < 1 || p->K < 1 || p->D < 32 || p->I < 32 || p->D % 32 || p->I % 32 || p->act) return 0;
+    if (p->fmt >= 100) {   /* a GGUF's experts: a decode step's rows on the GEMV kernels, a prompt chunk's sorted through the f16 tiles */
+        if (!moe_bd_ok(p) || p->D > MOE_DIM_MAX || p->I > MOE_DIM_MAX) return 0;
+        DeviceContext *bc = find_ctx(device);
+        if (!select_ctx(bc)) return 0;
+        cudaStream_t bst = (cudaStream_t)stream;
+        const bd_u32 *btab = bd_table(bc);
+        static int tiles = -1;
+        if (tiles < 0) { const char *e = getenv("COLI_CUDA_BD_TILES"); tiles = !(e && *e == '0'); }   /* 0: every row on the GEMV kernels */
+        int brows = tiles && btab && p->S > CC_MOE_FRAME_ROWS && p->E > 0 && p->E <= 4096 && hcg_ok(bc) && p->D % HCG_BK == 0 && p->I % HCG_BK == 0 &&
+                    (!x || ((uintptr_t)(x + p->x_off) & 15) == 0) && p->x_row % 4 == 0;
+        MoeSort bm = moe_sort_of(hid, p);
+        if ((p->parts & 1) && (!x || !(brows ? moe_rows_bd_launch(tab, x, ids, hid, bm, p, btab, bst) : moe_bd_launch(bc, tab, x, ids, hid, p, bst))))
+            return 0;
+        if (p->parts & 2) {
+            if (!w || !y || (p->h_off >= 0 && !hy)) return 0;
+            dim3 g((unsigned)((p->D + 255) / 256), (unsigned)p->S);
+            if (brows) moe_rows_sum_k<<<g, 256, 0, bst>>>(w, hid, hy, y, bm, *p);
+            else moe_sum_k<<<g, 256, 0, bst>>>(tab, ids, w, hid, hy, y, *p);
+            if (!cuda_ok(cudaGetLastError(), "chain moe sum launch")) return 0;
+        }
+        return 1;
+    }
     if (p->fmt == 4 && (p->gs < 16 || p->gs % 16)) return 0;
     if (p->fmt != 1 && p->fmt != 2 && p->fmt != 4 && p->fmt != 8) return 0;
     if (p->D > MOE_DIM_MAX || p->I > MOE_DIM_MAX) return 0;   /* an input row in 48 KiB of shared memory, the fp8 table beside it */
@@ -4089,6 +4430,8 @@ extern "C" int coli_cuda_expert_group_resident_issue(ColiCudaTensor *const *gate
         int home_device, const float *x_src_dev, float *partial_slot_dev){
     if(!gates||!ups||!downs||!weights||count<1||count>64||!x_src_dev||!partial_slot_dev) return 0;
     ColiCudaTensor *first=gates[0]; if(!first) return 0;
+    for(int i=0;i<count;i++)   /* the block formats: the chain's GEMVs only */
+        if((gates[i]&&gates[i]->fmt>=100)||(ups[i]&&ups[i]->fmt>=100)||(downs[i]&&downs[i]->fmt>=100)) return 0;
     int device=first->device,D=first->I,I=first->O;
     GroupDesc host[64];
     int total=0,all_s4=1;
@@ -4213,6 +4556,7 @@ extern "C" int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x
     if (fault_injected()) return 0;
     if(!t||S<1) return 0;
     DeviceContext *ctx=find_ctx(t->device); if(!select_ctx(ctx)) return 0;
+    if(t->fmt>=100) return bd_tensor_gemv(ctx,t,y_dev,x_dev,S,0);
     dim3 grid((unsigned)t->O,(unsigned)S);
     quant_matmul<<<grid,256>>>(y_dev,x_dev,t->weights,t->scales,t->fmt,S,t->I,t->O,
         row_bytes(t->fmt,t->I),t->gs,t->ng);

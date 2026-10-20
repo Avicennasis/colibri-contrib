@@ -1,0 +1,99 @@
+/* The CUDA tier with a GGUF's experts (qt_init_gguf), on the fake backend: the file's rows go
+ * up as the backend's block formats, gate/up and down of each layer's own types.
+ *   - With the arena (the default): one device allocation, slots of the biggest layer's
+ *     expert, every expert uploaded into a slot (coli_cuda_tensor_upload_at), and a swap may
+ *     pair layers of any types, the newcomer taking the victim's slot.
+ *   - Without it (the arena refused, or QT_GGUF_ARENA=0): an expert costs what three device
+ *     allocations take, and a swap pairs only layers of the same types: a swap into another
+ *     layer's types freed and allocated device memory under a dense chain's hybrid layer,
+ *     which deadlocked it (the device waiting for the host's word, the host's next launch
+ *     behind the free). */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../compat.h"
+#include "qwen36_fake_cuda.h"
+
+#include "../qwen36_tier.c"
+
+static int fails;
+static void check(int ok, const char *what) {
+    if (!ok) { printf("  FAIL: %s\n", what); fails++; }
+}
+static void drain(int want) {
+    for (int i = 0; i < 1000 && fake_uploads < want; i++) {
+        struct timespec ts = {0, 2000000};
+        nanosleep(&ts, NULL);
+    }
+}
+
+enum { NL = 3, NE = 4, D = 256, IH = 256, TOPK = 2 };
+/* layers 0 and 1: IQ2_XXS gate/up, IQ2_S down; layer 2 a bigger down (IQ3_S), as published files mix them */
+static const int tg[NL] = {16, 16, 16}, td[NL] = {22, 22, 21};
+static const size_t gb[NL] = {(size_t)IH * 66, (size_t)IH * 66, (size_t)IH * 66}, db[NL] = {(size_t)D * 82, (size_t)D * 82, (size_t)D * 110};
+
+static void run(int arena) {
+    printf("%s\n", arena ? "the arena:" : "a device allocation a matrix:");
+    fake_alloc_fail = !arena;   /* the arena refused: the tier falls back */
+    if (!qt_init_gguf(NL, NE, D, IH, NE, TOPK, tg, td, gb, db)) { printf("  FAIL: the tier refused a GGUF's experts\n"); fails++; return; }
+    check(G.wfmt == QT_GGUF, "a GGUF's tier holds its block formats");
+    check(G_arena_on == arena, arena ? "the arena is up" : "no arena when the device refuses it");
+    size_t pg = (gb[2] + 3 * (size_t)IH) / 4 * 4, pd = (db[2] + 3 * (size_t)D) / 4 * 4;
+    if (arena) check(G.exp_bytes == 2 * qt_pad256(pg) + qt_pad256(pd), "an expert costs its slot: the biggest layer's rows, no rounding");
+    else check(G.exp_bytes == 2 * dev_alloc_footprint(pg) + dev_alloc_footprint(pd), "an expert costs the biggest layer's three allocations");
+    int f, fd;
+    check(qt_chain_format(&f, NULL) && f == QT_GGUF, "the chain sees a GGUF's formats");
+    check(qt_chain_layer_format(0, &f, &fd) && f == 116 && fd == 122, "layer 0: IQ2_XXS gate/up, IQ2_S down");
+    check(qt_chain_layer_format(2, &f, &fd) && f == 116 && fd == 121, "layer 2: IQ3_S down");
+    check(swap_ok(0, 1) && (arena ? swap_ok(0, 2) : !swap_ok(0, 2) && !swap_ok(2, 1)),
+          arena ? "the arena's slots take any layer's types" : "without the arena, swaps pair only same-typed layers");
+
+    /* every expert goes up as the file's rows, its own types */
+    unsigned char *g = malloc(gb[2]), *u = malloc(gb[2]), *d = malloc(db[2]);
+    memset(g, 0x31, gb[2]); memset(u, 0x32, gb[2]); memset(d, 0x33, db[2]);
+    int layers[NL * NE], eids[NL * NE];
+    int planned = qt_plan_fill(layers, eids, NL * NE);
+    check(planned == NL * NE, "every expert fits the fake device");
+    int before = fake_uploads, at0 = fake_upload_at;
+    for (int i = 0; i < planned; i++) qt_note_planned(layers[i], eids[i], g, u, d, NULL, NULL, NULL);
+    drain(before + 3 * planned);
+    qt_fill_wait();
+    check(fake_uploads == before + 3 * planned, "three matrices an expert went up");
+    check(arena ? fake_upload_at == at0 + 3 * planned : fake_upload_at == at0, arena ? "into the arena's slots" : "as tensors of their own");
+    if (arena) {
+        int distinct = 1, used = 0;
+        for (int i = 0; i < NL * NE; i++) { if (G.slot[i].aslot) used++; for (int j = 0; j < i; j++) if (G.slot[i].aslot && G.slot[i].aslot == G.slot[j].aslot) distinct = 0; }
+        check(used == NL * NE && distinct && G_anfree[0] == G_aslots[0] - NL * NE, "each resident holds a slot of its own");
+    }
+
+    /* the re-plan: candidates in layer 0, residents in layers 1 and 2, layer 2's the coldest */
+    pthread_mutex_lock(&G.mx);
+    for (int e = 0; e < NE; e++) res_set(qs(0, e), 0);   /* layer 0 not resident (its tensors and slots stay, as an eviction leaves them) */
+    pthread_mutex_unlock(&G.mx);
+    uint32_t *counts = calloc(NL * NE, sizeof *counts);
+    for (int e = 0; e < NE; e++) { counts[e] = 100 + e; counts[NE + e] = 5; }
+    int np = qt_replan(-1, counts, 8);
+    check(np == NE, "each of layer 0's experts found a victim");
+    qt_fill_wait();
+    int vl[16], ve[16], nv = qt_evicted_take(vl, ve, 16), want = 1;
+    for (int i = 0; i < nv; i++) want &= arena ? vl[i] == 2 : vl[i] == 1;
+    check(nv == NE && want, arena ? "the coldest go, layer 2's (IQ3_S): the slot takes layer 0's types" :
+                                    "the victims are layer 1's (IQ2_S down), never layer 2's (IQ3_S)");
+    qt_shutdown();
+    check(!G_arena[0] && !G_arena_on, "the arena goes with the tier");
+    free(g); free(u); free(d); free(counts);
+}
+
+int main(void) {
+    setenv("COLI_CUDA", "1", 1);
+    setenv("COLI_GPUS", "0", 1);
+    setenv("QT_NO_WARMSTART", "1", 1);
+    fake_block_elems = 0;
+    check(!qt_init_gguf(NL, NE, D, IH, NE, TOPK, tg, td, gb, db), "a backend that takes no block format refuses a GGUF's experts");
+    fake_block_elems = 256;
+    run(1);
+    run(0);
+    printf(fails ? "qwen36 tier gguf: %d FAIL\n" : "qwen36 tier gguf: ok\n", fails);
+    return fails != 0;
+}

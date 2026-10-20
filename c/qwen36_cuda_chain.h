@@ -314,7 +314,8 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     ch->ok = 1;
     ch->dm_on = q36cc_dm_able(ch, m);
     if (ch->dm_on) fprintf(stderr, "[chain] qwen36: a decode step's routed experts in the frame (the tier's residents by address, "
-                                   "format %d, group %d; COLI_CUDA_CHAIN_MOE=0: the host's step)\n", ch->dm_fmt, ch->dm_gs);
+                                   "format %d%s, group %d; COLI_CUDA_CHAIN_MOE=0: the host's step)\n", ch->dm_fmt,
+                                   ch->dm_fmt >= 100 ? " (a GGUF's blocks, by layer)" : "", ch->dm_gs);
     fprintf(stderr, "[chain] qwen36: %d layers on CUDA device %d (%d attention), lm_head too; %.1f MiB of parameters, "
                     "%.1f MiB of router, b|a and gate rows, %.0f MB of DeltaNet state\n",
             L, ch->dev, ch->n_attn, np * 4 / 1048576.0, own / 1048576.0,
@@ -505,7 +506,8 @@ static int q36cc_deltanet(Q36CChain *ch, Model *m, Layer *l, int i, int n, int c
         CcBuf *rs = ns ? ch->rec_snap[c0 + r][i] : NULL, *cs = ns ? ch->ring_snap[c0 + r][i] : NULL;
         CcDnConv cp = {len, CD, c->dn_convk, s0 * PD, PD, s0 * CD, CD, snap_row, 0, (int)ch->o_conv[i], 0, 0};
         CcDnRec rp = {len, vh, c->dn_kheads, c->dn_vdim, c->dn_kheads * c->dn_kdim, s0 * CD, CD, s0 * 2 * vh, 2 * vh,
-                      vh + s0 * 2 * vh, 2 * vh, CD + s0 * PD, PD, s0 * vd, vd, snap_row, 0, c->eps,
+                      vh + s0 * 2 * vh, 2 * vh, CD + s0 * PD, PD, s0 * vd, vd, snap_row,
+                      (g_ssm_a_direct ? 2 : 0) | (g_dn_tiled ? 4 : 0), c->eps,   /* a GGUF's layout (qwen36.c) */
                       1.f / sqrtf((float)c->dn_kdim), 0, 0, (int)ch->o_dn[i]};
         ok = cc_dnconv(ch->qkvz, ch->prm, ch->ring[i], ch->cv, cs, &cp) &&
              cc_dnrec(c->dn_kdim, ch->cv, ch->ab, ch->qkvz, ch->rec[i], ch->prm, ch->dny, rs, &rp);
@@ -568,6 +570,10 @@ static int q36cc_dm_able(Q36CChain *ch, Model *m) {
     if (!qt_chain_format(&ch->dm_fmt, &ch->dm_gs)) return 0;
     if (c->hidden % 32 || c->inter % 32 || c->hidden > CC_MOE_DIM_MAX || c->inter > CC_MOE_DIM_MAX ||
         (ch->dm_fmt == 4 && (ch->dm_gs < 16 || ch->dm_gs % 16))) return 0;
+    for (int i = 0; ch->dm_fmt >= 100 && i < c->n_layers; i++) {   /* a GGUF's experts: every layer's types, cc_moe's */
+        int fg, fd;
+        if (!qt_chain_layer_format(i, &fg, &fd) || !cc_moe_block_type(fg - 100) || !cc_moe_block_type(fd - 100)) return 0;
+    }
     return 1;
 }
 static void q36cc_kv_down(Q36CChain *ch, Model *m, int i, int n, int pb) {
@@ -709,7 +715,8 @@ static int q36cc_dm_layer(Q36CChain *ch, Model *m, Layer *l, int i, int n, unsig
     CcRoute rp = {n, E, K, 0, 0, E, 0, 0, io, K, io, K, ng, ng > 1 ? c->topk_group : 1, 1, 1.f, 1.f, 0.f};
     int part;
     CcBuf *tab = q36cc_dm_tab(ch, i, n, &part);
-    CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1, E, tab == ch->dm_tabb};
+    CcMoe mp = {n, K, D, I, ch->dm_fmt, ch->dm_gs, 0, 1, i * E, 0, D, io, K, io, K, 0, D, -1, E, tab == ch->dm_tabb, 0};
+    if (ch->dm_fmt >= 100) qt_chain_layer_format(i, &mp.fmt, &mp.fmt_d);   /* a GGUF's types change from layer to layer */
     int stg = q36cc_stages(ch, tab, i);
     int ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_route(ch->lg, NULL, ch->dm_ids, ch->dm_w, &rp) &&
              cc_copy(ch->dm_idsd, io, ch->dm_ids, io, (size_t)n * K) && cc_copy(ch->dm_wd, io, ch->dm_w, io, (size_t)n * K);

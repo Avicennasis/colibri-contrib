@@ -72,6 +72,9 @@ namespace nvcuda { namespace wmma = ::rocwmma; }
 #define cudaFree                 hipFree
 #define cudaMemcpy               hipMemcpy
 #define cudaMemcpy2D             hipMemcpy2D
+#define cudaFuncSetAttribute     hipFuncSetAttribute
+#define cudaGetDevice            hipGetDevice
+#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaMemcpyAsync          hipMemcpyAsync
 #define cudaMemcpyToSymbol       hipMemcpyToSymbol   /* fmt=6 E8 codebook upload */
 #define cudaMemcpyHostToDevice   hipMemcpyHostToDevice

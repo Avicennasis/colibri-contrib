@@ -182,6 +182,19 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_overwrite(ColiCudaTensor *tensor, const
 COLI_CUDA_DLLEXPORT int coli_cuda_host_register(void *p, size_t bytes);
 COLI_CUDA_DLLEXPORT void coli_cuda_host_unregister(void *p);
 COLI_CUDA_DLLEXPORT int coli_cuda_planar_rows(int device, int D, int I);
+/* A GGUF's block formats (cuda_bd.cuh): fmt 100 + ggml type t, each row as the file stores
+ * it (no scale array: the scales are in the blocks), uploaded with coli_cuda_tensor_upload
+ * and computed by coli_cuda_matmul, coli_cuda_pipe_gemm and the dense chain's matmul (a
+ * speculative verify's rows sharing every weight load). The elements of a block of fmt, 0
+ * when the backend does not take it (a row's width must be a multiple of it and of 32).
+ * Optional in the DLL loader: 0 from a backend that predates it. */
+COLI_CUDA_DLLEXPORT int coli_cuda_block_elems(int fmt);
+/* A block-format tensor (fmt >= 100) in device memory the caller owns (dev, cap bytes: an
+ * arena's slot, at least O rows of the file's row padded to words), its rows uploaded from
+ * weights; coli_cuda_tensor_free leaves the memory. No cudaMalloc, so none of its rounding
+ * (a 576 KiB matrix took 1 MiB) and none of its synchronisation. Optional in the DLL loader. */
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload_at(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights,
+                                                   int fmt, int I, int O, int device);
 #ifdef COLI_ANS
 /* Experimental Linux-only GPU-resident entropy tier. The archive remains in
  * VRAM and is decoded into per-device scratch immediately before a grouped
