@@ -588,6 +588,11 @@ void qt_experts_withdraw(const char *why){
     if(!G.on || G_trunk_only || (bg && strcmp(bg,"auto") && atof(bg) > 0)) return;
     G_trunk_only = 1;
     for(int i = 0; i < G.ndev; i++) G.budget[i] = 0;
+    for(int i = 0; i < QT_MAX_DEV; i++){   /* a GGUF's arena: nothing is resident yet (before the warm start) */
+        if(G_arena[i]) coli_cuda_pipe_free(G.dev[i], G_arena[i]);
+        G_arena[i] = NULL; free(G_afree[i]); G_afree[i] = NULL; G_aslots[i] = G_anfree[i] = 0;
+    }
+    G_arena_on = 0;
     fprintf(stderr,"[qtier] the experts stay on the CPU too (%s; CUDA_EXPERT_GB=<GB> keeps them on the device)\n",
             why ? why : "withdrawn");
 }

@@ -8188,6 +8188,9 @@ int main(int argc, char **argv) {
 #ifdef COLI_CUDA
         if (q36cc_env_on() && q36cc_setup(&m, g_q36_mux_slots)) { g_cuda_chain = 1; chain_up = 1; atexit(cc_shutdown); }
 #endif
+        /* a GGUF's experts compute only in the chain's frame (the tier's expert groups take no
+         * block format): without the chain they stay the CPU's, their VRAM back */
+        if (gguf_tier && !chain_up) qt_experts_withdraw("a GGUF's experts run in the CUDA chain's frame, which is off");
         if (!chain_up && dn_gpu_env_on()) {
             int n = 0; double vram = 0;
             for (int i = 0; i < m.c.n_layers; i++) {
