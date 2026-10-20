@@ -431,6 +431,21 @@ int main(void) {
             ck(same, "and each of its three rows the one-row call's bits");
             coli_cuda_tensor_free(t4); T->free(xb4); T->free(yb4); T->free(yb1);
         }
+        for (int shape = 0; shape < 3; shape++) {   /* and quant_matmul's bits (coli_cuda_matmul still runs it) */
+            static const int sI[3] = {10240, 2048, 2048}, sO[3] = {4, 256, 1};
+            const int I5 = sI[shape], O5 = sO[shape], S5 = 2;
+            std::vector<float> x5 = rnd((size_t)S5 * I5, 16 + shape), w5 = rnd((size_t)I5 * O5, 19 + shape), one5(O5, 1.f), q5((size_t)S5 * O5);
+            ColiCudaTensor *t5 = NULL, *tq = NULL;
+            CcBuf *xb5 = T->buf((size_t)S5 * I5 * 4, CC_DEV), *yb5 = T->buf((size_t)S5 * O5 * 4, CC_DOWN);
+            int ok5 = xb5 && yb5 && coli_cuda_tensor_upload(&t5, w5.data(), one5.data(), 0, I5, O5, 0) && T->begin() &&
+                      T->write(xb5, 0, x5.data(), x5.size() * 4) && T->matmul(t5, xb5, 0, yb5, 0, S5) && T->submit(1) &&
+                      coli_cuda_matmul(&tq, q5.data(), x5.data(), w5.data(), one5.data(), 0, S5, I5, O5, 0, 0);
+            char what[96]; snprintf(what, sizeof what, "f32 rows, %d outputs of %d: quant_matmul's bits", O5, I5);
+            ck(ok5 && !memcmp(T->ptr(yb5), q5.data(), q5.size() * 4), what);
+            if (ok5 && memcmp(T->ptr(yb5), q5.data(), q5.size() * 4))
+                printf("  (largest difference %.3g)\n", maxdiff((const float *)T->ptr(yb5), q5.data(), q5.size()));
+            coli_cuda_tensor_free(t5); coli_cuda_tensor_free(tq); T->free(xb5); T->free(yb5);
+        }
         coli_cuda_tensor_free(t); coli_cuda_tensor_free(t0); T->free(xb); T->free(yb);
     }
     printf("norm\n");
@@ -825,7 +840,7 @@ int main(void) {
     printf("lost\n");
     {
         CcStats st; T->stats(&st);
-        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 15, "the counters saw the frames, ops and matmuls");
+        ck(st.frames > 10 && st.ops > 30 && st.matmuls == 18, "the counters saw the frames, ops and matmuls");
         setenv("COLI_GPU_FAIL_AFTER", "0", 1);
         std::vector<float> w = rnd(64, 81), ones(8, 1.f);
         ColiCudaTensor *t = NULL;

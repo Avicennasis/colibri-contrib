@@ -1513,13 +1513,20 @@ static size_t bd_file_row_bytes(int fmt, int I) {
     if (!bd_fmt_ok(fmt) || I < 32 || I % 32 || I % BD_BLK[fmt - 100]) return 0;
     return (size_t)I / BD_BLK[fmt - 100] * BD_BYTES[fmt - 100];
 }
+/* A resident tensor's copies done on the device before the caller may use it: a cudaMemcpy
+ * from pageable host memory returns once the bytes are staged, its DMA (and a conversion
+ * kernel after it) still on the legacy stream, which the chain's non-blocking stream does
+ * not wait for. A kernel there read a just-uploaded f32 matrix's later rows unwritten. */
+static int upload_settled(const char *what) { return cuda_ok(cudaStreamSynchronize(0), what); }
 /* O rows of rb bytes from the host into rows of row_words words; zero_pad: the padding zeroed
  * first (a new tensor's; a refill keeps what the upload wrote there) */
 static int bd_rows_copy(ColiCudaTensor *t, const void *weights, int zero_pad) {
     size_t rb = bd_file_row_bytes(t->fmt, t->I), pitch = (size_t)t->row_words * 4;
-    if (pitch == rb) return cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "block tensor upload");
+    if (pitch == rb) return cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "block tensor upload") &&
+                            upload_settled("block tensor upload");
     return (!zero_pad || cuda_ok(cudaMemset(t->weights, 0, t->weight_bytes), "block tensor padding")) &&
-           cuda_ok(cudaMemcpy2D(t->weights, pitch, weights, rb, rb, (size_t)t->O, cudaMemcpyHostToDevice), "block tensor upload");
+           cuda_ok(cudaMemcpy2D(t->weights, pitch, weights, rb, rb, (size_t)t->O, cudaMemcpyHostToDevice), "block tensor upload") &&
+           upload_settled("block tensor upload");
 }
 static int bd_tensor_upload(ColiCudaTensor **tensor, const void *weights, int fmt, int I, int O, int device) {
     DeviceContext *ctx = find_ctx(device);
@@ -1640,6 +1647,7 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
             return 0;
         }
     }
+    if (!upload_settled("tensor upload")) { coli_cuda_tensor_free(t); return 0; }
     if (fmt == 6) t->scale_count = 0;      /* in-block scales: nothing separate to track */
     t->tracked = 1;
     ctx->tensor_count++;
@@ -1675,7 +1683,7 @@ extern "C" int coli_cuda_tensor_overwrite(ColiCudaTensor *t, const void *weights
     }
     if (t->fmt && t->fmt != 6 &&
         !cuda_ok(cudaMemcpy(t->scales, scales, tensor_scale_bytes(t), cudaMemcpyHostToDevice), "scale overwrite")) return 0;
-    return 1;
+    return upload_settled("tensor overwrite");
 }
 
 #ifdef COLI_ANS
