@@ -50,9 +50,11 @@
  *            the rest by the device, every row the reference's; a prompt step (20 rows) and
  *            COLI_VK_HYBRID=0 leave them all to the device;
  *   pool copy the same experts and the streaming's slots: a prompt step's host pool experts
- *            are copied into the slots on the device (coli_vk_tensor_copy_as: the copy engine
- *            with staged uploads, the CPU through the mapping otherwise) and computed there,
- *            every row the reference's; COLI_VK_TIER_POOL_COPY=0 reads them in place.
+ *            are copied into the slots on the device (coli_vk_xb_sub_copy: at the head of the
+ *            batch with staged uploads, the CPU through the mapping otherwise) and computed
+ *            there, those of at most COLI_VK_HYBRID_BIG_ROWS rows (2) by the CPU in place at
+ *            the join, every row the reference's; COLI_VK_TIER_POOL_COPY=0 and
+ *            COLI_VK_HYBRID_BIG_ROWS=0 read them in place.
  *
  *   make tests/test_vk_tier VK=1 && VK_ICD_FILENAMES=.../lvp_icd.json ./tests/test_vk_tier */
 #include <stdio.h>
@@ -1381,6 +1383,11 @@ static void hybrid_case(void) {
     H = H0; F = F0;
 }
 
+/* the report's ", and S prompt steps' P pairs": P, 0 without the part */
+static unsigned long long big_pairs(const char *line) {
+    const char *p = strstr(line, "prompt steps' ");
+    return p ? strtoull(p + 14, NULL, 10) : 0;
+}
 /* the report's "N host pool experts copied into the slots": N, 0 without the part */
 static unsigned long long pc_count(const char *line) {
     const char *p = strstr(line, " host pool experts copied into the slots");
@@ -1406,7 +1413,9 @@ static void pool_copy_case(void) {
     setenv("COLI_VK_TIER_STREAM_HALF", "40", 1);   /* sub-batches of 40 rows: the slots refilled within a step */
     uint32_t hist[L][E], *rows[L];
     for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 : 1; }
-    for (int c = 0; c < 2; c++) {   /* the copies on, then COLI_VK_TIER_POOL_COPY=0 */
+    setenv("GQ_EXACT", "1", 1);   /* the CPU's pairs in its float form, against the float reference */
+    for (int c = 0; c < 2; c++) {   /* the copies and the CPU's few-row pairs on, then both off */
+        setenv("COLI_VK_HYBRID_BIG_ROWS", c ? "0" : "2", 1);
         if (c) setenv("COLI_VK_TIER_POOL_COPY", "0", 1);
         set_budget(8, gu, dn);
         snprintf(gb, sizeof gb, "%.12f", (L * E + 0.5) * eb);
@@ -1430,16 +1439,18 @@ static void pool_copy_case(void) {
                 if (r > worst) worst = r;
             }
         char line[4096]; report_line(line, sizeof line);
-        unsigned long long copies = pc_count(line);
-        printf("  Q4_K/Q6_K experts in the host pool, %s: %llu copied into the slots, %llu of %llu assignments on the device, "
-               "worst relative error %.2e\n", c ? "COLI_VK_TIER_POOL_COPY=0" : "the copies on", copies, bk.dev, bk.routed, worst);
+        unsigned long long copies = pc_count(line), cpu = big_pairs(line);
+        printf("  Q4_K/Q6_K experts in the host pool, %s: %llu copied into the slots, %llu pairs on the CPU in place, "
+               "%llu of %llu assignments taken, worst relative error %.2e\n", c ? "both off" : "the copies on, 2 rows",
+               copies, cpu, bk.dev, bk.routed, worst);
         CHECK(worst < 2e-3, "pool copy: relative error %.3g", worst);
         CHECK(bk.dev == bk.routed, "pool copy: the device took %llu of %llu", bk.dev, bk.routed);
-        if (!c) CHECK(copies > 0, "pool copy: no host pool expert was copied into a slot");
-        else CHECK(copies == 0, "pool copy: COLI_VK_TIER_POOL_COPY=0 copied %llu", copies);
+        if (!c) CHECK(copies > 0 && cpu > 0, "pool copy: %llu copied into a slot, %llu pairs on the CPU", copies, cpu);
+        else CHECK(copies == 0 && cpu == 0, "pool copy: off, yet %llu copied and %llu pairs on the CPU", copies, cpu);
         vkt_shutdown();
     }
     unsetenv("COLI_VK_TIER_POOL_COPY"); unsetenv("COLI_VK_TIER_PROMOTE"); unsetenv("COLI_VK_TIER_RATE");
+    unsetenv("COLI_VK_HYBRID_BIG_ROWS"); unsetenv("GQ_EXACT");
     unsetenv("COLI_VK_TIER_STREAM_SLOTS"); unsetenv("COLI_VK_TIER_STREAM_HALF");
     unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_SYNC");
     setenv("COLI_VK_TIER_HOST", "0", 1);

@@ -155,6 +155,8 @@ static struct {
      * instead of the device reading them over PCIe; hy_of[i] pair i's place among them (-1
      * none), hy_v their rows, hy_x their input rows, hy_out their outputs */
     int hybrid, hy_n, chy, cho; int *hy_of;
+    int hy_big;                          /* a prompt step's host pool experts of at most hy_big rows on the CPU too (0: none) */
+    unsigned long long hyb_steps, hyb_pairs;
     VktHostExpert *hy_v; const VktHostExpert **hy_hx; const float **hy_x;
     float *hy_gu, *hy_hh, *hy_out;
     unsigned long long hy_steps, hy_pairs; double hy_ms;
@@ -1261,6 +1263,8 @@ static int d2_issue_big(int layer, const float *x, int K, const float *w, const 
     T.d2_served += (unsigned long long)j; T.d2_steps++; T.d2_big++;
     return j;
 }
+static int host_view_share(int layer, int e, VktHostExpert *hx, int share);   /* below, with the hybrid steps */
+static int grow_hy(int n, int np);
 static int issue_big(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken) {
     const int E = T.c.experts, H = T.c.hidden, n = S * K;
     int *cnt = T.bcnt, *ofs = T.bofs, *cls = T.bcls;
@@ -1301,6 +1305,26 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         for (int e = 0; e < E; e++) T.pred[(size_t)layer * E + e] = (uint32_t)cnt[e];
         T.pred_ok[layer] = 1;
     }
+    /* A host pool expert of block types with at most hy_big rows: the CPU computes its pairs in
+     * place at the join (vkt_host_pairs), while it waits for the device anyway, instead of its
+     * bytes crossing the bus for a row or two (the device's alternative is a copy, so the
+     * decode's PCIe share does not apply) */
+    T.hy_n = 0;
+    int nhy = 0;
+    if (T.hybrid && T.hy_big > 0 && grow_hy(n, 0)) {
+        for (int i = 0; i < n; i++) T.hy_of[i] = -1;
+        for (int e = 0; e < E; e++) {
+            if (cnt[e] < 1 || cnt[e] > T.hy_big || (cls[e] != BC_DEV && cls[e] != BC_STREAM) || !slot(layer, e)->host) continue;
+            VktHostExpert hv;
+            if (!host_view_share(layer, e, &hv, 0) || !grow_hy(n, T.hy_n + cnt[e])) continue;
+            for (int r = 0; r < cnt[e]; r++) {
+                const int i = T.blist[ofs[e] + r];
+                T.hy_v[T.hy_n] = hv; T.hy_x[T.hy_n] = x + (size_t)(i / K) * H; T.hy_of[i] = T.hy_n++;
+            }
+            if (T.bpool && T.bpool[e]) { T.bpool[e] = 0; npool--; }
+            cls[e] = BC_NONE; nhy++;   /* none of the device's */
+        }
+    }
     int ndev = 0, nst = 0, nkept = 0, kept_rows = 0, nd2 = 0;
     for (int e = 0; e < E; e++) {
         ndev += cls[e] == BC_DEV; nst += cls[e] == BC_STREAM; nd2 += cls[e] == BC_DEV2;
@@ -1330,11 +1354,12 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         else fprintf(stderr, "the GEMM's %d rows: the upload and the CPU's rows not measured yet", T.gemm_rows);
         fprintf(stderr, "); layer %d: %d resident, %d streamed (%d of them copied from the host pool), %d kept on the CPU (%d rows)",
                 layer, ndev, nst, npool, nkept, kept_rows);
+        if (nhy) fprintf(stderr, ", %d of the host pool on the CPU in place (%d rows or fewer)", nhy, T.hy_big);
         if (T.d2) fprintf(stderr, ", %d on the second device", nd2);
         fprintf(stderr, "\n");
     }
     T.st_kept += (unsigned long long)nkept; T.st_kept_rows += (unsigned long long)kept_rows;
-    if (!ndev && !nst && !nd2) return 0;
+    if (!ndev && !nst && !nd2 && !T.hy_n) return 0;
     /* The backend counts both halves, activation buffers, descriptor windows and
      * growth before allocating. Leave half of available RAM for CPU work too. */
     int half = T.st_half < n ? T.st_half : n;
@@ -1489,6 +1514,11 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     free(order); free(bex); free(brows); free(bx); free(bw); free(bidx); free(eslot);
     total += d2_taken;
     T.big_taken = total;
+    if (T.hy_n) {   /* the join computes them */
+        for (int i = 0; i < n; i++) if (T.hy_of[i] >= 0) taken[i] = 1;
+        for (int p = 0; p < T.hy_n; p++) T.hy_hx[p] = &T.hy_v[p];
+        T.inflight = 1;
+    }
     if (!total && !T.inflight) {   /* nothing went (or everything failed before a submit) */
         T.big = 0;
         if (T.sy_step) { coli_vk_xb_step_end(); T.sy_step = NULL; }
@@ -1501,11 +1531,20 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     T.steps++; T.served += (unsigned long long)total; T.st_steps++;
     T.S = S; T.K = K;
     T.t_issued = vkt_now_ms();
-    return total;
+    return total + T.hy_n;
 }
 static int join_big(const float **rows) {
     double t0 = vkt_now_ms(), tc = t0 - T.t_issued;
     T.cpu_ms += tc;
+    /* the host pool's pairs of few rows, while the device computes its batches */
+    const int hn = T.hy_n;
+    int hok = 1;
+    if (hn) {
+        hok = vkt_host_pairs(T.hy_hx, T.hy_x, hn, T.c.hidden, T.c.inter, T.c.act_limit, 0, T.hy_gu, T.hy_hh, T.hy_out);
+        double th = vkt_now_ms() - t0;
+        T.hy_ms += th; T.cpu_ms += th; T.hyb_steps++; T.hyb_pairs += (unsigned long long)hn;
+        T.hy_n = 0;
+    }
     /* the oldest first */
     int a = (int)(T.sk % 2), b = !a;
     st_join_half(a); st_join_half(b);
@@ -1517,7 +1556,7 @@ static int join_big(const float **rows) {
         if (ok1) for (int q = 0; q < T.nd2; q++) memcpy((T.sy_step ? T.sy_step : T.sy) + (size_t)T.d2_idx[q] * T.c.hidden, T.d2_y[q], (size_t)T.c.hidden * sizeof(float));
         T.d2_inflight = 0;
     }
-    int cpu_pairs = T.big_n - T.big_taken;
+    int cpu_pairs = T.big_n - T.big_taken - hn;   /* the engine's own */
     if (cpu_pairs >= 32 && tc > 0) {
         double r = tc / cpu_pairs;
         T.cpu_row_ms = T.cpu_row_ms > 0 ? 0.8 * T.cpu_row_ms + 0.2 * r : r;
@@ -1525,7 +1564,9 @@ static int join_big(const float **rows) {
     T.inflight = 0; T.big = 0;
     int ok = !T.big_fail;
     const float *SY = T.sy_step ? T.sy_step : T.sy;
-    for (int i = 0; i < T.big_n; i++) rows[i] = ok && ok1 && T.map[i] >= 0 ? SY + (size_t)i * T.c.hidden : NULL;
+    for (int i = 0; i < T.big_n; i++)
+        rows[i] = !(ok && ok1 && hok) ? NULL : T.map[i] >= 0 ? SY + (size_t)i * T.c.hidden
+                : hn && T.hy_of[i] >= 0 ? T.hy_out + (size_t)T.hy_of[i] * T.c.hidden : NULL;
     for (int i = 0; T.st && i < T.st_n; i++) if (T.st[i].state == SS_BUSY) { T.st[i].state = SS_FREE; T.st[i].pending = 0; }
     if (!ok) {
         fprintf(stderr, "[VK] tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
@@ -1537,6 +1578,10 @@ static int join_big(const float **rows) {
         return 0;
     }
     quiesce();
+    if (!hok) {   /* the CPU computes the step's pairs from its own copies */
+        fprintf(stderr, "[VK] tier %s: a prompt step's host pool pairs could not be computed in place, the step goes to the CPU\n", T.engine);
+        return 0;
+    }
     return 1;
 }
 
@@ -1600,12 +1645,12 @@ static double hybrid_pcie_share(void) {
  * device's share (by a hash of (layer, expert): the same split at every step and every read
  * of a table, the CPU's share spread over the experts), its three tensors block types the
  * CPU has rows of (a GGUF's, as the file has them), gate and up of one type. *hx its rows. */
-static int host_view(int layer, int e, VktHostExpert *hx) {
+static int host_view_share(int layer, int e, VktHostExpert *hx, int share) {
     VSlot *v = slot(layer, e);
     if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex || !v->host) return 0;
     uint32_t hsh = (uint32_t)(layer * 2654435761u) ^ (uint32_t)(e * 2246822519u);
     hsh ^= hsh >> 15; hsh *= 2654435761u; hsh ^= hsh >> 13;
-    if ((double)(hsh & 0xffff) / 65536.0 < hybrid_pcie_share()) return 0;
+    if (share && (double)(hsh & 0xffff) / 65536.0 < hybrid_pcie_share()) return 0;
     ColiVkTensor *t[3]; ColiVkTensorInfo ti[3]; const void *r[3]; int ok = 1;
     coli_vk_xb_expert_tensors(v->ex, &t[0], &t[1], &t[2]);
     for (int k = 0; k < 3 && ok; k++)
@@ -1616,6 +1661,7 @@ static int host_view(int layer, int e, VktHostExpert *hx) {
                           (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4};
     return 1;
 }
+static int host_view(int layer, int e, VktHostExpert *hx) { return host_view_share(layer, e, hx, 1); }
 
 static int hy_threads(void) {   /* the CPU's team: COLI_VK_HYBRID_THREADS, else OpenMP's */
     static int n = -1;
@@ -2438,6 +2484,9 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
      * reads them over PCIe). SwiGLU only: DeepSeek V4's expert rounds as its own kernel does. */
     const char *hy = getenv("COLI_VK_HYBRID");
     T.hybrid = T.dmax[2] > 0 && T.c.act == VKT_ACT_SWIGLU && !(hy && *hy == '0');
+    /* and a prompt step's host pool experts of at most COLI_VK_HYBRID_BIG_ROWS rows */
+    const char *hbr = getenv("COLI_VK_HYBRID_BIG_ROWS");
+    T.hy_big = hbr && *hbr ? atoi(hbr) : 1;
     /* a prompt step's host pool experts of block types copied into the streaming's slots by
      * the copy engine (12.6 GB/s on a PCIe 4.0 x8 card), where the grouped GEMMs read them
      * in place at about 4 (COLI_VK_TIER_POOL_COPY=0: in place) */
@@ -2468,9 +2517,11 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
                 T.f_pool, T.f_copy, T.f_sets);
     if (T.balance) fprintf(stderr, " | balance: device share %.2f, %llu rows handed to the CPU", T.share, T.handed);
     if (T.chain_served) fprintf(stderr, " | in the dense chain: %llu routed experts with no host step", T.chain_served);
-    if (T.hy_steps)
+    if (T.hy_steps || T.hyb_steps) {
         fprintf(stderr, " | hybrid: %llu steps, %llu host pool pairs computed by the CPU in place (%.1f ms, %.0f us a pair)",
-                T.hy_steps, T.hy_pairs, T.hy_ms, T.hy_ms * 1e3 / (double)T.hy_pairs);
+                T.hy_steps, T.hy_pairs, T.hy_ms, T.hy_ms * 1e3 / (double)(T.hy_pairs + T.hyb_pairs));
+        if (T.hyb_steps) fprintf(stderr, ", and %llu prompt steps' %llu pairs", T.hyb_steps, T.hyb_pairs);
+    }
     if (T.c.extra_layers)
         fprintf(stderr, " | extra layers (%d): %llu of %llu routed experts on the device, resident %d (budget %d)",
                 T.c.extra_layers, T.extra_served, T.extra_routed, T.xres, T.xmax);
