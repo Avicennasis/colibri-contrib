@@ -298,22 +298,36 @@ void vkt_ram_gave(void);
  * routes and computes a layer's experts there, with no host step, for the layers whose
  * experts the tier holds on the primary device.
  *   vkt_epoch       changes whenever a resident comes or goes (the engine thread's
- *                   quiescent points: a vkt_issue, vkt_join, vkt_note or vkt_put_done);
- *                   residents stay put between two of them
+ *                   quiescent points: a vkt_issue, vkt_join, vkt_note, vkt_put_done,
+ *                   vkt_dev_count or vkt_settle); residents stay put between two of them
  *   vkt_dev_table   layer's E entries for vkc_moe (COLI_VK_XB_ENTRY words each, a zero
  *                   entry where the expert is not resident there); returns how many are,
  *                   -1 when the device cannot read them by address
  *   vkt_dev_count   the books for S rows of K experts the device computed (idx as
- *                   vkt_issue's): heat, routed and served, as a vkt_issue that took them */
+ *                   vkt_issue's): heat, routed and served, as a vkt_issue that took them;
+ *                   after the frame, with nothing in flight: where the host pool holds
+ *                   every expert, the routed ones it served move up to the device's
+ *                   memory and the coldest there go back to their copy in the pool
+ *   vkt_settle      at a frame's start, nothing in flight: the experts that moved up
+ *                   since take their entries (the table read next has them)
+ *   vkt_dev_changes the slots (layer * experts + expert) whose entries the epochs after
+ *                   `since` changed, oldest first; -1 when the tier cannot say (more than
+ *                   max, or its log starts later): read the tables whole
+ *   vkt_dev_entry   one expert's entry as vkt_dev_table gives it (and, ent_hybrid and hx
+ *                   given, as vkt_dev_table_hybrid does; host: in the host pool): 1 resident
+ *                   on the primary device, 0 not, -1 an error */
 unsigned vkt_epoch(void);
 int  vkt_dev_table(int layer, uint32_t *entries);
 void vkt_dev_count(int layer, int S, int K, const int *idx);
+void vkt_settle(void);
+int  vkt_dev_changes(unsigned since, int *slots, int max);
 /* The dense chain's hybrid steps (vk_dmoe.h): an expert of the host pool the CPU can
  * compute in place (a GGUF block type: its rows as the file has them, in system RAM) gets
  * a zero entry, so the device skips it, and its rows in hx[e]; every other expert's entry
  * as vkt_dev_table gives it, its hx[e] zero. The count is vkt_dev_table's. */
 typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; } VktHostExpert;   /* rgu, rd: bytes a row */
 int  vkt_dev_table_hybrid(int layer, uint32_t *entries, VktHostExpert *hx);
+int  vkt_dev_entry(int layer, int eid, uint32_t *ent, uint32_t *ent_hybrid, VktHostExpert *hx, uint8_t *host);
 /* whether the tier keeps experts in its host pool (system RAM the device reads over PCIe) */
 int  vkt_host_pool_on(void);
 /* the device memory the budget left for a prompt chunk's staging (VktConfig.stage), 0 none */
@@ -331,6 +345,8 @@ static inline int vkt_dev_host(int l,uint8_t *h){(void)l;(void)h;return -1;}
 static inline int vkt_score(int l,uint64_t *s){(void)l;(void)s;return -1;}
 typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; } VktHostExpert;   /* rgu, rd: bytes a row */
 static inline int vkt_dev_table_hybrid(int l,uint32_t *e,VktHostExpert *h){(void)l;(void)e;(void)h;return -1;}
+static inline int vkt_dev_entry(int l,int e,uint32_t *t,uint32_t *th,VktHostExpert *h,uint8_t *o){(void)l;(void)e;(void)t;(void)th;(void)h;(void)o;return -1;}
+static inline int vkt_dev_changes(unsigned s,int *c,int m){(void)s;(void)c;(void)m;return -1;}
 static inline int  vkt_wanted(void){return 0;}
 static inline int  vkt_init(const VktConfig *c, uint32_t *const *h){(void)c;(void)h;return 0;}
 static inline int  vkt_ready(void){return 0;}
@@ -358,6 +374,7 @@ static inline void vkt_ram_gave(void){}
 static inline unsigned vkt_epoch(void){return 0;}
 static inline int  vkt_dev_table(int l,uint32_t *e){(void)l;(void)e;return -1;}
 static inline void vkt_dev_count(int l,int S,int K,const int *i){(void)l;(void)S;(void)K;(void)i;}
+static inline void vkt_settle(void){}
 #endif
 
 #endif

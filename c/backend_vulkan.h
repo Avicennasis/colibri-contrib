@@ -227,6 +227,13 @@ int    coli_vk_tier_tensor(ColiVkTensor **t, int fmt, int I, int O, int gs,
  * frees. With mapped memory it does nothing. Thread-safe; the n tensors on one device.
  * 0 = the copy failed (the device is lost): free the tensors. */
 int    coli_vk_tensor_commit(ColiVkTensor *const *t, int n);
+/* A tier tensor on device dev with the layout of src, a tensor of the host pool (a
+ * promotion: the tier copies its host pool expert up). Staged uploads: empty, then
+ * coli_vk_tensor_copy fills the n of them from their sources by the device's copy engine
+ * (none of the bytes through the CPU); mapped memory: filled here, and the copy does
+ * nothing. 0 = no room, no memory, or (the copy) the device is lost: free them. */
+int    coli_vk_tier_tensor_like(int dev, ColiVkTensor **t, const ColiVkTensor *src, size_t pad_w, size_t pad_s);
+int    coli_vk_tensor_copy(ColiVkTensor *const *dst, ColiVkTensor *const *src, int n);
 int    coli_vk_staged(void);   /* 1 = resident data goes to the device through staged uploads */
 size_t coli_vk_tensor_row_bytes(int fmt, int I);
 int coli_vk_block_elems(int fmt);   /* block formats (100 + ggml type, 200-203): elements per block; else 0 */

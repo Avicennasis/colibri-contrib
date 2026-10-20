@@ -1818,6 +1818,8 @@ static int pool_suballoc(VkWPool *P, size_t bytes, VkBuffer *buf, void **ptr, Vk
         .size = bytes ? bytes : 4, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     if (pool_staged(P)) { bi.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT; up_sharing(&g_up[P->dev], &bi); }
+    /* the host pool's: the source of a copy to the device (coli_vk_tensor_copy), on the uploader's queue */
+    else if (P->host) { bi.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT; up_sharing(&g_up[P->dev], &bi); }
     if (pool_bda(P)) bi.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     VKCHECK(vkCreateBuffer(dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
@@ -5691,6 +5693,55 @@ int coli_vk_tensor_commit(ColiVkTensor *const *t, int n) {
     if (!ok) up_failed(dev, "the tensors are not resident");
     pthread_mutex_unlock(&u->mx);
     for (int k = 0; k < n; k++) if (t[k]) { up_img_free(t[k]->img, t[k]->img_al); t[k]->img = NULL; }
+    return ok;
+}
+/* A tier tensor on device dev (0, or 1: COLI_VK_DEV2's) with the layout of src, a tensor of
+ * the host pool, and its ranges padded as coli_vk_tier_tensor_pad's: with staged uploads
+ * empty, for coli_vk_tensor_copy to fill; with mapped memory filled here from src's
+ * mapping. 0 = no room or no memory. */
+int coli_vk_tier_tensor_like(int dev, ColiVkTensor **t, const ColiVkTensor *src, size_t pad_w, size_t pad_s) {
+    if (!G.ready || !t || !src || src->pool != &g_hpool || !src->wmap || !src->smap || (dev == 1 && !G2.ready)) return 0;
+    VkWPool *P = dev == 1 ? &g_tpool2 : &g_tpool;
+    size_t sb = scale_floats(src->fmt, src->I, src->O, src->gs) * sizeof(float);
+    if (pool_staged(P)) {
+        ColiVkTensor *n = tensor_alloc_pad(P, src->fmt, src->I, src->O, src->gs, pad_w, pad_s, NULL, NULL);
+        if (!n) return 0;
+        *t = n;
+        return 1;
+    }
+    void *w, *s;
+    ColiVkTensor *n = tensor_alloc_pad(P, src->fmt, src->I, src->O, src->gs, pad_w, pad_s, &w, &s);
+    if (!n) return 0;
+    memcpy(w, src->wmap, src->wbytes);
+    memcpy(s, src->smap, sb);
+    *t = n;
+    return 1;
+}
+/* Tensors made by coli_vk_tier_tensor_like filled from their sources in the host pool by
+ * the device's copy engine (staged uploads; nothing to do with mapped memory), all n
+ * before this returns: the bytes go over the bus once, none through the CPU. Any thread;
+ * the n tensors on one device. 0 = the copy failed (the device is lost): free them. */
+int coli_vk_tensor_copy(ColiVkTensor *const *dst, ColiVkTensor *const *src, int n) {
+    int dev = -1;
+    for (int k = 0; k < n; k++) if (dst[k] && pool_staged(dst[k]->pool)) dev = dst[k]->dev;
+    if (dev < 0) return 1;
+    VkUp *u = &g_up[dev];
+    pthread_mutex_lock(&u->mx);
+    int ok = 1;
+    for (int k = 0; k < n && ok; k++) {
+        if (!dst[k] || !pool_staged(dst[k]->pool)) continue;
+        if (!src[k] || src[k]->pool != &g_hpool || src[k]->wbytes != dst[k]->wbytes) { ok = 0; break; }
+        size_t sb = scale_floats(src[k]->fmt, src[k]->I, src[k]->O, src[k]->gs) * sizeof(float);
+        if (!(ok = up_open(u))) break;
+        VkBufferCopy cw = {0, 0, src[k]->wbytes}, cs = {0, 0, sb};
+        vkCmdCopyBuffer(u->cmd[u->cur], src[k]->wbuf, dst[k]->wbuf, 1, &cw);
+        if (sb) vkCmdCopyBuffer(u->cmd[u->cur], src[k]->sbuf, dst[k]->sbuf, 1, &cs);
+        u->bytes += src[k]->wbytes + sb; u->copies += 1 + (sb != 0);
+        if (k == 0 && n > 1 && up_fault("copy")) ok = up_fail(u, VK_ERROR_OUT_OF_DEVICE_MEMORY, "copy");
+    }
+    ok = up_finish(u, dev) && ok;
+    if (!ok) up_failed(dev, "the tensors are not resident");
+    pthread_mutex_unlock(&u->mx);
     return ok;
 }
 /* A tier tensor filled again in place (a staging slot of the tier's streaming): mapped

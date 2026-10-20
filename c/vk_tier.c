@@ -34,6 +34,13 @@
 #define VKT_QCAP 32                 /* promotions staged and waiting for the uploader */
 #define VKT_CAND 64                 /* victim candidates kept per refresh */
 #define VKT_DECAY_TOKENS 1024u      /* tier.h's decay period, in tokens */
+/* T.full's promotions (promote): from steps of up to this many rows (decode, a verify; a
+ * prompt chunk routes nearly every expert once), and a newcomer beats the coldest resident
+ * by this many routings. Qwen3.8 IQ2_XS on an RTX PRO 4000, a frozen history: without the
+ * margin the prompt that wrote the history lost 4% to swaps that found nothing more on the
+ * card; with it that prompt keeps its speed and another topic its gain. */
+#define VKT_UP_ROWS 8
+#define VKT_UP_MARGIN 2u
 
 enum { VS_NONE = 0, VS_QUEUED, VS_RESIDENT, VS_EVICT };
 
@@ -44,9 +51,13 @@ typedef struct {
     uint8_t dev;                       /* the device it is on or on its way to (0, or 1: COLI_VK_DEV2's) */
     uint8_t host;                      /* dev 0 with its tensors in the host pool (coli_vk_tier_host_pool): the
                                         * primary device reads them over PCIe, in a batch and in the dense chain */
+    uint8_t up;                        /* T.full: on its way from the host pool to the device (promote) */
+    ColiVkExpert *hex;                 /* T.full: its copy in the host pool (ex itself while host) */
 } VSlot;
-typedef struct { int layer, eid, dev; uint8_t *buf; } VQ;   /* dev: the place (place_of) */
-typedef struct { int layer, eid, ok, copy_failed; ColiVkTensor *g, *u, *d; } VDone;
+/* dev: the place (place_of); src: a promotion's host pool copy, copied up instead of buf */
+typedef struct { int layer, eid, dev; uint8_t *buf; ColiVkExpert *src; } VQ;
+/* hg, hu, hd: vkt_put's copy in the host pool beside a device's (T.full) */
+typedef struct { int layer, eid, ok, copy_failed; ColiVkTensor *g, *u, *d, *hg, *hu, *hd; } VDone;
 /* streaming: a staging slot (an expert's three tensors on the device, filled again for
  * every expert it carries) and a sub-batch in flight */
 enum { SS_FREE = 0, SS_FILLED, SS_BUSY };
@@ -80,6 +91,16 @@ static struct {
      * second device's (dmax[1] = 0 without one), 2 the host pool (dmax[2] = 0 without it) */
     int dmax[3], dres[3], dque[3];
     size_t h_budget;                   /* the host pool's bytes */
+    /* Every expert in the host pool (host_init): the device's experts keep a copy there, so
+     * the routed ones the device reads from the pool move up to its memory as a conversation
+     * routes them (promote) and the coldest there give way by going back to their copy. full:
+     * on; promote_rate: the most a forward (COLI_VK_TIER_PROMOTE); ups, up_victims: done, and
+     * residents that gave way; dfree: the device copies of those, freed at a quiescent point;
+     * vram_routed: routed pairs the dense chain found in the device's memory */
+    int full, promote_rate, upromos;
+    ColiVkExpert **dfree; int ndfree, cdfree;
+    unsigned long long ups, up_victims, vram_routed;
+    unsigned long long dec_routed, dec_vram;   /* the same in steps of up to VKT_UP_ROWS rows (decode, a verify) */
     size_t stage_room;                 /* left out of the budget for a prompt chunk's staging (VktConfig.stage) */
     /* the second device (COLI_VK_DEV2) */
     int d2;                            /* the tier holds experts there */
@@ -127,6 +148,11 @@ static struct {
      * what each join waited (the device was the slower side) or did not */
     int balance, can_balance; float share; unsigned long long handed;
     unsigned epoch;                      /* bumps when a resident comes or goes (vkt_epoch) */
+    /* The slots whose entries changed (note_change), published together with an epoch at a
+     * quiescent point (publish), and the log of what each epoch changed (vkt_dev_changes),
+     * whole from log_from on: a chain updates those entries of its table and reads no other */
+    int *pend; int npend, cpend, pend_all;
+    int *log_slot; unsigned *log_ep; int nlog, clog; unsigned log_from;
     unsigned long long chain_served;     /* pairs the dense chain computed (vkt_dev_count) */
     /* accounting */
     unsigned long long routed, served, steps, uploads, upload_bytes, evictions, qfull, rated, refused, failed, warm;
@@ -349,7 +375,38 @@ size_t vkt_expert_bytes(int H, int F, VktFmt gu, VktFmt dn) {
 }
 
 /* ---- the uploader -------------------------------------------------------------- */
-static void push_done(int layer, int eid, int ok, int copy_failed, ColiVkTensor *t[3]) {
+static void push_done(int layer, int eid, int ok, int copy_failed, ColiVkTensor *t[3], ColiVkTensor *h[3]);
+/* A promotion (promote): the expert's host pool copy to new device tensors, by the device's
+ * copy engine. Refused for room, it waits for the victim's free as an upload does. */
+static void promote_copy(const VQ *e) {
+    ColiVkTensor *src[3], *t[3] = {NULL, NULL, NULL};
+    coli_vk_xb_expert_tensors(e->src, &src[0], &src[1], &src[2]);
+    int ok = 0, copy_failed = 0;
+    for (int frees = 0, waited = 0; ; ) {
+        int k = 0;
+        for (; k < 3; k++) if (!src[k] || !coli_vk_tier_tensor_like(0, &t[k], src[k], T.pad_w[k == 2], T.pad_s[k == 2])) break;
+        if (k == 3) { ok = 1; break; }
+        for (int j = 0; j < k; j++) { coli_vk_tensor_free(t[j]); t[j] = NULL; }
+        if (!src[k] || frees >= 3 || waited >= 600 || T.sync) break;
+        pthread_mutex_lock(&T.mx);
+        unsigned long gen = T.room_gen;
+        while (T.room_gen == gen && !T.stop && waited < 600) {
+            struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_nsec += 100 * 1000000L; if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+            if (pthread_cond_timedwait(&T.cv_room, &T.mx, &until) == ETIMEDOUT) waited++;
+        }
+        if (T.room_gen != gen) frees++;
+        int stop = T.stop;
+        pthread_mutex_unlock(&T.mx);
+        if (stop) break;
+    }
+    if (ok && !coli_vk_tensor_copy(t, src, 3)) {
+        for (int k = 0; k < 3; k++) { coli_vk_tensor_free(t[k]); t[k] = NULL; }
+        ok = 0; copy_failed = 1;
+    }
+    push_done(e->layer, e->eid, ok, copy_failed, t, NULL);
+}
+static void push_done(int layer, int eid, int ok, int copy_failed, ColiVkTensor *t[3], ColiVkTensor *h[3]) {
     pthread_mutex_lock(&T.mx);
     if (T.ndone == T.cdone) {
         int nc = T.cdone ? 2 * T.cdone : 64;
@@ -357,12 +414,12 @@ static void push_done(int layer, int eid, int ok, int copy_failed, ColiVkTensor 
         if (!n) {   /* cannot even record it: the slot stays queued and is never used */
             T.busy = 0; pthread_cond_broadcast(&T.cv_done);
             pthread_mutex_unlock(&T.mx);
-            for (int k = 0; k < 3; k++) if (t[k]) coli_vk_tensor_free(t[k]);
+            for (int k = 0; k < 3; k++) { if (t[k]) coli_vk_tensor_free(t[k]); if (h && h[k]) coli_vk_tensor_free(h[k]); }
             return;
         }
         T.done = n; T.cdone = nc;
     }
-    T.done[T.ndone++] = (VDone){layer, eid, ok, copy_failed, t[0], t[1], t[2]};
+    T.done[T.ndone++] = (VDone){layer, eid, ok, copy_failed, t[0], t[1], t[2], h ? h[0] : NULL, h ? h[1] : NULL, h ? h[2] : NULL};
     T.busy = 0; pthread_cond_broadcast(&T.cv_done);
     pthread_mutex_unlock(&T.mx);
 }
@@ -380,6 +437,7 @@ static void *uploader(void *arg) {
         if (T.stop) { pthread_mutex_unlock(&T.mx); return NULL; }
         VQ e = T.q[T.qh]; T.qh = (T.qh + 1) % VKT_QCAP; T.qn--; T.busy = 1;
         pthread_mutex_unlock(&T.mx);
+        if (e.src) { promote_copy(&e); continue; }
         const uint8_t *b = e.buf;
         const int fi = form_of(e.layer);
         const size_t guc = T.form[fi].gu_codes, dc = T.form[fi].d_codes, gus = T.form[fi].gu_scales;
@@ -413,21 +471,67 @@ static void *uploader(void *arg) {
         }
         free(e.buf);
         if (!ok) t[0] = t[1] = t[2] = NULL;
-        push_done(e.layer, e.eid, ok, r < 0, t);
+        push_done(e.layer, e.eid, ok, r < 0, t, NULL);
     }
 }
 
 /* ---- quiescent points: nothing in flight ---------------------------------------- */
+#define VKT_LOG_MAX 65536
+static void note_change(int i) {
+    if (T.pend_all) return;
+    if (T.npend == T.cpend) {
+        int nc = T.cpend ? 2 * T.cpend : 256;
+        int *n = nc <= VKT_LOG_MAX ? realloc(T.pend, (size_t)nc * sizeof(int)) : NULL;
+        if (!n) { T.pend_all = 1; return; }
+        T.pend = n; T.cpend = nc;
+    }
+    T.pend[T.npend++] = i;
+}
+/* The changes noted since the last epoch become the next one's; a change that could not be
+ * noted, or a log grown past its bound, starts the log again from that epoch. */
+static void publish(void) {
+    if (!T.npend && !T.pend_all) return;
+    T.epoch++;
+    int all = T.pend_all || T.nlog + T.npend > VKT_LOG_MAX;
+    if (!all && T.nlog + T.npend > T.clog) {
+        int nc = T.clog ? T.clog : 1024;
+        while (nc < T.nlog + T.npend) nc *= 2;
+        int *a = realloc(T.log_slot, (size_t)nc * sizeof(int));
+        if (a) T.log_slot = a;
+        unsigned *b = a ? realloc(T.log_ep, (size_t)nc * sizeof(unsigned)) : NULL;
+        if (b) { T.log_ep = b; T.clog = nc; } else all = 1;
+    }
+    if (all) { T.nlog = 0; T.log_from = T.epoch; }
+    else for (int k = 0; k < T.npend; k++) { T.log_slot[T.nlog] = T.pend[k]; T.log_ep[T.nlog++] = T.epoch; }
+    T.npend = 0; T.pend_all = 0;
+}
+/* T.full: the device copies of residents that went back to the host pool (promote), freed
+ * when nothing is in flight: an upload waiting for their room goes on. */
+static void free_victims(void) {
+    if (T.inflight || !T.ndfree) return;
+    for (int i = 0; i < T.ndfree; i++) coli_vk_xb_expert_free(T.dfree[i]);
+    T.ndfree = 0;
+    pthread_mutex_lock(&T.mx);
+    T.room_gen++; T.evict_pending = T.nevict;
+    pthread_cond_broadcast(&T.cv_room);
+    pthread_mutex_unlock(&T.mx);
+}
 static void quiesce(void) {
     if (T.inflight) return;
-    int freed = 0, had = T.nevict;
+    int freed = 0, had = T.nevict + T.ndfree;
     for (int i = 0; i < T.nevict; i++) {
         VSlot *v = &T.s[T.evict[i]];
-        if (v->ex) { coli_vk_xb_expert_free(v->ex); v->ex = NULL; freed = 1; }
+        if (v->ex) { coli_vk_xb_expert_free(v->ex); freed = 1; }
+        if (v->hex && v->hex != v->ex) coli_vk_xb_expert_free(v->hex);
+        v->ex = v->hex = NULL;
         v->state = VS_NONE;
+        note_change(T.evict[i]);
     }
-    if (had) T.epoch++;
     T.nevict = 0;
+    /* the device copies of residents that went back to the host pool (promote): their
+     * entries changed then, published below with the rest */
+    for (int i = 0; i < T.ndfree; i++) { coli_vk_xb_expert_free(T.dfree[i]); freed = 1; }
+    T.ndfree = 0;
     if (had) {   /* room made: an upload may be waiting for it */
         pthread_mutex_lock(&T.mx);
         if (freed) T.room_gen++;
@@ -452,12 +556,34 @@ static void quiesce(void) {
         VSlot *v = slot(d[i].layer, d[i].eid);
         int dv = v->dev, pl = place_of(v), kd = kind_of(d[i].layer);
         if (d[i].ok && (dv == 0 || T.d2) && busy[dv ? 1 : 0]) { d[kept++] = d[i]; continue; }
+        if (v->up) {   /* a promotion from the host pool: the device's copy takes the slot, the pool's stays */
+            v->up = 0; T.queued--; T.dque[0]--;
+            ColiVkExpert *e = d[i].ok ? coli_vk_xb_expert(d[i].g, d[i].u, d[i].d) : NULL;
+            if (e) {
+                v->ex = e; v->host = 0; T.dres[0]++; T.dres[2]--; T.ups++;
+                note_change(d[i].layer * T.c.experts + d[i].eid);
+                T.uploads++; T.upload_bytes += coli_vk_tensor_bytes(d[i].g) + coli_vk_tensor_bytes(d[i].u) + coli_vk_tensor_bytes(d[i].d);
+                continue;
+            }
+            for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].g : k == 1 ? d[i].u : d[i].d; if (t) coli_vk_tensor_free(t); }
+            T.failed++;
+            if (d[i].ok) T.f_sets++; else if (d[i].copy_failed) T.f_copy++; else T.f_pool++;
+            if (!d[i].ok && !d[i].copy_failed && T.dmax[0] > T.dres[0] + T.dque[0]) {
+                T.max_resident -= T.dmax[0] - (T.dres[0] + T.dque[0]);
+                T.dmax[0] = T.dres[0] + T.dque[0];
+            }
+            continue;
+        }
         T.queued--; if (kd) T.xque--; else T.dque[pl]--;
         /* an upload to a second device that has stopped meanwhile (d2_stop) is dropped */
         ColiVkExpert *e = d[i].ok && (dv == 0 || T.d2) ? coli_vk_xb_expert(d[i].g, d[i].u, d[i].d) : NULL;
+        /* T.full: a device's expert with its copy in the host pool (vkt_put); one put in the pool is its own copy */
+        ColiVkExpert *h = e && d[i].hg ? coli_vk_xb_expert(d[i].hg, d[i].hu, d[i].hd) : NULL;
+        if (!h) for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].hg : k == 1 ? d[i].hu : d[i].hd; if (t) coli_vk_tensor_free(t); }
         if (e) {
+            v->hex = h ? h : T.full && v->host ? e : NULL;
             v->ex = e; v->state = VS_RESIDENT; T.resident++; if (kd) T.xres++; else T.dres[pl]++;
-            T.epoch++;
+            note_change(d[i].layer * T.c.experts + d[i].eid);
             T.uploads++; T.upload_bytes += coli_vk_tensor_bytes(d[i].g) + coli_vk_tensor_bytes(d[i].u) + coli_vk_tensor_bytes(d[i].d);
             if (dv) T.d2_uploads++;
         } else {
@@ -491,13 +617,17 @@ static void quiesce(void) {
         pthread_mutex_unlock(&T.mx);
         for (int i = 0; i < kept; i++) {   /* no memory to keep them: as before, freed and counted */
             for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].g : k == 1 ? d[i].u : d[i].d; if (t) coli_vk_tensor_free(t); }
+            for (int k = 0; k < 3; k++) { ColiVkTensor *t = k == 0 ? d[i].hg : k == 1 ? d[i].hu : d[i].hd; if (t) coli_vk_tensor_free(t); }
             VSlot *v = slot(d[i].layer, d[i].eid);
             int kd = kind_of(d[i].layer);
+            T.failed++; T.f_sets++;
+            if (v->up) { v->up = 0; T.queued--; T.dque[0]--; continue; }   /* a promotion: it stays in the pool */
             T.queued--; if (kd) T.xque--; else T.dque[place_of(v)]--;
-            v->state = VS_NONE; set_place(v, 0); T.failed++; T.f_sets++;
+            v->state = VS_NONE; set_place(v, 0);
         }
     }
     free(d);
+    publish();
 }
 
 /* The second device stopped (a batch there failed, or the device did): its residents
@@ -514,7 +644,7 @@ static void d2_stop(const char *why) {
         if (v->ex) { coli_vk_xb_expert_free(v->ex); v->ex = NULL; }
         v->state = VS_NONE; v->dev = 0; T.resident--; T.dres[1]--;
     }
-    T.max_resident -= T.dmax[1]; T.dmax[1] = 0; T.epoch++;
+    T.max_resident -= T.dmax[1]; T.dmax[1] = 0; T.pend_all = 1; publish();
     fprintf(stderr, "[VK] tier %s: %s, its experts go back to the CPU and the tier goes on with %s\n",
             T.engine, why, coli_vk_device_name());
 }
@@ -533,13 +663,14 @@ static int room_dev(int layer) {
 /* ---- placement ------------------------------------------------------------------ */
 static uint64_t score(const VSlot *v) { return tier_lfru_score(v->heat, v->last, T.tick); }
 
-/* The coldest residents of each kind, ascending, once per forward. */
+/* The coldest residents of each kind, ascending, once per forward (T.full: on the device,
+ * the host pool holding every expert anyway). */
 static void refresh_candidates(void) {
     T.ncand[0] = T.ncand[1] = 0;
     size_t n = (size_t)T.c.layers * T.c.experts;
     for (size_t i = 0; i < n; i++) {
         VSlot *v = &T.s[i];
-        if (v->state != VS_RESIDENT) continue;
+        if (v->state != VS_RESIDENT || (T.full && (v->host || !v->hex))) continue;
         int k = kind_of((int)(i / (size_t)T.c.experts)), *c = T.cand[k];
         uint64_t sc = score(v), *cs = T.cand_score[k];
         if (T.ncand[k] == VKT_CAND && sc >= cs[VKT_CAND - 1]) continue;
@@ -560,9 +691,10 @@ static int peek_victim(int k, uint64_t hs) {
     while (T.ncand[k]) {
         int i = T.cand[k][0];
         VSlot *v = &T.s[i];
-        if (v->state != VS_RESIDENT) { drop_victim(k); continue; }
+        if (v->state != VS_RESIDENT || (T.full && v->host)) { drop_victim(k); continue; }
         uint64_t cs = score(v);
-        return hs > cs + (cs >> 2) + (4u << 8) ? i : -1;
+        /* T.full: a swap copies nothing back and no CPU time goes into it, so any hotter one wins */
+        return hs > (T.full ? cs + ((uint64_t)VKT_UP_MARGIN << 8) : cs + (cs >> 2) + (4u << 8)) ? i : -1;
     }
     return -1;
 }
@@ -571,7 +703,7 @@ static int peek_victim(int k, uint64_t hs) {
  * blocks of rows, or rows one by one, is the same forward). The tick counts tokens:
  * the rows of the forward's first layer, every block of them. */
 static void new_forward(void) {
-    T.promos[0] = T.promos[1] = 0; T.promo_cap = 0; T.said_fwd = 0;
+    T.promos[0] = T.promos[1] = 0; T.promo_cap = 0; T.said_fwd = 0; T.upromos = 0;
     if (T.tick >= T.decay_at) {
         size_t n = (size_t)T.c.layers * T.c.experts;
         for (size_t i = 0; i < n; i++) T.s[i].heat = tier_decay_value(T.s[i].heat);
@@ -594,7 +726,8 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
     const __typeof__(T.form[0]) *fm = &T.form[form_of(layer)];
     if (fm->gu_scales && (!src->gs || !src->us || !src->ds)) return;
     int victim = -1, dev = room_dev(layer);
-    if (dev < 0 && (!v->heat || (victim = peek_victim(kd, score(v))) < 0)) return;
+    /* T.full: the device's residents give way to promote's, which keeps their host pool copy */
+    if (dev < 0 && (T.full || !v->heat || (victim = peek_victim(kd, score(v))) < 0)) return;
     if (victim >= 0) dev = place_of(&T.s[victim]);   /* the newcomer takes its place, on its device or in the host pool */
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
@@ -624,7 +757,7 @@ void vkt_note(int layer, int eid, const VktExpertSrc *src) {
     }
     v->state = VS_QUEUED; set_place(v, dev); T.queued++; if (kd) T.xque++; else T.dque[dev]++; T.promos[kd]++;
     pthread_mutex_lock(&T.mx);
-    T.q[(T.qh + T.qn) % VKT_QCAP] = (VQ){layer, eid, dev, buf}; T.qn++;
+    T.q[(T.qh + T.qn) % VKT_QCAP] = (VQ){layer, eid, dev, buf, NULL}; T.qn++;
     pthread_cond_signal(&T.cv);
     pthread_mutex_unlock(&T.mx);
 }
@@ -634,11 +767,49 @@ int vkt_wants(int layer, int eid) {
     if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts) return 0;
     VSlot *v = slot(layer, eid);
     if (v->state != VS_NONE || T.promos[kind_of(layer)] >= T.promo_cap) return 0;
-    if (room_dev(layer) < 0 && (!v->heat || peek_victim(kind_of(layer), score(v)) < 0)) return 0;
+    if (room_dev(layer) < 0 && (T.full || !v->heat || peek_victim(kind_of(layer), score(v)) < 0)) return 0;
     pthread_mutex_lock(&T.mx);
     int qfull = T.qn >= VKT_QCAP;
     pthread_mutex_unlock(&T.mx);
     return !qfull;
+}
+
+/* T.full: a routed expert the device reads from the host pool moves up to its memory, into
+ * a free place or the coldest resident's there (refresh_candidates), which goes back to its
+ * host pool copy at once: nothing is copied back. Up to T.promote_rate a forward. The bytes
+ * go from the pool to the device by its copy engine on the uploader's thread (promote_copy)
+ * while the engine goes on; the expert keeps its host pool entry until they landed (quiesce).
+ * Only where the victim's device copy is read by nothing in flight before it is freed: the
+ * dense chain's books after its frame (vkt_dev_count), or a batch's step after its issue. */
+static void promote(int layer, int e) {
+    VSlot *v = slot(layer, e);
+    if (!T.full || v->state != VS_RESIDENT || !v->host || v->up || !v->hex || kind_of(layer) || T.upromos >= T.promote_rate) return;
+    int victim = -1;
+    if (T.dres[0] + T.dque[0] >= T.dmax[0] && (victim = peek_victim(0, score(v))) < 0) return;
+    pthread_mutex_lock(&T.mx);
+    int qfull = T.qn >= VKT_QCAP;
+    pthread_mutex_unlock(&T.mx);
+    if (qfull) { T.qfull++; return; }
+    if (victim >= 0) {
+        VSlot *w = &T.s[victim];
+        if (T.ndfree == T.cdfree) {
+            int nc = T.cdfree ? 2 * T.cdfree : 64;
+            ColiVkExpert **n = realloc(T.dfree, (size_t)nc * sizeof(*n));
+            if (!n) return;
+            T.dfree = n; T.cdfree = nc;
+        }
+        drop_victim(0);
+        T.dfree[T.ndfree++] = w->ex;
+        w->ex = w->hex; w->host = 1; T.dres[0]--; T.dres[2]++; T.evictions++; T.up_victims++;
+        note_change(victim);   /* published at the next quiescent point: a chain's frame start (vkt_settle) */
+        pthread_mutex_lock(&T.mx); T.evict_pending = T.nevict + T.ndfree; pthread_mutex_unlock(&T.mx);
+        free_victims();   /* nothing in flight: freed right away; else at the join */
+    }
+    v->up = 1; T.queued++; T.dque[0]++; T.upromos++;
+    pthread_mutex_lock(&T.mx);
+    T.q[(T.qh + T.qn) % VKT_QCAP] = (VQ){layer, e, 0, NULL, v->hex}; T.qn++;
+    pthread_cond_signal(&T.cv);
+    pthread_mutex_unlock(&T.mx);
 }
 
 /* ---- warm start ------------------------------------------------------------------ */
@@ -720,7 +891,12 @@ int vkt_put(int layer, int eid, const VktExpertSrc *src) {
     int dev = place_of(slot(layer, eid));   /* vkt_plan's choice: a device, or the host pool */
     int r = src && src->g && src->u && src->d ? upload(dev, layer, src->g, src->u, src->d, src->gs, src->us, src->ds, t) : 0;
     int ok = r > 0;
-    push_done(layer, eid, ok, r < 0, t);
+    /* T.full: the device's experts keep a copy in the host pool too (promote); without one an
+     * expert stays where it is put */
+    ColiVkTensor *h[3] = {NULL, NULL, NULL};
+    if (ok && T.full && dev == 0 && !kind_of(layer) &&
+        upload(2, layer, src->g, src->u, src->d, src->gs, src->us, src->ds, h) <= 0) h[0] = h[1] = h[2] = NULL;
+    push_done(layer, eid, ok, r < 0, t, h);
     if (ok) __atomic_add_fetch(&T.warm, 1, __ATOMIC_RELAXED);
     return ok;
 }
@@ -1434,6 +1610,10 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     }
     if (!took) return 0;
     T.inflight = 1; T.S = S; T.K = K; T.steps++; T.served += (unsigned long long)took;
+    /* T.full: the batch is in flight with the experts it took: a victim's device copy is
+     * freed at its join */
+    for (int i = 0; T.full && S <= VKT_UP_ROWS && i < n; i++)
+        if (idx[i] >= 0 && idx[i] < E && layer < T.main_layers) promote(layer, idx[i]);
     if (layer >= T.main_layers) T.extra_served += (unsigned long long)took;
     if (T.d2_inflight) { T.d2_served += (unsigned long long)(total - rows0); T.d2_steps++; }
     T.t_issued = vkt_now_ms();
@@ -1675,18 +1855,34 @@ static void host_init(long long all) {
     if (want < (double)T.exp_bytes || blk < T.exp_bytes) return;
     size_t full = (size_t)want / blk, rest = (size_t)want - full * blk;
     long long fit = (long long)full * (long long)(blk / T.exp_bytes) + (long long)(rest / T.exp_bytes);
+    /* Every expert, the device's too, where RAM holds them (T.full, not beside a second
+     * device): a conversation's routed experts then move up from the pool to the device and
+     * its coldest go back to their copy (promote). Without it the device keeps the warm
+     * start's set, and on another topic than the history's it reads most of a token's
+     * experts over the bus. COLI_VK_TIER_PROMOTE=0 keeps that set, =n sets the rate. */
+    const char *pe = getenv("COLI_VK_TIER_PROMOTE");
+    int rate = pe && *pe ? atoi(pe) : 32;
+    T.full = rate > 0 && !T.d2 && fit >= all;
+    long long held = T.full ? all : fit < left ? fit : left;
+    if (held < 1) { T.full = 0; return; }
     if (fit > left) fit = left;
-    if (fit < 1) return;
     /* the blocks those experts take: whole blocks of blk / exp_bytes, the last one partly */
-    long long per = (long long)(blk / T.exp_bytes), nb = (fit + per - 1) / per;
+    long long per = (long long)(blk / T.exp_bytes), nb = (held + per - 1) / per;
     size_t lim = (size_t)nb * blk;
-    if (fit < per) lim = (size_t)fit * T.exp_bytes + 4096;
+    if (held < per) lim = (size_t)held * T.exp_bytes + 4096;
     coli_vk_tier_pool_limit_dev(2, lim);
     T.dmax[2] = (int)fit; T.max_resident += (int)fit; T.h_budget = lim;
+    T.promote_rate = T.full ? rate : 0;
     char hb[32];
-    fprintf(stderr, "[VK] tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
-                    "(the %lld its memory leaves%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it)\n",
-            T.engine, T.dmax[2], human((double)lim, hb, sizeof hb), left, fit < left ? ", not all of them" : "");
+    if (T.full)
+        fprintf(stderr, "[VK] tier %s: host pool on, every expert of the model in %s of system RAM the device reads over PCIe: "
+                        "the %lld its memory leaves, and a copy of its own that the routed ones move up to, up to %d a "
+                        "forward (COLI_VK_TIER_PROMOTE; COLI_VK_TIER_HOST=0 off)\n",
+                T.engine, human((double)lim, hb, sizeof hb), left, T.promote_rate);
+    else
+        fprintf(stderr, "[VK] tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
+                        "(the %lld its memory leaves%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it)\n",
+                T.engine, T.dmax[2], human((double)lim, hb, sizeof hb), left, fit < left ? ", not all of them" : "");
 }
 
 int vkt_host_pool_on(void) { return T.on && T.dmax[2] > 0; }
@@ -1988,8 +2184,16 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     if (T.dmax[2]) {
         ColiVkPoolStats ph; coli_vk_pool_stats(5, &ph);
         char hh[32], hb[32];
-        fprintf(stderr, " | host pool: resident %d (budget %d, %s of %s)", T.dres[2], T.dmax[2],
-                human((double)ph.used, hh, sizeof hh), human((double)T.h_budget, hb, sizeof hb));
+        if (T.full)   /* every expert, and those the device reads from it (the ones on their way up among them) */
+            fprintf(stderr, " | host pool: every expert (%s of %s), %d read from it, %llu moved up to the device "
+                            "(%llu residents gave way)", human((double)ph.used, hh, sizeof hh),
+                    human((double)T.h_budget, hb, sizeof hb), T.dres[2], T.ups, T.up_victims);
+        else
+            fprintf(stderr, " | host pool: resident %d (budget %d, %s of %s)", T.dres[2], T.dmax[2],
+                    human((double)ph.used, hh, sizeof hh), human((double)T.h_budget, hb, sizeof hb));
+        if (T.chain_served)
+            fprintf(stderr, "; of the chain's routed experts %.1f%% in the device's memory, %.1f%% of a decode step's",
+                    100.0 * T.vram_routed / T.chain_served, T.dec_routed ? 100.0 * T.dec_vram / T.dec_routed : 0.0);
     }
     if (T.d2 || T.d2_lost) {
         ColiVkPoolStats p2; coli_vk_pool_stats(3, &p2);
@@ -2008,16 +2212,20 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
 int vkt_devices(void) { return !T.on ? 0 : T.d2 ? 2 : 1; }
 
 unsigned vkt_epoch(void) { return T.epoch; }
+/* one expert's entry (zero where it is not on the primary device): 1 resident there, 0 not, -1 an error */
+static int dev_entry(int layer, int e, uint32_t *o) {
+    VSlot *v = slot(layer, e);
+    memset(o, 0, COLI_VK_XB_ENTRY * sizeof *o);
+    if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex) return 0;
+    return coli_vk_xb_expert_entry(v->ex, o) ? 1 : -1;
+}
 int vkt_dev_table(int layer, uint32_t *ent) {
     if (!T.on || layer < 0 || layer >= T.c.layers || !ent) return -1;
     int n = 0;
     for (int e = 0; e < T.c.experts; e++) {
-        VSlot *v = slot(layer, e);
-        uint32_t *o = ent + (size_t)e * COLI_VK_XB_ENTRY;
-        memset(o, 0, COLI_VK_XB_ENTRY * sizeof *o);
-        if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex) continue;
-        if (!coli_vk_xb_expert_entry(v->ex, o)) return -1;
-        n++;
+        int r = dev_entry(layer, e, ent + (size_t)e * COLI_VK_XB_ENTRY);
+        if (r < 0) return -1;
+        n += r;
     }
     return n;
 }
@@ -2047,35 +2255,61 @@ static double hybrid_pcie_share(void) {
     if (f < 0) { const char *e = getenv("COLI_VK_HYBRID_PCIE"); f = e && *e ? atof(e) : 0.3; if (f < 0) f = 0; if (f > 1) f = 1; }
     return f;
 }
+static int dev_entry_hybrid(int layer, int e, uint32_t *o, VktHostExpert *hx);
 int vkt_dev_table_hybrid(int layer, uint32_t *ent, VktHostExpert *hx) {
     if (!T.on || layer < 0 || layer >= T.c.layers || !ent || !hx) return -1;
-    int n = 0; const double pf = hybrid_pcie_share();
+    int n = 0;
     for (int e = 0; e < T.c.experts; e++) {
-        VSlot *v = slot(layer, e);
-        uint32_t *o = ent + (size_t)e * COLI_VK_XB_ENTRY;
-        memset(o, 0, COLI_VK_XB_ENTRY * sizeof *o);
-        memset(&hx[e], 0, sizeof hx[e]);
-        if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex) continue;
-        n++;
-        /* the device's share of the host pool by a hash of (layer, expert): the same split at
-         * every read of the table, the CPU's share spread over the experts */
-        uint32_t hsh = (uint32_t)(layer * 2654435761u) ^ (uint32_t)(e * 2246822519u);
-        hsh ^= hsh >> 15; hsh *= 2654435761u; hsh ^= hsh >> 13;
-        if (v->host && (double)(hsh & 0xffff) / 65536.0 >= pf) {   /* the CPU's, where its three tensors are block types it has rows of */
-            ColiVkTensor *t[3]; ColiVkTensorInfo ti[3]; const void *r[3]; int ok = 1;
-            coli_vk_xb_expert_tensors(v->ex, &t[0], &t[1], &t[2]);
-            for (int k = 0; k < 3 && ok; k++)
-                ok = t[k] && coli_vk_tensor_info(t[k], &ti[k]) && ti[k].fmt >= 100 && ti[k].fmt < 164 &&
-                     (r[k] = coli_vk_tensor_host_rows(t[k], NULL)) != NULL;
-            if (ok && ti[0].fmt == ti[1].fmt) {
-                hx[e] = (VktHostExpert){r[0], r[1], r[2], ti[0].fmt - 100, ti[2].fmt - 100,
-                                        (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4};
-                continue;
-            }
-        }
-        if (!coli_vk_xb_expert_entry(v->ex, o)) return -1;
+        int r = dev_entry_hybrid(layer, e, ent + (size_t)e * COLI_VK_XB_ENTRY, &hx[e]);
+        if (r < 0) return -1;
+        n += r;
     }
     return n;
+}
+/* the published changes since epoch `since`: the slots (layer * experts + expert) of the
+ * epochs after it, oldest first, a slot again for each change; -1 when the log does not
+ * reach back to it or they are more than max (read the tables whole) */
+int vkt_dev_changes(unsigned since, int *slots, int max) {
+    if (!T.on || since < T.log_from || since > T.epoch) return -1;
+    int k = T.nlog;
+    while (k > 0 && T.log_ep[k - 1] > since) k--;
+    int n = T.nlog - k;
+    if (n > max) return -1;
+    if (n) memcpy(slots, T.log_slot + k, (size_t)n * sizeof(int));
+    return n;
+}
+int vkt_dev_entry(int layer, int eid, uint32_t *ent, uint32_t *ent_hybrid, VktHostExpert *hx, uint8_t *host) {
+    if (!T.on || layer < 0 || layer >= T.c.layers || eid < 0 || eid >= T.c.experts || !ent) return -1;
+    int r = dev_entry(layer, eid, ent);
+    if (r >= 0 && ent_hybrid && hx && dev_entry_hybrid(layer, eid, ent_hybrid, hx) < 0) r = -1;
+    VSlot *v = slot(layer, eid);
+    if (host) *host = v->state == VS_RESIDENT && v->dev == 0 && v->ex && v->host;
+    return r;
+}
+/* one expert's entry in the hybrid steps' table (zero for one the CPU computes, hx its rows):
+ * 1 resident on the primary device, 0 not, -1 an error */
+static int dev_entry_hybrid(int layer, int e, uint32_t *o, VktHostExpert *hx) {
+    VSlot *v = slot(layer, e);
+    memset(o, 0, COLI_VK_XB_ENTRY * sizeof *o);
+    memset(hx, 0, sizeof *hx);
+    if (v->state != VS_RESIDENT || v->dev != 0 || !v->ex) return 0;
+    /* the device's share of the host pool by a hash of (layer, expert): the same split at
+     * every read of the table, the CPU's share spread over the experts */
+    uint32_t hsh = (uint32_t)(layer * 2654435761u) ^ (uint32_t)(e * 2246822519u);
+    hsh ^= hsh >> 15; hsh *= 2654435761u; hsh ^= hsh >> 13;
+    if (v->host && (double)(hsh & 0xffff) / 65536.0 >= hybrid_pcie_share()) {   /* the CPU's, where its three tensors are block types it has rows of */
+        ColiVkTensor *t[3]; ColiVkTensorInfo ti[3]; const void *r[3]; int ok = 1;
+        coli_vk_xb_expert_tensors(v->ex, &t[0], &t[1], &t[2]);
+        for (int k = 0; k < 3 && ok; k++)
+            ok = t[k] && coli_vk_tensor_info(t[k], &ti[k]) && ti[k].fmt >= 100 && ti[k].fmt < 164 &&
+                 (r[k] = coli_vk_tensor_host_rows(t[k], NULL)) != NULL;
+        if (ok && ti[0].fmt == ti[1].fmt) {
+            *hx = (VktHostExpert){r[0], r[1], r[2], ti[0].fmt - 100, ti[2].fmt - 100,
+                                  (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4};
+            return 1;
+        }
+    }
+    return coli_vk_xb_expert_entry(v->ex, o) ? 1 : -1;
 }
 /* issue()'s books for pairs it never saw: a forward's start, the tick, heat, routed and
  * served (the device took every resident one) */
@@ -2105,8 +2339,15 @@ void vkt_dev_count(int layer, int S, int K, const int *idx) {
         if (v->state != VS_RESIDENT || v->dev != 0) continue;
         T.served++; T.chain_served++;
         if (layer >= T.main_layers) T.extra_served++;
+        if (!v->host) T.vram_routed++;
+        if (S > VKT_UP_ROWS) continue;
+        T.dec_routed++; T.dec_vram += !v->host;
+        if (v->host) promote(layer, e);   /* the frame is done: a victim's device copy is read by nothing now */
     }
 }
+/* T.full: the promotions that landed into the slot table, at a frame's start (vk_dmoe.h)
+ * where nothing reads the experts: the table read next has them. */
+void vkt_settle(void) { if (T.on && T.full) quiesce(); }
 int vkt_layers(void) { return T.on ? T.c.layers : 0; }
 static VSlot *g_old_slots;   /* the slot table of the tier shut down last (vkt_shutdown) */
 static uint32_t *g_old_routed, *g_old_seq;
@@ -2143,7 +2384,11 @@ void vkt_shutdown(void) {
     if (coli_vk_available()) {
         quiesce();
         size_t n = (size_t)T.c.layers * T.c.experts;
-        for (size_t i = 0; i < n; i++) if (T.s[i].ex) { coli_vk_xb_expert_free(T.s[i].ex); T.s[i].ex = NULL; }
+        for (size_t i = 0; i < n; i++) {
+            if (T.s[i].hex && T.s[i].hex != T.s[i].ex) coli_vk_xb_expert_free(T.s[i].hex);
+            T.s[i].hex = NULL;
+            if (T.s[i].ex) { coli_vk_xb_expert_free(T.s[i].ex); T.s[i].ex = NULL; }
+        }
         for (int i = 0; T.st && i < T.st_n; i++) if (T.st[i].ex) coli_vk_xb_expert_free(T.st[i].ex);
     }
     pthread_mutex_destroy(&T.mx); pthread_cond_destroy(&T.cv); pthread_cond_destroy(&T.cv_room); pthread_cond_destroy(&T.cv_done);
@@ -2153,7 +2398,7 @@ void vkt_shutdown(void) {
     free(g_old_routed); g_old_routed = T.routed_at;   /* the same for the routing marks */
     free(g_old_seq); g_old_seq = T.layer_seq;
     free(T.grp); free(T.map); free(T.touched); free(T.bex); free(T.brows); free(T.bfirst);
-    free(T.bx); free(T.by); free(T.bw); free(T.evict); free(T.done);
+    free(T.bx); free(T.by); free(T.bw); free(T.evict); free(T.done); free(T.dfree);
     free(T.st); free(T.sy); free(T.bcnt); free(T.bofs); free(T.bcls); free(T.blist); free(T.pred); free(T.pred_ok);
     for (int h = 0; h < 2; h++) { free(T.hf[h].slot); free(T.hf[h].yout); }
     free(T.d2_idx); free(T.d2_y); free(T.d2_bex); free(T.d2_brows); free(T.d2_bx); free(T.d2_bw);
