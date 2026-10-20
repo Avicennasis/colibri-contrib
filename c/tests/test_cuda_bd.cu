@@ -6,7 +6,8 @@
  *   - a verify's 2, 3 and 4 rows, sharing every weight load, each with the bits of the
  *     same row alone (a decode step's);
  *   - the routed experts of the dense chain (coli_cuda_moe_async, CcMoe.fmt >= 100) against
- *     the CPU's integer form, a row and a verify's;
+ *     the CPU's integer form, a row and a verify's; with some of them in page-locked host
+ *     memory (a host pool), read over the bus or staged, the same bits;
  *   - the backend's path: coli_cuda_tensor_upload of the file's rows (padded to words on the
  *     device where a row is not), the dense chain's matmul, the same bits as the kernel's.
  * BENCH=1 also times the GEMV at a few shapes, 1 to 4 rows. Build from c/:
@@ -295,6 +296,42 @@ static void check_moe(int tg, int td, int S, int K, int E, int D, int I) {
         free(xq); free(dxs); free(xss); free(h);
     }
     double tol = S > 8 ? 1e-2 : 2e-3;   /* past 8 rows the f16 tiles */
+    /* the same experts, the odd ones in page-locked host memory the device reads over the bus
+     * (CcExpert.host: an engine's host pool, gate, up and down from 256-byte boundaries): read
+     * there, copied to a staging first (coli_cuda_moe_stage), and with a staging of one place
+     * (the rest read where they are); each the bits of the run from device memory */
+    if (ok && S <= 8) {
+        size_t rgw = ((size_t)rg + 3) / 4 * 4, rdw = ((size_t)rd + 3) / 4 * 4;
+        size_t gpad = ((size_t)I * rgw + 255) / 256 * 256, slot = (2 * gpad + (size_t)D * rdw + 255) / 256 * 256;
+        char *hp = NULL, *dp = NULL, *stg = NULL;
+        CcExpert *htab = (CcExpert *)malloc((size_t)E * sizeof *htab), *dtab2 = NULL;
+        float *y2 = (float *)malloc((size_t)S * D * 4);
+        int hok = htab && y2 && cudaHostAlloc((void **)&hp, slot * E, cudaHostAllocMapped) == cudaSuccess &&
+                  cudaHostGetDevicePointer((void **)&dp, hp, 0) == cudaSuccess && cudaMalloc(&stg, CC_MOE_STAGE_MAP + 4 * slot) == cudaSuccess &&
+                  cudaMalloc(&dtab2, (size_t)E * sizeof *htab) == cudaSuccess;
+        if (hok) {
+            memcpy(htab, tab, (size_t)E * sizeof *htab);
+            memset(hp, 0, slot * E);
+            for (int e = 1; e < E; e += 2) {
+                char *b = hp + (size_t)e * slot;
+                for (int o = 0; o < I; o++) { memcpy(b + o * rgw, G + e * gb + o * rg, (size_t)rg); memcpy(b + gpad + o * rgw, U + e * gb + o * rg, (size_t)rg); }
+                for (int o = 0; o < D; o++) memcpy(b + 2 * gpad + o * rdw, Dn + e * db + o * rd, (size_t)rd);
+                htab[e].g = dp + (size_t)e * slot; htab[e].u = dp + (size_t)e * slot + gpad; htab[e].d = dp + (size_t)e * slot + 2 * gpad; htab[e].host = 1;
+            }
+            hok = cudaMemcpy(dtab2, htab, (size_t)E * sizeof *htab, cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+        static const char *how[3] = {"read over the bus", "staged (4 places)", "staged (1 place)"};
+        for (int md = 0; md < 3; md++) {
+            int same = hok && coli_cuda_moe_stage(0, md ? stg : NULL, slot, md == 1 ? 4 : 1) && cudaMemset(dy, 0, (size_t)S * D * 4) == cudaSuccess &&
+                       coli_cuda_moe_async(0, dtab2, dx_, di, dw, dh, dy, NULL, &mp, NULL) && cudaDeviceSynchronize() == cudaSuccess &&
+                       cudaMemcpy(y2, dy, (size_t)S * D * 4, cudaMemcpyDeviceToHost) == cudaSuccess && !memcmp(y2, y, (size_t)S * D * 4);
+            if (!same) { printf("FAIL moe %s/%s S %d: the host's experts %s differ from the device's\n", ref_name(tg), ref_name(td), S, how[md]); fails++; }
+        }
+        if (hok) printf("moe %-7s/%-7s S %d: the host's experts read over the bus, staged, one place staged: the device's bits\n", ref_name(tg), ref_name(td), S);
+        coli_cuda_moe_stage(0, NULL, 0, 0);
+        if (hp) cudaFreeHost(hp);
+        cudaFree(stg); cudaFree(dtab2); free(htab); free(y2);
+    }
     /* the tier's expert groups (coli_cuda_expert_group: the frame's kernels, a row a slot, K 1)
      * on row 0's experts, each expert's down output against the CPU's integer form */
     if (ok && S == 1) {

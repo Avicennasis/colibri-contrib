@@ -121,6 +121,7 @@ typedef struct {
     void *moe_tab; size_t moe_tab_cap; float *moe_host; size_t moe_host_cap;   /* group_moe_launch's table and row ids */
     bd_u32 *bdtab;          /* blockdec_host.h's table, made with the first block-format tensor */
     size_t smem_optin;      /* shared bytes a block may ask for (the block GEMVs past 48 KiB) */
+    char *moe_stage; size_t moe_stage_slot; int moe_stage_n;   /* coli_cuda_moe_stage: a decode step's host experts' copies */
 #ifdef COLI_ANS
     void *ans_raw; size_t ans_raw_cap;
     void *ans_host; size_t ans_host_cap;
@@ -2315,7 +2316,7 @@ static int group_moe_launch(DeviceContext *ctx, int device, const GroupDesc *hos
     float *w1 = (float *)(ids + total);
     for (int c = 0, r = 0; c < count; c++) {
         t[c].g = host[c].g; t[c].u = host[c].u; t[c].d = host[c].d;
-        t[c].gs = host[c].gs; t[c].us = host[c].us; t[c].ds = host[c].ds; t[c].planar = 0; t[c].pad_ = 0;
+        t[c].gs = host[c].gs; t[c].us = host[c].us; t[c].ds = host[c].ds; t[c].planar = 0; t[c].host = 0;
         for (int k = 0; k < rows[c]; k++) { w1[r] = 1.f; ids[r++] = c; }
     }
     if (!cuda_ok(cudaMemcpyAsync(ctx->moe_tab, ctx->moe_host, nb, cudaMemcpyHostToDevice, ctx->stream), "expert group table")) return 0;
@@ -4008,9 +4009,80 @@ static int moe_gv_launch(const CcExpert *tab, const float *x, const int *ids, fl
  * (b, s) quantizing row s of x once and taking units u = k * I + o (slot k's row o) over lpr
  * lanes; down as moe_gv_dn_k, block (pair j, tile) quantizing pair j's hidden row. A row of
  * the matrices is rw words (the file's row padded). */
+/* A host pool's experts (CcExpert.host: page-locked host memory the device reads over the
+ * bus) through these kernels' word loads came at a third of the bus's rate (Qwen3.8 IQ2_S
+ * gate/up, an RTX PRO 4000 on PCIe 4.0 x8: 3.3 GB/s). With a staging (coli_cuda_moe_stage)
+ * a decode step's distinct such experts, in slot order, are first copied there in 16-byte
+ * loads (bd_stage_k), and the kernels read them there: the map at the staging's start says
+ * slot j's place (-1: none, the entry as it is). Up to BD_STAGE_SLOTS slots (S * K) a step;
+ * an expert's span (g to the end of down, rounded up to 16 bytes) must fit a place. */
+#define BD_STAGE_SLOTS (CC_MOE_STAGE_MAP / 4)
+__device__ static inline void bd_stage_at(CcExpert *x, const char *stg, size_t sslot, int pc) {
+    const char *g0 = (const char *)x->g, *b = stg + CC_MOE_STAGE_MAP + (size_t)pc * sslot;
+    x->g = b; x->u = b + ((const char *)x->u - g0); x->d = b + ((const char *)x->d - g0);
+}
+__global__ static void __launch_bounds__(256) bd_stage_k(const CcExpert *__restrict__ tab, const int *__restrict__ ids, CcMoe p,
+        char *__restrict__ stg, size_t sslot, int nslot, size_t gub, size_t dnb) {
+    __shared__ int eid[BD_STAGE_SLOTS], fo[BD_STAGE_SLOTS], pl[BD_STAGE_SLOTS];
+    __shared__ const char *src[BD_STAGE_SLOTS];
+    __shared__ size_t len[BD_STAGE_SLOTS];
+    int n = p.S * p.K, j = threadIdx.x;
+    if (j < n) {   /* each slot's expert, whether the bus serves it, its span */
+        int s = j / p.K, e = ids[p.i_off + s * p.i_row + (j - s * p.K)];
+        int h = 0;
+        if (e >= 0) {
+            CcExpert x = tab[p.t_off + e];
+            const char *g = (const char *)x.g, *u = (const char *)x.u, *d = (const char *)x.d;
+            size_t sp = 0;
+            if (x.host && g && u >= g && d >= g) {
+                size_t a = (size_t)(u - g) + gub, b = (size_t)(d - g) + dnb;
+                sp = ((a > b ? a : b) + 15) / 16 * 16;
+            }
+            h = sp && sp <= sslot;
+            src[j] = g; len[j] = sp;
+        }
+        eid[j] = h ? e : -1;
+    }
+    __syncthreads();
+    if (j < n) {   /* the slot an expert first takes */
+        int f = j;
+        if (eid[j] >= 0) for (int q = 0; q < j; q++) if (eid[q] == eid[j]) { f = q; break; }
+        fo[j] = f;
+    }
+    __syncthreads();
+    if (j < n) {   /* the place: the distinct ones before it, in slot order */
+        int r = -1;
+        if (eid[j] >= 0) {
+            int f = fo[j];
+            r = 0;
+            for (int q = 0; q < f; q++) r += eid[q] >= 0 && fo[q] == q;
+            if (r >= nslot) r = -1;
+        }
+        pl[j] = r;
+        if (blockIdx.x == 0 && blockIdx.y == 0) ((int *)stg)[j] = r;
+    }
+    __syncthreads();
+    int place = (int)blockIdx.y, from = -1;
+    for (int q = 0; q < n; q++) if (pl[q] == place && fo[q] == q) { from = q; break; }
+    if (from < 0) return;
+    const uint4 *a = (const uint4 *)src[from];
+    uint4 *b = (uint4 *)(stg + CC_MOE_STAGE_MAP + (size_t)place * sslot);
+    size_t nv = len[from] / 16, step = (size_t)gridDim.x * blockDim.x;
+    for (size_t v = (size_t)blockIdx.x * blockDim.x + threadIdx.x; v < nv; v += 4 * step) {   /* four loads in flight a thread */
+        uint4 r0 = a[v], r1, r2, r3;
+        if (v + step < nv) r1 = a[v + step];
+        if (v + 2 * step < nv) r2 = a[v + 2 * step];
+        if (v + 3 * step < nv) r3 = a[v + 3 * step];
+        b[v] = r0;
+        if (v + step < nv) b[v + step] = r1;
+        if (v + 2 * step < nv) b[v + 2 * step] = r2;
+        if (v + 3 * step < nv) b[v + 3 * step] = r3;
+    }
+}
 template<int TG>
 __global__ static void __launch_bounds__(256) moe_bd_gu_k(const CcExpert *__restrict__ tab, const float *__restrict__ x,
-        const int *__restrict__ ids, float *__restrict__ hid, CcMoe p, int lpr, int rw, const bd_u32 *__restrict__ btab) {
+        const int *__restrict__ ids, float *__restrict__ hid, CcMoe p, int lpr, int rw, const bd_u32 *__restrict__ btab,
+        const char *__restrict__ stg, size_t sslot) {
     extern __shared__ uint4 bd_sm4[];
     __shared__ CcExpert ke[CC_ROUTE_KMAX];
     __shared__ int kl[CC_ROUTE_KMAX];
@@ -4025,7 +4097,12 @@ __global__ static void __launch_bounds__(256) moe_bd_gu_k(const CcExpert *__rest
         int e = ids[p.i_off + s * p.i_row + tid];
         int on = e >= 0 && tab[p.t_off + e].g != nullptr;
         kl[tid] = on;
-        if (on) ke[tid] = tab[p.t_off + e];
+        if (on) {
+            CcExpert ex = tab[p.t_off + e];
+            int pc = stg ? ((const int *)stg)[s * p.K + tid] : -1;
+            if (pc >= 0) bd_stage_at(&ex, stg, sslot, pc);
+            ke[tid] = ex;
+        }
     }
     __syncthreads();
     BdX X = {xq, dx, xs, qr, nb};
@@ -4045,7 +4122,8 @@ __global__ static void __launch_bounds__(256) moe_bd_gu_k(const CcExpert *__rest
 }
 template<int TD>
 __global__ static void __launch_bounds__(256) moe_bd_dn_k(const CcExpert *__restrict__ tab, const int *__restrict__ ids,
-        float *__restrict__ hid, CcMoe p, int lpr, int tiles, int rw, const bd_u32 *__restrict__ btab) {
+        float *__restrict__ hid, CcMoe p, int lpr, int tiles, int rw, const bd_u32 *__restrict__ btab,
+        const char *__restrict__ stg, size_t sslot) {
     extern __shared__ uint4 bd_sm4[];
     int wgi = (int)(blockIdx.x + blockIdx.y * gridDim.x), j = wgi / tiles, tile = wgi - j * tiles;
     if (j >= p.S * p.K) return;
@@ -4053,6 +4131,8 @@ __global__ static void __launch_bounds__(256) moe_bd_dn_k(const CcExpert *__rest
     if (e < 0) return;
     CcExpert ex = tab[p.t_off + e];
     if (!ex.g) return;
+    int pc = stg ? ((const int *)stg)[j] : -1;
+    if (pc >= 0) bd_stage_at(&ex, stg, sslot, pc);
     constexpr int TW = bd_tab_words(TD);
     BdTabs tb = bd_tables_fill<TD>(reinterpret_cast<bd_u32 *>(bd_sm4), btab);
     int nb = p.I / 32, qr = bd_xq_row(p.I);
@@ -4079,7 +4159,7 @@ __global__ static void __launch_bounds__(256) moe_bd_dn_k(const CcExpert *__rest
 }
 template<int TG>
 static int moe_bd_gu_launch(const CcExpert *tab, const float *x, const int *ids, float *hid, const CcMoe *p, const bd_u32 *btab,
-                            size_t smem_max, cudaStream_t st) {
+                            size_t smem_max, const char *stg, size_t sslot, cudaStream_t st) {
     size_t sm = (size_t)bd_tab_words(TG) * 4 + bd_x_bytes(p->D, 1);
     if (sm > smem_max) return 0;
     static unsigned raised;
@@ -4087,12 +4167,12 @@ static int moe_bd_gu_launch(const CcExpert *tab, const float *x, const int *ids,
     int lpr = bd_lpr(p->D), upw = 8 * (32 / lpr), nwg = (p->K * p->I + upw - 1) / upw;   /* units a block */
     if (nwg > 1024) nwg = 1024;
     int rw = (int)((size_t)p->D / BD_BLK[TG] * BD_BYTES[TG] + 3) / 4;
-    moe_bd_gu_k<TG><<<dim3((unsigned)nwg, (unsigned)p->S), 256, sm, st>>>(tab, x, ids, hid, *p, lpr, rw, btab);
+    moe_bd_gu_k<TG><<<dim3((unsigned)nwg, (unsigned)p->S), 256, sm, st>>>(tab, x, ids, hid, *p, lpr, rw, btab, stg, sslot);
     return 1;
 }
 template<int TD>
 static int moe_bd_dn_launch(const CcExpert *tab, const int *ids, float *hid, const CcMoe *p, const bd_u32 *btab,
-                            size_t smem_max, cudaStream_t st) {
+                            size_t smem_max, const char *stg, size_t sslot, cudaStream_t st) {
     size_t sm = (size_t)bd_tab_words(TD) * 4 + bd_x_bytes(p->I, 1);
     if (sm > smem_max) return 0;
     static unsigned raised;
@@ -4101,7 +4181,7 @@ static int moe_bd_dn_launch(const CcExpert *tab, const int *ids, float *hid, con
     uint64_t nb = (uint64_t)p->S * p->K * tiles;
     unsigned gx = nb < 65535 ? (unsigned)nb : 65535u, gy = (unsigned)((nb + gx - 1) / gx);
     int rw = (int)((size_t)p->I / BD_BLK[TD] * BD_BYTES[TD] + 3) / 4;
-    moe_bd_dn_k<TD><<<dim3(gx, gy), 256, sm, st>>>(tab, ids, hid, *p, lpr, tiles, rw, btab);
+    moe_bd_dn_k<TD><<<dim3(gx, gy), 256, sm, st>>>(tab, ids, hid, *p, lpr, tiles, rw, btab, stg, sslot);
     return 1;
 }
 #define BD_MOE_TYPES(X) X(8) X(10) X(11) X(12) X(13) X(14) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42)
@@ -4114,16 +4194,24 @@ static int moe_bd_ok(const CcMoe *p) {
 static int moe_bd_launch(DeviceContext *ctx, const CcExpert *tab, const float *x, const int *ids, float *hid, const CcMoe *p, cudaStream_t st) {
     const bd_u32 *btab = bd_table(ctx);
     if (!btab || ((uintptr_t)(x + p->x_off) & 15) || p->x_row % 4) return 0;
-    int ok = 0;
-    switch (p->fmt - 100) {
-#define BD_GU_CASE(t) case t: ok = moe_bd_gu_launch<t>(tab, x, ids, hid, p, btab, ctx->smem_optin, st); break;
+    int ok = 0, tg = p->fmt - 100, td = (p->fmt_d ? p->fmt_d : p->fmt) - 100;
+    const char *stg = nullptr;
+    size_t sslot = 0;
+    if (ctx->moe_stage && p->S * p->K <= BD_STAGE_SLOTS) {   /* the step's host experts to the staging first */
+        size_t gub = (size_t)p->I * (((size_t)p->D / BD_BLK[tg] * BD_BYTES[tg] + 3) / 4 * 4);
+        size_t dnb = (size_t)p->D * (((size_t)p->I / BD_BLK[td] * BD_BYTES[td] + 3) / 4 * 4);
+        stg = ctx->moe_stage; sslot = ctx->moe_stage_slot;
+        bd_stage_k<<<dim3(48u, (unsigned)ctx->moe_stage_n), 256, 0, st>>>(tab, ids, *p, ctx->moe_stage, sslot, ctx->moe_stage_n, gub, dnb);
+    }
+    switch (tg) {
+#define BD_GU_CASE(t) case t: ok = moe_bd_gu_launch<t>(tab, x, ids, hid, p, btab, ctx->smem_optin, stg, sslot, st); break;
         BD_MOE_TYPES(BD_GU_CASE)
 #undef BD_GU_CASE
         default: return 0;
     }
     if (!ok) return 0;
-    switch ((p->fmt_d ? p->fmt_d : p->fmt) - 100) {
-#define BD_DN_CASE(t) case t: ok = moe_bd_dn_launch<t>(tab, ids, hid, p, btab, ctx->smem_optin, st); break;
+    switch (td) {
+#define BD_DN_CASE(t) case t: ok = moe_bd_dn_launch<t>(tab, ids, hid, p, btab, ctx->smem_optin, stg, sslot, st); break;
         BD_MOE_TYPES(BD_DN_CASE)
 #undef BD_DN_CASE
         default: return 0;
@@ -4144,6 +4232,14 @@ static int moe_launch(const CcExpert *tab, const float *x, const int *ids, float
     moe_gu_k<FMT><<<gg, 256, sg, st>>>(tab, x, ids, hid, *p);
     moe_dn_k<FMT><<<gd, 256, sd, st>>>(tab, ids, hid, *p);
     return cuda_ok(cudaGetLastError(), "chain moe launch");
+}
+/* the staging a decode step's host experts go to (moe_bd_launch): stage NULL, none */
+extern "C" int coli_cuda_moe_stage(int device, void *stage, size_t slot_bytes, int slots) {
+    DeviceContext *ctx = find_ctx(device);
+    if (!ctx || (stage && (slots < 1 || slot_bytes % 16))) return 0;
+    ctx->moe_stage = (char *)stage; ctx->moe_stage_slot = stage ? slot_bytes : 0;
+    ctx->moe_stage_n = stage ? (slots < BD_STAGE_SLOTS ? slots : BD_STAGE_SLOTS) : 0;
+    return 1;
 }
 extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream) {
