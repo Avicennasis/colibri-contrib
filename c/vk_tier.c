@@ -1648,10 +1648,13 @@ static int host_fmt_ok(const ColiVkTensorInfo *ti) {
     if (ti->fmt >= 100 && ti->fmt < 164) return 1;
     if (ti->I % 32) return 0;
     if (ti->fmt == 1 || ti->fmt == 2) return 1;
-    return (ti->fmt == 4 || ti->fmt == 13) && ti->gs >= 32 && ti->gs % 32 == 0;
+    if (ti->fmt == 5) return ti->I % 64 == 0;
+    return (ti->fmt == 4 || ti->fmt == 13 || ti->fmt == 7 || ti->fmt == 12) && ti->gs >= 32 && ti->gs % 32 == 0;
 }
 static int host_type(const ColiVkTensorInfo *ti) { return ti->fmt >= 100 ? ti->fmt - 100 : -ti->fmt; }
-static int host_gs(const ColiVkTensorInfo *ti) { return ti->fmt == 4 || ti->fmt == 13 ? ti->gs : 0; }
+static int host_gs(const ColiVkTensorInfo *ti) {
+    return ti->fmt == 5 ? 64 : ti->fmt == 4 || ti->fmt == 13 || ti->fmt == 7 || ti->fmt == 12 ? ti->gs : 0;
+}
 /* A resident expert of the host pool the CPU computes in place in a hybrid step: outside the
  * device's share (by a hash of (layer, expert): the same split at every step and every read
  * of a table, the CPU's share spread over the experts), its three tensors block types the
@@ -1685,8 +1688,9 @@ static int hy_threads(void) {   /* the CPU's team: COLI_VK_HYBRID_THREADS, else 
     return 1;
 #endif
 }
-/* colibri's int8 (fmt 1, 13) and int4 (fmt 2, 4) rows. dev_codes: an int4 row's codes in
- * element order (the pairs' low nibble first), 0..15 (the value + 8), into u (I bytes). */
+/* colibri's int8 (fmt 1, 13), int4 (fmt 2, 4), int3-g64 (fmt 5), MXFP4 (fmt 7) and FP8 (fmt 12)
+ * rows. dev_codes: an int4 row's codes in element order (the pairs' low nibble first), 0..15
+ * (the value + 8), into u (I bytes). */
 static void dev_codes(uint8_t *u, const uint8_t *row, int I) {
     int j = 0;
 #if defined(__AVX2__)
@@ -1700,11 +1704,30 @@ static void dev_codes(uint8_t *u, const uint8_t *row, int I) {
 #endif
     for (; j < I / 2; j++) { u[2 * j] = row[j] & 15; u[2 * j + 1] = row[j] >> 4; }
 }
+/* an int3-g64 row's codes (16 bytes of 2-bit low planes, then 8 of high bits, a group of 64),
+ * 0..7 (the value + 4) */
+static void dev_codes3(uint8_t *u, const uint8_t *row, int I) {
+    for (int g = 0; g < I / 64; g++) {
+        const uint8_t *lo = row + (size_t)g * 24, *hi = lo + 16;
+        uint8_t *o = u + (size_t)g * 64;
+        for (int j = 0; j < 64; j++) o[j] = (uint8_t)(((lo[j >> 2] >> ((j & 3) * 2)) & 3u) | (((hi[j >> 3] >> (j & 7)) & 1u) << 2));
+    }
+}
+/* an MXFP4 row's values times 2, as int8 (e2m1: 0, 0.5, 1, 1.5, 2, 3, 4, 6 and the sign) */
+static void dev_codes_fp4(int8_t *w, const uint8_t *row, int I) {
+    static const int8_t v2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    for (int j = 0; j < I / 2; j++) { w[2 * j] = v2[row[j] & 15]; w[2 * j + 1] = v2[row[j] >> 4]; }
+}
+static float dev_fp8(uint8_t b) {   /* e4m3 as the backend decodes it */
+    const int e = (b >> 3) & 15, m = b & 7;
+    const float v = e == 0 ? m / 512.0f : ldexpf(1.0f + m / 8.0f, e - 7);
+    return (b & 0x80) ? -v : v;
+}
 /* Activation row q (int8 per 32, dx its scales, xs its sums per 16) against a row's codes:
  * int8 w8, or int4 u4 (0..15, the value + 8: the bias comes back with the activation's
  * sums). rs: the row's scale (gs 0) or its groups' of gs columns. Integer sums a block, then
  * the block's scale: dx times the group's (the row's at the end). */
-static float dev_dot(const int8_t *w8, const uint8_t *u4, const float *rs, int gs, const int8_t *q, const float *dx,
+static float dev_dot(const int8_t *w8, const uint8_t *u4, int zero, const float *rs, int gs, const int8_t *q, const float *dx,
                      const int32_t *xs, int I) {
     float bias = 0.f;
 #if defined(__AVX2__)
@@ -1736,13 +1759,22 @@ static float dev_dot(const int8_t *w8, const uint8_t *u4, const float *rs, int g
         r += (float)p * sc;
     }
 #endif
-    r -= 8.f * bias;
+    r -= (float)zero * bias;
     return gs ? r : r * rs[0];
 }
 /* the float reference: the row dequantized (its codes times their scale) */
 static void dev_dequant(float *o, const uint8_t *row, int fmt, const float *rs, int gs, int I) {
+    static const float e2m1[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
     for (int i = 0; i < I; i++) {
-        const float w = fmt == 1 || fmt == 13 ? (float)((const int8_t *)row)[i] : (float)(((i & 1) ? row[i >> 1] >> 4 : row[i >> 1] & 15) - 8);
+        const int nib = (i & 1) ? row[i >> 1] >> 4 : row[i >> 1] & 15;
+        float w;
+        if (fmt == 1 || fmt == 13) w = (float)((const int8_t *)row)[i];
+        else if (fmt == 12) w = dev_fp8(row[i]);
+        else if (fmt == 7) w = (nib & 8) ? -e2m1[nib & 7] : e2m1[nib & 7];
+        else if (fmt == 5) {
+            const uint8_t *lo = row + (size_t)(i >> 6) * 24, *hi = lo + 16; const int j = i & 63;
+            w = (float)((int)(((lo[j >> 2] >> ((j & 3) * 2)) & 3u) | (((hi[j >> 3] >> (j & 7)) & 1u) << 2)) - 4);
+        } else w = (float)(nib - 8);
         o[i] = w * (gs ? rs[i / gs] : rs[0]);
     }
 }
@@ -1752,12 +1784,29 @@ static void dev_dequant(float *o, const uint8_t *row, int fmt, const float *rs, 
  * bits whatever rows share the call. tmp: I floats, and for an int4 row I bytes after them. */
 static inline void host_rows(float *y, int ys, const gq_act *a, const float *const *xf, const uint8_t *row, int t, int I,
                              float *tmp, const float *rs, int gs) {
+    if (t < 0 && (-t == 12 || (-t == 7 && I / gs > 2048)) && !gq_exact_mode()) {   /* FP8 has no integer form: its floats against x's */
+        dev_dequant(tmp, row, -t, rs, gs, I);
+        for (int s = 0; s < a->S; s++) {
+            const float *x = xf[s];
+            float acc = 0.f;
+            for (int i = 0; i < I; i++) acc += tmp[i] * x[i];
+            y[(size_t)s * ys] = acc;
+        }
+        return;
+    }
     if (t < 0 && !gq_exact_mode()) {
-        const int fmt = -t, i4 = fmt == 2 || fmt == 4;
-        uint8_t *u = i4 ? (uint8_t *)(tmp + I) : NULL;
-        if (i4) dev_codes(u, row, I);
+        const int fmt = -t;
+        uint8_t *u = NULL; const int8_t *w8 = (const int8_t *)row; int zero = 0;
+        float half[2048], *rsx = (float *)rs;
+        if (fmt == 2 || fmt == 4) { u = (uint8_t *)(tmp + I); dev_codes(u, row, I); zero = 8; }
+        else if (fmt == 5) { u = (uint8_t *)(tmp + I); dev_codes3(u, row, I); zero = 4; }
+        else if (fmt == 7) {   /* the values doubled: the group's scale halved */
+            int8_t *w = (int8_t *)(tmp + I); dev_codes_fp4(w, row, I); w8 = w;
+            for (int g = 0; g < I / gs; g++) half[g] = 0.5f * rs[g];   /* at most 2048: above */
+            rsx = half;
+        }
         for (int s = 0; s < a->S; s++)
-            y[(size_t)s * ys] = dev_dot((const int8_t *)row, u, rs, gs, a->q + (size_t)s * I, a->d + (size_t)s * (I / 32),
+            y[(size_t)s * ys] = dev_dot(w8, u, zero, rsx, gs, a->q + (size_t)s * I, a->d + (size_t)s * (I / 32),
                                         a->s + (size_t)s * (I / 16), I);
         return;
     }

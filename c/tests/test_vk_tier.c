@@ -57,7 +57,7 @@
  *            the join, every row the reference's; COLI_VK_TIER_POOL_COPY=0 and
  *            COLI_VK_HYBRID_BIG_ROWS=0 read them in place;
  *   host pairs vkt_host_pairs on the CPU alone (Q4_K/Q6_K, IQ2_XXS/IQ3_XXS, colibri's int4-g64
- *            pairs and int8 a row): the
+ *            pairs, int8 a row, int3-g64, MXFP4 and FP8): the
  *            pairs of one expert computed together give the bits of each pair computed on its
  *            own, and the dequantized reference within the form's error. Here the float form
  *            (GQ_EXACT=1, set for the whole run: vk_tier.c reads it once); with the argument
@@ -1341,13 +1341,15 @@ static void host_pairs_case(double tol) {
     static const int pe[NP] = {0, 1, 2, 0, 1, 0, 2, 1, 0, 2, 2, 1}, pr[NP] = {0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 4, 4};
     /* a GGUF's block types, and colibri's int4-g64 pairs (fmt 4) and int8 a row (fmt 1), the
      * host pool's layouts of VKT_SRC_I4U_PAIRS_GS and VKT_SRC_I8_ROW */
-    static const int ty[4][2] = {{GQ_Q4_K, GQ_Q6_K}, {GQ_IQ2_XXS, GQ_IQ3_XXS}, {-4, -4}, {-1, -1}};
-    static const char *nm[4] = {"Q4_K/Q6_K", "IQ2_XXS/IQ3_XXS", "int4-g64 pairs", "int8 a row"};
-    for (int c = 0; c < 4; c++) {
+    static const int ty[7][2] = {{GQ_Q4_K, GQ_Q6_K}, {GQ_IQ2_XXS, GQ_IQ3_XXS}, {-4, -4}, {-1, -1}, {-5, -5}, {-7, -7}, {-12, -12}};
+    static const char *nm[7] = {"Q4_K/Q6_K", "IQ2_XXS/IQ3_XXS", "int4-g64 pairs", "int8 a row", "int3-g64", "MXFP4 g32", "FP8 g128"};
+    static const VktFmt cf[7] = {{0, 0}, {0, 0}, {VKT_SRC_I4U_PAIRS_GS, 64}, {VKT_SRC_I8_ROW, 0}, {VKT_SRC_I3_G64, 64},
+                                 {VKT_SRC_MXFP4_F32, 32}, {VKT_SRC_FP8_GS, 128}};
+    for (int c = 0; c < 7; c++) {
         const int blk = ty[c][0] >= 0;
-        VktFmt gu = blk ? (VktFmt){(VktSrc)(VKT_SRC_GGML + ty[c][0]), 0} : c == 2 ? (VktFmt){VKT_SRC_I4U_PAIRS_GS, 64} : (VktFmt){VKT_SRC_I8_ROW, 0};
+        VktFmt gu = blk ? (VktFmt){(VktSrc)(VKT_SRC_GGML + ty[c][0]), 0} : cf[c];
         VktFmt dn = blk ? (VktFmt){(VktSrc)(VKT_SRC_GGML + ty[c][1]), 0} : gu;
-        const int gsv = c == 2 ? 64 : 0;
+        const int gsv = blk || c == 3 ? 0 : cf[c].gs;
         Ex xe[NE]; VktHostExpert hv[NE], hp[NP]; const VktHostExpert *hx[NP]; const float *xr[NP];
         for (int e = 0; e < NE; e++) {
             if (blk) { mat_make_block(&xe[e].g, gu, HP, FP); mat_make_block(&xe[e].u, gu, HP, FP); mat_make_block(&xe[e].d, dn, FP, HP); }
