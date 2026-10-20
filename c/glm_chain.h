@@ -139,8 +139,55 @@ static int glmc_dev2_wanted(void) { const char *e = getenv("COLI_VK_CHAIN_DEV2")
 /* The device's copy of a resident QT, uploaded once (the per-matrix path's own copy
  * when COLI_VK_DENSE put it there); f32 goes up as the backend's fmt 10. NULL: no
  * device form (int2, E8/IQ3, fp8, planar int4). */
-static ColiVkTensor *glmc_tensor(QT *t) {
+/* A GGUF matrix's rows as the file has them (the loader interleaved some by 16 for the
+ * CPU: gq_r16_unpack gives whole groups back): *rows a malloc'd copy, or NULL when q4
+ * holds them so; *type the file's type. -1: rows not in whole groups, or no memory. */
+static int glmc_gq_rows(const QT *t, uint8_t **rows, int *type) {
+    const int b = gq_r16_base(t->gt);
+    *type = b >= 0 ? b : t->gt; *rows = NULL;
+    if (b < 0) return 0;
+    if (t->O % 16) return -1;
+    if (!(*rows = malloc((size_t)gq_row_bytes(*type, t->I) * (size_t)t->O))) return -1;
+    gq_r16_unpack(t->gt, *rows, t->q4, t->O, t->I);
+    return 0;
+}
+/* a GGUF matrix's device form: its blocks (100 + the file's type), -1 without one */
+static int glmc_gq_fmt(const QT *t) {
+    const int b = gq_r16_base(t->gt), ty = b >= 0 ? b : t->gt, be = coli_vk_block_elems(100 + ty);
+    if (!t->q4 || t->O <= 0 || t->I <= 0 || (b >= 0 && t->O % 16)) return -1;
+    return be > 0 && t->I % be == 0 ? 100 + ty : -1;
+}
+/* A GGUF matrix on the device as floats (fmt 10): a GGUF's kv_b split, whose k_b and v_b
+ * the MLA core reads as k_abs and v_abs on its per-head GEMVs, which take no blocks */
+static ColiVkTensor *glmc_gq_f32(QT *t) {
     if (t->vk) return t->vk;
+    uint8_t *rows; int ty;
+    if (!t->q4 || glmc_gq_rows(t, &rows, &ty) < 0) return NULL;
+    const uint8_t *src = rows ? rows : t->q4;
+    const int64_t rb = gq_row_bytes(ty, t->I);
+    float *f = malloc((size_t)t->O * (size_t)t->I * sizeof(float));
+    if (!f) { free(rows); return NULL; }
+    for (int r = 0; r < t->O; r++) gq_dequant_row(ty, src + (int64_t)r * rb, f + (size_t)r * t->I, t->I);
+    free(rows);
+    const int ok = g_glmc_dev ? coli_vk_tensor_ensure2(&t->vk, f, NULL, 10, t->I, t->O, 0)
+                              : coli_vk_tensor_ensure(&t->vk, f, NULL, 10, t->I, t->O, 0);
+    free(f);
+    return ok ? t->vk : NULL;
+}
+static ColiVkTensor *glmc_tensor(QT *t) {
+    if (t->fmt == QT_KVB)   /* k_b and v_b on their own (the split's QTs hold them); kv_b's own copy stays none */
+        return t->kvb && glmc_gq_f32(&t->kvb->kb) && glmc_gq_f32(&t->kvb->vb) ? t->kvb->kb.vk : NULL;
+    if (t->vk) return t->vk;
+    if (t->fmt == QT_GGML) {   /* a GGUF's blocks as the file has them */
+        const int f = glmc_gq_fmt(t);
+        uint8_t *rows; int ty;
+        if (f < 0 || glmc_gq_rows(t, &rows, &ty) < 0) return NULL;
+        const void *src = rows ? (const void *)rows : (const void *)t->q4;
+        const int ok = g_glmc_dev ? coli_vk_tensor_ensure2(&t->vk, src, NULL, f, t->I, t->O, 0)
+                                  : coli_vk_tensor_ensure(&t->vk, src, NULL, f, t->I, t->O, 0);
+        free(rows);
+        return ok ? t->vk : NULL;
+    }
     int fmt; const void *w;
     switch (t->fmt) {
     case 0: fmt = 10; w = t->qf; break;
@@ -167,6 +214,8 @@ static int glmc_form(const QT *t, int *gs) {
     case 2: return t->planar || !t->q4 ? -1 : 2;
     case 4: if (t->planar || t->gs < 8 || t->gs % 8 || !t->q4) return -1; *gs = t->gs; return 4;
     case 5: return t->q4 ? 5 : -1;
+    case QT_GGML: return glmc_gq_fmt(t);
+    case QT_KVB: return t->kvb ? 10 : -1;   /* k_b and v_b as floats: the checkpoint's [H*(nope+V)][kv_lora] in bytes */
     default: return -1;
     }
 }
@@ -394,14 +443,18 @@ static int glmc_setup_dev(Model *m, int d) {
         QT *q[11]; int nq = glmc_layer_qts(m, i, q), up = 1;
         for (int k = 0; k < nq && up; k++) up = glmc_tensor(q[k]) != NULL;
         if (!up) {   /* free what it placed: the layer runs on the CPU, from its host copies */
-            ColiVkTensor **t[11];
-            for (int k = 0; k < nq; k++) t[k] = &q[k]->vk;
-            vkc_layer_free(t, nq, NULL, 0);
+            ColiVkTensor **t[13]; int nt = 0;
+            for (int k = 0; k < nq; k++) t[nt++] = &q[k]->vk;
+            if (l->kv_b.fmt == QT_KVB && l->kv_b.kvb) { t[nt++] = &l->kv_b.kvb->kb.vk; t[nt++] = &l->kv_b.kvb->vb.vk; }
+            vkc_layer_free(t, nt, NULL, 0);
             vkc_fit_shrink(nm, fit, i - lo, vkc_lost() ? "the device was lost" : "a matrix was refused");
             break;
         }
         ch->mla[i] = (VkcMla){c->n_heads, c->qk_nope, c->qk_rope, c->v_head, c->kv_lora, D, c->q_lora, c->eps, c->attn_scale,
-                              VKC_ROPE_INTERLEAVED, l->q_a.vk, l->q_b.vk, l->kv_a.vk, l->kv_b.vk, NULL, NULL, l->o.vk,
+                              VKC_ROPE_INTERLEAVED, l->q_a.vk, l->q_b.vk, l->kv_a.vk,
+                              l->kv_b.fmt == QT_KVB ? NULL : l->kv_b.vk,                      /* a GGUF's split: */
+                              l->kv_b.fmt == QT_KVB ? l->kv_b.kvb->kb.vk : NULL,              /* k_abs */
+                              l->kv_b.fmt == QT_KVB ? l->kv_b.kvb->vb.vk : NULL, l->o.vk,     /* v_abs */
                               ch->prm, o_qn[i], o_kn[i]};
         if (!d) glm_dho_drop_layer(m, i);   /* COLI_VK_DENSE_HOST: all of the layer is there, its host copies go */
         vkc_fit_mark(fit, i - lo);
