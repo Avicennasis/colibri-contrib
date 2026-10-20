@@ -24,7 +24,7 @@ dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engin
 Qwen3 -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
 Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
 glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine),
-deepseek41 (DeepSeek V4.1 Flash, antirez's format and the published K-quant and IQ files ->
+deepseek41 (DeepSeek V4.1 Flash, files with the config whole and the published K-quant and IQ ones ->
 deepseek_v41 engine), olmoe (OLMoE -> olmoe engine).
 
 Usage:
@@ -585,7 +585,7 @@ def deepseek41_meta_config(meta, tensors):
 
 
 def deepseek41_config(meta, tensors, overrides=None):
-    """DeepSeek V4.1: antirez's deepseek41 carries the checkpoint's config.json whole
+    """DeepSeek V4.1: a deepseek41 file may carry the checkpoint's config.json whole
     (deepseek41.config), and the engine reads it as it is; the published K-quant and IQ files have its keys
     (deepseek41_meta_config). The model's layers are the blocks with attention (no MTP
     block in these files)."""
