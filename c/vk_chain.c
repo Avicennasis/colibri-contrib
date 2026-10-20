@@ -1255,8 +1255,11 @@ static int matmul_bd(const ColiVkTensorInfo *ti, VkcBuf *x, size_t xb, VkcBuf *y
     VkcBind bd[4] = {{x->buf, xb, 0, 0}, {(VkBuffer)ti->wbuf, 0, 0, 0}, {tab, 0, 0, 0}, {y->buf, yb, 0, 1}};
     x->last_frame = y->last_frame = KC.serial;
     KC.kind = PK_GEMV;
-    /* a prompt's rows: the tiled GEMM, each weight decoded once for 64 rows of x */
-    VkPipeline gp = S > 4 && ti->fmt < 164 && ti->I % 64 == 0 ? bdg_pipe(ti->fmt - 100, ti->rowWords) : VK_NULL_HANDLE;
+    /* a prompt's rows: the tiled GEMM, each weight decoded once for 64 rows of x; not a
+     * speculative verify's (vkc_gemm_rows(0)): its rows past 4 the GEMV a row each, a decode
+     * step's bits (the tiles gave a verify of 5 or 6 rows other bits, and speculative decoding's
+     * output then followed the drafts' count) */
+    VkPipeline gp = S > 4 && KC.gemm_rows != 0 && ti->fmt < 164 && ti->I % 64 == 0 ? bdg_pipe(ti->fmt - 100, ti->rowWords) : VK_NULL_HANDLE;
     if (gp) {
         struct VkcPC pc = {ti->fmt, S, ti->I, ti->O, ti->rowWords, ti->gs};
         KC.kind = PK_GEMM;
@@ -1526,9 +1529,19 @@ int vkc_attn_block_rows(void) {
  * chain_attn gives a (head, row) one workgroup that walks the positions in turn: a decode
  * step's few rows leave the device all but idle (Qwen3.6's 16 heads, about 160 us a
  * layer at 700 positions on an RTX PRO 4000). From VKC_ATTN_DEC_MIN positions a call of
- * up to 4 rows without a selection list runs in blocks of L positions, a workgroup a
- * (head, block, row), the blocks then joined. COLI_VK_ATTN_DEC=0 keeps chain_attn. */
+ * up to VKC_ATTN_DEC_ROWS rows without a selection list runs in blocks of L positions, a
+ * workgroup a (head, block, row), the blocks then joined; each row's blocks as its own
+ * positions choose them (attn_dec_len), the rows short of VKC_ATTN_DEC_MIN positions through
+ * chain_attn, as a decode step of each alone would run: a verify's rows get their decode
+ * steps' bits (a verify of 5 rows took chain_attn before, and speculative decoding's output
+ * then followed the drafts' count). COLI_VK_ATTN_DEC=0 keeps chain_attn. */
 #define VKC_ATTN_DEC_MIN 128
+#define VKC_ATTN_DEC_ROWS 8
+static int attn_dec_len(int n, int H) {   /* chain_attn_dec.comp's dec_len */
+    int L = 64, nb = (n + L - 1) / L;
+    while (L < 256 && (int64_t)H * nb > 1024) { L *= 2; nb = (n + L - 1) / L; }
+    return L;
+}
 static VkPipeline adec_pipe(void) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("COLI_VK_ATTN_DEC"); on = !(e && *e == '0'); }
@@ -1566,9 +1579,12 @@ static int attn_dec(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, 
     int G = w->a.H / w->a.KVH;
     if (!(KC.mod_fa && vkc_attn_flash_rows() > 0 && !w->win && !w->ring && !w->kv_pm && !w->sink && w->vd == w->a.hd &&
           w->a.hd % 64 == 0 && 16 % G == 0 && fa_pipe(w->a.hd, G))) return 0;
-    if (S < 1 || S > 4 || n < VKC_ATTN_DEC_MIN || !adec_pipe()) return 0;
-    int L = 64, nb = (n + L - 1) / L;
-    while (L < 256 && (int64_t)w->a.H * nb > 1024) { L *= 2; nb = (n + L - 1) / L; }
+    if (S < 1 || S > VKC_ATTN_DEC_ROWS || n < VKC_ATTN_DEC_MIN || w->a.pos_base + 1 < VKC_ATTN_DEC_MIN || !adec_pipe()) return 0;
+    int L = attn_dec_len(n, w->a.H), nb = 1;
+    for (int r = 0; r < S; r++) {   /* the most blocks a row takes */
+        int nr = w->a.pos_base + r + 1, Lr = attn_dec_len(nr, w->a.H), m = (nr + Lr - 1) / Lr;
+        if (m > nb) nb = m;
+    }
     VkcBuf *xs = adec_scratch((size_t)S * w->a.H * nb * (w->vd + 2) * 4);
     if (!xs) return 0;
     struct { VkcAttnW w; int mode, L, nb; } pc = {*w, 0, L, nb};
@@ -1593,7 +1609,16 @@ int vkc_attn_w(VkcBuf *q, VkcBuf *kc, VkcBuf *vc, VkcBuf *o, VkcBuf *gate, VkcBu
     VkPipeline fp = KC.mod_fa && fl > 0 && w.a.S >= fl && !(sel && w.a.sel_row > 0) && !w.win && !w.ring && !w.kv_pm &&
                     !w.sink && w.vd == w.a.hd && w.a.hd % 64 == 0 && 16 % G == 0 ? fa_pipe(w.a.hd, G) : VK_NULL_HANDLE;
     int blocked = !fp && blk > 0 && w.a.S >= blk && G <= 32 && kab_pipe(), br = w.a.sel_row > 0 ? 1 : 32 / G;
-    /* a decode's or a verify's rows over many positions: split over them */
+    /* a decode's or a verify's rows over many positions: split over them; a verify across
+     * VKC_ATTN_DEC_MIN positions in two calls, its rows before it as their decode steps run */
+    if (!fp && !blocked && !(sel && w.a.sel_row > 0) && w.a.S > 1 && w.a.S <= VKC_ATTN_DEC_ROWS &&
+        w.a.pos_base + 1 < VKC_ATTN_DEC_MIN && w.a.pos_base + w.a.S >= VKC_ATTN_DEC_MIN) {
+        int k = VKC_ATTN_DEC_MIN - (w.a.pos_base + 1);
+        VkcAttnW lo = *p, hi = *p;
+        lo.a.S = k;
+        hi.a.S -= k; hi.a.pos_base += k; hi.a.q_off += k * p->a.q_row; hi.a.o_off += k * p->a.o_row; hi.a.g_off += k * p->a.g_row;
+        return vkc_attn_w(q, kc, vc, o, gate, sel, snk, &lo) && vkc_attn_w(q, kc, vc, o, gate, sel, snk, &hi);
+    }
     if (!fp && !blocked && !(sel && w.a.sel_row > 0) && attn_dec(q, kc, vc, o, gate, snk, &w)) return 1;
     int S = w.a.S, rr = attn_slice_rows(S, w.a.pos_base, (double)w.a.H * (w.a.hd > w.vd ? w.a.hd : w.vd),
                                         fp ? 16 / G : blocked ? br : 1);

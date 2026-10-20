@@ -246,6 +246,28 @@ static void test_chunk_rows(void) {
 }
 
 /* ---- attention ---------------------------------------------------------------------- */
+/* a verify's S rows: each the bits of a decode step of that row alone (chain_attn_dec.comp's
+ * blocks from each row's own positions, the rows before VKC_ATTN_DEC_MIN as theirs run) */
+static void test_attn_rows_bits(int S, int pos_base, int H, int KVH, int hd) {
+    int cap = pos_base + S + 4, qseg = 2 * hd, koff = 64;
+    size_t kn = (size_t)koff + (size_t)KVH * cap * hd;
+    float *q = fvec((size_t)S * H * qseg, 1.f), *kc = fvec(kn, 1.f), *vc = fvec(kn, 1.f);
+    VkcBuf *qb = up(q, (size_t)S * H * qseg), *kb = up(kc, kn), *vb = up(vc, kn);
+    VkcBuf *ob = vkc_buf((size_t)S * H * hd * 4, VKC_DOWN), *o1 = vkc_buf((size_t)H * hd * 4, VKC_DOWN);
+    VkcAttn p = {S, H, KVH, hd, pos_base, cap, 0, H * qseg, qseg, hd, H * qseg, qseg, 1, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), koff, koff};
+    vkc_begin(); int ok = vkc_attn(qb, kb, vb, ob, qb, NULL, &p); vkc_submit(1);
+    float *all = malloc((size_t)S * H * hd * 4);
+    memcpy(all, vkc_ptr(ob), (size_t)S * H * hd * 4);
+    int same = ok;
+    for (int r = 0; r < S && same; r++) {
+        VkcAttn p1 = p; p1.S = 1; p1.pos_base = pos_base + r; p1.q_off = p.q_off + r * p.q_row; p1.g_off = p.g_off + r * p.g_row;
+        vkc_begin(); same = vkc_attn(qb, kb, vb, o1, qb, NULL, &p1); vkc_submit(1);
+        same = same && !memcmp(vkc_ptr(o1), all + (size_t)r * H * hd, (size_t)H * hd * 4);
+    }
+    CHECK(same, "attn S %d pos %d H %d/%d hd %d: each row a one-row step's bits", S, pos_base, H, KVH, hd);
+    free(all); free(q); free(kc); free(vc);
+    vkc_free(qb); vkc_free(kb); vkc_free(vb); vkc_free(ob); vkc_free(o1);
+}
 static void test_attn_hk(int S, int pos_base, int H, int KVH, int hd, int use_list) {
     int cap = 300, gsz = hd, qseg = hd + gsz, koff = 64;
     int T = pos_base + S;
@@ -3885,6 +3907,8 @@ int main(int argc, char **argv) {
         test_attn_hk(3, 250, 16, 2, 256, 0); test_attn_hk(1, 299, 4, 2, 128, 0);
         test_attn_win(4, 900, 8, 2, 128, 128, 0, 0, 1, 0); test_attn_win(1, 2000, 4, 2, 64, 64, 512, 512, 0, 1);
         test_attn_win(2, 3000, 16, 4, 64, 96, 0, 0, 0, 0);
+        test_attn_rows_bits(3, 700, 16, 2, 256); test_attn_rows_bits(6, 700, 16, 2, 256);
+        test_attn_rows_bits(6, 125, 16, 2, 128); test_attn_rows_bits(6, 4093, 16, 2, 128);
         VkcStats ad; vkc_stats(&ad); printf("  decode attentions in blocks of positions: %llu\n", ad.attn_dec);
         rng = rng_was;
     }

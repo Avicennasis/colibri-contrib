@@ -10,7 +10,8 @@
 //   mode 1: workgroup (head h, row s): the blocks joined (the sink's logit with them),
 //           acc / l, times sigmoid(gate) when has_gate, into o.
 // The bindings and push constants are chain_attn.comp's (no selection list: the host
-// keeps those there), plus the scratch at binding 7 and mode, L, nb.
+// keeps those there), plus the scratch at binding 7 and mode, L, nb. Each row takes the
+// blocks its own positions choose (dec_len), so a verify's row has its decode step's bits.
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_basic : require
 layout(local_size_x = 256) in;
@@ -39,6 +40,15 @@ shared float qs[256];
 shared float sc[256];
 shared float red[64];
 
+// the positions a block takes for a row of n positions, as a decode step of that row alone
+// chooses them (vk_chain.c's attn_dec: 64, doubled to 256 at most while there would be more
+// than 1024 blocks); p.L is unused
+int dec_len(int n) {
+    int L = 64, nb = (n + L - 1) / L;
+    while (L < 256 && p.H * nb > 1024) { L *= 2; nb = (n + L - 1) / L; }
+    return L;
+}
+
 void main() {
     int tid = int(gl_LocalInvocationID.x), sg = int(gl_SubgroupID), nsg = int(gl_NumSubgroups);
     int lane = int(gl_SubgroupInvocationID), sgs = int(gl_SubgroupSize);
@@ -48,8 +58,8 @@ void main() {
         int b = int(gl_WorkGroupID.y), s = int(gl_WorkGroupID.z);
         int kvh = h / (p.H / p.KVH);
         int first = p.win > 0 ? max(0, p.pos_base + s - p.win + 1) : 0;
-        int n = p.pos_base + s + 1 - first;
-        int t0 = b * p.L, cnt = min(p.L, n - t0);
+        int n = p.pos_base + s + 1 - first, L = dec_len(n);
+        int t0 = b * L, cnt = min(L, n - t0);
         int xo = ((s * p.H + h) * p.nb + b) * stride;
         if (cnt <= 0) {   // past the row's positions: an empty block
             if (tid == 0) { xs[xo] = -3.0e38; xs[xo + 1] = 0.0; }
@@ -102,7 +112,7 @@ void main() {
     // mode 1: the row's blocks joined
     int s = int(gl_WorkGroupID.y);
     int first = p.win > 0 ? max(0, p.pos_base + s - p.win + 1) : 0;
-    int n = p.pos_base + s + 1 - first, nb = (n + p.L - 1) / p.L;
+    int n = p.pos_base + s + 1 - first, L = dec_len(n), nb = (n + L - 1) / L;
     int xo = (s * p.H + h) * p.nb * stride;
     float M = p.sink != 0 ? snk[p.sink_off + h] : -3.0e38;
     for (int b = 0; b < nb; b++) M = max(M, xs[xo + b * stride]);
