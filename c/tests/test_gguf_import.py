@@ -246,6 +246,10 @@ def write_deepseek41(path, rng):
     w.add_array(p + "swiglu_clamp_exp", [10.0] * layers); w.add_array(p + "swiglu_clamp_shexp", [10.0] * layers)
     w.add_array(p + "attention.compress_ratios", ratios); w.add_array(p + "attention.kv_source_layers", kv_src)
     w.add_array(p + "attention.indexer.source_layers", idx_src); w.add_array(p + "ple.layers", eng)
+    for key, v in (("dspark.block_size", 3), ("dspark.noise_token_id", 7), ("dspark.markov_rank", 32),
+                   ("dspark.expert_count", 4), ("dspark.expert_used_count", 2)):   # write_dflash's head
+        w.add_uint32(p + key, v)
+    w.add_array(p + "dspark.target_layers", [3, 4, 5])
     # The engram: per layer, (ngram - 1) * heads buckets of distinct primes above the
     # engram vocabulary, their offsets running over every layer's (one tensor holds all),
     # and a layer's ngram odd hash multipliers, past 32 bits as the file's are.
@@ -311,6 +315,64 @@ def write_deepseek41(path, rng):
         if L in eng:
             f32(b + "engram_gate.weight", (hc, h), 0.05, 1.0)
             q(b + "engram_kv.weight", (h * (hc + 1), (ngram - 1) * eh * ehd), "Q8_0")
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+
+
+def write_dflash(path, rng, targets=(3, 4, 5)):
+    """write_deepseek41's DSpark head as the published files ship it, a GGUF of its own (arch
+    dflash): two stages as blk.<s> under V4.1's layer names, MXFP4 routed experts (4, 2 a
+    token) and Q8_0 projections, and beside them fc (the target layers 3, 4 and 5 into the
+    width), enc.output_norm, output_norm, conf_proj and the BF16 Markov head (rank 32). The
+    experts' e8m0 scales are 2^-7 to 2^-4 (make_blocks draws any byte, 2^127 among them)."""
+    w = gguf.GGUFWriter(str(path), "dflash")
+    p = "dflash."
+    stages, h, mi, e, k, heads, hd, ql, ol, og, hc, rank = 2, 256, 256, 4, 2, 4, 64, 64, 32, 2, 4, 32
+    for key, v in (("block_count", stages), ("context_length", 4096), ("embedding_length", h),
+                   ("feed_forward_length", mi), ("attention.head_count", heads), ("attention.head_count_kv", 1),
+                   ("attention.key_length", hd), ("attention.value_length", hd), ("rope.dimension_count", 16),
+                   ("attention.q_lora_rank", ql), ("attention.sliding_window", 8), ("expert_count", e),
+                   ("expert_used_count", k), ("expert_feed_forward_length", mi), ("expert_shared_count", 1),
+                   ("expert_gating_func", 4), ("attention.output_group_count", og), ("attention.output_lora_rank", ol),
+                   ("hyper_connection.count", hc), ("hyper_connection.sinkhorn_iterations", 20), ("block_size", 3)):
+        w.add_uint32(p + key, v)
+    w.add_array(p + "target_layers", list(targets)); w.add_array(p + "attention.compress_ratios", [0] * stages)
+
+    def f32(name, shape, std=0.02, base=0.0):
+        w.add_tensor(name, (base + rng.standard_normal(shape) * std).astype(np.float32))
+    def bf16(name, shape, std=0.05):
+        v = (rng.standard_normal(shape) * std).astype(np.float32)
+        w.add_tensor(name, (v.view(np.uint32) >> 16).astype(np.uint16).view(np.uint8).reshape(*shape[:-1], shape[-1] * 2),
+                     raw_dtype=QT.BF16)
+    def q(name, shape, t):
+        if t == "MXFP4":   # each block's e8m0 byte first, then its 16 bytes of codes
+            rows, nb = int(np.prod(shape[:-1])), shape[-1] // 32
+            raw = make_blocks("MXFP4", rows * nb, rng)
+            raw[:, 0] = rng.integers(120, 124, size=rows * nb, dtype=np.uint8)
+            raw = raw.reshape(*shape[:-1], nb * 17)
+        else:
+            raw = blocks(t, shape, rng)
+        w.add_tensor(name, raw, raw_dtype=QT[t])
+    mix = (2 + hc) * hc
+    for S in range(stages):
+        b = f"blk.{S}."
+        f32(b + "attn_norm.weight", (h,), 0.01, 1.0); f32(b + "ffn_norm.weight", (h,), 0.01, 1.0)
+        for which in ("attn", "ffn"):
+            f32(b + f"hc_{which}_fn.weight", (mix, hc * h), 0.01); f32(b + f"hc_{which}_base.weight", (mix,), 0.1)
+            w.add_tensor(b + f"hc_{which}_scale.weight", np.full(3, 0.5, np.float32))
+        f32(b + "attn_sinks.weight", (heads,), 0.1)
+        q(b + "attn_q_a.weight", (ql, h), "Q8_0"); w.add_tensor(b + "attn_q_a_norm.weight", np.ones(ql, np.float32))
+        q(b + "attn_q_b.weight", (heads * hd, ql), "Q8_0")
+        q(b + "attn_kv.weight", (hd, h), "Q8_0"); w.add_tensor(b + "attn_kv_a_norm.weight", np.ones(hd, np.float32))
+        q(b + "attn_output_a.weight", (og * ol, heads * hd // og), "Q8_0"); q(b + "attn_output_b.weight", (h, og * ol), "Q8_0")
+        f32(b + "ffn_gate_inp.weight", (e, h), 0.05); f32(b + "exp_probs_b.bias", (e,), 0.1)
+        q(b + "ffn_gate_shexp.weight", (mi, h), "Q8_0"); q(b + "ffn_up_shexp.weight", (mi, h), "Q8_0")
+        q(b + "ffn_down_shexp.weight", (h, mi), "Q8_0")
+        q(b + "ffn_gate_exps.weight", (e, mi, h), "MXFP4"); q(b + "ffn_up_exps.weight", (e, mi, h), "MXFP4")
+        q(b + "ffn_down_exps.weight", (e, h, mi), "MXFP4")
+    q("fc.weight", (h, len(targets) * h), "Q8_0")
+    w.add_tensor("enc.output_norm.weight", np.ones(h, np.float32)); w.add_tensor("output_norm.weight", np.ones(h, np.float32))
+    f32("conf_proj.weight", (1, h + rank), 0.05)
+    bf16("markov_w1.weight", (VOCAB, rank)); bf16("markov_w2.weight", (VOCAB, rank))
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
 
 
@@ -810,6 +872,43 @@ class DeepSeek41Config(unittest.TestCase):
         self.assertEqual(resident("blk.1.engram_embd.weight", 10 ** 11, {}), 0)          # a GGUF's table
         self.assertEqual(resident("layers.1.engram.embed.weight", 10 ** 11, {}), 0)      # the checkpoint's
         self.assertEqual(resident("blk.1.engram_kv.weight", 1000, {}), 1000)             # its projection is resident
+
+
+@unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+class DeepSeek41DSparkHead(unittest.TestCase):
+    """The published files' DSpark head, a dflash GGUF next to the model: the importer
+    finds it, checks it against the model's keys and names it in gguf.json."""
+    def test_the_head_next_to_the_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_deepseek41(d / "ds41.gguf", np.random.default_rng(3))
+            write_dflash(d / "dspark-ds41-Q8_0.gguf", np.random.default_rng(4))
+            for flag, want in (([], True), (["--no-mtp"], False)):
+                out = d / ("dir" if want else "plain")
+                p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(d / "ds41.gguf"), str(out), *flag],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                self.assertEqual(p.returncode, 0, p.stdout.decode())
+                link = json.loads((out / "gguf.json").read_text())
+                text = json.loads((out / "config.json").read_text())["text_config"]
+                if not want:
+                    self.assertNotIn("dspark", link); self.assertNotIn("n_mtp_layers", text)
+                    continue
+                self.assertEqual(Path(link["dspark"]), (d / "dspark-ds41-Q8_0.gguf").resolve())
+                self.assertEqual({k: v for k, v in text.items() if k == "n_mtp_layers" or k.startswith("dspark_")},
+                                 {"n_mtp_layers": 2, "dspark_block_size": 3, "dspark_noise_token_id": 7,
+                                  "dspark_target_layer_ids": [3, 4, 5], "dspark_markov_rank": 32,
+                                  "dspark_n_routed_experts": 4, "dspark_n_activated_experts": 2})
+
+    def test_a_head_of_another_model_is_passed_over(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_deepseek41(d / "ds41.gguf", np.random.default_rng(3))
+            write_dflash(d / "dspark-other-Q8_0.gguf", np.random.default_rng(4), targets=(2, 4, 5))
+            p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(d / "ds41.gguf"), str(d / "out")],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertEqual(p.returncode, 0, p.stdout.decode())
+            self.assertIn("not this model's DSpark head (its target layers are not the model's)", p.stdout.decode())
+            self.assertNotIn("dspark", json.loads((d / "out" / "gguf.json").read_text()))
 
 
 class DeepSeek41LlamaConfig(unittest.TestCase):
