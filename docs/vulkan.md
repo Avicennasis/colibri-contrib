@@ -420,6 +420,37 @@ of them on the device the way a GPU-equipped PC should use its card:
   than 1.25 x their heat + 4). A promotion copies the expert's bytes once on the engine thread
   (at most `COLI_VK_TIER_RATE` per token, 16) and an uploader thread writes it to
   the device; it serves from the next layer step on.
+- **Also when the device computes every expert.** With the host pool (system RAM the
+  device reads over PCIe, below) the device computes every routed expert and the CPU
+  none, so no expert passes by the CPU any more and the set on the device would stay
+  the warm start's. Where RAM holds every expert, the host pool now takes the device's
+  experts too (the warm start puts each in both places). After a decode step or a
+  verify (up to 8 rows: a prompt chunk routes nearly every expert once), a routed expert
+  the device read from the pool moves up into a free place on the device or the coldest
+  resident's, when it beats that one by two routings, up to `COLI_VK_TIER_PROMOTE` (32) a
+  forward. The resident goes back to its pool copy at once and nothing is copied back;
+  the newcomer is copied up by the device's copy engine from the pool
+  (`coli_vk_tensor_copy`: no byte through the CPU) while the engine goes on, and takes
+  its place in the tables at the next frame's start (`vkt_settle`). The tier logs which
+  entries each change touched (`vkt_dev_changes`), and the dense chain rewrites those
+  entries only: read whole at every change, the tables cost Qwen3.8's decode a fifth
+  (the code prompt below: 37.5-40.3 tok/s).
+  Measured on an RTX PRO 4000 with Qwen3.8-Flash-Next IQ2_XS (34.6 GiB of experts in
+  the pool, 10443 places on the card), each server on a copy of one history, three
+  runs:
+
+  | prompt | decode, `COLI_VK_TIER_PROMOTE=0` | decode, the default | the decode's experts in VRAM |
+  |---|---|---|---|
+  | code (not in the history) | 30.3-31.6 tok/s | 46.4-48.0 tok/s | 66.7% -> 92.7% |
+  | Italian prose (not in the history) | 54.4-56.1 tok/s | 61.7-64.0 tok/s | 79.9% -> 93.2% |
+  | the meeting report that wrote the history | 49.6-50.8 tok/s | 48.7-51.4 tok/s | 93.9% -> 93.3% |
+
+  Without the two routings' margin the last one lost 4% to swaps that found nothing
+  more on the card; at 16 a forward the code prompt reached 89% in VRAM, not 93%. The
+  greedy text is the same with and without (Qwen3.8 IQ2_XS, Qwen3.6 Q4_K_M with
+  `COLI_VK_TIER_GB=8`, where the second took 8.6 s against 11.1 s for 400 tokens).
+  Without the RAM for every expert, or beside a second device, the tier keeps the warm
+  start's set as before.
 - **A fresh install starts warm.** A model downloaded a minute ago has no history,
   so its first runs would fill the tier one routing at a time. `coli setup` copies a
   starting history into the model folder when it has none, for the catalog models
@@ -496,6 +527,7 @@ the device, since no Vulkan tier runs.
 | `COLI_VK_TIER_GB` | measured | The tier's budget in GiB, within what the device can hold. Unset: below. |
 | `COLI_VK_TIER_RESERVE_GB` | `1` | Device memory left to everything else (scratch, KV mirrors, the driver) on top of the dense weights the engine still has to place and, on qwen38, the chain's KV mirror and a prompt chunk. |
 | `COLI_VK_TIER_RATE` | `16` | Promotions per token at most (a prompt's forward gets this many per prompt token): each copies one expert on the engine thread. |
+| `COLI_VK_TIER_PROMOTE` | `32` | With a host pool that holds every expert: the most routed experts that move up from it to the device a forward (below). `0`: the warm start's set. |
 | `COLI_VK_TIER_BALANCE` | on | `0`: the device takes every resident expert of a step even when it is the slower side (see below). |
 | `COLI_VK_TIER_WARM` | on | `0`: no warm start; the tier fills as experts pass by. |
 | `COLI_VK_TIER_FILL` | on | The warm start fills the device: the history's experts first (hottest first), then the room left with the experts no history named, one of each layer in turn. A first run used to start with an empty device and fill it at the promotion rate (Qwen3.6 on a 3090 Ti: 16.5% of the routed experts on the device and the CPU's speed, then 97% and three times it from the second run, #2081). A model whose experts all fit now goes up whole at start. `0`: the history's experts only. |

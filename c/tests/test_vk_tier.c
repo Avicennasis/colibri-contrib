@@ -35,7 +35,15 @@
  *            upload refused), and streamed through slots that change format between
  *            the layers' steps;
  *   timeout  a batch's wait gives up (COLI_VK_WAIT_FAULT): the tier stops and the experts
- *            that batch names keep their device memory until the device is idle.
+ *            that batch names keep their device memory until the device is idle;
+ *   promote  a host pool that holds every expert (COLI_VK_TIER_HOST=1), the device four:
+ *            the warm start puts every expert in the pool and the history's four on the
+ *            device too; a batch step's routed pool experts move up to the device and the
+ *            coldest there go back to their pool copy (no upload refused, every expert
+ *            resident throughout, every device row the reference's, from either place);
+ *            the dense chain's books (vkt_dev_count, then vkt_settle at a frame's start)
+ *            move them the same way, the table whole at every read; with a pool short of
+ *            one expert the device keeps the warm start's set.
  *
  *   make tests/test_vk_tier VK=1 && VK_ICD_FILENAMES=.../lvp_icd.json ./tests/test_vk_tier */
 #include <stdio.h>
@@ -1199,14 +1207,118 @@ static void grouped(void) {
     H = h0;
 }
 
+/* vkt_report's line, read back from its stderr into out */
+static void report_line(char *out, size_t n) {
+    out[0] = 0;
+    FILE *t = tmpfile();
+    if (!t) return;
+    fflush(stderr);
+    int saved = dup(2);
+    if (saved < 0) { fclose(t); return; }
+    dup2(fileno(t), 2);
+    vkt_report("test", 0, 0);
+    fflush(stderr);
+    dup2(saved, 2); close(saved);
+    rewind(t);
+    char line[4096];
+    while (fgets(line, sizeof line, t)) { fputs(line, stderr); if (strstr(line, "] tier test test:")) snprintf(out, n, "%s", line); }
+    fclose(t);
+}
+static unsigned long long after(const char *line, const char *key) {
+    const char *p = strstr(line, key);
+    return p ? strtoull(p + strlen(key), NULL, 10) : ~0ull;
+}
+/* the experts of each layer on the device's memory (not the host pool), as a mask */
+static unsigned dev_mask(int l) {
+    uint8_t host[E]; unsigned m = 0;
+    if (vkt_dev_host(l, host) < 0) return ~0u;
+    for (int e = 0; e < E; e++) if (vkt_resident(l, e) && !host[e]) m |= 1u << e;
+    return m;
+}
+static void promote_case(void) {
+    VktFmt f = {VKT_SRC_I8_ROW, 0};
+    model_make(f, f); g_act = VKT_ACT_SWIGLU; g_limit = 0;
+    const double eb = (double)vkt_expert_bytes(H, F, f, f) / 1073741824.0;
+    char gb[64];
+    setenv("COLI_VK_TIER_HOST", "1", 1);
+    setenv("COLI_VK_TIER_SYNC", "1", 1);
+    uint32_t hist[L][E], *rows[L];
+    for (int l = 0; l < L; l++) { rows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 : 1; }
+    for (int c = 0; c < 2; c++) {   /* the pool: every expert, then one short of them */
+        set_budget(4, f, f);
+        snprintf(gb, sizeof gb, "%.12f", (c ? L * E - 0.5 : L * E + 0.5) * eb);
+        setenv("COLI_VK_TIER_HOST_GB", gb, 1);
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU, 0);
+        int on = vkt_init(&vc, rows);
+        CHECK(on, "promote: the tier did not start");
+        if (!on) break;
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        CHECK(n == L * E, "promote: planned %d experts of %d", n, L * E);
+        for (int i = 0; i < n; i++) { VktExpertSrc src = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &src); }
+        vkt_put_done();
+        unsigned m0 = dev_mask(0), m1 = dev_mask(1);
+        CHECK(m0 == 3u && m1 == 3u, "promote: the warm start's device set is %#x / %#x, not the history's 0 and 1", m0, m1);
+        /* phase A: batch steps on experts 5..9 (5 and 6 the hottest) */
+        Books bk = {0, 0}; double worst = 0;
+        int idx[8 * K]; float w[8 * K];
+        for (int t = 0; t < 40; t++)
+            for (int l = 0; l < L; l++) { route(4, 5, 5, idx, w); double r = step(l, 4, idx, w, &bk); if (r > worst) worst = r; }
+        unsigned a0 = dev_mask(0), a1 = dev_mask(1);
+        int res = 0; for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) res += vkt_resident(l, e);
+        /* phase B: the dense chain's books on experts 2..4 (8 rows a step: they pass 5 and 6), the
+         * table read at each frame */
+        unsigned ep = vkt_epoch(); int whole = 1;
+        uint32_t *tab = malloc((size_t)E * COLI_VK_XB_ENTRY * sizeof(uint32_t));
+        for (int t = 0; t < 40 && tab; t++) {
+            vkt_settle();
+            for (int l = 0; l < L; l++) whole &= vkt_dev_table(l, tab) == E;
+            for (int l = 0; l < L; l++) { route(8, 2, 3, idx, w); vkt_dev_count(l, 8, K, idx); }
+        }
+        vkt_settle();
+        free(tab);
+        unsigned b0 = dev_mask(0), b1 = dev_mask(1);
+        char line[4096]; report_line(line, sizeof line);
+        unsigned long long ups = after(line, "read from it, "), failed = after(line, "failed ");
+        printf("  promote, %s: device sets %#x / %#x after the warm start, %#x / %#x after batch steps on 5..9 "
+               "(device %llu of %llu routed, relative error %.2e), %#x / %#x after the chain's books on 2..4; "
+               "%llu moved up, failed %llu, resident %d\n", c ? "a pool short of one expert" : "every expert in the pool",
+               m0, m1, a0, a1, bk.dev, bk.routed, worst, b0, b1, ups == ~0ull ? 0 : ups, failed, res);
+        CHECK(worst < 2e-3, "promote: relative error %.3g", worst);
+        CHECK(failed == 0, "promote: %llu failed uploads", failed);
+        CHECK(res == L * E && bk.dev == bk.routed, "promote: %d of %d resident, the device took %llu of %llu",
+              res, L * E, bk.dev, bk.routed);
+        CHECK(whole, "promote: a table read in the chain's books was not whole");
+        if (!c) {
+            CHECK(ups != ~0ull && ups >= 8, "promote: %llu experts moved up", ups);
+            CHECK(!(a0 & 3u) && !(a1 & 3u) && (a0 & 0x60u) && (a1 & 0x60u),
+                  "promote: after the batch steps on 5..9 the device holds %#x / %#x", a0, a1);
+            CHECK(!((b0 | b1) & 0x3e0u) && (b0 & 0x1cu) && (b1 & 0x1cu),
+                  "promote: after the chain's books on 2..4 the device holds %#x / %#x", b0, b1);
+            CHECK(vkt_epoch() != ep, "promote: the epoch did not move");
+        } else
+            CHECK(ups == ~0ull && a0 == 3u && a1 == 3u && b0 == 3u && b1 == 3u,
+                  "promote: a pool short of one expert moved them (%#x / %#x, %#x / %#x)", a0, a1, b0, b1);
+        vkt_shutdown();
+        ColiVkPoolStats ph; coli_vk_pool_stats(5, &ph);
+        CHECK(ph.live == 0, "promote: %d host pool ranges still live after the shutdown", ph.live);
+    }
+    unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_SYNC");
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    model_free();
+}
+
 int main(int argc, char **argv) {
     char buf[1024];
     const char *spv = argc > 1 ? argv[1] : coli_vk_shader_path(buf, sizeof buf);
+    /* a device that shares the host's RAM (Lavapipe) has a type for the host pool only with
+     * COLI_VK_TIER_HOST=1 at the device's start (backend_vulkan.c): promote_case's pool */
+    int host_set = getenv("COLI_VK_TIER_HOST") != NULL;
+    if (!host_set) setenv("COLI_VK_TIER_HOST", "1", 1);
     if (!coli_vk_init(spv)) { printf("FAIL: no Vulkan device (shaders %s)\n", spv); return 1; }
     setenv("COLI_VK_TIER_RESERVE_GB", "0", 1);
     /* the budgets, evictions and promotions below are the device's: the host pool (a
      * discrete card's system RAM) would take what the device leaves */
-    setenv("COLI_VK_TIER_HOST", "0", 0);
+    if (!host_set) setenv("COLI_VK_TIER_HOST", "0", 1);
     scratch_budget();
     printf("formats:\n"); formats();
     printf("blocks:\n"); blocks();
@@ -1220,6 +1332,7 @@ int main(int argc, char **argv) {
     printf("DeepSeek V4:\n"); v4_act();
     printf("stream:\n"); stream();
     printf("layers:\n"); layers();
+    printf("promote:\n"); promote_case();
     ColiVkPoolStats ps, px; coli_vk_pool_stats(1, &ps); coli_vk_pool_stats(4, &px);
     CHECK(ps.live == 0 && px.live == 0, "%d + %d tier ranges still live after every shutdown", ps.live, px.live);
     coli_vk_shutdown();   /* with staged uploads: where the experts were ("[VK] memory at exit") */
