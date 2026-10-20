@@ -1451,6 +1451,76 @@ static void hybrid_case(VktFmt gu, VktFmt dn, const char *nm) {
     H = H0; F = F0;
 }
 
+/* DeepSeek V4's expert in the hybrid: MXFP4 ue8m0 experts, four on the device and the rest
+ * in the host pool, the CPU computing the pool's pairs in place with the device's roundings
+ * (vk_tier.c hy_act_v4, the route weight in the row). The float form (GQ_EXACT=1) against
+ * expert_v4, the engine's arithmetic: most rows bit-identical once rounded to bf16, every
+ * one close; then the same steps with COLI_VK_HYBRID=0. */
+static void v4_hybrid_case(void) {
+    VktFmt f = {VKT_SRC_MXFP4_E8M0, 32};
+    model_make(f, f);
+    const float limit = 10.0f;
+    const double eb = (double)vkt_expert_bytes(H, F, f, f) / 1073741824.0;
+    char gb[64];
+    setenv("COLI_VK_TIER_HOST", "1", 1); setenv("COLI_VK_TIER_SYNC", "1", 1);
+    setenv("COLI_VK_TIER_PROMOTE", "0", 1); setenv("GQ_EXACT", "1", 1);
+    uint32_t hist[L][E], *hrows[L];
+    for (int l = 0; l < L; l++) { hrows[l] = hist[l]; for (int e = 0; e < E; e++) hist[l][e] = e < 2 ? 100 : 1; }
+    for (int c = 0; c < 2; c++) {   /* the hybrid on, then COLI_VK_HYBRID=0 */
+        if (c) setenv("COLI_VK_HYBRID", "0", 1);
+        set_budget(4, f, f);
+        snprintf(gb, sizeof gb, "%.12f", (L * E + 0.5) * eb);
+        setenv("COLI_VK_TIER_HOST_GB", gb, 1);
+        VktConfig vc = cfg_of(f, f, VKT_ACT_SWIGLU_V4, limit);
+        int on = vkt_init(&vc, hrows);
+        CHECK(on, "v4 hybrid: the tier did not start");
+        if (!on) break;
+        int pl[L * E], pe[L * E], n = vkt_plan(pl, pe, L * E);
+        for (int i = 0; i < n; i++) { VktExpertSrc src = src_of(&ex[pl[i]][pe[i]]); vkt_put(pl[i], pe[i], &src); }
+        vkt_put_done();
+        unsigned long long dev = 0, same = 0, routed = 0; double worst = 0;
+        static const int Ss[] = {1, 3, 8, 1, 2, 8};
+        for (int t = 0; t < 6; t++)
+            for (int l = 0; l < L; l++) {
+                int S = Ss[t], idx[8 * K]; float w[8 * K];
+                route(S, 0, E, idx, w);
+                float *xq = malloc(sizeof(float) * S * H), *y = malloc(sizeof(float) * H);
+                uint8_t taken[8 * K]; const float *rows[8 * K];
+                for (int i = 0; i < S * H; i++) xq[i] = frnd() * 4.0f;
+                for (int s = 0; s < S; s++) qdq128(xq + (size_t)s * H, H);   /* the engine's rounding of x */
+                int k = vkt_issue_w(l, xq, S, K, idx, w, taken);
+                int joined = k ? vkt_join(rows) : 1;
+                CHECK(joined, "v4 hybrid: join failed");
+                for (int i = 0; i < S * K; i++) {
+                    routed++;
+                    if (!taken[i] || !joined) continue;
+                    float dr[HF_MAX];
+                    expert_v4(&ex[l][idx[i]], xq + (size_t)(i / K) * H, w[i], limit, y);
+                    for (int d = 0; d < H; d++) dr[d] = bf16r(rows[i][d]);
+                    double r = rel(dr, y, H); if (r > worst) worst = r;
+                    same += !memcmp(dr, y, (size_t)H * sizeof(float));
+                    dev++;
+                }
+                free(xq); free(y);
+            }
+        char line[4096]; report_line(line, sizeof line);
+        unsigned long long pairs = hy_pairs(line);
+        printf("  MXFP4 ue8m0 experts in the host pool, DeepSeek V4 roundings, the hybrid %s: %llu pairs computed by the CPU, "
+               "%llu of %llu assignments taken, %llu rows bit-identical to the engine's arithmetic, worst row %.2e\n",
+               c ? "off" : "on", pairs == ~0ull ? 0 : pairs, dev, routed, same, worst);
+        CHECK(dev == routed, "v4 hybrid: the tier took %llu of %llu", dev, routed);
+        CHECK(same * 2 > dev, "v4 hybrid: only %llu of %llu rows equal the engine's arithmetic", same, dev);
+        CHECK(worst < 2e-2, "v4 hybrid: a row off the reference (%.3g)", worst);
+        if (!c) CHECK(pairs != ~0ull && pairs > 0, "v4 hybrid: no host pool pair computed by the CPU");
+        else CHECK(pairs == ~0ull, "v4 hybrid: COLI_VK_HYBRID=0 computed %llu pairs on the CPU", pairs);
+        vkt_shutdown();
+    }
+    unsetenv("COLI_VK_HYBRID"); unsetenv("GQ_EXACT"); unsetenv("COLI_VK_TIER_PROMOTE");
+    unsetenv("COLI_VK_TIER_HOST_GB"); unsetenv("COLI_VK_TIER_SYNC");
+    setenv("COLI_VK_TIER_HOST", "0", 1);
+    model_free();
+}
+
 /* the report's ", and S prompt steps' P pairs": P, 0 without the part */
 static unsigned long long big_pairs(const char *line) {
     const char *p = strstr(line, "prompt steps' ");
@@ -1566,6 +1636,7 @@ int main(int argc, char **argv) {
     hybrid_case((VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}, (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0}, "Q4_K/Q6_K");
     hybrid_case((VktFmt){VKT_SRC_I4U_PAIRS_GS, 64}, (VktFmt){VKT_SRC_I4U_PAIRS_GS, 64}, "int4-g64");
     hybrid_case((VktFmt){VKT_SRC_I8_ROW, 0}, (VktFmt){VKT_SRC_I8_ROW, 0}, "int8");
+    v4_hybrid_case();
     printf("pool copy:\n"); pool_copy_case();
     printf("host pairs:\n"); host_pairs_case(2e-3);
     ColiVkPoolStats ps, px; coli_vk_pool_stats(1, &ps); coli_vk_pool_stats(4, &px);

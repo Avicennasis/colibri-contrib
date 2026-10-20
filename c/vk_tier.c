@@ -149,16 +149,17 @@ static struct {
     ColiVkExpert **bex; int *brows; int *bfirst; int cb;
     const float **bx, **by; int *rowsrc; int cbx;
     float *bw;                           /* the rows' route weights (vkt_issue_w), beside bx */
-    /* hybrid steps (hybrid: COLI_VK_HYBRID, SwiGLU, a host pool): in a step of up to
+    /* hybrid steps (hybrid: COLI_VK_HYBRID, SwiGLU or DeepSeek V4's, a host pool): in a step of up to
      * VKT_UP_ROWS rows, the pairs of the host pool's experts of block types the CPU computes
      * in place at the join (vkt_host_pairs) while the device computes the ones it holds,
      * instead of the device reading them over PCIe; hy_of[i] pair i's place among them (-1
-     * none), hy_v their rows, hy_x their input rows, hy_out their outputs */
+     * none), hy_v their rows, hy_x their input rows, hy_w their route weights (VKT_ACT_SWIGLU_V4
+     * applies them as the device does), hy_out their outputs */
     int hybrid, hy_n, chy, cho; int *hy_of;
     int hy_big;                          /* a prompt step's host pool experts of at most hy_big rows on the CPU too (0: none) */
     unsigned long long hyb_steps, hyb_pairs;
     VktHostExpert *hy_v; const VktHostExpert **hy_hx; const float **hy_x;
-    float *hy_gu, *hy_hh, *hy_out;
+    float *hy_gu, *hy_hh, *hy_out, *hy_w;
     unsigned long long hy_steps, hy_pairs; double hy_ms;
     int max_dev_rows;
     double t_issued;
@@ -1319,7 +1320,8 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
             if (!host_view_share(layer, e, &hv, 0) || !grow_hy(n, T.hy_n + cnt[e])) continue;
             for (int r = 0; r < cnt[e]; r++) {
                 const int i = T.blist[ofs[e] + r];
-                T.hy_v[T.hy_n] = hv; T.hy_x[T.hy_n] = x + (size_t)(i / K) * H; T.hy_of[i] = T.hy_n++;
+                T.hy_v[T.hy_n] = hv; T.hy_x[T.hy_n] = x + (size_t)(i / K) * H; T.hy_w[T.hy_n] = w ? w[i] : 1.f;
+                T.hy_of[i] = T.hy_n++;
             }
             if (T.bpool && T.bpool[e]) { T.bpool[e] = 0; npool--; }
             cls[e] = BC_NONE; nhy++;   /* none of the device's */
@@ -1533,6 +1535,8 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     T.t_issued = vkt_now_ms();
     return total + T.hy_n;
 }
+static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
+                      float limit, int nt, float *gu, float *hh, float *dn, const float *pw);
 static int join_big(const float **rows) {
     double t0 = vkt_now_ms(), tc = t0 - T.t_issued;
     T.cpu_ms += tc;
@@ -1540,7 +1544,8 @@ static int join_big(const float **rows) {
     const int hn = T.hy_n;
     int hok = 1;
     if (hn) {
-        hok = vkt_host_pairs(T.hy_hx, T.hy_x, hn, T.c.hidden, T.c.inter, T.c.act_limit, 0, T.hy_gu, T.hy_hh, T.hy_out);
+        hok = host_pairs(T.hy_hx, T.hy_x, hn, T.c.hidden, T.c.inter, T.c.act_limit, 0, T.hy_gu, T.hy_hh, T.hy_out,
+                         T.c.act == VKT_ACT_SWIGLU_V4 ? T.hy_w : NULL);
         double th = vkt_now_ms() - t0;
         T.hy_ms += th; T.cpu_ms += th; T.hyb_steps++; T.hyb_pairs += (unsigned long long)hn;
         T.hy_n = 0;
@@ -1825,8 +1830,61 @@ static int hy_key_cmp(const void *a, const void *b) {
     if (x->g != y->g) return (uintptr_t)x->g < (uintptr_t)y->g ? -1 : 1;
     return x->p - y->p;
 }
-int vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
-                   float limit, int nt, float *gu, float *hh, float *dn) {
+/* DeepSeek V4's expert between gate/up and down, as shaders/expert_act.comp (act 2) and
+ * expert_act_v4.comp compute it and its CPU kernel does: gate and up to bf16 (nearest
+ * even), the clamped SwiGLU with the sigmoid's two forms, times the route weight and to
+ * bf16, then E4M3 and back per 128 inputs under a power-of-two scale (the smallest 2^e
+ * with max(amax, 1e-4) <= 448 * 2^e). Each step is exact in f32 or rounds once. */
+static float hy_bf16(float v) {
+    uint32_t b; memcpy(&b, &v, 4);
+    if ((b & 0x7f800000u) != 0x7f800000u) b += 0x7fffu + ((b >> 16) & 1u);
+    b &= 0xffff0000u; memcpy(&v, &b, 4);
+    return v;
+}
+static float hy_e4m3(float x) {   /* |x| <= 448: the nearest E4M3 value, ties to even */
+    float a = fabsf(x), r;
+    if (a == 0.f) return x;
+    if (a >= 448.f) r = 448.f;
+    else if (a < 0.015625f) {   /* subnormal codes, steps of 2^-9 */
+        float t = a * 512.f, f = floorf(t), fr = t - f;
+        if (fr > 0.5f || (fr == 0.5f && ((int)f & 1))) f += 1.f;
+        r = f * 0.001953125f;
+    } else {
+        uint32_t b; memcpy(&b, &a, 4);
+        const int E = (int)((b >> 23) & 0xffu) - 127;
+        uint32_t sig = 0x800000u | (b & 0x7fffffu), q = sig >> 20, rem = sig & 0xfffffu;
+        if (rem > 0x80000u || (rem == 0x80000u && (q & 1u))) q++;
+        r = ldexpf((float)q, E - 3);
+    }
+    return x < 0.f ? -r : r;
+}
+static void hy_act_v4(float *h, const float *g, const float *u, int I, float limit, float w) {
+    for (int o = 0; o < I; o++) {
+        float gv = hy_bf16(g[o]), uv = hy_bf16(u[o]);
+        if (limit > 0.f) { gv = gv < limit ? gv : limit; uv = uv < -limit ? -limit : uv > limit ? limit : uv; }
+        const float sg = gv >= 0.f ? 1.f / (1.f + expf(-gv)) : expf(gv) / (1.f + expf(gv));
+        h[o] = hy_bf16(gv * sg * uv * w);
+    }
+    for (int b0 = 0; b0 < I; b0 += 128) {
+        const int b1 = b0 + 128 < I ? b0 + 128 : I;
+        float amax = 0.f;
+        for (int o = b0; o < b1; o++) amax = fmaxf(amax, fabsf(h[o]));
+        const float m = fmaxf(amax, 1e-4f);
+        uint32_t mb; memcpy(&mb, &m, 4);
+        const int E = (int)((mb >> 23) & 0xffu) - 127;
+        int e = (mb & 0x7fffffu) <= 0x600000u ? E - 8 : E - 7;
+        e = e < -126 ? -126 : e > 126 ? 126 : e;
+        for (int o = b0; o < b1; o++) {
+            float v = ldexpf(h[o], -e);
+            v = v < -448.f ? -448.f : v > 448.f ? 448.f : v;
+            h[o] = ldexpf(hy_e4m3(v), e);
+        }
+    }
+}
+/* pw: the pairs' route weights for DeepSeek V4's expert (hy_act_v4, the weight in the row as
+ * the device's), NULL for SwiGLU */
+static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
+                      float limit, int nt, float *gu, float *hh, float *dn, const float *pw) {
     if (np < 1) return 1;
     /* The pairs of one expert side by side (q: their place in ord), a group reading the
      * expert's rows once for all of its pairs: a prompt step's experts of a few rows, or the
@@ -1883,6 +1941,7 @@ int vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int n
         #pragma omp for schedule(static)
         for (int q = 0; q < np; q++) {
             const float *g = gu + (size_t)q * 2 * I, *u = g + I; float *h = hh + (size_t)q * I;
+            if (pw) { hy_act_v4(h, g, u, I, limit, pw[ord[q]]); continue; }
             for (int o = 0; o < I; o++) {
                 float gv = g[o], uv = u[o];
                 if (limit > 0.f) { gv = gv < limit ? gv : limit; uv = uv < -limit ? -limit : uv > limit ? limit : uv; }
@@ -1911,6 +1970,14 @@ out:
     free(xa); free(ord); free(gs); free(gx); free(key); free(xo); free(ho); free(ag); free(ah); free(xb); free(dq);
     return !err;
 }
+int vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
+                   float limit, int nt, float *gu, float *hh, float *dn) {
+    return host_pairs(hx, xr, np, D, I, limit, nt, gu, hh, dn, NULL);
+}
+int vkt_host_pairs_w(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
+                     float limit, int nt, float *gu, float *hh, float *dn, const float *w) {
+    return host_pairs(hx, xr, np, D, I, limit, nt, gu, hh, dn, w);
+}
 /* room for n pairs of the step (hy_of) and for np of them on the CPU */
 static int grow_hy(int n, int np) {
     if (n > T.chy) {
@@ -1926,7 +1993,8 @@ static int grow_hy(int n, int np) {
         float *g = realloc(T.hy_gu, (size_t)nc * 2 * I * sizeof(float)); if (g) T.hy_gu = g;
         float *u = realloc(T.hy_hh, (size_t)nc * I * sizeof(float)); if (u) T.hy_hh = u;
         float *o = realloc(T.hy_out, (size_t)nc * H * sizeof(float)); if (o) T.hy_out = o;
-        if (!v || !h || !x || !g || !u || !o) return 0;
+        float *w = realloc(T.hy_w, (size_t)nc * sizeof(float)); if (w) T.hy_w = w;
+        if (!v || !h || !x || !g || !u || !o || !w) return 0;
         T.cho = nc;
     }
     return 1;
@@ -1974,7 +2042,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
         v->last = T.tick;
         if (v->state != VS_RESIDENT) continue;
         if (hyb && v->host && grow_hy(n, T.hy_n + 1) && host_view(layer, e, &T.hy_v[T.hy_n])) {
-            T.hy_x[T.hy_n] = x + (size_t)(i / K) * H;
+            T.hy_x[T.hy_n] = x + (size_t)(i / K) * H; T.hy_w[T.hy_n] = w ? w[i] : 1.f;
             T.hy_of[i] = T.hy_n++;
             continue;
         }
@@ -2111,8 +2179,8 @@ int vkt_join(const float **rows) {
     const int hn = T.hy_n;
     int hok = 1;
     if (hn) {
-        hok = vkt_host_pairs(T.hy_hx, T.hy_x, hn, T.c.hidden, T.c.inter, T.c.act_limit, 0,
-                             T.hy_gu, T.hy_hh, T.hy_out);
+        hok = host_pairs(T.hy_hx, T.hy_x, hn, T.c.hidden, T.c.inter, T.c.act_limit, 0,
+                         T.hy_gu, T.hy_hh, T.hy_out, T.c.act == VKT_ACT_SWIGLU_V4 ? T.hy_w : NULL);
         double th = vkt_now_ms() - t0;
         T.hy_ms += th; T.hy_steps++; T.hy_pairs += (unsigned long long)hn;
         tc += th; t0 += th;
@@ -2663,9 +2731,10 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     host_init(all);           /* and the rest in system RAM the device reads */
     /* hybrid steps: a decode step's or a verify's host pool experts of block types on the CPU,
      * in place, while the device computes the ones it holds (COLI_VK_HYBRID=0: the device
-     * reads them over PCIe). SwiGLU only: DeepSeek V4's expert rounds as its own kernel does. */
+     * reads them over PCIe). SwiGLU, and DeepSeek V4's expert with the device's roundings
+     * (hy_act_v4); Kimi K3's SiTU stays on the device. */
     const char *hy = getenv("COLI_VK_HYBRID");
-    T.hybrid = T.dmax[2] > 0 && T.c.act == VKT_ACT_SWIGLU && !(hy && *hy == '0');
+    T.hybrid = T.dmax[2] > 0 && (T.c.act == VKT_ACT_SWIGLU || T.c.act == VKT_ACT_SWIGLU_V4) && !(hy && *hy == '0');
     /* and a prompt step's host pool experts of at most COLI_VK_HYBRID_BIG_ROWS rows */
     const char *hbr = getenv("COLI_VK_HYBRID_BIG_ROWS");
     T.hy_big = hbr && *hbr ? atoi(hbr) : 2;
@@ -2917,7 +2986,7 @@ void vkt_shutdown(void) {
     free(T.st); free(T.sy); free(T.bcnt); free(T.bofs); free(T.bcls); free(T.blist); free(T.pred); free(T.pred_ok);
     for (int h = 0; h < 2; h++) { free(T.hf[h].slot); free(T.hf[h].yout); }
     free(T.d2_idx); free(T.d2_y); free(T.d2_bex); free(T.d2_brows); free(T.d2_bx); free(T.d2_bw);
-    free(T.hy_of); free(T.hy_v); free(T.hy_hx); free(T.hy_x); free(T.hy_gu); free(T.hy_hh); free(T.hy_out); free(T.bpool);
+    free(T.hy_of); free(T.hy_v); free(T.hy_hx); free(T.hy_x); free(T.hy_gu); free(T.hy_hh); free(T.hy_out); free(T.hy_w); free(T.bpool);
     memset(&T, 0, sizeof T);
 }
 #endif /* COLI_VULKAN */

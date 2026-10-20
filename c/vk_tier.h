@@ -353,6 +353,11 @@ int  vkt_dev_entry(int layer, int eid, uint32_t *ent, uint32_t *ent_hybrid, VktH
  * 0 = a row it could not quantize, or no memory. */
 int  vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
                     float limit, int nt, float *gu, float *hh, float *out);
+/* vkt_host_pairs for DeepSeek V4's expert (VKT_ACT_SWIGLU_V4): w[p] pair p's route weight,
+ * applied between gate/up and down with the device's roundings (bf16, then E4M3 per 128),
+ * so out[p] carries it, as the device's rows do. */
+int  vkt_host_pairs_w(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
+                      float limit, int nt, float *gu, float *hh, float *out, const float *w);
 /* whether the tier keeps experts in its host pool (system RAM the device reads over PCIe) */
 int  vkt_host_pool_on(void);
 /* the device memory the budget left for a prompt chunk's staging (VktConfig.stage), 0 none */
