@@ -2342,17 +2342,27 @@ int main(int argc, char **argv) {
             g_q38_gguf = 1; g_q38_a_direct = 1; g_q38_dn_tiled = 1;
             fprintf(stderr, "[gguf] %s: %d file(s), %d tensors, read in place (native ggml types, no conversion)\n",
                     gp, g_q38gg.n_files, g_q38gg.n_tensors);
-            /* The CUDA chain runs a GGUF (its experts on the card and in a host pool), a little
-             * behind the Vulkan chain on the same card (Qwen3.8-Flash-Next IQ2_XS, RTX PRO 4000:
-             * prompt 186 against 195 tok/s, decode 48 against 50): a build with both backends
-             * runs a GGUF on Vulkan when CUDA was asked for and COLI_VULKAN was not set;
-             * COLI_VULKAN=0 keeps CUDA. A CUDA-only build runs it on the CUDA chain. */
+            /* The CUDA chain runs a GGUF whose experts' types its frame computes (their blocks on
+             * the card and in a host pool; Qwen3.8-Flash-Next IQ2_XS on an RTX PRO 4000: prompt
+             * 209-213 tok/s and decode 49.6-50.8 against the Vulkan chain's 194-197 and 44-51). Any
+             * other GGUF runs on Vulkan in a build with both backends when CUDA was asked for and
+             * COLI_VULKAN was not set; COLI_VULKAN=0 keeps CUDA. */
+            int cuda_blocks = 1;
+#ifdef COLI_CUDA
+            for (int i = 0; i < g_q38gg.n_tensors && cuda_blocks; i++) {
+                if (!strstr(g_q38gg.t[i].name, "_exps.weight")) continue;
+                const int t = g_q38gg.t[i].type;
+                cuda_blocks = cc_moe_block_type(t) && coli_cuda_block_elems(100 + t) > 0;
+            }
+#else
+            cuda_blocks = 0;
+#endif
             {   const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
-                if (cu && *cu == '1' && !(vk && *vk)) {
+                if (cu && *cu == '1' && !(vk && *vk) && !cuda_blocks) {
 #if defined(COLI_CUDA) && defined(COLI_VULKAN)
                     setenv("COLI_VULKAN", "1", 1); setenv("COLI_CUDA", "0", 1);
-                    fprintf(stderr, "[gguf] this GGUF runs on Vulkan, the same card: a little faster than the CUDA chain there "
-                                    "(COLI_VULKAN=0 keeps CUDA)\n");
+                    fprintf(stderr, "[gguf] the CUDA chain's frame does not take every expert type of this GGUF: it runs on "
+                                    "Vulkan, the same card (COLI_VULKAN=0 keeps CUDA, those experts then on the CPU)\n");
 #endif
                 }
             }
