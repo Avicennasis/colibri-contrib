@@ -112,8 +112,12 @@ typedef struct {
  * planar 1: int4 per 64 as the engine keeps it in RAM (expert_ffn.h's planar blocks: in each
  * 64 weights' 32 bytes, byte k holds weight k in its low nibble and k + 32 in its high one,
  * both v + 8), as a prompt chunk stages it from the tier's RAM cache (cc_fetch; its GEMMs
- * only); 0: the backend's own layout (signed nibbles, weight 2j low and 2j + 1 high). */
-typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; int planar, pad_; } CcExpert;
+ * only); 0: the backend's own layout (signed nibbles, weight 2j low and 2j + 1 high).
+ * host 1: the matrices are in page-locked host memory the device reads over the bus (an
+ * engine's host pool, a GGUF's experts: g, u and d in one span from g); a decode step
+ * copies its such experts into the staging cc_moe_stage gave first, where there is one. */
+typedef struct { const void *g, *u, *d; const float *gs, *us, *ds; int planar, host; } CcExpert;
+#define CC_MOE_STAGE_MAP 256   /* the staging's map of a step's slots to its places, bytes before them */
 /* A layer's routed experts on the device for S rows (cc_moe): x (x_off + s*x_row, D
  * floats) routed to ids and w as cc_route writes them (i_off + s*i_row, w_off + s*w_row,
  * K each); expert e is entry t_off + e of the table (E of them), its matrices of format fmt (1 int8
@@ -217,11 +221,18 @@ typedef struct ColiCudaChainOps {
      * cache). fetch: n regions into dst, once the frame's ops recorded before the last
      * fetch_done are done (the buffer's last reader); fetch_wait: the frame's later ops wait
      * for the last fetch's copies; fetch_done: the buffer is free again once the frame's
-     * earlier ops are done. dev_addr: a DEV buffer's device address, for a CcExpert. */
+     * earlier ops are done. dev_addr: a buffer's device address, for a CcExpert (an UP or DOWN
+     * buffer's: where the device reads the host's pages over the bus; NULL from a backend
+     * before the host pool). */
     int  (*fetch)(CcBuf *dst, const CcFetch *r, int n);
     int  (*fetch_wait)(void);
     int  (*fetch_done)(void);
     const void *(*dev_addr)(const CcBuf *b);
+    /* moe_stage: a DEV buffer the context's cc_moe copies a decode step's host experts
+     * (CcExpert.host) into before its kernels read them, slots of slot_bytes after a
+     * 256-byte map; NULL: none (they read the host's memory where it is). A GGUF's experts
+     * (fmt >= 100) only. */
+    int  (*moe_stage)(CcBuf *b, size_t slot_bytes, int slots);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -279,6 +290,8 @@ static inline int cc_fetch(CcBuf *dst, const CcFetch *r, int n) { return cc_fetc
 static inline int cc_fetch_wait(void) { return cc_fetch_ready() ? cc_ops()->fetch_wait() : 0; }
 static inline int cc_fetch_done(void) { return cc_fetch_ready() ? cc_ops()->fetch_done() : 0; }
 static inline const void *cc_dev_addr(const CcBuf *b) { return cc_fetch_ready() ? cc_ops()->dev_addr(b) : NULL; }
+static inline int cc_moe_stage_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, moe_stage) + sizeof t->moe_stage; }
+static inline int cc_moe_stage(CcBuf *b, size_t slot_bytes, int slots) { return cc_moe_stage_ready() ? cc_ops()->moe_stage(b, slot_bytes, slots) : 0; }
 #endif
 
 #ifdef __cplusplus

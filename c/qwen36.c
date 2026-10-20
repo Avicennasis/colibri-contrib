@@ -8089,7 +8089,7 @@ int main(int argc, char **argv) {
                  m.c.hidden % coli_cuda_block_elems(100 + x->tg) == 0 && m.c.inter % coli_cuda_block_elems(100 + x->td) == 0;
             if (ok) { tg[l] = x->tg; td[l] = x->td; bg[l] = (size_t)x->eb_g; bdn[l] = (size_t)x->eb_d; }
         }
-        if (ok && qt_init_gguf(L, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk, tg, td, bg, bdn)) gguf_tier = 1;
+        if (ok && qt_init_gguf(L, m.c.n_experts, m.c.hidden, m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) gguf_tier = 1;   /* the slots' rows stay */
         else fprintf(stderr, "[qwen36] COLI_CUDA=1: %s; the routed experts stay on the CPU\n",
                      ok ? "the CUDA expert tier did not start" : "the GGUF's expert types are not all ones the CUDA chain's experts take");
         free(tg); free(td); free(bg); free(bdn);

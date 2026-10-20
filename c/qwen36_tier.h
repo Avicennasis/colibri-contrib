@@ -150,11 +150,12 @@ int  qt_init(int n_layers, int n_experts, int hidden, int inter,
 /* A GGUF's experts as the file has them (fmt 100 + ggml type: the backend's block formats,
  * coli_cuda_block_elems): gate and up of type tg[l], down of td[l] in layer l, one gate (or
  * up) matrix gu_bytes[l] bytes and one down d_bytes[l]; qt_note hands over the file's rows
- * (g4, u4, d4; no scales). The residents compute in the dense chain's frame only
- * (qt_chain_layer_format): the expert group takes no block format. */
+ * (g4, u4, d4; no scales); copy 1: those rows live only for the call (copy mode, as below
+ * full residency). The residents compute in the dense chain's frame (qt_chain_layer_format)
+ * and in the tier's expert groups. */
 int  qt_init_gguf(int n_layers, int n_experts, int hidden, int inter,
                   int cap_experts_per_layer, int topk, const int *tg, const int *td,
-                  const size_t *gu_bytes, const size_t *d_bytes);
+                  const size_t *gu_bytes, const size_t *d_bytes, int copy);
 int  qt_ready(void);
 int  qt_streaming(void);   /* copy mode: no pointer into the engine's slots is kept */
 int  qt_experts_on(void);  /* some device has room for experts (not trunk-only) */
@@ -236,6 +237,12 @@ void qt_chain_hold(int on);
 void qt_chain_count(int layer, const int *eids, int K);
 int  qt_chain_format(int *fmt, int *gs);
 int  qt_chain_layer_format(int layer, int *fmt, int *fmt_d);
+/* copy mode: 1 when a qt_note of the expert now would copy it (convert the bytes only then);
+ * qt_note_heat counts a pass of one the engine does not hand over */
+/* the warm start's order from an engine's expert history (counts[l][e], nl x ne) */
+void qt_heat_order(uint32_t *const *counts, int nl, int ne);
+int  qt_note_wanted(int layer, int eid);
+void qt_note_heat(int layer, int eid);
 int  qt_chain_devices(void);
 /* The host pool (qwen36_tier.c): qt_note_host page-locks a non-resident expert's RAM copy (its
  * planar blocks and scales, as the engine's slot holds them) for the device to copy a prompt
@@ -250,7 +257,7 @@ int  qt_chain_host_count(void);
 
 static inline int  qt_init(int a,int b,int c,int d,int e,int f,int g,int h){(void)h;(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
 static inline int  qt_init_fp8(int a,int b,int c,int d,int e,int f,const float*g){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;return 0;}
-static inline int  qt_init_gguf(int a,int b,int c,int d,int e,int f,const int*g,const int*h,const size_t*i,const size_t*j){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;return 0;}
+static inline int  qt_init_gguf(int a,int b,int c,int d,int e,int f,const int*g,const int*h,const size_t*i,const size_t*j,int k){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;(void)j;(void)k;return 0;}
 static inline int  qt_lmhead_init(const int8_t*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int  qt_lmhead_matmul(float*a,const float*b,int c,int d){(void)a;(void)b;(void)c;(void)d;return 0;}
 #define QT_PLACE_CPU (-1)
@@ -287,6 +294,9 @@ static inline void qt_chain_hold(int a){(void)a;}
 static inline void qt_chain_count(int a,const int*b,int c){(void)a;(void)b;(void)c;}
 static inline int  qt_chain_format(int*a,int*b){(void)a;(void)b;return 0;}
 static inline int  qt_chain_layer_format(int a,int*b,int*c){(void)a;(void)b;(void)c;return 0;}
+static inline void qt_heat_order(uint32_t*const*a,int b,int c){(void)a;(void)b;(void)c;}
+static inline int  qt_note_wanted(int a,int b){(void)a;(void)b;return 0;}
+static inline void qt_note_heat(int a,int b){(void)a;(void)b;}
 static inline int  qt_chain_devices(void){return 0;}
 static inline void qt_note_host(int l,int e,const uint8_t*g,const uint8_t*u,const uint8_t*d,const float*a,const float*b,const float*c){(void)l;(void)e;(void)g;(void)u;(void)d;(void)a;(void)b;(void)c;}
 static inline int  qt_chain_host(int l,int e,const void**w,size_t*wb,const float**sc,size_t*sb){(void)l;(void)e;(void)w;(void)wb;(void)sc;(void)sb;return 0;}

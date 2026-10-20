@@ -31,6 +31,7 @@ extern "C" int coli_cuda_tensor_shape(const ColiCudaTensor *t, int *fmt, int *I,
 extern "C" int coli_cuda_tensor_gemm_async(ColiCudaTensor *t, float *y_dev, const float *x_dev, int S, void *stream);
 /* and the routed experts' kernels (cc_moe), on the same terms, and a resident tensor's device copy */
 extern "C" int coli_cuda_tensor_dev(const ColiCudaTensor *t, const void **w, const float **sc, int *gs);
+extern "C" int coli_cuda_moe_stage(int device, void *stage, size_t slot_bytes, int slots);
 extern "C" int coli_cuda_moe_async(int device, const CcExpert *tab, const float *x, const int *ids, const float *w,
                                    float *hid, float *y, const float *hy, const CcMoe *p, void *stream);
 
@@ -1310,6 +1311,11 @@ static int cc_wait_host(CcBuf *flag, size_t word, unsigned v) {
     cc_wait_k<<<1, 1, 0, c->stream>>>((volatile unsigned *)flag->d + word, v);
     return launched(c, "wait host");
 }
+static int cc_moe_stage_op(CcBuf *b, size_t slot_bytes, int slots) {
+    CcCtx *c = live();
+    if (!c || (b && (b->kind != CC_DEV || slots < 1 || CC_MOE_STAGE_MAP + (size_t)slots * slot_bytes > b->bytes))) return 0;
+    return coli_cuda_moe_stage(c->device, b ? (void *)b->d : nullptr, b ? slot_bytes : 0, b ? slots : 0);
+}
 static void cc_stats(CcStats *st) { if (st) *st = g_st; }
 
 /* ---- staging: copies from page-locked host memory beside the frame ---------------- */
@@ -1351,7 +1357,7 @@ static int cc_fetch_done(void) {
     if (!c || !c->cs_ok) return 0;
     return cc_ok(c, cudaEventRecord(c->ev_free, c->stream), "fetch done");
 }
-static const void *cc_dev_addr(const CcBuf *b) { return b && b->kind == CC_DEV ? (const void *)b->d : nullptr; }
+static const void *cc_dev_addr(const CcBuf *b) { return b ? (const void *)b->d : nullptr; }   /* a mapped UP/DOWN buffer's: where the device reads it */
 
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
@@ -1364,5 +1370,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_qsa, cc_ple,
     cc_route, cc_moe, cc_signal, cc_wait_host, coli_cuda_tensor_dev,
     cc_fetch, cc_fetch_wait, cc_fetch_done, cc_dev_addr,
+    cc_moe_stage_op,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

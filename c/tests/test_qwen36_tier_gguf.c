@@ -36,7 +36,7 @@ static const size_t gb[NL] = {(size_t)IH * 66, (size_t)IH * 66, (size_t)IH * 66}
 static void run(int arena) {
     printf("%s\n", arena ? "the arena:" : "a device allocation a matrix:");
     fake_alloc_fail = !arena;   /* the arena refused: the tier falls back */
-    if (!qt_init_gguf(NL, NE, D, IH, NE, TOPK, tg, td, gb, db)) { printf("  FAIL: the tier refused a GGUF's experts\n"); fails++; return; }
+    if (!qt_init_gguf(NL, NE, D, IH, NE, TOPK, tg, td, gb, db, 0)) { printf("  FAIL: the tier refused a GGUF's experts\n"); fails++; return; }
     check(G.wfmt == QT_GGUF, "a GGUF's tier holds its block formats");
     check(G_arena_on == arena, arena ? "the arena is up" : "no arena when the device refuses it");
     size_t pg = (gb[2] + 3 * (size_t)IH) / 4 * 4, pd = (db[2] + 3 * (size_t)D) / 4 * 4;
@@ -90,7 +90,7 @@ int main(void) {
     setenv("COLI_GPUS", "0", 1);
     setenv("QT_NO_WARMSTART", "1", 1);
     fake_block_elems = 0;
-    check(!qt_init_gguf(NL, NE, D, IH, NE, TOPK, tg, td, gb, db), "a backend that takes no block format refuses a GGUF's experts");
+    check(!qt_init_gguf(NL, NE, D, IH, NE, TOPK, tg, td, gb, db, 0), "a backend that takes no block format refuses a GGUF's experts");
     fake_block_elems = 256;
     run(1);
     run(0);

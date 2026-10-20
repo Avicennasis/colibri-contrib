@@ -106,6 +106,7 @@ static int home2(int layer, int eid);
  * while the bytes pass by. Before, qwen36 refused the tier outright below full
  * residency, and a 32 GB box with a 4 GB card ran the CPU alone (#2090). */
 static int G_stream;
+static uint32_t G_cold_heat[QT_MAX_DEV];   /* copy mode: the coldest resident's heat a device (UINT32_MAX: none), each tick */
 /* No expert format the tier takes (the mixed layout, int8 with grouped scales,
  * experts=cpu): the devices still take the dense trunk, which is read on every
  * token. Before, each of these switched the trunk off as well. */
@@ -118,7 +119,7 @@ static int G_src_planar;
  * up of ggml type G_gtg[l] and down of G_gtd[l] in layer l (the types change from layer to
  * layer in published files), fmt 100 + type (cuda_bd.cuh); no scale arrays. G.wfmt QT_GGUF. */
 #define QT_GGUF 100
-static int *G_gtg, *G_gtd, G_gguf_init;
+static int *G_gtg, *G_gtd, G_gguf_init, G_gguf_copy;   /* G_gguf_copy: the rows qt_note hands over live only for the call */
 static size_t *G_gmb, *G_gmbd;          /* a gate (or up) matrix's bytes and a down's, per layer */
 /* A GGUF's experts in one arena a device: slots of G_aslot bytes, an expert's gate, up and
  * down rows (padded to words) at 0, G_aoff_u, G_aoff_d, any layer's types in any slot. A
@@ -695,8 +696,9 @@ static int qt_arena_up(void){
     return 1;
 }
 int qt_init_gguf(int nl, int ne, int D, int Ih, int cap, int topk, const int *tg, const int *td,
-                 const size_t *gu_bytes, const size_t *d_bytes){
+                 const size_t *gu_bytes, const size_t *d_bytes, int copy){
     if(G.on || nl<1 || !tg || !td || !gu_bytes || !d_bytes) return 0;
+    G_gguf_copy = copy;
     free(G_gtg); free(G_gtd); free(G_gmb); free(G_gmbd);
     G_gtg=malloc((size_t)nl*sizeof(int)); G_gtd=malloc((size_t)nl*sizeof(int));
     G_gmb=malloc((size_t)nl*sizeof(size_t)); G_gmbd=malloc((size_t)nl*sizeof(size_t));
@@ -739,7 +741,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     if(topk>QT_MAX_ROWS){ fprintf(stderr,"[qtier] topk>%d unsupported\n",QT_MAX_ROWS); return 0; }
     /* cap > n_experts holds every expert too (a slot per expert, never recycled):
      * it used to be refused along with the smaller caps */
-    G_stream = G_fp8_stream || cap < ne;
+    G_stream = G_fp8_stream || cap < ne || (G_gguf_init && G_gguf_copy);
     G_trunk_only = expert_is_int4 < 0;
     if(G_stream && !G_fp8_stream && !G_trunk_only)
         fprintf(stderr,"[qtier] RAM holds %d of %d experts a layer: the tier copies each expert it takes as it passes\n",cap,ne);
@@ -1443,6 +1445,36 @@ void qt_note(int layer,int eid,
     pthread_mutex_unlock(&G.mx);
 }
 
+/* The warm start's order from an engine's expert history (route_trace.h's counts, counts[l][e]
+ * for nl layers of ne experts): qt_plan_fill hands out the most used first, as HEAT_FILE's. */
+void qt_heat_order(uint32_t *const *counts, int nl, int ne){
+    if(!G.on || !counts || nl!=G.nl || ne!=G.ne) return;
+    pthread_mutex_lock(&G.mx);
+    if(!G.heat0) G.heat0=malloc((size_t)nl*ne*4);
+    if(G.heat0){
+        for(int l=0;l<nl;l++) for(int e=0;e<ne;e++) G.heat0[(size_t)l*ne+e]=counts[l]?counts[l][e]:0;
+        free(G.fill_order); G.fill_order=NULL;   /* sorted again at the next plan */
+    }
+    pthread_mutex_unlock(&G.mx);
+}
+/* Copy mode: whether a qt_note of this expert now would copy it (not resident nor queued,
+ * and room on its device or a resident colder than it, as of the last tick), so an engine
+ * converts the bytes only then; qt_note_heat counts a pass of one it does not hand over. */
+int qt_note_wanted(int layer,int eid){
+    if(!G.on || G_trunk_only || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return 0;
+    if(!G_stream) return 1;
+    QSlot *s=qs(layer,eid);
+    if(s->resident || s->queued) return 0;
+    int hd=home2(layer,eid);
+    if(G.used[hd]+G.exp_bytes<=G.budget[hd]) return 1;
+    return G_cold_heat[hd]!=0xFFFFFFFFu && tier_should_promote(s->heat+1,G_cold_heat[hd]);
+}
+void qt_note_heat(int layer,int eid){
+    if(!G.on || layer<0 || layer>=G.nl || eid<0 || eid>=G.ne) return;
+    QSlot *s=qs(layer,eid);
+    if(s->heat<0xFFFFFFFFu) __atomic_add_fetch(&s->heat,1u,__ATOMIC_RELAXED);
+}
+
 /* blocking variant for the warmstart (waits for queue space). */
 void qt_note_block(int layer,int eid,
              const uint8_t *g4,const uint8_t *u4,const uint8_t *d4,
@@ -1684,6 +1716,13 @@ void qt_stats_mark(void){
 static void qt_lfru_tick_locked(void){
     size_t n=(size_t)G.nl*G.ne;
     G.tick++;
+    if(G_stream){   /* copy mode: qt_note_wanted's bar */
+        for(int di=0;di<G.ndev;di++) G_cold_heat[di]=0xFFFFFFFFu;
+        for(size_t i=0;i<n;i++){
+            QSlot *s=&G.slot[i]; int di=home2((int)(i/G.ne),(int)(i%G.ne));
+            if(s->resident && !s->queued && s->heat<G_cold_heat[di]) G_cold_heat[di]=s->heat;
+        }
+    }
     if(!(G.tick%1024))
         for(size_t i=0;i<n;i++) G.slot[i].heat=tier_decay_value(G.slot[i].heat);
     replan_drain_locked(QT_REPLAN_PER_TICK);              /* pending re-plan pairs, a few per token */
