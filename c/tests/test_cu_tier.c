@@ -25,7 +25,7 @@
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
-enum { L = 2, E = 10, K = 3, HF_MAX = 512 };
+enum { L = 2, E = 10, K = 3, HF_MAX = 4096 };
 static int H = 192, F = 128;   /* hidden and expert width; grouped() widens H */
 static unsigned rng = 7;
 static unsigned rnd(void) { rng = rng * 1103515245u + 12345u; return rng >> 8; }
@@ -485,6 +485,71 @@ static void v4_act(void) {
     cut_shutdown(); model_free();
 }
 
+/* DeepSeek V4's activation on a GGUF's experts at the model's size (V4 Flash: hidden 4096, expert
+ * width 2048, IQ1_S gate and up, IQ3_XXS down), as v4_act does on MXFP4 */
+static void v4_gguf(VktFmt gu, VktFmt f, int h, int w, const char *nm) {
+    const int H0 = H, F0 = F;
+    H = h; F = w;
+    const int blk = gu.kind >= VKT_SRC_GGML;
+    for (int l = 0; l < L; l++) for (int e = 0; e < E; e++) {
+        if (blk) { mat_make_block(&ex[l][e].g, gu, H, F); mat_make_block(&ex[l][e].u, gu, H, F); mat_make_block(&ex[l][e].d, f, F, H); }
+        else { mat_make(&ex[l][e].g, gu, H, F); mat_make(&ex[l][e].u, gu, H, F); mat_make(&ex[l][e].d, f, F, H); }
+    }
+    const float limit = 10.0f;
+    set_budget(L * E, gu, f);
+    setenv("COLI_VK_TIER_RATE", "64", 1);
+    VktConfig vc = cfg_of(gu, f, VKT_ACT_SWIGLU_V4, limit);
+    int on = cut_init(&vc, NULL);
+    CHECK(on, "v4: the tier did not start");
+    if (!on) { model_free(); H = H0; F = F0; return; }
+    unsigned long long dev = 0, rows_same = 0, routed = 0; double worst = 0, worst_sum = 0;
+    static const int Ss[] = {1, 3, 20, 1, 2, 24};
+    for (int t = 0; t < 6; t++)
+        for (int l = 0; l < L; l++) {
+            int S = Ss[t], idx[24 * K]; float w[24 * K];
+            route(S, 0, E, idx, w);
+            float *x = malloc(sizeof(float) * S * H), *xq = malloc(sizeof(float) * S * H);
+            float *cpu = calloc((size_t)S * K * H, sizeof(float)), *y = malloc(sizeof(float) * H);
+            float *out = calloc((size_t)S * H, sizeof(float)), *ref = calloc((size_t)S * H, sizeof(float));
+            uint8_t taken[24 * K]; const float *rows[24 * K];
+            for (int i = 0; i < S * H; i++) x[i] = frnd() * 4.0f;
+            memcpy(xq, x, sizeof(float) * S * H);
+            for (int s = 0; s < S; s++) qdq128(xq + (size_t)s * H, H);   /* the engine's rounding of x */
+            int n = cut_issue_w(l, xq, S, K, idx, w, taken);
+            for (int i = 0; i < S * K; i++) {
+                if (taken[i]) continue;
+                expert_v4(&ex[l][idx[i]], xq + (size_t)(i / K) * H, w[i], limit, cpu + (size_t)i * H);
+                VktExpertSrc src = src_of(&ex[l][idx[i]]); cut_note(l, idx[i], &src);
+            }
+            int joined = n ? cut_join(rows) : 1;
+            CHECK(joined, "v4: join failed");
+            for (int s = 0; s < S; s++)
+                for (int k = 0; k < K; k++) {
+                    int i = s * K + k;
+                    expert_v4(&ex[l][idx[i]], xq + (size_t)s * H, w[i], limit, y);
+                    for (int d = 0; d < H; d++) ref[(size_t)s * H + d] += y[d];
+                    if (taken[i] && joined) {
+                        float dr[HF_MAX];
+                        for (int d = 0; d < H; d++) dr[d] = bf16r(rows[i][d]);
+                        double r = rel(dr, y, H); if (r > worst) worst = r;
+                        rows_same += !memcmp(dr, y, (size_t)H * sizeof(float));
+                        for (int d = 0; d < H; d++) out[(size_t)s * H + d] += dr[d];
+                        dev++;
+                    } else for (int d = 0; d < H; d++) out[(size_t)s * H + d] += cpu[(size_t)i * H + d];
+                    routed++;
+                }
+            double r = rel(out, ref, S * H); if (r > worst_sum) worst_sum = r;
+            free(x); free(xq); free(cpu); free(y); free(out); free(ref);
+        }
+    printf("  %-34s device %3llu of %3llu assignments, %llu rows bit-identical to the CPU's arithmetic, worst row %.2e, worst sum %.2e\n",
+           nm, dev, routed, rows_same, worst, worst_sum);
+    CHECK(dev > 0, "v4: nothing ran on the device");
+    CHECK(rows_same * 2 > dev, "v4: only %llu of %llu device rows equal the CPU's arithmetic", rows_same, dev);
+    CHECK(worst < 2e-2 && worst_sum < 2e-2, "v4: device rows off the reference (row %.3g, sum %.3g)", worst, worst_sum);
+    cut_shutdown(); model_free();
+    H = H0; F = F0;
+}
+
 
 static void report_line(char *out, size_t n) {
     out[0] = 0;
@@ -584,6 +649,10 @@ int main(void) {
     printf("blocks:\n"); blocks();
     printf("adapt:\n"); adapt();
     printf("DeepSeek V4:\n"); v4_act();
+    v4_gguf((VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_IQ1_S), 0}, (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_IQ3_XXS), 0}, 4096, 2048, "IQ1_S/IQ3_XXS 4096x2048, V4");
+    v4_gguf((VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_IQ1_S), 0}, (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_IQ3_XXS), 0}, 512, 256, "IQ1_S/IQ3_XXS 512x256, V4");
+    v4_gguf((VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_IQ1_S), 0}, (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_IQ2_XXS), 0}, 4096, 2048, "IQ1_S/IQ2_XXS 4096x2048, V4");
+    v4_gguf((VktFmt){VKT_SRC_MXFP4_E8M0, 32}, (VktFmt){VKT_SRC_MXFP4_E8M0, 32}, 4096, 2048, "MXFP4 4096x2048, V4");
     printf("host pool:\n");
     hybrid_case((VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q4_K), 0}, (VktFmt){(VktSrc)(VKT_SRC_GGML + GQ_Q6_K), 0}, "Q4_K/Q6_K");
     hybrid_case((VktFmt){VKT_SRC_I4U_PAIRS_GS, 64}, (VktFmt){VKT_SRC_I4U_PAIRS_GS, 64}, "int4-g64");

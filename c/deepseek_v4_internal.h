@@ -741,8 +741,8 @@ void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
 extern int (*coli_v4_expert_store_ram_first)(int layer, int expert);
 extern void (*coli_v4_expert_store_ram_gave)(void);
 
-#ifdef COLI_VULKAN
-/* The Vulkan routed-expert tier (vk_tier.c, Makefile.deepseek-v4 VK=1). The MoE
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+/* The routed-expert tier (vk_tier.c, Makefile.deepseek-v4 VK=1; cu_tier.c on a CUDA device). The MoE
  * units reach it through this table, which the engine's own unit fills when
  * COLI_VULKAN=1 started the tier (GENERATE_STATS, the one unit that links the
  * backend); it stays NULL in every other link of the units, the parent's tests
@@ -782,6 +782,8 @@ int coli_v4_expert_store_read_private(ColiExpertStore *store, ColiExpertKey key,
                                       unsigned char *buffer, ColiExpertView *view);
 extern int (*coli_v4_expert_store_device_tier)(int layer, int expert);
 
+#endif /* COLI_VULKAN || COLI_CUDA */
+#ifdef COLI_VULKAN
 /* The dense chain (deepseek_v4_chain.h, COLI_VK_CHAIN): a layer's attention state as its
  * units keep it, so the chain can mirror it on the device and write back what a forward
  * changed, as the CPU would have left it. The views point into the live state.
