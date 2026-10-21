@@ -376,6 +376,77 @@ def write_dflash(path, rng, targets=(3, 4, 5)):
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
 
 
+def write_kimik3(path, rng):
+    """A published kimi-k3 GGUF (Kimi K3), small: five layers, the first dense, the fourth MLA
+    and the rest KDA (head_count_kv 1 and 0); the routed experts in the latent between
+    ffn_routed_up and ffn_routed_down, IQ1_S and IQ2_XXS with IQ1_S down as UD-IQ1_S has
+    them, a Q6_K and Q8_0 trunk; res_score (res_norm * res_proj), ssm_a (-exp(A_log)) and
+    MLA's kv_b split per head into k_b (transposed) and v_b, as the file has them."""
+    w = gguf.GGUFWriter(str(path), "kimi-k3")
+    p = "kimi-k3."
+    layers, h, lat, mi, e, k, heads, kdh, dense = 5, 256, 256, 256, 8, 2, 2, 128, 512
+    ql, kvl, nope, rope, vh = 64, 64, 32, 16, 32
+    kv = [0, 0, 0, 1, 0]
+    P = heads * kdh
+    for key, v in (("block_count", layers), ("context_length", 4096), ("embedding_length", h),
+                   ("feed_forward_length", dense), ("attention.head_count", heads), ("expert_count", e),
+                   ("expert_used_count", k), ("expert_group_used_count", 1), ("expert_gating_func", 2),
+                   ("attention.key_length", kvl + rope), ("attention.value_length", kvl), ("ssm.conv_kernel", 4),
+                   ("kda.head_dim", kdh), ("attention.q_lora_rank", ql), ("attention.kv_lora_rank", kvl),
+                   ("rope.dimension_count", rope), ("attention.key_length_mla", nope + rope),
+                   ("attention.value_length_mla", vh), ("expert_feed_forward_length", mi), ("expert_shared_count", 1),
+                   ("leading_dense_block_count", 1), ("expert_latent_length", lat), ("attn_res.block_size", 2)):
+        w.add_uint32(p + key, v)
+    w.add_array(p + "attention.head_count_kv", kv)
+    for key, v in (("rope.freq_base", 10000.0), ("attention.layer_norm_rms_epsilon", 1e-5), ("expert_weights_scale", 1.0),
+                   ("kda.gate_lower_bound", -5.0), ("activation.situ_beta", 4.0), ("activation.situ_linear_beta", 25.0)):
+        w.add_float32(p + key, v)
+    w.add_bool(p + "expert_weights_norm", True)
+    toks = [f"<0x{b:02X}>" if b < 256 else f"t{b}" for b in range(VOCAB - 3)] + ["[BOS]", "[EOS]", "[PAD]"]
+    w.add_tokenizer_model("gpt2"); w.add_tokenizer_pre("kimi-k2"); w.add_token_list(toks)
+    w.add_token_types([1] * (VOCAB - 3) + [3, 3, 3]); w.add_token_merges([])
+    w.add_bos_token_id(VOCAB - 3); w.add_eos_token_id(VOCAB - 2)
+
+    def f32(name, shape, std=0.02, base=0.0):
+        w.add_tensor(name, (base + rng.standard_normal(shape) * std).astype(np.float32))
+    def q(name, shape, t): w.add_tensor(name, blocks(t, shape, rng), raw_dtype=QT[t])
+    q("token_embd.weight", (VOCAB, h), "Q8_0"); q("output.weight", (VOCAB, h), "Q6_K")
+    w.add_tensor("output_norm.weight", np.ones(h, np.float32)); f32("output_res_score.weight", (h,), 0.05)
+    for L in range(layers):
+        b = f"blk.{L}."
+        f32(b + "attn_norm.weight", (h,), 0.01, 1.0); f32(b + "ffn_norm.weight", (h,), 0.01, 1.0)
+        f32(b + "attn_res_score.weight", (h,), 0.05); f32(b + "ffn_res_score.weight", (h,), 0.05)
+        if kv[L] == 0:   # KDA
+            q(b + "attn_q.weight", (P, h), "Q6_K"); q(b + "attn_k.weight", (P, h), "Q6_K")
+            q(b + "attn_v.weight", (P, h), "Q6_K"); q(b + "ssm_g.weight", (P, h), "Q6_K")
+            q(b + "attn_output.weight", (h, P), "Q6_K")
+            for c3 in "qkv":
+                f32(b + f"ssm_conv1d_{c3}.weight", (P, 1, 4), 0.2)
+            q(b + "ssm_f_a.weight", (kdh, h), "Q6_K"); q(b + "ssm_f_b.weight", (P, kdh), "Q8_0")
+            f32(b + "ssm_beta.weight", (heads, h), 0.05); f32(b + "ssm_dt.bias", (P,), 0.1)
+            w.add_tensor(b + "ssm_norm.weight", np.ones(kdh, np.float32))
+            w.add_tensor(b + "ssm_a", -np.exp(rng.standard_normal(heads).astype(np.float32) * 0.3))
+        else:            # MLA
+            q(b + "attn_q_a.weight", (ql, h), "Q6_K"); w.add_tensor(b + "attn_q_a_norm.weight", np.ones(ql, np.float32))
+            q(b + "attn_q_b.weight", (heads * (nope + rope), ql), "Q8_0")
+            q(b + "attn_kv_a_mqa.weight", (kvl + rope, h), "Q6_K"); w.add_tensor(b + "attn_kv_a_norm.weight", np.ones(kvl, np.float32))
+            q(b + "attn_k_b.weight", (heads, kvl, nope), "Q8_0"); q(b + "attn_v_b.weight", (heads, vh, kvl), "Q8_0")
+            q(b + "attn_output.weight", (h, heads * vh), "Q8_0"); q(b + "attn_gate.weight", (heads * vh, h), "Q6_K")
+        if L == 0:
+            q(b + "ffn_gate.weight", (dense, h), "Q6_K"); q(b + "ffn_up.weight", (dense, h), "Q6_K")
+            q(b + "ffn_down.weight", (h, dense), "Q6_K")
+            continue
+        f32(b + "ffn_gate_inp.weight", (e, h), 0.05); f32(b + "exp_probs_b.bias", (e,), 0.1)
+        w.add_tensor(b + "ffn_routed_norm.weight", np.ones(lat, np.float32))
+        q(b + "ffn_routed_down.weight", (lat, h), "Q6_K"); q(b + "ffn_routed_up.weight", (h, lat), "Q6_K")
+        q(b + "ffn_gate_shexp.weight", (mi, h), "Q6_K"); q(b + "ffn_up_shexp.weight", (mi, h), "Q6_K")
+        q(b + "ffn_down_shexp.weight", (h, mi), "Q6_K")
+        gu = "IQ2_XXS" if L == 1 else "IQ1_S"
+        q(b + "ffn_gate_exps.weight", (e, mi, lat), gu); q(b + "ffn_up_exps.weight", (e, mi, lat), gu)
+        q(b + "ffn_down_exps.weight", (e, lat, mi), "IQ1_S")
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+
+
 def engine_tokens(snap, ref, env=None):
     p = subprocess.run([str(ENGINE), "2", "8", str(ref)], env=dict(os.environ, SNAP=str(snap), OMP_NUM_THREADS="2",
                        COLI_NO_OMP_TUNE="1", **(env or {})), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -829,6 +900,52 @@ class MimoGguf(unittest.TestCase):
             link, copy = self.tokens("link", env), self.tokens("copy", env)
             self.assertEqual(len(link), 6, link)
             self.assertEqual(link, copy, env)
+
+
+@unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+class KimiK3Gguf(unittest.TestCase):
+    """A published kimi-k3 GGUF: the checkpoint's text_config from the keys (KDA layers by
+    head_count_kv, MLA's own head sizes) and the kimi-k2 split, as tools/k3_tokenizer.py's."""
+    def test_the_config_and_the_tokenizer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_kimik3(d / "k3.gguf", np.random.default_rng(6))
+            p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(d / "k3.gguf"), str(d / "out")],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertEqual(p.returncode, 0, p.stdout.decode())
+            cfg = json.loads((d / "out" / "config.json").read_text())
+            t = cfg["text_config"]
+            self.assertEqual(cfg["model_type"], "kimi_k3")
+            self.assertEqual({k: t[k] for k in ("model_type", "num_hidden_layers", "first_k_dense_replace", "qk_nope_head_dim",
+                                                "qk_rope_head_dim", "v_head_dim", "routed_expert_hidden_size",
+                                                "num_shared_experts", "attn_res_block_size")},
+                             {"model_type": "kimi_linear", "num_hidden_layers": 5, "first_k_dense_replace": 1,
+                              "qk_nope_head_dim": 32, "qk_rope_head_dim": 16, "v_head_dim": 32,
+                              "routed_expert_hidden_size": 256, "num_shared_experts": 1, "attn_res_block_size": 2})
+            self.assertEqual(t["linear_attn_config"]["kda_layers"], [1, 2, 3, 5])
+            sys.path.insert(0, str(HERE / "tools"))
+            import k3_tokenizer
+            tok = json.loads((d / "out" / "tokenizer.json").read_text())
+            self.assertEqual(tok["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"], k3_tokenizer.PAT)
+
+    def test_a_gating_other_than_sigmoid_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_kimik3(d / "k3.gguf", np.random.default_rng(6))
+            r = gguf.GGUFReader(str(d / "k3.gguf"))
+            meta = {}
+            for k, f in r.fields.items():
+                if k.startswith("kimi-k3.") and len(f.data) == 1:
+                    meta[k] = f.parts[f.data[0]].tolist()[0]
+                elif k.startswith("kimi-k3."):
+                    meta[k] = [f.parts[i].tolist()[0] for i in f.data]
+            tensors = {t.name: {"dims": [int(x) for x in t.shape]} for t in r.tensors}
+            sys.path.insert(0, str(HERE / "tools"))
+            import gguf_import as gi
+            cfg, layers = gi.kimik3_config(meta, tensors)
+            self.assertEqual(layers, 5)
+            with self.assertRaises(SystemExit):
+                gi.kimik3_config(dict(meta, **{"kimi-k3.expert_gating_func": 1}), tensors)
 
 
 class DeepSeek41Config(unittest.TestCase):

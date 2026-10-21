@@ -276,6 +276,7 @@ jobs:
           # and gated MLA layers on the device, and the same under ASan and UBSan
           - family: kimi-chain
             req: c/tools/requirements-kimi-k3-tiny.txt
+            extra: gguf>=0.19
           - family: kimi-chain-sanitize
             req: c/tools/requirements-kimi-k3-tiny.txt
           # the dense weights on the device only (COLI_VK_DENSE_HOST=0): the host copies
