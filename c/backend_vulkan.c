@@ -2272,6 +2272,11 @@ int coli_vk_matmul(ColiVkTensor **tensor, float *y, const float *x,
                    const void *weights, const float *scales,
                    int fmt, int S, int I, int O, int gs) {
     if (!G.ready || S < 1 || !upload_tensor(tensor, weights, scales, fmt, I, O, gs)) return 0;
+    /* A block format (a GGUF's ggml type, colibri's low-bit experts) has no shader here: its
+     * GEMVs are the expert batch's and the chain's (qmatmul_bd.spv, chain_gemv_bd.spv), and
+     * qmatmul.spv read its rows as zeros, returning 1. The tensor stays up for those; the
+     * caller's CPU path computes this one. */
+    if (bd_fmt(fmt)) return 0;
     ColiVkTensor *t = *tensor;
     /* VK_PROF=1: phase split of the dense per-call cost, printed every 8192 calls —
      * separates our code (memcpy/desc/record) from the driver (submit) and the GPU
@@ -3457,6 +3462,7 @@ int coli_vk_matmul_pair(ColiVkTensor **t1p, float *y1, const void *w1, const flo
                         int fmt, const float *x, int S, int I, int grp) {
     if (!G.ready || S < 1) return 0;
     if (!upload_tensor(t1p, w1, s1, fmt, I, O1, grp) || !upload_tensor(t2p, w2, s2, fmt, I, O2, grp)) return 0;
+    if (bd_fmt(fmt)) return 0;   /* no block-format shader here (coli_vk_matmul) */
     ColiVkTensor *t1 = *t1p, *t2 = *t2p;
     size_t xb = (size_t)S * I * 4, yb1 = (size_t)S * O1 * 4, yb2 = (size_t)S * O2 * 4;
     if (!scratch_reserve(&G.x, xb) || !scratch_reserve_mt(&G.y, yb1, G.memtype_cached) ||
@@ -5845,6 +5851,10 @@ size_t coli_vk_tensor_row_bytes(int fmt, int I) { return cpu_row_bytes(fmt, I); 
 /* elements per block of a block format (shaders/blockdec.glsl), 0 for any other format */
 int coli_vk_block_elems(int fmt) { return !bd_fmt(fmt) || !bd_shaders() ? 0 : fmt == 203 ? 64 : fmt >= 200 ? 128 : (int)BD_BLK[fmt - 100]; }
 void *coli_vk_block_table_dev(int dev) { return bd_shaders() ? (void *)bdtab_buf(dev == 1 ? 1 : 0) : NULL; }
+size_t coli_vk_block_table_bytes(int dev) {
+    const ColiVkTensor *t = __atomic_load_n(&g_bdtab[dev == 1 ? 1 : 0], __ATOMIC_ACQUIRE);
+    return t ? t->acct : 0;
+}
 uint64_t coli_vk_block_table_addr(int dev) {   /* the primary device's (vk_addr's) */
     VkBuffer b = !dev && bd_shaders() && G.has_bda ? bdtab_buf(0) : VK_NULL_HANDLE;
     return b ? vk_addr(b) : 0;
