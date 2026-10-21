@@ -14123,64 +14123,24 @@ static int v4_dho_place(ColiV4Engine *engine, int layer) {
  * its address, as the Vulkan per-matrix path finds one, and only in memory the engine keeps
  * (v4_vk_resident). A type or width the device does not take, a refused upload, or one past the
  * budget stays the CPU's. COLI_CUDA_DENSE=0 keeps them all on the CPU. */
-typedef struct { const void *data; int type, rows, columns, refused; void *t; } V4CuEntry;
-static V4CuEntry *g_v4_cu_map;
-static size_t g_v4_cu_cap, g_v4_cu_used;
-
-static size_t v4_cu_hash(const void *data, size_t cap) {
-    uint64_t h = (uint64_t)(uintptr_t)data * 0x9E3779B97F4A7C15ull;
-    return (size_t)(h >> 20) & (cap - 1);
-}
-/* the entry of a matrix (its handle for cud_mm), made on its first use; NULL when the map
- * cannot grow */
-static V4CuEntry *v4_cu_entry(const void *data, int type, int rows, int columns) {
-    for (size_t at = g_v4_cu_cap ? v4_cu_hash(data, g_v4_cu_cap) : 0; g_v4_cu_cap; at = (at + 1) & (g_v4_cu_cap - 1)) {
-        V4CuEntry *e = &g_v4_cu_map[at];
-        if (!e->data) break;
-        if (e->data == data && e->type == type && e->rows == rows && e->columns == columns) return e;
-    }
-    if ((g_v4_cu_used + 1) * 2 > g_v4_cu_cap) {
-        size_t cap = g_v4_cu_cap ? g_v4_cu_cap * 2 : 256;
-        V4CuEntry *map = calloc(cap, sizeof(*map));
-        if (!map) return NULL;
-        for (size_t i = 0; i < g_v4_cu_cap; i++) {
-            if (!g_v4_cu_map[i].data) continue;
-            size_t at = v4_cu_hash(g_v4_cu_map[i].data, cap);
-            while (map[at].data) at = (at + 1) & (cap - 1);
-            map[at] = g_v4_cu_map[i];
-        }
-        free(g_v4_cu_map);
-        g_v4_cu_map = map;
-        g_v4_cu_cap = cap;
-    }
-    size_t at = v4_cu_hash(data, g_v4_cu_cap);
-    while (g_v4_cu_map[at].data) at = (at + 1) & (g_v4_cu_cap - 1);
-    g_v4_cu_map[at] = (V4CuEntry){data, type, rows, columns, 0, NULL};
-    g_v4_cu_used++;
-    return &g_v4_cu_map[at];
-}
 static int v4_cu_ggml(float *output, const ColiTensorView *w, const float *input, int batch) {
     if (!g_v4_cu_dense || !output || !input || batch < 1 || !coli_ggml_view_ok(w)) return -1;
     const int type = coli_ggml_view_type(w), rows = (int)w->rows, columns = (int)w->columns;
-    V4CuEntry *e = v4_cu_entry(w->data, type, rows, columns);
-    if (!e || e->refused) return -1;
-    if (!e->t && !v4_vk_resident(w->data, w->data_bytes)) {   /* only memory the engine keeps */
-        e->refused = 1;
+    CudEntry *e = cud_entry(w->data, 100 + type, rows, columns);   /* found by its address (cu_dense.h) */
+    if (!e || e->no) return -1;
+    if (!e->h && !v4_vk_resident(w->data, w->data_bytes)) {   /* only memory the engine keeps */
+        e->no = 1;
         g_cud.left++;
         return -1;
     }
-    return cud_mm(&e->t, &e->refused, output, input, batch, 100 + type, w->data, NULL, rows, columns, 0) ? 0 : -1;
+    return cud_mm(&e->h, &e->no, output, input, batch, 100 + type, w->data, NULL, rows, columns, 0) ? 0 : -1;
 }
 static void v4_cu_dense_close(void) {
     cud_report("deepseek_v4");
     coli_v4_cu_ggml = NULL;
     g_v4_cu_dense = 0;
     g_cud.on = 0;
-    for (size_t i = 0; i < g_v4_cu_cap; i++)
-        if (g_v4_cu_map[i].t) coli_cuda_tensor_free((ColiCudaTensor *)g_v4_cu_map[i].t);
-    free(g_v4_cu_map);
-    g_v4_cu_map = NULL;
-    g_v4_cu_cap = g_v4_cu_used = 0;
+    cud_map_free();
 }
 
 static void v4_cu_open(const ColiV4Engine *engine) {

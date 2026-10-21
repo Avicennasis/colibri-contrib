@@ -27,6 +27,7 @@
 #define CU_DENSE_H
 #include <pthread.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include "backend_cuda.h"
 #include "ggml_quants.h"
@@ -122,6 +123,53 @@ static int cud_mm(void **h, int *no, float *y, const float *x, int S, int fmt, c
     g_cud.calls++;
     g_cud.rows += (unsigned long long)S;
     return 1;
+}
+
+/* Matrices found by their host address, for an engine that makes its views on the fly (a
+ * group's rows of a larger matrix, a view built for each call): an entry keeps the handle and
+ * the flag cud_mm keeps. Only for memory the engine keeps until it closes; a buffer that holds
+ * one matrix and then another would find the first one's copy. */
+typedef struct { const void *data; int fmt, O, I, no; void *h; } CudEntry;
+static CudEntry *g_cud_map;
+static size_t g_cud_cap, g_cud_used;
+static size_t cud_hash(const void *data, size_t cap) {
+    uint64_t h = (uint64_t)(uintptr_t)data * 0x9E3779B97F4A7C15ull;
+    return (size_t)(h >> 20) & (cap - 1);
+}
+/* the entry of a matrix, made on its first use; NULL when the map cannot grow */
+static CudEntry *cud_entry(const void *data, int fmt, int O, int I) {
+    for (size_t at = g_cud_cap ? cud_hash(data, g_cud_cap) : 0; g_cud_cap; at = (at + 1) & (g_cud_cap - 1)) {
+        CudEntry *e = &g_cud_map[at];
+        if (!e->data) break;
+        if (e->data == data && e->fmt == fmt && e->O == O && e->I == I) return e;
+    }
+    if ((g_cud_used + 1) * 2 > g_cud_cap) {
+        size_t cap = g_cud_cap ? g_cud_cap * 2 : 256;
+        CudEntry *map = (CudEntry *)calloc(cap, sizeof(*map));
+        if (!map) return NULL;
+        for (size_t i = 0; i < g_cud_cap; i++) {
+            if (!g_cud_map[i].data) continue;
+            size_t at = cud_hash(g_cud_map[i].data, cap);
+            while (map[at].data) at = (at + 1) & (cap - 1);
+            map[at] = g_cud_map[i];
+        }
+        free(g_cud_map);
+        g_cud_map = map;
+        g_cud_cap = cap;
+    }
+    size_t at = cud_hash(data, g_cud_cap);
+    while (g_cud_map[at].data) at = (at + 1) & (g_cud_cap - 1);
+    g_cud_map[at] = (CudEntry){data, fmt, O, I, 0, NULL};
+    g_cud_used++;
+    return &g_cud_map[at];
+}
+/* the map's device copies freed and the map with them */
+static void cud_map_free(void) {
+    for (size_t i = 0; i < g_cud_cap; i++)
+        if (g_cud_map[i].h) coli_cuda_tensor_free((ColiCudaTensor *)g_cud_map[i].h);
+    free(g_cud_map);
+    g_cud_map = NULL;
+    g_cud_cap = g_cud_used = 0;
 }
 
 static void cud_report(const char *engine) {

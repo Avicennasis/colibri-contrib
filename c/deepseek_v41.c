@@ -109,8 +109,10 @@ static int g_v41_dho_try;   /* the fit runs where the trunk may live on the devi
 #include "xtier.h"   /* the routed-expert tier on Vulkan or CUDA (XT); vk_tier.h's stubs without either */
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
+#include "cu_dense.h"      /* a GGUF's dense matrices on the tier's device, a matrix at a time */
 #include "route_trace.h"   /* the tier's expert history (.coli_usage), kept while it is on */
 static int g_v41_cu = 0;   /* COLI_CUDA=1 and the device opened for the tier (v41_cu_tier_start) */
+static size_t g_v41_cud;   /* the room the dense matrices take there (cud_open) */
 #endif
 
 #define V41_MAX_LAYERS 64
@@ -722,6 +724,21 @@ static int vk_mul(int fmt, const void *data, const uint8_t *tiles, int O, int I,
 }
 #endif
 
+#ifdef COLI_CUDA
+/* A GGUF's dense matrix on the tier's CUDA device (cu_dense.h), found by its blocks' address:
+ * wo_a's groups are views made for each call. Rows strided otherwise than packed stay the
+ * CPU's. 1 = done there. Only mv8's and mvb's callers come here, the dense part: a routed
+ * expert's slot holds one expert and then another, and goes to v41_gx_rows. */
+static int v41_cu_mm(float *y, int ystride, const uint8_t *q, int type, int O, int I,
+                     const float *x, int xstride, int rows) {
+    if (!g_cud.on || (rows > 1 && (xstride != I || ystride != O))) return 0;
+    CudEntry *e = cud_entry(q, 100 + type, O, I);
+    return e && !e->no && cud_mm(&e->h, &e->no, y, x, rows, 100 + type, q, NULL, O, I, 0);
+}
+#define V41_CU(...) if (v41_cu_mm(__VA_ARGS__)) return;
+#else
+#define V41_CU(...)
+#endif
 /* y = W x for `rows` positions, W a GGUF matrix (ggml blocks of held type `type`): the
  * ggml_quants.h kernels, the activations quantized once for every row; x and y strided as
  * mv8_rows takes them. */
@@ -749,7 +766,7 @@ static void v41_gx_rows(float *y, int ystride, const uint8_t *q, int type, int O
  * checkpoint, the attention block was 41% of a turn's wall clock -- more than
  * the expert reads from disk. A scalar byte-at-a-time decode was most of it. */
 static void mv8(float *y, const W8 *w, const float *x) {
-    if (w->gx) { v41_gx_rows(y, w->O, w->q, w->gt, w->O, w->I, x, w->I, 1); return; }
+    if (w->gx) { V41_CU(y, w->O, w->q, w->gt, w->O, w->I, x, w->I, 1) v41_gx_rows(y, w->O, w->q, w->gt, w->O, w->I, x, w->I, 1); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(12, w->q, w->s, w->O, w->I, y, w->O, x, w->I, 1)) return;
     v41_dho_host(w->q);
@@ -802,7 +819,7 @@ static int mv_block_rows(int I) {
 }
 
 static void mv8_rows(float *y, int ystride, const W8 *w, const float *x, int xstride, int rows) {
-    if (w->gx) { v41_gx_rows(y, ystride, w->q, w->gt, w->O, w->I, x, xstride, rows); return; }
+    if (w->gx) { V41_CU(y, ystride, w->q, w->gt, w->O, w->I, x, xstride, rows) v41_gx_rows(y, ystride, w->q, w->gt, w->O, w->I, x, xstride, rows); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(12, w->q, w->s, w->O, w->I, y, ystride, x, xstride, rows)) return;
     v41_dho_host(w->q);
@@ -880,7 +897,7 @@ static void mvb_cpu(float *y, const WB *w, const float *x) {
     }
 }
 static void mvb(float *y, const WB *w, const float *x) {
-    if (w->gx) { v41_gx_rows(y, w->O, w->g, w->gt, w->O, w->I, x, w->I, 1); return; }
+    if (w->gx) { V41_CU(y, w->O, w->g, w->gt, w->O, w->I, x, w->I, 1) v41_gx_rows(y, w->O, w->g, w->gt, w->O, w->I, x, w->I, 1); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(11, w->w, NULL, w->O, w->I, y, w->O, x, w->I, 1)) return;
     v41_dho_host(w->w);
@@ -891,7 +908,7 @@ static void mvb(float *y, const WB *w, const float *x) {
  * per position), the one-position kernel row by row on the CPU, so the CPU bits are
  * mvb's. A prefill site that projected token by token calls this once instead. */
 static void mvb_rows(float *y, int ystride, const WB *w, const float *x, int xstride, int rows) {
-    if (w->gx) { v41_gx_rows(y, ystride, w->g, w->gt, w->O, w->I, x, xstride, rows); return; }
+    if (w->gx) { V41_CU(y, ystride, w->g, w->gt, w->O, w->I, x, xstride, rows) v41_gx_rows(y, ystride, w->g, w->gt, w->O, w->I, x, xstride, rows); return; }
 #ifdef COLI_VULKAN
     if (vk_mul(11, w->w, NULL, w->O, w->I, y, ystride, x, xstride, rows)) return;
     v41_dho_host(w->w);
@@ -5609,6 +5626,9 @@ static int *load_ids(jval *root, const char *key, int *count) {
  * coli_vk_matmul_calls() counts only calls that completed there, so a path that
  * initialised and never ran cannot pass for one that did. */
 static void vk_report(void) {
+#ifdef COLI_CUDA
+    if (g_v41_cu) cud_report("deepseek_v41");
+#endif
 #ifdef COLI_VULKAN
     if (!g_vk_ready) return;
     size_t bytes = 0, tensors = 0;
@@ -5674,7 +5694,26 @@ static int v41_tier_block_elems(int fmt) {
     (void)fmt; return 0;
 #endif
 }
+#ifdef COLI_CUDA
+/* a GGUF's dense matrices as the CUDA device would hold them (cu_dense.h): the head and the layers' */
+static size_t v41_cu_w8(const W8 *w) { return w->gx ? cud_bytes(100 + w->gt, w->O, w->I, 0) : 0; }
+static size_t v41_cu_wb(const WB *w) { return w->gx ? cud_bytes(100 + w->gt, w->O, w->I, 0) : 0; }
+static size_t v41_cu_dense_bytes(const Model *m) {
+    size_t b = v41_cu_wb(&m->head);
+    for (int i = 0; i < m->c.n_layers; i++) {
+        const Layer *l = &m->L[i];
+        b += v41_cu_w8(&l->wq_a) + v41_cu_w8(&l->wq_b) + v41_cu_w8(&l->wkv) + v41_cu_w8(&l->wo_a) +
+             v41_cu_w8(&l->wo_b) + v41_cu_w8(&l->idx_wq_b) + v41_cu_w8(&l->sh_w1) + v41_cu_w8(&l->sh_w3) +
+             v41_cu_w8(&l->sh_w2) + v41_cu_w8(&l->eng_wkv) + v41_cu_wb(&l->comp_wkv) + v41_cu_wb(&l->comp_wgate) +
+             v41_cu_wb(&l->idx_wk) + v41_cu_wb(&l->idx_wproj) + v41_cu_wb(&l->gate_w);
+    }
+    return b;
+}
+#endif
 static size_t v41_tier_dense_bytes(Model *m) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) return g_v41_cud;
+#endif
 #ifdef COLI_VULKAN
     if (!xt_cuda()) return vk_dense_bytes(m);
 #endif
@@ -5904,9 +5943,9 @@ static int v41_gguf_report(Model *m, const char *snap) {
 int main(int argc, char **argv) {
 #if defined(COLI_CUDA) && defined(COLI_VULKAN)
     {   /* A build with both backends runs on Vulkan, the same card, when CUDA was asked for
-         * (COLI_CUDA=1) and COLI_VULKAN was not set: the dense chain puts the trunk on the card, where the CUDA tier
-         * leaves it on the CPU. COLI_VULKAN=0 keeps the CUDA tier; without a Vulkan
-         * device the CUDA tier still starts. */
+         * (COLI_CUDA=1) and COLI_VULKAN was not set: the dense chain runs a layer's work on the card in one
+         * frame, where the CUDA path (cu_dense.h) takes a matrix at a time. COLI_VULKAN=0 keeps the CUDA
+         * tier; without a Vulkan device the CUDA tier still starts. */
         const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
         if (cu && atoi(cu) && !(vk && *vk)) {
             setenv("COLI_VULKAN", "1", 1);
@@ -5999,7 +6038,8 @@ int main(int argc, char **argv) {
 #endif
 #ifdef COLI_CUDA
     {   /* COLI_CUDA=1 with no Vulkan tier: the CUDA device opens for the routed experts, the same
-         * tier (cu_tier.h) holds them, the dense part stays on the CPU */
+         * tier (cu_tier.h) holds them, and a GGUF's dense matrices go there too as far as their
+         * budget goes (cu_dense.h), which the tier leaves them */
         const char *cu = getenv("COLI_CUDA");
         int dev = 0;
         if (cu && atoi(cu) && !vkt_ready() && c->n_routed > 0 && cut_wanted()) {
@@ -6007,8 +6047,9 @@ int main(int argc, char **argv) {
             else {
                 g_v41_cu = 1;
                 xt_use_cuda(1);
+                g_v41_cud = cud_open("deepseek_v41", coli_cuda_device_at(0), v41_cu_dense_bytes(&m));
                 vk_tier_start(&m, snap, cap);
-                if (!cut_ready()) { xt_use_cuda(0); g_v41_cu = 0; }
+                if (!cut_ready()) { xt_use_cuda(0); g_v41_cu = 0; g_cud.on = 0; }
             }
         }
     }
