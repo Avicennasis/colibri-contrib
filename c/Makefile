@@ -824,7 +824,12 @@ kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
 	deepseek-v4-tiny-check deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
-deepseek-v4:
+# Every shader the other engines build (VK_SPV, empty without VK=1): backend_vulkan.c
+# looks for them at run time and goes without one that is not there, and
+# Makefile.deepseek-v4's own list stopped at the chain's first shaders. Without
+# qmatmul_bd.spv and qmatmul_gate_up_bd.spv a GGUF had no device form at all: the
+# chain and the tier of DeepSeek V4 Flash UD-IQ1_S stayed off, 0 matmuls on the GPU.
+deepseek-v4: $(VK_SPV)
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
 
 deepseek-v4-clean:
