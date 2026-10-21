@@ -1775,15 +1775,16 @@ static float dev_dot(const int8_t *w8, const uint8_t *u4, int zero, const float 
 static void dev_dequant(float *o, const uint8_t *row, int fmt, const float *rs, int gs, int I) {
     static const float e2m1[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
     for (int i = 0; i < I; i++) {
-        const int nib = (i & 1) ? row[i >> 1] >> 4 : row[i >> 1] & 15;
         float w;
         if (fmt == 1 || fmt == 13) w = (float)((const int8_t *)row)[i];
         else if (fmt == 12) w = dev_fp8(row[i]);
-        else if (fmt == 7) w = (nib & 8) ? -e2m1[nib & 7] : e2m1[nib & 7];
-        else if (fmt == 5) {
+        else if (fmt == 5) {   /* 3/8 of a byte a weight: no nibble to read */
             const uint8_t *lo = row + (size_t)(i >> 6) * 24, *hi = lo + 16; const int j = i & 63;
             w = (float)((int)(((lo[j >> 2] >> ((j & 3) * 2)) & 3u) | (((hi[j >> 3] >> (j & 7)) & 1u) << 2)) - 4);
-        } else w = (float)(nib - 8);
+        } else {
+            const int nib = (i & 1) ? row[i >> 1] >> 4 : row[i >> 1] & 15;
+            w = fmt == 7 ? ((nib & 8) ? -e2m1[nib & 7] : e2m1[nib & 7]) : (float)(nib - 8);
+        }
         o[i] = w * (gs ? rs[i / gs] : rs[0]);
     }
 }
