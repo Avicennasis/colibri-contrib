@@ -667,6 +667,64 @@ def deepseek41_ple_engram(meta, t, ids):
             "token_map": token_map}
 
 
+def kimik3_config(meta, tensors, overrides=None):
+    """kimi-k3 (Kimi K3): the checkpoint's text_config (kimi_linear) from the keys, as
+    kimi_k3.c and the planner read it. The KDA layers are those whose head_count_kv is 0,
+    the MLA layers' 1; MLA's own head sizes are key_length_mla and value_length_mla (the
+    plain key_length and value_length are the KDA side's). The routed experts work in the
+    latent (expert_latent_length) between ffn_routed_up and ffn_routed_down."""
+    p = "kimi-k3."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    kv = [int(x) for x in need("attention.head_count_kv")]
+    if len(kv) != layers or any(v not in (0, 1) for v in kv):
+        sys.exit(f"{p}attention.head_count_kv: not one 0 (KDA) or 1 (MLA) a layer")
+    gating = int(meta.get(p + "expert_gating_func", 2))
+    if gating != 2:
+        sys.exit(f"{p}expert_gating_func {gating}: the engine routes with sigmoid scores (2) only")
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    rope, qk = int(need("rope.dimension_count")), int(need("attention.key_length_mla"))
+    heads = int(need("attention.head_count"))
+    text = {
+        "model_type": "kimi_linear",
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "vocab_size": int(emb["dims"][1]),
+        "first_k_dense_replace": int(need("leading_dense_block_count")),
+        "intermediate_size": int(need("feed_forward_length")),
+        "num_attention_heads": heads,
+        "q_lora_rank": int(need("attention.q_lora_rank")),
+        "kv_lora_rank": int(need("attention.kv_lora_rank")),
+        "qk_nope_head_dim": qk - rope,
+        "qk_rope_head_dim": rope,
+        "v_head_dim": int(need("attention.value_length_mla")),
+        "num_experts": int(need("expert_count")),
+        "num_experts_per_token": int(need("expert_used_count")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "routed_expert_hidden_size": int(need("expert_latent_length")),
+        "num_shared_experts": int(need("expert_shared_count")),
+        "attn_res_block_size": int(need("attn_res.block_size")),
+        "activation_situ_beta": float(need("activation.situ_beta")),
+        "activation_situ_linear_beta": float(need("activation.situ_linear_beta")),
+        "rms_norm_eps": float(need("attention.layer_norm_rms_epsilon")),
+        "rope_parameters": {"rope_theta": float(meta.get(p + "rope.freq_base", 10000.0))},
+        "max_position_embeddings": int(meta.get(p + "context_length", 1048576)),
+        "routed_scaling_factor": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "norm_topk_prob": bool(meta.get(p + "expert_weights_norm", True)),
+        "linear_attn_config": {"num_heads": heads, "head_dim": int(need("kda.head_dim")),
+                               "short_conv_kernel_size": int(need("ssm.conv_kernel")),
+                               "gate_lower_bound": float(meta.get(p + "kda.gate_lower_bound", -5.0)),
+                               "kda_layers": [i + 1 for i, v in enumerate(kv) if v == 0]},
+    }
+    present = sum(1 for b in range(layers + 4) if f"blk.{b}.attn_norm.weight" in tensors)
+    if present != layers:
+        sys.exit(f"kimi-k3: {present} blocks, the config declares {layers}")
+    cfg = {"architectures": ["KimiK3ForConditionalGeneration"], "model_type": "kimi_k3",
+           "bos_token_id": int(meta.get("tokenizer.ggml.bos_token_id", 163584)),
+           "eos_token_id": int(meta.get("tokenizer.ggml.eos_token_id", 163586)), "text_config": text}
+    return cfg, layers
+
+
 def olmoe_config(meta, tensors, overrides=None):
     """OLMoE (llama.cpp's olmoe: OLMoE-1B-7B) as the olmoe engine's config.json. The converter
     keeps q and k in the checkpoint's layout and writes no norm_topk_prob: false, as the
@@ -778,7 +836,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 
 COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the
@@ -896,7 +954,18 @@ O200K_SPLITS = ["[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p
 # cl100k's, as GLM-5.3-Flash's tokenizer.json has it (llama.cpp's "glm4")
 CL100K_SPLITS = ["(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|"
                  "\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"]
-PRE_SPLITS = {"glm4": CL100K_SPLITS, "deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
+# Kimi's tiktoken split (tools/k3_tokenizer.py's PAT, one regex as tiktoken applies it)
+KIMI_SPLITS = ["|".join([
+    r"""[\p{Han}]+""",
+    r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+    r"""[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?""",
+    r"""\p{N}{1,3}""",
+    r""" ?[^\s\p{L}\p{N}]+[\r\n]*""",
+    r"""\s*[\r\n]+""",
+    r"""\s+(?!\S)""",
+    r"""\s+""",
+])]
+PRE_SPLITS = {"glm4": CL100K_SPLITS, "kimi-k2": KIMI_SPLITS, "deepseek-v3": DEEPSEEK_SPLITS, "joyai-llm": DEEPSEEK_SPLITS,
               "hunyuan-dense": DEEPSEEK_SPLITS, "hy_v4": DEEPSEEK_SPLITS,
               "inkling": O200K_SPLITS, "gpt-4o": O200K_SPLITS}
 # BPE options of the tokenizer.json a family ships (the GGUF does not carry them)

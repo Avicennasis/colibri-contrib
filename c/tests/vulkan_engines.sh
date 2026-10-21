@@ -2655,6 +2655,36 @@ k3c_gate() {
     echo "OK $tag $c: tokens = CPU, $lg, $(chain_count kimi_k3 vk.log) chain forwards$(grep -o 'rebuilding the state of [0-9]* positions\|the host.s state is current' vk.log | sed 's/^/, /')"
   done
 }
+# A published kimi-k3 GGUF (tests/test_gguf_import.py write_kimik3: IQ1_S and IQ2_XXS
+# experts in the latent, a Q6_K and Q8_0 trunk, res_score, ssm_a and MLA's k_b and v_b as
+# the file has them), imported. k3g_gate <tag> <env...>: the CPU's tokens and every logits
+# row (within k3c_close) from the chain, in the float forms (GQ_EXACT=1, and kv_b rebuilt as
+# floats: K3_MLA_BITS=32), as k3c_gate does for the checkpoint.
+k3_gguf_tiny() {
+  $PY - <<'PY' || fail "gguf-py (pip install gguf) is needed for the GGUF gates"
+import sys
+sys.path.insert(0, "tests")
+import numpy as np
+from test_gguf_import import write_kimik3
+write_kimik3("k3_gguf_tiny.gguf", np.random.default_rng(6))
+PY
+  rm -rf k3_gguf_tiny
+  $PY tools/gguf_import.py k3_gguf_tiny.gguf k3_gguf_tiny > /dev/null
+}
+k3g_gate() {
+  local tag=$1 ids="5 6 7 8 20 21 22 23"; shift
+  rm -f k3g.usage cpu.f32 vk.f32
+  env "$@" COLI_USAGE=$PWD/k3g.usage USAGE_SAVE=0 K3_VAL_LOGITS=cpu.f32 ./kimi_k3 k3_gguf_tiny --ids "$ids" --ngen 8 \
+    2> cpu.log | sed 's/ *TUNE.*//' > cpu.tok
+  env "$@" COLI_USAGE=$PWD/k3g.usage USAGE_SAVE=0 K3_VAL_LOGITS=vk.f32 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
+    COLI_VK_CHAIN=${CHAINMODE:-1} ./kimi_k3 k3_gguf_tiny --ids "$ids" --ngen 8 2> vk.log | sed 's/ *TUNE.*//' > vk.tok
+  { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag: the chain's tokens differ from the CPU"; }
+  [ "$(chain_count kimi_k3 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
+  local lg; lg=$(k3c_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }
+  # the fit counts a GGUF's blocks: what the chain placed is what it counted
+  ptl_check_placed kimi_k3 vk.log "$tag"
+  echo "OK $tag: tokens = CPU, $lg, $(chain_count kimi_k3 vk.log) chain forwards, $(ptl_n kimi_k3 vk.log) of $(ptl_L kimi_k3 vk.log) layers on the device"
+}
 k3c_serve_fixture() {   # the tiny fixture with the tokenizer the serve tests speak through
   rm -rf kimi_k3_serve && mkdir kimi_k3_serve
   cp kimi_k3_tiny/config.json kimi_k3_tiny/model.safetensors kimi_k3_serve/
@@ -2710,6 +2740,18 @@ family_kimi_chain() {
   # in chain chunks of 5 rows (seven chunks a 32-row forward), the loss in the third
   # chunk of the second forward: the state its first chunks advanced is not used
   K3C_CASES=long FAULT_BACK=124 REBUILD=1 k3c_gate "chain kimi_k3 device lost inside a chunked forward" $O COLI_VK_CHAIN_ROWS=5
+  # a GGUF's blocks: the trunk on the chain, the experts in the tier, as the file has them
+  k3_gguf_tiny
+  local G="GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0 K3_MLA_BITS=32 COLI_TEMP=0"
+  k3g_gate "chain kimi_k3 GGUF" $G
+  grep -q "tier kimi_k3: the GGUF experts' blocks go to the device" vk.log && [ "$(tier_count kimi_k3 vk.log)" -gt 0 ] ||
+    { cat vk.log; fail "chain kimi_k3 GGUF: the tier took no expert as the file has it"; }
+  k3g_gate "chain kimi_k3 GGUF, tier off" $G COLI_VK_TIER=0
+  k3g_gate "chain kimi_k3 GGUF, chain chunks of 3" $G COLI_VK_CHAIN_ROWS=3
+  k3g_gate "chain kimi_k3 GGUF, the dense weights on the device only" $G COLI_VK_DENSE_HOST=0
+  # a partial chain: two layers on the device, the rest and the head on the CPU's blocks
+  k3g_gate "chain kimi_k3 GGUF, a partial chain" $G COLI_VK_CHAIN_LAYERS=2
+  ptl_check_n kimi_k3 vk.log 2 "chain kimi_k3 GGUF, a partial chain"
   # serve sessions frame for frame, the KDA state across turns
   local S="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 K3_PREFIX_LOG=1 USAGE_SAVE=0"
   export CHAIN_SERVE_TOL=2e-2
