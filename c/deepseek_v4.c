@@ -11417,15 +11417,20 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     engine->gpu.device = 0;
     if (!v4_gpu_wanted()) return 0;
 #ifdef COLI_VULKAN
-    {   /* The CUDA tier mirrors native FP4 experts only (v4_gpu_expert_attach_cached_ex): a GGUF's
-         * routed experts stayed on the CPU under it, where Vulkan's tier reads the file's blocks.
-         * A build with both backends runs a GGUF on Vulkan, the same card, unless COLI_VULKAN
-         * was set (qwen38.c's way); COLI_VULKAN=0 keeps CUDA. */
+    {   /* This path mirrors native FP4 experts and FP8 and bf16 matrices only
+         * (v4_gpu_expert_attach_cached_ex): a GGUF's experts and dense part stayed on the CPU
+         * under it, where Vulkan's tier and chain read the file's blocks. A build with both
+         * backends runs a GGUF on Vulkan, the same card, unless COLI_VULKAN=0 asks for CUDA
+         * (qwen38.c's way), whose expert tier then takes the experts (v4_cu_open). A COLI_VULKAN=1
+         * said outright used to leave this path open: its experts' mirror then held the Vulkan
+         * tier off and the chain's layers on the CPU, which ran the model at its own speed. */
         const char *vk = getenv("COLI_VULKAN");
-        if (coli_v4_index_gguf(engine->target_index) && !(vk && *vk)) {
-            setenv("COLI_VULKAN", "1", 1);
-            fprintf(stderr, "v4_gpu: the CUDA tier takes native FP4 experts only: this GGUF runs on Vulkan, the same card "
-                            "(COLI_VULKAN=0 keeps CUDA, the routed experts then on the CPU)\n");
+        if (coli_v4_index_gguf(engine->target_index) && !(vk && *vk == '0')) {
+            if (!(vk && *vk)) {
+                setenv("COLI_VULKAN", "1", 1);
+                fprintf(stderr, "v4_gpu: a GGUF runs on Vulkan in a build with both backends, the same card "
+                                "(COLI_VULKAN=0 keeps CUDA and its expert tier)\n");
+            }
             return 0;
         }
     }
@@ -13647,8 +13652,10 @@ static pthread_t g_v4_vk_thread;     /* the engine thread: the CUDA tier's start
 #endif
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
+#include "cu_dense.h"                /* the dense matrices on that device, a matrix at a time */
 static int g_v4_cu_on;               /* the CUDA device open for the tier (v4_cu_open) */
 static int g_v4_cu_dense;            /* a GGUF's dense matrices go to that device (v4_cu_ggml) */
+static size_t g_v4_cu_budget;        /* the room they take there (cud_open), the tier's dense bytes */
 #endif
 #ifndef COLI_VULKAN
 static int v4c_partial(void) { return 0; }   /* no dense chain without Vulkan */
@@ -13683,6 +13690,15 @@ static int v4_tier_dense(void) {
 #else
     return 0;
 #endif
+}
+/* what the dense part still puts on the tier's device after it starts: on CUDA, cu_dense.h's
+ * budget; on Vulkan, the dense weights the per-matrix path places (a chain placed all it places) */
+static size_t v4_tier_dense_bytes(const ColiV4Engine *engine) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) return g_v4_cu_dense ? g_v4_cu_budget : 0;
+#endif
+    return v4_tier_dense() && !v4c_partial() && !v4c_whole()
+        ? (size_t)(engine->dense_resident.total_bytes - engine->dense_resident.dropped_bytes + engine->head_cache.bytes) : 0;
 }
 static void v4_tier_atexit_device(void) {
 #ifdef COLI_VULKAN
@@ -13878,8 +13894,7 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                         ? (size_t)(st.capacity_bytes - st.resident_bytes) : 0,
                     /* what the device has still to take: matrices placed already
                      * (the dense weights on the device only) are in its usage */
-                    .dense_bytes = v4_tier_dense() && !v4c_partial() && !v4c_whole()   /* a chain placed all it places */
-                        ? (size_t)(engine->dense_resident.total_bytes - engine->dense_resident.dropped_bytes + engine->head_cache.bytes) : 0,
+                    .dense_bytes = v4_tier_dense_bytes(engine),
                     .in_ram = v4_vkt_in_ram, .ram_ctx = store,
                     .load = v4_vkt_load, .release = v4_vkt_unhold, .load_ctx = store};
     /* The device goes before the drivers unload, after the tier's teardown (atexit runs
@@ -14103,22 +14118,21 @@ static int v4_dho_place(ColiV4Engine *engine, int layer) {
  * (attention, the compressors and the indexer, the shared expert, the head) go to the tier's
  * device as the file's blocks (backend_cuda.cu, fmt 100 + ggml type: cuda_bd.cuh's GEMV, and
  * the tensor cores' tiles for a prompt chunk's rows), each the first time it is used, and run
- * there from then on; one the CPU holds 16 rows interleaved goes up as the file's rows. The
- * tier's budget leaves them their room (v4_tier_dense). The rules are the Vulkan per-matrix
- * path's: memory the engine keeps (v4_vk_resident), the engine thread, no OpenMP region. A type
- * or width the device does not take, or a refused upload, stays the CPU's. COLI_CUDA_DENSE=0
- * keeps them all on the CPU. */
-typedef struct { const void *data; int type, rows, columns, refused; ColiCudaTensor *t; } V4CuEntry;
+ * there from then on; one the CPU holds 16 rows interleaved goes up as the file's rows
+ * (cu_dense.h, whose budget the tier leaves them: v4_tier_dense_bytes). A matrix is found by
+ * its address, as the Vulkan per-matrix path finds one, and only in memory the engine keeps
+ * (v4_vk_resident). A type or width the device does not take, a refused upload, or one past the
+ * budget stays the CPU's. COLI_CUDA_DENSE=0 keeps them all on the CPU. */
+typedef struct { const void *data; int type, rows, columns, refused; void *t; } V4CuEntry;
 static V4CuEntry *g_v4_cu_map;
-static size_t g_v4_cu_cap, g_v4_cu_used, g_v4_cu_bytes;
-static int g_v4_cu_dev, g_v4_cu_mats, g_v4_cu_left;
-static unsigned long long g_v4_cu_calls, g_v4_cu_rows;
+static size_t g_v4_cu_cap, g_v4_cu_used;
 
 static size_t v4_cu_hash(const void *data, size_t cap) {
     uint64_t h = (uint64_t)(uintptr_t)data * 0x9E3779B97F4A7C15ull;
     return (size_t)(h >> 20) & (cap - 1);
 }
-/* the entry of a matrix, made on its first use; NULL when the map cannot grow */
+/* the entry of a matrix (its handle for cud_mm), made on its first use; NULL when the map
+ * cannot grow */
 static V4CuEntry *v4_cu_entry(const void *data, int type, int rows, int columns) {
     for (size_t at = g_v4_cu_cap ? v4_cu_hash(data, g_v4_cu_cap) : 0; g_v4_cu_cap; at = (at + 1) & (g_v4_cu_cap - 1)) {
         V4CuEntry *e = &g_v4_cu_map[at];
@@ -14145,53 +14159,25 @@ static V4CuEntry *v4_cu_entry(const void *data, int type, int rows, int columns)
     g_v4_cu_used++;
     return &g_v4_cu_map[at];
 }
-static int v4_cu_left(V4CuEntry *e) {   /* the matrix stays the CPU's from now on */
-    if (e->t) coli_cuda_tensor_free(e->t);
-    e->t = NULL;
-    e->refused = 1;
-    g_v4_cu_left++;
-    return -1;
-}
 static int v4_cu_ggml(float *output, const ColiTensorView *w, const float *input, int batch) {
-    if (!g_v4_cu_dense || !output || !input || batch < 1 || !coli_ggml_view_ok(w) ||
-        !pthread_equal(pthread_self(), g_v4_vk_thread)) return -1;
-#ifdef _OPENMP
-    if (omp_in_parallel()) return -1;
-#endif
+    if (!g_v4_cu_dense || !output || !input || batch < 1 || !coli_ggml_view_ok(w)) return -1;
     const int type = coli_ggml_view_type(w), rows = (int)w->rows, columns = (int)w->columns;
-    const int base = gq_r16_base(type) >= 0 ? gq_r16_base(type) : type, fmt = 100 + base;
     V4CuEntry *e = v4_cu_entry(w->data, type, rows, columns);
     if (!e || e->refused) return -1;
-    if (e->t) {
-        if (!coli_cuda_matmul(&e->t, output, input, w->data, NULL, fmt, batch, columns, rows, g_v4_cu_dev, 0)) return -1;
-    } else {   /* its first use: the file's rows go up */
-        const int64_t rb = gq_row_bytes(base, columns);
-        const int blk = coli_cuda_block_elems(fmt);
-        if (rb <= 0 || blk < 1 || columns % 32 || columns % blk || (base != type && rows % 16) ||
-            !v4_vk_resident(w->data, w->data_bytes)) return v4_cu_left(e);
-        uint8_t *unpacked = base != type ? malloc((size_t)rb * rows) : NULL;
-        if (base != type && !unpacked) return v4_cu_left(e);
-        if (unpacked) gq_r16_unpack(type, unpacked, w->data, rows, columns);
-        const int ok = coli_cuda_matmul(&e->t, output, input, unpacked ? (const void *)unpacked : w->data, NULL,
-                                        fmt, batch, columns, rows, g_v4_cu_dev, 0);
-        free(unpacked);
-        if (!ok) return v4_cu_left(e);
-        g_v4_cu_mats++;
-        g_v4_cu_bytes += (size_t)rb * rows;
+    if (!e->t && !v4_vk_resident(w->data, w->data_bytes)) {   /* only memory the engine keeps */
+        e->refused = 1;
+        g_cud.left++;
+        return -1;
     }
-    g_v4_cu_calls++;
-    g_v4_cu_rows += (unsigned long long)batch;
-    return 0;
+    return cud_mm(&e->t, &e->refused, output, input, batch, 100 + type, w->data, NULL, rows, columns, 0) ? 0 : -1;
 }
 static void v4_cu_dense_close(void) {
-    if (g_v4_cu_mats || g_v4_cu_left)
-        fprintf(stderr, "[CUDA] deepseek_v4: %d dense matrices of the GGUF on the device (%.2f GiB), %d left to the CPU; "
-                        "%llu calls, %llu rows\n", g_v4_cu_mats, g_v4_cu_bytes / 1073741824.0, g_v4_cu_left,
-                g_v4_cu_calls, g_v4_cu_rows);
+    cud_report("deepseek_v4");
     coli_v4_cu_ggml = NULL;
     g_v4_cu_dense = 0;
+    g_cud.on = 0;
     for (size_t i = 0; i < g_v4_cu_cap; i++)
-        if (g_v4_cu_map[i].t) coli_cuda_tensor_free(g_v4_cu_map[i].t);
+        if (g_v4_cu_map[i].t) coli_cuda_tensor_free((ColiCudaTensor *)g_v4_cu_map[i].t);
     free(g_v4_cu_map);
     g_v4_cu_map = NULL;
     g_v4_cu_cap = g_v4_cu_used = 0;
@@ -14209,7 +14195,6 @@ static void v4_cu_open(const ColiV4Engine *engine) {
     }
     const char *dense = getenv("COLI_CUDA_DENSE");
     g_v4_cu_on = 1;
-    g_v4_cu_dev = dev;
     g_v4_cu_dense = coli_v4_index_gguf(engine->target_index) && engine->runtime.dense_resident &&
                     !(dense && *dense && atoi(dense) == 0);
     g_v4_vk_engine = engine;
@@ -14227,16 +14212,16 @@ static void v4_cu_open(const ColiV4Engine *engine) {
             }
         }
     }
-    xt_use_cuda(1);
-    v4_vk_tier_start(engine);   /* its budget leaves the dense matrices their room (v4_tier_dense) */
-    if (!coli_v4_vk_tier) { xt_use_cuda(0); g_v4_cu_on = g_v4_cu_dense = 0; return; }
-    if (g_v4_cu_dense) {
-        coli_v4_cu_ggml = v4_cu_ggml;
-        fprintf(stderr, "[CUDA] deepseek_v4: the GGUF's dense matrices to the device as they are first used, "
-                        "%.2f GiB resident (COLI_CUDA_DENSE=0 keeps them on the CPU)\n",
-                (engine->dense_resident.total_bytes - engine->dense_resident.dropped_bytes + engine->head_cache.bytes)
-                    / 1073741824.0);
+    if (g_v4_cu_dense) {   /* the budget the tier leaves them (cu_dense.h) */
+        g_v4_cu_budget = cud_open("deepseek_v4", coli_cuda_device_at(0),
+                                  (size_t)(engine->dense_resident.total_bytes - engine->dense_resident.dropped_bytes +
+                                           engine->head_cache.bytes));
+        g_v4_cu_dense = g_v4_cu_budget > 0;
     }
+    xt_use_cuda(1);
+    v4_vk_tier_start(engine);   /* its budget leaves the dense matrices their room (v4_tier_dense_bytes) */
+    if (!coli_v4_vk_tier) { xt_use_cuda(0); g_v4_cu_on = g_v4_cu_dense = 0; g_cud.on = 0; return; }
+    if (g_v4_cu_dense) coli_v4_cu_ggml = v4_cu_ggml;
 }
 static void v4_cu_close(void) {
     v4_cu_dense_close();

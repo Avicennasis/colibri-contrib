@@ -116,6 +116,7 @@
 #include "quant.h"
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
+#include "cu_dense.h"      /* the dense matrices on the CUDA tier's device, a matrix at a time */
 #endif
 #include "omp_tune.h"
 #include "route_trace.h"
@@ -164,6 +165,8 @@ typedef struct {
 typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; uint8_t *gg; int O, I, gs;
                  void *vk;    /* ColiVkTensor* once uploaded (K3_VK); NULL = CPU only */
                  void *metal; /* ColiMetalTensor* once registered (K3_METAL); NULL = CPU only */
+                 void *cu; int cu_no;   /* COLI_CUDA: the device's copy (cu_dense.h), NULL before its
+                                         * first use; cu_no once the matrix stays the CPU's */
                  st_mapped_raw data_map, scale_map;
                  int mapped;
                  /* COLI_VULKAN: how to read it back from disk (k3_w_reload), and 1 while the
@@ -566,6 +569,12 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
     if(g_k3_dho&&g_k3_vk&&w->vk&&S>=1&&S<=65535&&!k3_in_par()&&k3_w_vk_mm(w,y,x,S))
         return;
     if(w->vk_gone) k3_w_reload((W*)w);    /* the CPU needs a matrix the device held alone (a lost device) */
+#endif
+#ifdef COLI_CUDA
+    {   /* the dense part on the CUDA tier's device (cu_dense.h; off unless it opened) */
+        const void *d=w->fmt==0?(const void*)w->f:w->fmt==1?(const void*)w->q8:w->fmt==4?(const void*)w->q4:(const void*)w->gg;
+        if(cud_mm(&((W*)w)->cu,&((W*)w)->cu_no,y,x,S,w->fmt,d,w->s,w->O,w->I,w->gs)) return;
+    }
 #endif
     if(w->fmt==0)      matmul(y,x,w->f,S,w->I,w->O);
     else if(w->fmt>=100){   /* a GGUF's blocks */
@@ -2437,9 +2446,26 @@ static int k3_tier_open(Model *m, VktFmt gu, VktFmt dn, VktFmt *lgu, VktFmt *ldn
     return 1;
 }
 #ifdef COLI_CUDA
+/* The dense matrices w_matmul multiplies, as the device would hold them (cu_dense.h): the
+ * layers' in order, then the head. */
+static size_t k3_cu_w(const W *w){ return cud_bytes(w->fmt,w->O,w->I,w->gs); }
+static size_t k3_cu_dense_bytes(const Model *m){
+    const Cfg *c=&m->c;
+    size_t b=0;
+    for(int i=0;i<c->n_layers;i++){
+        const Layer *l=&m->L[i];
+        if(l->kda){ const Kda *k=&l->a; b+=k3_cu_w(&k->q)+k3_cu_w(&k->k)+k3_cu_w(&k->v)+k3_cu_w(&k->g)+k3_cu_w(&k->o); }
+        else { const Mla *q=&l->m; b+=k3_cu_w(&q->qa)+k3_cu_w(&q->qb)+k3_cu_w(&q->kva)+k3_cu_w(&q->o)+k3_cu_w(&q->g); }
+        if(l->sparse){ const Moe *o=&l->moe;
+            b+=k3_cu_w(&o->lat_down)+k3_cu_w(&o->lat_up)+k3_cu_w(&o->sh_gate)+k3_cu_w(&o->sh_up)+k3_cu_w(&o->sh_down); }
+        else b+=k3_cu_w(&l->d_gate)+k3_cu_w(&l->d_up)+k3_cu_w(&l->d_down);
+    }
+    return b+k3_cu_w(&m->lm_head);
+}
 /* COLI_CUDA's run (K3_CUDA=1, which coli sets for COLI_CUDA=1) with no Vulkan tier: the routed
- * experts in the tier on the CUDA device (cu_tier.h), resident from the history, the dense part
- * on the CPU. Once it is on, the per-call path (cuda_expert_apply, which uploads every routed
+ * experts in the tier on the CUDA device (cu_tier.h), resident from the history, and the dense
+ * matrices on the same device as far as its budget goes (cu_dense.h), which the tier's budget
+ * leaves them. Once it is on, the per-call path (cuda_expert_apply, which uploads every routed
  * MXFP4 expert at every call) stays off: the experts the tier has not taken run on the CPU. */
 static void k3_cu_tier_start(Model *m){
     Cfg *c=&m->c;
@@ -2451,10 +2477,14 @@ static void k3_cu_tier_start(Model *m){
     VktFmt gu={VKT_SRC_MXFP4_E8M0,32}, dn=gu, *lgu=NULL, *ldn=NULL;
     const char *gno=m->gx?k3_vk_gguf_forms(m,&gu,&dn,&lgu,&ldn):NULL;
     if(gno){ fprintf(stderr,"[CUDA] tier kimi_k3: the GGUF's experts: %s; the tier stays off\n",gno); xt_use_cuda(0); return; }
-    if(k3_tier_open(m,gu,dn,lgu,ldn,cap,nmoe,0)) g_k3_cuda=0;
-    else xt_use_cuda(0);
+    const size_t dense=cud_open("kimi_k3",coli_cuda_device_at(0),k3_cu_dense_bytes(m));
+    if(k3_tier_open(m,gu,dn,lgu,ldn,cap,nmoe,dense)) g_k3_cuda=0;
+    else { xt_use_cuda(0); g_cud.on=0; }
 }
-static void k3_cu_report(const Model *m, const char *scope){ if(xt_cuda()) cut_report(scope,m->hits,m->miss); }
+static void k3_cu_report(const Model *m, const char *scope){
+    if(xt_cuda()) cut_report(scope,m->hits,m->miss);
+    cud_report("kimi_k3");
+}
 #endif
 #endif
 

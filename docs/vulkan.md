@@ -6,6 +6,8 @@ That includes cards the vendor stacks have dropped (ROCm 7 removed Polaris:
 an RX 580 runs here via RADV) and, measured on an RX 9070 (RDNA4), it is
 *faster* than the ROCm/HIP backend on the same card.
 
+The same models on the CPU, Vulkan and CUDA, one machine and one build: [gpu-parity.md](gpu-parity.md).
+
 ```bash
 cd c
 make glm VK=1                # needs the Vulkan headers + glslc (shaderc) for the shaders

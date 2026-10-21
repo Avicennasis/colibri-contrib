@@ -102,7 +102,9 @@ static int g_g53_partial = 0;
 #include "xtier.h"          /* the routed-expert tier on Vulkan or CUDA (XT); stubs without either */
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
+#include "cu_dense.h"       /* the dense matrices on the tier's CUDA device, a matrix at a time */
 static int g_g53_cu = 0;    /* COLI_CUDA=1 and the device opened for the tier */
+static size_t g_g53_cud;    /* the room the dense matrices take there (cud_open) */
 #endif
 #include "compat.h"
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
@@ -682,6 +684,8 @@ typedef struct {
     int vk_kind, vk_gone;
     int vk_hgemv;                         /* read per head by the chain's MLA (k_b, v_b): a GGUF's goes up
                                            * dequantized, which that op reads (glm53_chain.h) */
+    void *cu; int cu_no;                  /* COLI_CUDA: the device's copy (cu_dense.h), NULL before its
+                                           * first use; cu_no once the matrix stays the CPU's */
 } Mat;
 
 enum { G53_GGML = 32 };
@@ -1007,7 +1011,7 @@ static Mat load_mat(GModel *m, int64_t rows, int64_t columns, const char *fmt, .
             blocks = p;
         }
         mat.fmt = G53_GGML; mat.q4 = blocks; mat.gs = held;
-        mat.rows = (int)rows; mat.columns = (int)columns;
+        mat.rows = (int)rows; mat.columns = (int)columns; mat.resident = 1;
         return mat;
     }
 
@@ -1185,7 +1189,19 @@ static void mv_rows(float *out, const Mat *w, const float *x, int row0, int rows
  *
  * Il campo `vk` e' una cache dentro a una matrice che il resto del codice
  * tratta come sola lettura: da qui il cast, che riguarda solo lui. */
+#ifdef COLI_CUDA
+/* a resident matrix on the tier's CUDA device (cu_dense.h): 1 done there */
+static int g53_cu_mm(const Mat *w, float *out, const float *x, int S) {
+    if (!w->resident || !g_cud.on) return 0;
+    const void *d = w->fmt == 0 ? (const void *)w->f : w->fmt == 1 ? (const void *)w->q8 : (const void *)w->q4;
+    return cud_mm(&((Mat *)w)->cu, &((Mat *)w)->cu_no, out, x, S, w->fmt == G53_GGML ? 100 + w->gs : w->fmt, d, w->s,
+                  w->rows, w->columns, w->gs);
+}
+#endif
 static void mv(float *out, const Mat *w, const float *x) {
+#ifdef COLI_CUDA
+    if (g53_cu_mm(w, out, x, 1)) return;
+#endif
 #ifdef COLI_METAL
     if (g_metal_ready && w->resident && (w->fmt == 1 || w->fmt == 4)) {
         Mat *mutable_w = (Mat *)w;
@@ -1220,6 +1236,9 @@ static void mv(float *out, const Mat *w, const float *x) {
  * A matrix on the Vulkan device takes the S rows in one call (the backend's GEMM);
  * Metal keeps the per-row path it already has. */
 static void mm(float *out, const Mat *w, const float *x, int S) {
+#ifdef COLI_CUDA
+    if (g53_cu_mm(w, out, x, S)) return;
+#endif
     if (w->fmt == G53_GGML) { g53_gq(out, w, x, S, 0, w->rows); return; }   /* GGUF: all S rows at once */
     int gpu = 0;
 #ifdef COLI_METAL
@@ -2178,11 +2197,11 @@ static void expert_mats(const GModel *m, int layer, const Slot *slot, Mat *gate,
     }
     const Mat shape[3] = {
         { 4, NULL, NULL, slot->piece[0], (const float *)slot->piece[1],
-          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, 0 },
+          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, 0, NULL, 0 },
         { 4, NULL, NULL, slot->piece[2], (const float *)slot->piece[3],
-          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, 0 },
+          inter, hidden, 64, NULL, 0, NULL, NULL, 0, 0, 0, NULL, 0 },
         { 4, NULL, NULL, slot->piece[4], (const float *)slot->piece[5],
-          hidden, inter, 64, NULL, 0, NULL, NULL, 0, 0, 0 },
+          hidden, inter, 64, NULL, 0, NULL, NULL, 0, 0, 0, NULL, 0 },
     };
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
@@ -5433,8 +5452,29 @@ static size_t glm53_dense_dev_bytes(const GModel *m) {
     return b;
 }
 #endif
+#ifdef COLI_CUDA
+/* the resident matrices as the CUDA device would hold them (cu_dense.h), the head and the layers' */
+static size_t glm53_cu_dense_bytes(const GModel *m) {
+    size_t b = 0;
+    const Mat *head = &m->head;
+    if (head->resident) b += cud_bytes(head->fmt == G53_GGML ? 100 + head->gs : head->fmt, head->rows, head->columns, head->gs);
+    for (int i = m->layer_begin; i < m->layer_end; i++) {
+        const GLayer *l = &m->layer[i];
+        const Mat *all[] = {&l->kq, &l->kk, &l->kv, &l->ko, &l->kga, &l->kgb, &l->kfa, &l->kfb, &l->kb,
+                            &l->qa, &l->qb, &l->kva, &l->kvb_kt, &l->kvb_v, &l->o, &l->iwq, &l->iwk,
+                            &l->iwp, &l->ikpg, &l->dg, &l->du, &l->dd, &l->rg, &l->ru, &l->rd};
+        for (size_t k = 0; k < sizeof(all) / sizeof(all[0]); k++)
+            if (all[k]->resident)
+                b += cud_bytes(all[k]->fmt == G53_GGML ? 100 + all[k]->gs : all[k]->fmt, all[k]->rows, all[k]->columns, all[k]->gs);
+    }
+    return b;
+}
+#endif
 /* what the dense part still puts on the tier's device after it starts */
 static size_t g53_tier_dense_bytes(const GModel *m) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) return g_g53_cud;
+#endif
 #ifdef COLI_VULKAN
     if (!xt_cuda())   /* a partial chain: nothing more of the trunk goes up, but the chain's first
                        * forward allocates its scratch and the N layers' MLA caches */
@@ -5550,10 +5590,14 @@ static void glm53_vk_report(const GModel *m, const char *scope) {
 #ifdef COLI_VULKAN
     if (!xt_cuda()) fprintf(stderr, "[VK] glm53: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
 #endif
+#ifdef COLI_CUDA
+    if (xt_cuda()) cud_report("glm53");
+#endif
 }
 #ifdef COLI_CUDA
 /* COLI_CUDA=1 with no Vulkan tier: the CUDA device opens for the routed experts, the same tier
- * (cu_tier.h) holds them, the dense part stays on the CPU */
+ * (cu_tier.h) holds them, and the resident dense matrices go to it as far as their budget goes
+ * (cu_dense.h) */
 static void glm53_cu_tier_start(GModel *m) {
     const char *cu = getenv("COLI_CUDA");
     int dev = 0;
@@ -5561,8 +5605,9 @@ static void glm53_cu_tier_start(GModel *m) {
     if (!coli_cuda_init(&dev, 1)) { fprintf(stderr, "[CUDA] glm53: no CUDA device, the routed experts stay on the CPU\n"); return; }
     g_g53_cu = 1;
     xt_use_cuda(1);
+    g_g53_cud = cud_open("glm53", coli_cuda_device_at(0), glm53_cu_dense_bytes(m));   /* the tier leaves it room */
     glm53_vk_tier_start(m);
-    if (!cut_ready()) { xt_use_cuda(0); g_g53_cu = 0; }
+    if (!cut_ready()) { xt_use_cuda(0); g_g53_cu = 0; g_cud.on = 0; }
 }
 #endif
 #endif
@@ -5624,9 +5669,9 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
 int main(int argc, char **argv) {
 #if defined(COLI_CUDA) && defined(COLI_VULKAN)
     {   /* A build with both backends runs on Vulkan, the same card, when CUDA was asked for
-         * (COLI_CUDA=1) and COLI_VULKAN was not set: the dense chain puts the trunk on the card, where the CUDA tier
-         * leaves it on the CPU. COLI_VULKAN=0 keeps the CUDA tier; without a Vulkan
-         * device the CUDA tier still starts. */
+         * (COLI_CUDA=1) and COLI_VULKAN was not set: the dense chain runs a layer's work on the card in one
+         * frame, where the CUDA path (cu_dense.h) takes a matrix at a time. COLI_VULKAN=0 keeps the CUDA
+         * tier; without a Vulkan device the CUDA tier still starts. */
         const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
         if (cu && atoi(cu) && !(vk && *vk)) {
             setenv("COLI_VULKAN", "1", 1);
