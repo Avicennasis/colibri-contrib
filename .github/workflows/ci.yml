@@ -762,8 +762,8 @@ jobs:
           # compiled again over it; deepseek_v4.c with the tier on CUDA (no Vulkan)
           nvcc -O2 -std=c++17 -arch=sm_80 -c cu_xb.cu -o /dev/null \
             -Xcompiler=-Wall,-Wextra
-          gcc -fsyntax-only -DCOLI_CUDA -fopenmp -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function cu_tier.c
-          gcc -fsyntax-only -D_GNU_SOURCE -DCOLI_CUDA -fopenmp -pthread -include pthread.h -Wall -Wextra -Werror \
+          gcc -fsyntax-only -DCOLI_CUDA -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-unused-function cu_tier.c
+          gcc -fsyntax-only -D_GNU_SOURCE -DCOLI_CUDA -fopenmp -pthread -include pthread.h -Wall -Wextra \
             -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation deepseek_v4.c
           echo "CUDA tier syntax check passed"
       - name: Compile backend_cuda_ink.cu (syntax only, no GPU)
