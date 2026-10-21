@@ -171,7 +171,7 @@ class BackendChoice(unittest.TestCase):
     def test_engine_without_cuda_path_uses_vulkan(self):
         rtx_vk = {"name": RTX["name"], "type": "discrete", "api_version": "1.3.289",
                   "api_version_raw": (1 << 22) | (3 << 12) | 289}
-        decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[RTX]), family="mimo")
+        decision = self.choose(hw_report(vulkan=rtx_vk, nvidia=[RTX]), family="olmoe")
         self.assertEqual(decision["backend"], "vulkan")
 
     def test_integrated_gpu_only_for_engines_measured_faster_there(self):
@@ -533,9 +533,17 @@ class CudaBackendChoice(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CUDA_ARCH": "sm_70"}):         # set by hand: kept
             self.assertEqual(self.choose([V100], None, tc=dict(TC_ALL, **tc))["make_args"], [])
 
-    def test_glm53_has_no_cuda_path(self):
-        decision = self.choose([RTX3090], "13.0.88", family="glm53", vulkan=DGPU)
-        self.assertEqual(decision["backend"], "vulkan")
+    def test_glm53_cuda_build_brings_vulkan(self):
+        """glm53, deepseek_v41 and mimo hold their routed experts on the CUDA tier; their CUDA
+        build has Vulkan too, which the engine runs on unless COLI_VULKAN=0 (its dense chain)."""
+        for family in ("glm53", "deepseek_v41", "mimo"):
+            with self.subTest(family=family):
+                decision = self.choose([RTX3090], "13.0.88", family=family, vulkan=DGPU)
+                self.assertEqual(decision["backend"], "cuda")
+                with modeled("linux"), mock.patch.dict(os.environ, {"ARCH": "", "CUDA_ARCH": ""}):
+                    cmd, _cwd, _env = setup_flow.make_command(family_by_id(family), "cuda", TC_ALL)
+                self.assertIn("CUDA=1", cmd)
+                self.assertIn("VK=1", cmd)
 
     def test_make_command_takes_the_decision_arguments(self):
         with modeled("linux"), mock.patch.dict(os.environ, {"ARCH": "", "CUDA_ARCH": ""}):

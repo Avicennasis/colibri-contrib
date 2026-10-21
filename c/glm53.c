@@ -99,9 +99,10 @@ static int g_vk_dense = 0;  /* the resident matrices run there (coli_vk_dense_de
 static int g_g53_partial = 0;
 #define G53_VK_MAY(w) ((!g_g53_partial || (w)->vk != NULL) && !((w)->vk && coli_vk_tensor_dev((const ColiVkTensor *)(w)->vk)))
 #endif
-#ifndef COLI_VULKAN   /* exclusive RAM/VRAM (vk_tier.h) is the Vulkan build's: no device holds an expert */
-static inline int  vkt_ram_first(int layer, int eid) { (void)layer; (void)eid; return 0; }
-static inline void vkt_ram_gave(void) {}
+#include "xtier.h"          /* the routed-expert tier on Vulkan or CUDA (XT); stubs without either */
+#ifdef COLI_CUDA
+#include "backend_cuda.h"
+static int g_g53_cu = 0;    /* COLI_CUDA=1 and the device opened for the tier */
 #endif
 #include "compat.h"
 #include "serve_poll.h"          /* CANCEL a meta' turno (#1332) */
@@ -776,8 +777,10 @@ typedef struct {
     ColiVisionTower vision;
     ColiVisionBlock *vblocks;
 } GModel;
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+static void glm53_vk_report(const GModel *m, const char *scope);   /* the tier's lines of a run or turn */
+#endif
 #ifdef COLI_VULKAN
-static void glm53_vk_report(const GModel *m, const char *scope);   /* the [VK] lines of a run or turn */
 /* the dense chain (glm53_chain.h): the session's KDA state between the host and the device */
 static void g53c_sync_host(const GModel *m, const GSession *s);
 static void g53c_host_wrote(const GSession *s);
@@ -2208,9 +2211,9 @@ static int expert_block_reserve(GModel *m, int index, const int *ids, int here,
             for (int j = 1; j < cache->n; j++)
                 if (cache->s[j].used < cache->s[lru].used) lru = j;
             for (int j = 0; j < cache->n; j++)
-                if (cache->s[j].eid >= 0 && vkt_ram_first(index, cache->s[j].eid) &&
+                if (cache->s[j].eid >= 0 && XT(ram_first)(index, cache->s[j].eid) &&
                     (dev < 0 || cache->s[j].used < cache->s[dev].used)) dev = j;
-            if (dev >= 0) { lru = dev; vkt_ram_gave(); }
+            if (dev >= 0) { lru = dev; XT(ram_gave)(); }
             victim = &cache->s[lru];
         }
         /* prenotato subito: cosi' la scelta successiva non lo ripesca */
@@ -2238,13 +2241,13 @@ static void expert_block_read(GModel *m, int index, const int *ids, int here,
     m->t_disk += now_s() - t_batch0;  /* fuori dalla regione omp: e' il muro del batch */
 }
 
-#ifdef COLI_VULKAN
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
 /* ---- the routed experts on the Vulkan device (COLI_VULKAN=1) -----------------------
  * The shared tier (vk_tier.c) keeps a cache of routed experts on the device: warm from
  * .coli_usage, then adapting (an expert the CPU computes is offered to it, promoted when
  * there is room or when it is hotter than the coldest resident, which is evicted).
  * ffn_layer_vk takes a layer's routed experts by blocks of GLM53_VK_ROWS rows: the
- * resident (row, rank) pairs go to the device as one batch (vkt_issue) while the CPU
+ * resident (row, rank) pairs go to the device as one batch (XT(issue)) while the CPU
  * reads and computes the others into rows of their own (ffn_vk_cpu: the cache-sized
  * blocks of ffn_layer), then every rank of every row joins `out` in routing order,
  * after the shared expert that ffn_layer wrote first. The device clamps exactly as
@@ -2331,9 +2334,9 @@ static void ffn_vk_cpu(GModel *m, int index, const float *x, int rows, int K, co
             mlp3_rows(tmp, xg, R, &gate, &up, &down, c->swiglu_limit, sg, su);
             for (int r = 0; r < R; r++)
                 memcpy(ctb + (size_t)rws[r] * D, tmp + (size_t)r * D, (size_t)D * sizeof(float));
-            if (note && (!g53_gx_ilv(m, index) || vkt_wants(index, eid))) {   /* converted only for the tier to take */
+            if (note && (!g53_gx_ilv(m, index) || XT(wants)(index, eid))) {   /* converted only for the tier to take */
                 VktExpertSrc src = glm53_slot_src(m, index, slot);
-                vkt_note(index, eid, &src);
+                XT(note)(index, eid, &src);
                 glm53_drop_rows(slot);
             }
         }
@@ -2343,26 +2346,26 @@ static void ffn_vk_cpu(GModel *m, int index, const float *x, int rows, int K, co
 static void ffn_layer_vk(GModel *m, int index, const float *x, int tokens, const int *chosen,
                          const float *weight, float *out, float *sg, float *su, float *tmp, float *xg) {
     const Cfg *c = &m->c;
-    const int D = c->hidden, K = c->topk, B = vkt_step_rows(tokens, GLM53_VK_ROWS), nmax = B * K;   /* a whole prompt chunk when the tier streams */
+    const int D = c->hidden, K = c->topk, B = XT(step_rows)(tokens, GLM53_VK_ROWS), nmax = B * K;   /* a whole prompt chunk when the tier streams */
     uint8_t *taken = calloc((size_t)nmax, 1), *want = calloc((size_t)nmax, 1);
     const float **dev = malloc((size_t)nmax * sizeof(*dev));
     float *ctb = malloc((size_t)nmax * D * sizeof(float));
     if (!taken || !want || !dev || !ctb) { fprintf(stderr, "OOM in the expert tier\n"); exit(1); }
     /* the first MoE layer of a forward pass: the tier cannot tell this from the layer
      * index alone when there is one MoE layer (the tiny fixtures) */
-    if (index == (c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin)) vkt_begin_forward();
+    if (index == (c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin)) XT(begin_forward)();
     for (int t0 = 0; t0 < tokens; t0 += B) {
         const int rows = tokens - t0 < B ? tokens - t0 : B, n = rows * K;
         const float *xb = x + (size_t)t0 * D;
         const int *ib = chosen + (size_t)t0 * K;
         const float *wb = weight + (size_t)t0 * K;
-        const int ndev = vkt_issue(index, xb, rows, K, ib, taken);   /* returns at once */
+        const int ndev = XT(issue)(index, xb, rows, K, ib, taken);   /* returns at once */
         for (int i = 0; i < n; i++) {
             if (taken[i]) ehit_mark(m, index, ib[i]);
             want[i] = !taken[i] && wb[i] != 0.0f;    /* ffn_layer skips a zero weight too */
         }
         ffn_vk_cpu(m, index, xb, rows, K, ib, want, ctb, sg, su, tmp, xg, 1);
-        if (ndev && !vkt_join(dev)) {               /* the batch failed (the tier stops): those pairs here */
+        if (ndev && !XT(join)(dev)) {               /* the batch failed (the tier stops): those pairs here */
             for (int i = 0; i < n; i++) want[i] = taken[i] && wb[i] != 0.0f;
             ffn_vk_cpu(m, index, xb, rows, K, ib, want, ctb, sg, su, tmp, xg, 0);
             memset(taken, 0, (size_t)n);
@@ -3266,10 +3269,10 @@ static void ffn_layer_ex(GModel *m, const GLayer *l, int index, const float *x,
         return;
     }
 
-#ifdef COLI_VULKAN
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
     /* CLUSTER_WORKERS wins over the device tier: the routed experts were put on
      * other machines on purpose, and the tier keeps what it already holds. */
-    if (vkt_ready() && !g_glm53_cluster_n) {   /* the expert tier: routed experts in rank order after the shared */
+    if (XT(ready)() && !g_glm53_cluster_n) {   /* the expert tier: routed experts in rank order after the shared */
         ffn_layer_vk(m, index, x, tokens, chosen, weight, out, sg, su, tmp, xg);
         free(row_w); free(row_t); free(xg); free(tmp); free(su); free(sg); free(weight); free(chosen);
         return;
@@ -5261,8 +5264,10 @@ static int serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
                elapsed > 0 ? emitted / elapsed : 0.0,
                m->miss + m->hits ? 100.0 * m->hits / (double)(m->hits + m->miss) : 0.0,
                rss_gb(), prompt_tokens, limited);
-#ifdef COLI_VULKAN
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
     glm53_vk_report(m, "turn");
+#endif
+#ifdef COLI_VULKAN
     g53c_report();   /* the dense chain's line, when it ran */
 #endif
     free(sequence);
@@ -5321,8 +5326,8 @@ static void emap_emit(GModel *m) {
             int tier = 0;                       /* 0 = su disco, 1 = in RAM (cache), 2 = sul device */
             if (m->ecache) { const LCache *cache = &m->ecache[i];
                 for (int j = 0; j < cache->n; j++) if (cache->s[j].eid == e) { tier = 1; break; } }
-#ifdef COLI_VULKAN
-            if (vkt_resident(i, e)) tier = 2;
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+            if (XT(resident)(i, e)) tier = 2;
 #endif
             const int b = tier << 6;            /* nessun contatore di calore qui: heat = 0 */
             hex[w++] = "0123456789abcdef"[b >> 4]; hex[w++] = "0123456789abcdef"[b & 15];
@@ -5350,12 +5355,34 @@ static void hits_emit(GModel *m) {
     serve_line("HITS %d %d %s\n", rows, cols, hex); free(hex); free(bm);
 }
 
-#ifdef COLI_VULKAN
-/* ---- COLI_VULKAN=1: the routed experts' tier, at startup ---------------------------
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+/* ---- the routed experts' tier, at startup (COLI_VULKAN=1, or COLI_CUDA=1: cu_tier.h) --------
  * After the weights and the history (glm53_telemetry_init): the streaming container's
  * int4-gs64 experts are described to the shared tier (vk_tier.c) and its warm start
  * reads the history's hottest. A device without the tier gets the resident matrices
  * back (the dense default for a run with no expert tier). */
+/* the device the tier runs on: whether it is open, a block type's elements there (0: no device
+ * form), and what its dense part still takes (the CUDA tier's engine keeps it on the CPU) */
+static int g53_tier_dev(void) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) return g_g53_cu;
+#endif
+#ifdef COLI_VULKAN
+    return g_vk_ready;
+#else
+    return 0;
+#endif
+}
+static int g53_block_elems(int fmt) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) return coli_cuda_block_elems(fmt);
+#endif
+#ifdef COLI_VULKAN
+    return coli_vk_block_elems(fmt);
+#else
+    (void)fmt; return 0;
+#endif
+}
 static int glm53_in_ram(void *ctx, int layer, int eid) {
     const GModel *m = ctx;
     if (!m->ecache || layer < 0 || layer >= m->c.n_layers) return 0;
@@ -5382,9 +5409,10 @@ static void glm53_ram_given(void *ctx, size_t bytes) {
         if (cap > cache->cap) cap = cache->cap;
         was = cache->cap; now = cap; cache->cap = cap;
     }
-    fprintf(stderr, "[VK] glm53: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
-            bytes / 1073741824.0, now, was);
+    fprintf(stderr, "%s glm53: the tier's host pool took %.1f GiB of the RAM the expert cache was sized from: %d slots a layer, not %d\n",
+            XT_TAG, bytes / 1073741824.0, now, was);
 }
+#ifdef COLI_VULKAN
 /* Bytes the resident matrices will take on the device: they upload at first use,
  * after the tier has taken its budget. */
 static size_t glm53_mat_dev_bytes(const Mat *w) {
@@ -5404,13 +5432,23 @@ static size_t glm53_dense_dev_bytes(const GModel *m) {
     }
     return b;
 }
+#endif
+/* what the dense part still puts on the tier's device after it starts */
+static size_t g53_tier_dense_bytes(const GModel *m) {
+#ifdef COLI_VULKAN
+    if (!xt_cuda())   /* a partial chain: nothing more of the trunk goes up, but the chain's first
+                       * forward allocates its scratch and the N layers' MLA caches */
+        return g_g53_partial ? g_g53c_lazy : g_vk_dense && !coli_vk_dense_device_only() ? glm53_dense_dev_bytes(m) : 0;
+#endif
+    (void)m; return 0;
+}
 static void glm53_vk_tier_start(GModel *m) {
-    if (!g_vk_ready) return;
+    if (!g53_tier_dev()) return;
     const Cfg *c = &m->c;
-    if (m->streaming && c->n_experts > 0 && vkt_wanted() && !(c->swiglu_limit > 0.f))
-        fprintf(stderr, "[VK] tier glm53: swiglu_limit is %g; the CPU clamps there (swiglu_clamped) and "
-                        "the device would not, so the routed experts stay on the CPU\n", c->swiglu_limit);
-    else if (m->streaming && c->n_experts > 0 && vkt_wanted()) {
+    if (m->streaming && c->n_experts > 0 && XT(wanted)() && !(c->swiglu_limit > 0.f))
+        fprintf(stderr, "%s tier glm53: swiglu_limit is %g; the CPU clamps there (swiglu_clamped) and "
+                        "the device would not, so the routed experts stay on the CPU\n", XT_TAG, c->swiglu_limit);
+    else if (m->streaming && c->n_experts > 0 && XT(wanted)()) {
         const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
         const int sparse = m->layer_end > from ? m->layer_end - from : 0;
         const int cap = m->ecache && sparse ? m->ecache[from].cap : 0;
@@ -5425,7 +5463,7 @@ static void glm53_vk_tier_start(GModel *m) {
             if (!lgu || !ldn) no = "out of memory";
             for (int l = from; !no && l < m->layer_end; l++) {
                 const int *t3 = m->gx_t + 3 * l;
-                const int bg = coli_vk_block_elems(100 + t3[0]), bd = coli_vk_block_elems(100 + t3[2]);
+                const int bg = g53_block_elems(100 + t3[0]), bd = g53_block_elems(100 + t3[2]);
                 if (t3[0] != t3[1]) no = "gate and up differ in type";
                 else if (!bg || !bd || c->hidden % bg || c->moe_inter % bd) no = "a type without a device form";
                 lgu[l] = (VktFmt){(VktSrc)(VKT_SRC_GGML + t3[0]), 0};
@@ -5443,14 +5481,14 @@ static void glm53_vk_tier_start(GModel *m) {
             if (!no) {
                 for (int l = 0; l < L; l++) if (l < from || l >= m->layer_end) { lgu[l] = lgu[best]; ldn[l] = ldn[best]; }
                 gu = lgu[best]; dn = ldn[best];
-                fprintf(stderr, "[VK] tier glm53: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down",
-                        gq_type_name(m->gx_t[3 * best]), gq_type_name(m->gx_t[3 * best + 2]));
+                fprintf(stderr, "%s tier glm53: the GGUF experts' blocks go to the device as the file has them (%s gate/up, %s down",
+                        XT_TAG, gq_type_name(m->gx_t[3 * best]), gq_type_name(m->gx_t[3 * best + 2]));
                 if (forms > 1) fprintf(stderr, " on %d of %d layers, the others their own types", bestn, sparse);
                 fprintf(stderr, ")\n");
                 if (forms == 1) { free(lgu); free(ldn); lgu = ldn = NULL; }
             } else {
                 free(lgu); free(ldn); lgu = ldn = NULL;
-                fprintf(stderr, "[VK] tier glm53: the GGUF's experts: %s; the routed experts stay on the CPU\n", no);
+                fprintf(stderr, "%s tier glm53: the GGUF's experts: %s; the routed experts stay on the CPU\n", XT_TAG, no);
             }
         }
         VktConfig vc = {.engine = "glm53", .layers = c->n_layers, .experts = c->n_experts,
@@ -5462,20 +5500,21 @@ static void glm53_vk_tier_start(GModel *m) {
                         .ram_floor = (size_t)c->topk * (size_t)sparse * (size_t)m->e_slot, .ram_given = glm53_ram_given,
                         /* a partial chain: nothing more of the trunk goes up, but the chain's first
                          * forward allocates its scratch and the N layers' MLA caches */
-                        .dense_bytes = g_g53_partial ? g_g53c_lazy
-                                     : g_vk_dense && !coli_vk_dense_device_only() ? glm53_dense_dev_bytes(m) : 0,
+                        .dense_bytes = g53_tier_dense_bytes(m),
                         .in_ram = glm53_in_ram, .ram_ctx = m,
                         .load = glm53_vk_load, .release = glm53_vk_unhold, .load_ctx = m,
                         .load_batch = glm53_vk_load_batch};
-        atexit(coli_vk_shutdown);   /* before vkt_init, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
-        const int tier_on = !no && vkt_init(&vc, rt_counts_all());
-        free(lgu); free(ldn);   /* read during vkt_init only */
+#ifdef COLI_VULKAN
+        if (!xt_cuda()) atexit(coli_vk_shutdown);   /* before the tier's start, which makes the expert batch's pipelines and can still refuse (no room): the device goes at exit either way, after the tier's teardown */
+#endif
+        const int tier_on = !no && XT(init)(&vc, rt_counts_all());
+        free(lgu); free(ldn);   /* read during XT(init) only */
         if (tier_on) {
-            atexit(vkt_shutdown);
+            atexit(XT(shutdown));
             const int all = c->n_layers * c->n_experts;
             int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
             const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
-            const int n = pl && pe && !(warm && *warm == '0') ? vkt_plan(pl, pe, all) : 0;
+            const int n = pl && pe && !(warm && *warm == '0') ? XT(plan)(pl, pe, all) : 0;
             if (n > 0) {
                 /* the warm start reads are not routing misses: the counters stay the run's */
                 const long hits = m->hits, miss = m->miss; const uint64_t eb = m->ebytes;
@@ -5487,27 +5526,45 @@ static void glm53_vk_tier_start(GModel *m) {
                     Slot tmp; memset(&tmp, 0, sizeof tmp); tmp.eid = -1;
                     expert_read(m, pl[i], pe[i], &tmp);
                     VktExpertSrc src = glm53_slot_src(m, pl[i], &tmp);
-                    vkt_put(pl[i], pe[i], &src);
+                    XT(put)(pl[i], pe[i], &src);
                     free(tmp.own); free(tmp.vk_rows);
                 }
-                vkt_put_done();
+                XT(put_done)();
                 m->hits = hits; m->miss = miss; m->ebytes = eb;
-                vkt_warm_report("glm53", n, now_s() - t0);
+                XT(warm_report)("glm53", n, now_s() - t0);
             }
             free(pl); free(pe);
         }
     }
-    if (!vkt_ready() && !g_vk_dense) {              /* no tier after all: the default place */
+#ifdef COLI_VULKAN
+    if (!xt_cuda() && !XT(ready)() && !g_vk_dense) {   /* no tier after all: the default place */
         g_vk_dense = coli_vk_dense_decide("glm53", 0, 1);
         if (g_vk_dense) fprintf(stderr, "Vulkan: active for resident matrices\n");
     }
+#endif
 }
 /* The device's lines at the end of a run or a serve turn. */
 static void glm53_vk_report(const GModel *m, const char *scope) {
-    if (!g_vk_ready) return;
-    vkt_report(scope, (unsigned long long)m->hits, (unsigned long long)m->miss);
-    fprintf(stderr, "[VK] glm53: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+    if (!g53_tier_dev()) return;
+    XT(report)(scope, (unsigned long long)m->hits, (unsigned long long)m->miss);
+#ifdef COLI_VULKAN
+    if (!xt_cuda()) fprintf(stderr, "[VK] glm53: %llu matmuls on the GPU\n", coli_vk_matmul_calls());
+#endif
 }
+#ifdef COLI_CUDA
+/* COLI_CUDA=1 with no Vulkan tier: the CUDA device opens for the routed experts, the same tier
+ * (cu_tier.h) holds them, the dense part stays on the CPU */
+static void glm53_cu_tier_start(GModel *m) {
+    const char *cu = getenv("COLI_CUDA");
+    int dev = 0;
+    if (!(cu && atoi(cu)) || XT(ready)() || !m->streaming || m->c.n_experts < 1 || !cut_wanted()) return;
+    if (!coli_cuda_init(&dev, 1)) { fprintf(stderr, "[CUDA] glm53: no CUDA device, the routed experts stay on the CPU\n"); return; }
+    g_g53_cu = 1;
+    xt_use_cuda(1);
+    glm53_vk_tier_start(m);
+    if (!cut_ready()) { xt_use_cuda(0); g_g53_cu = 0; }
+}
+#endif
 #endif
 
 static void serve_loop(GModel *m, Tok *tokenizer) {
@@ -5565,6 +5622,19 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
 
 #ifndef GLM53_NO_MAIN
 int main(int argc, char **argv) {
+#if defined(COLI_CUDA) && defined(COLI_VULKAN)
+    {   /* A build with both backends runs on Vulkan, the same card, when CUDA was asked for
+         * (COLI_CUDA=1) and COLI_VULKAN was not set: the dense chain puts the trunk on the card, where the CUDA tier
+         * leaves it on the CPU. COLI_VULKAN=0 keeps the CUDA tier; without a Vulkan
+         * device the CUDA tier still starts. */
+        const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
+        if (cu && atoi(cu) && !(vk && *vk)) {
+            setenv("COLI_VULKAN", "1", 1);
+            fprintf(stderr, "[CUDA] glm53: a build with Vulkan runs on it, the same card, its dense chain and expert tier "
+                            "(COLI_VULKAN=0 keeps the CUDA tier)\n");
+        }
+    }
+#endif
     /* Physical-core team sizing, the same shared helper colibri/inkling/
      * kimi_k3/olmoe/deepseek-v41 call. This engine has no OpenMP sizing of its
      * own, so on an SMT host it ran one thread per logical CPU; #718 measured
@@ -5614,6 +5684,11 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
         glm53_vk_tier_start(&served);   /* after the history: the warm start reads it */
         g53c_atexit();                  /* after the tier's: the chain goes before the device */
+#endif
+#ifdef COLI_CUDA
+        glm53_cu_tier_start(&served);   /* COLI_CUDA=1 with no Vulkan tier: the tier on the CUDA device */
+#endif
+#ifdef COLI_VULKAN
 #endif
         Tok serve_tok;
         char tokenizer_path[1024];
@@ -5676,6 +5751,11 @@ int main(int argc, char **argv) {
 #ifdef COLI_VULKAN
     glm53_vk_tier_start(&model);   /* after the history: the warm start reads it */
     g53c_atexit();                 /* after the tier's: the chain goes before the device */
+#endif
+#ifdef COLI_CUDA
+    glm53_cu_tier_start(&model);   /* COLI_CUDA=1 with no Vulkan tier: the tier on the CUDA device */
+#endif
+#ifdef COLI_VULKAN
 #endif
     const double load_seconds = now_s() - load_start;
     if (getenv("GLM53_VERBOSE")) cfg_report(&model.c);
@@ -5776,8 +5856,10 @@ int main(int argc, char **argv) {
     if (model.streaming)
         printf("experts hits %ld miss %ld bytes %llu\n",
                model.hits, model.miss, (unsigned long long)model.ebytes);
-#ifdef COLI_VULKAN
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
     glm53_vk_report(&model, "run");
+#endif
+#ifdef COLI_VULKAN
     g53c_report();
 #endif
 #ifdef COLI_METAL

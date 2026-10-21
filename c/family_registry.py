@@ -1627,15 +1627,13 @@ FAMILIES = (
         planner_id="deepseek_v41",
         planner_geometry=_dsv41_geometry,
         planner_unsupported_reason="",
-        # No VRAM tier to plan: the engine links no CUDA/Metal path. Since #1830 a
-        # VK=1 build can put its resident matrices on a Vulkan device
-        # (COLI_VULKAN=1), opt-in and outside the planner, which is why
-        # tests/test_registry_engine_agreement.py does not count VK_OBJ. The
-        # planner must not offer a VRAM tier it cannot execute. Left at the default True it wrote "VRAM 296.0 GB hot
-        # tier ... 100% projected expert residency" into `coli plan` for this
-        # model; resource_plan.py:945 is the gate and says the same thing in
-        # words ("a CPU-only engine has no VRAM tier").
-        supports_accelerator=False,
+        # A CUDA build holds the routed experts in VRAM on the shared tier
+        # (cu_tier.h, COLI_CUDA=1); a build with Vulkan too runs on Vulkan unless
+        # COLI_VULKAN=0. Before that the engine linked no CUDA/Metal path and this
+        # was False: the planner must not offer a VRAM tier it cannot execute
+        # (resource_plan.py's gate, "a CPU-only engine has no VRAM tier").
+        # tests/test_registry_engine_agreement.py holds it to the build rule.
+        supports_accelerator=True,
         expert_inventory=_dsv41_expert_inventory,
         resident_inventory=_dsv41_resident_inventory,
         config_section="text_config",
@@ -1681,11 +1679,10 @@ FAMILIES = (
         planner_id="mimo",
         planner_geometry=_mimo_geometry,
         planner_unsupported_reason="",
-        # No VRAM tier to plan: mimo.c links no CUDA/Metal backend. Its Vulkan path
-        # (#1830's dense matrices, and the routed experts on the shared Vulkan tier,
-        # vk_tier.c) is opt-in and outside the planner (see deepseek_v41 above for
-        # why the planner must not offer a VRAM tier the engine cannot use).
-        supports_accelerator=False,
+        # A CUDA build holds the routed experts in VRAM on the shared tier, as
+        # deepseek_v41's above (cu_tier.h); a build with Vulkan too runs on Vulkan
+        # unless COLI_VULKAN=0.
+        supports_accelerator=True,
         expert_inventory=_mimo_expert_inventory,
         resident_inventory=_mimo_resident_inventory,
         config_section="root",
