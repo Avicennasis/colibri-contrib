@@ -1554,9 +1554,15 @@ static int bd_tensor_gemm(DeviceContext *ctx, ColiCudaTensor *t, float *y, const
 static int bd_tensor_gemv(DeviceContext *ctx, ColiCudaTensor *t, float *y, const float *x, int S, cudaStream_t st) {
     const bd_u32 *tab = bd_table(ctx);
     if (!tab || ((uintptr_t)x & 15)) return 0;
-    if (S > BD_GEMV_MAX_S && bd_tensor_gemm(ctx, t, y, x, S, st)) return 1;
-    const char *e = std::getenv("COLI_CUDA_BD_FLOAT");   /* 1: the float form for every type (tests) */
-    if (!bd_gemv_launch(y, x, (const bd_u32 *)t->weights, tab, t->fmt, t->I, t->O, t->row_words, S, ctx->smem_optin, e && *e == '1', st)) return 0;
+    /* the float form for every type and every row count: COLI_CUDA_BD_FLOAT=1 (tests), or
+     * GQ_EXACT=1, where the CPU's GGUF matmuls are the float reference (as cu_xb.cu's) */
+    static int exact = -1;
+    if (exact < 0) {
+        const char *e = std::getenv("COLI_CUDA_BD_FLOAT"), *q = std::getenv("GQ_EXACT");
+        exact = (e && *e == '1') || (q && *q == '1');
+    }
+    if (!exact && S > BD_GEMV_MAX_S && bd_tensor_gemm(ctx, t, y, x, S, st)) return 1;
+    if (!bd_gemv_launch(y, x, (const bd_u32 *)t->weights, tab, t->fmt, t->I, t->O, t->row_words, S, ctx->smem_optin, exact, st)) return 0;
     return cuda_ok(cudaGetLastError(), "block gemv launch");
 }
 /* a block-format tensor in device memory the caller owns (an arena's slot of cap bytes):
