@@ -211,7 +211,11 @@ ring, wo, mHC) and enables the GPU decode attention/indexer paths;
 (route-aware refill, expert-grouped GEMM); `DSV4_CUDA_EXPERT_MIRRORS` is the
 decode-side VRAM expert cache; `V4_MOE_REFILL_GROUP` the refill lookup width.
 All default to CPU-safe values when unset; the GPU tier itself is on when the
-DLL loads (`DSV4_CUDA=0` disables it).
+DLL loads (`DSV4_CUDA=0` disables it). A GGUF on the CUDA expert tier
+(`COLI_CUDA=1`) is the exception: its dense matrices are already on the card
+(`COLI_CUDA_DENSE`), so the batched attention is on there unless
+`COLI_CUDA_ATTN_BATCH=0`; a layer without the FP8 `wq_a` mirror takes the
+device the engine opened.
 
 ## VRAM budget and per-card settings
 
@@ -429,7 +433,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 | `DSV4_CUDA` (1) | master switch for the V4 GPU tier; `0` = CPU only |
 | `DSV4_CUDA_DEVICE` (0) | CUDA device ordinal |
 | `COLI_DSV4_DLL` | Windows: force a backend DLL file name (loader) |
-| `COLI_CUDA_ATTN_BATCH` (0) | `1` = GPU batched prefill attention block + GPU decode attention/indexer |
+| `COLI_CUDA_ATTN_BATCH` (0; 1 for a GGUF on the CUDA expert tier) | `1` = GPU batched prefill attention block + GPU decode attention/indexer; unset, it is on for a GGUF whose dense matrices the CUDA expert tier's device holds (`COLI_CUDA=1`, `COLI_CUDA_DENSE`), `0` keeps it on the CPU |
 | `COLI_CUDA_MOE_BATCH` (0) | `1` = prefill MoE on the transient VRAM expert bank |
 | `COLI_CUDA_MOE_BATCH_MIN` (256) | min fresh tokens to engage the bank |
 | `DSV4_CUDA_EXPERT_MIRRORS` (4096) | upper bound on decode VRAM expert mirrors (12.75 MiB each); free VRAM sizes the cache at run time |

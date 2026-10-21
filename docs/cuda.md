@@ -162,12 +162,14 @@ DeepSeek V4 Flash UD-IQ1_S (82.5 GB) on an RTX PRO 4000 (24 GB, PCIe 4.0 x8) wit
 | CUDA, the experts on the CPU (the tier off) | 7.8-8.4 tok/s | 2.67-2.68 tok/s |
 | CUDA, the tier, the dense part on the CPU (`COLI_CUDA_DENSE=0`) | 14.0-14.1 tok/s | 4.11-4.19 tok/s |
 | CUDA, the tier and the dense part on the card | 17.4-18.8 tok/s | 7.23-7.70 tok/s |
+| CUDA, and the batched attention on the card (the default now) | 23.2-24.4 tok/s | 7.79-8.14 tok/s |
 | Vulkan (the tier and the dense chain) | 20-22 tok/s | 6.6-6.9 tok/s |
 
 - The CPU read the dense part (791 matrices, 5.98 GiB) every token: half of a decode step went to it.
 - On the card it leaves the tier 2333 experts instead of 3280, and the host pool 614 (4.25 GiB) instead of 7709: the pool takes what RAM has free less the room of the engine's expert cache, and the CPU computes the other experts from that cache (78.5% of the routed experts on the card, 95.6% before).
 - A pool that takes the cache's room instead (the cache down to its least, 22 slots a layer: 6215 experts in the pool, 509 disk reads against 4612) measured the same decode (7.60-7.69) and a slower prompt (15.1-15.4), so the cache keeps its room.
-- In the float forms (`GQ_EXACT=1 COLI_CUDA_BD_FLOAT=1 COLI_CUDA_BD_TILES=0`, and `COLI_VK_TIER_WARM=0`: the warm start places experts from many threads, so its pool can leave out a different few each run) the 40-token greedy text is the CPU's.
+- The batched attention (`COLI_CUDA_ATTN_BATCH`): the attention core, the indexer, the KV ring and the mHC mixes on the card. It used to find its device through a layer's FP8 `wq_a` mirror, which a GGUF never has, and stayed on the CPU (about 2.6 s of an 8.3 s prompt); a layer without that mirror takes the device the engine opened, and with the dense part on the card it is on unless `COLI_CUDA_ATTN_BATCH=0`. Two pairs of servers alternated: prompt 23.2-24.4 tok/s against 18.2-18.9 without it, decode 7.79-8.14 against 7.56-7.70.
+- In the float forms (`GQ_EXACT=1 COLI_CUDA_BD_FLOAT=1 COLI_CUDA_BD_TILES=0`, and `COLI_VK_TIER_WARM=0`: the warm start places experts from many threads, so its pool can leave out a different few each run) and `COLI_CUDA_ATTN_BATCH=0`, the 40-token greedy text is the CPU's. The batched attention sums in another order than the CPU's, and its text parts from the CPU's within those 40 tokens; take `COLI_CUDA_ATTN_BATCH=0` for a comparison with the CPU.
 
 The same models on the CPU, Vulkan and CUDA, one machine and one build: [gpu-parity.md](gpu-parity.md).
 

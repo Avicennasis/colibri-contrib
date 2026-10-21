@@ -21,13 +21,14 @@ performance and 8 efficiency cores) and 62 GB of RAM, on Linux.
 | Qwen3.6-35B-A3B, colibri int4 group 64 (22 GB) | 108-112 / 13.9-14.0 | 1242-1250 / 84.3-84.7 | 1332-1464 / 100.7-102.8 |
 | Qwen3.6-35B-A3B, GGUF Q4_K_M (21 GB) | 89-91 / 13.3-13.4 | 979-1067 / 73.9-74.4 | 882-941 / 97.8-98.4 |
 | Qwen3.8 Flash Next, GGUF IQ2_XS (64 GB) | 27.5-28.0 / 9.3-9.9 | 95.9-97.4 / 58.3-61.0 | 98.1-99.2 / 59.2-63.4 |
-| DeepSeek V4 Flash, GGUF UD-IQ1_S (82.5 GB) | 7.8 / 2.68 | 21.4-21.9 / 6.88-7.00 | 18.6-18.9 / 7.52-7.60 |
+| DeepSeek V4 Flash, GGUF UD-IQ1_S (82.5 GB) | 7.8 / 2.68 | 21.4-21.9 / 6.88-7.00 | 23.2-24.4 / 7.79-8.14 |
 | OLMoE-1B-7B, GGUF Q4_K_M (4 GB) | 94-97 / 41.0-42.7 | 2835-3170 / 205.9-206.3 | no CUDA path |
 
 Each cell is prefill / decode in tok/s, over runs 2 to 4 (the first run is left out because
 some engines still fill their caches then). On CUDA, Qwen3.6 and Qwen3.8 run their dense
 chain (`cuda_chain.cu`) beside their expert tiers. DeepSeek V4 runs the shared CUDA expert
-tier (`cu_tier`), with its dense matrices on the card a matrix at a time (`cu_dense.h`).
+tier (`cu_tier`), with its dense matrices on the card a matrix at a time (`cu_dense.h`) and
+its attention core there too (`COLI_CUDA_ATTN_BATCH`).
 
 ## What the table says
 
@@ -37,10 +38,10 @@ tier (`cu_tier`), with its dense matrices on the card a matrix at a time (`cu_de
   against 979-1067).
 - **Qwen3.8 Flash Next**, larger than the card (64 GB), comes out even: prefill 98-99 against
   96-97, decode 59-63 against 58-61.
-- **DeepSeek V4 Flash**, also larger than the card, decodes faster on CUDA (7.5-7.6 against
-  6.9-7.0) and reads a prompt faster on Vulkan (21-22 against 19). On CUDA the attention
-  core and the hyper-connection mixes stay on the CPU (about 2.6 s of an 8.3 s prompt),
-  where Vulkan's dense chain runs a layer's whole work on the card.
+- **DeepSeek V4 Flash**, also larger than the card, runs faster on CUDA: decode 7.8-8.1 against
+  6.9-7.0, prompt 23-24 against 21-22. The attention core, the indexer and the
+  hyper-connection mixes run on the card there too (`COLI_CUDA_ATTN_BATCH`, on by default for a
+  GGUF whose dense part the card holds); without them CUDA read a prompt at 18-19.
 - **OLMoE** has no CUDA path; Vulkan's chain runs it at 206 tok/s.
 - **Kimi K3** UD-IQ1_S (594 GB) was measured in two other sessions on this machine, with the
   same method: 0.4-0.5 / 0.18-0.22 on the CPU, 1.0 / 0.28 on Vulkan and 0.6 / 0.26 on CUDA.
@@ -61,5 +62,8 @@ whose CUDA path lacks Vulkan's dense chain on Vulkan unless `COLI_VULKAN=0`: a D
 GGUF, Kimi K3, Inkling, GLM-5.3, DeepSeek V4.1 and MiMo. `coli setup` builds both backends
 for them on an NVIDIA card.
 
-On the numbers above, DeepSeek V4's decode is the one place where that choice leaves speed
-behind: CUDA's is 9% higher, and Vulkan's prompt is 15% higher.
+On the numbers above, DeepSeek V4 is the one place where that choice leaves speed behind: on
+this 24 GB card `COLI_VULKAN=0` decodes 14% faster and reads a prompt 10% faster. The build
+still picks Vulkan for it, since CUDA keeps its dense part (6 GiB for V4 Flash) on the CPU
+where half of the card's free memory less the reserve does not hold it (a 12 GB card), and Vulkan's chain
+then still puts part of it on the card.
