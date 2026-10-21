@@ -13630,6 +13630,51 @@ static int v4_vk_matmul_impl(int fmt, const void *data, const float *scales,
     return ok ? 0 : -1;
 }
 
+#endif /* COLI_VULKAN: the per-matrix path */
+
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
+#include "xtier.h"   /* the tier on either device: vk_tier.h's calls, XT() */
+#ifndef COLI_VULKAN
+#include <pthread.h>
+static int g_v4_vk_ready;            /* no Vulkan in this build */
+static pthread_t g_v4_vk_thread;     /* the engine thread: the CUDA tier's start sets it */
+#endif
+#ifdef COLI_CUDA
+#include "backend_cuda.h"
+static int g_v4_cu_on;               /* the CUDA device open for the tier (v4_cu_open) */
+#endif
+static int v4_cu_ready(void) {
+#ifdef COLI_CUDA
+    return g_v4_cu_on;
+#else
+    return 0;
+#endif
+}
+/* the device the tier runs on: a block type's elements there (0: no device form), whether
+ * the dense matrices are there (the CUDA tier's engine keeps them on the CPU), and the device
+ * going at exit after the tier's teardown */
+static int v4_tier_block_elems(int fmt) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) return coli_cuda_block_elems(fmt);
+#endif
+#ifdef COLI_VULKAN
+    return coli_vk_block_elems(fmt);
+#else
+    (void)fmt; return 0;
+#endif
+}
+static int v4_tier_dense(void) {
+#ifdef COLI_VULKAN
+    if (!xt_cuda()) return coli_vk_dense();
+#endif
+    return 0;
+}
+static void v4_tier_atexit_device(void) {
+#ifdef COLI_VULKAN
+    if (!xt_cuda()) atexit(coli_vk_shutdown);
+#endif
+}
+
 /* ---- the routed-expert tier (vk_tier.c) ---------------------------------------
  * The experts as the store reads them: fp4 with a ue8m0 scale per 32 inputs
  * (MXFP4_E8M0, fmt 7 on the device), gate w1, up w3, down w2. The activation is
@@ -13638,9 +13683,8 @@ static int v4_vk_matmul_impl(int fmt, const void *data, const float *scales,
  * down's input to E4M3 per 128, and the device does the same. The MoE units reach
  * the tier through coli_v4_vk_tier, from this thread only (the issue declines any
  * other). A hot expert the store keeps in the rows16 layout is unpacked to rows
- * for the tier, and only when the tier will take it (vkt_wants). The history is
+ * for the tier, and only when the tier will take it (XT(wants)). The history is
  * the store's .coli_usage, and the warm start reads its experts outside the cache. */
-#include "vk_tier.h"
 static ColiV4VkTier g_v4_vkt;
 
 static int v4_vkt_thread(void) {
@@ -13653,14 +13697,14 @@ static int v4_vkt_thread(void) {
 static int v4_vkt_issue(int layer, const float *x, int S, int K, const int *idx,
                         const float *w, uint8_t *taken) {
     if (!v4_vkt_thread()) { memset(taken, 0, (size_t)S * K); return 0; }
-    return vkt_issue_w(layer, x, S, K, idx, w, taken);
+    return XT(issue_w)(layer, x, S, K, idx, w, taken);
 }
-static int v4_vkt_join(const float **rows) { return vkt_join(rows); }
+static int v4_vkt_join(const float **rows) { return XT(join)(rows); }
 static void v4_vkt_routed(ColiExpertKey key) { coli_v4_expert_store_note_routed(g_v4_vkt.store, key); }
 static int v4_vkt_in_ram(void *ctx, int layer, int expert) {
     return coli_v4_expert_store_in_ram((ColiExpertStore *)ctx, (ColiExpertKey){layer, expert});
 }
-static int v4_vkt_device_tier(int layer, int expert) { return vkt_resident(layer, expert); }
+static int v4_vkt_device_tier(int layer, int expert) { return XT(resident)(layer, expert); }
 
 /* rows16 (coli_fp4_pack_rows16_v10) back to rows: byte `column` of row `row` sits
  * at ((row / 16) * stride + column) * 16 + row % 16. */
@@ -13721,11 +13765,11 @@ static void v4_vkt_note(const ColiExpertView *view) {
     const ColiTensorView *m[3] = {&view->gate, &view->up, &view->down};
     int copy = 0;
     for (int k = 0; k < 3; k++) copy |= m[k]->block_rows == 16 || v4_vkt_ggml_r16(m[k]);
-    if (copy && !vkt_wants(layer, expert)) return;   /* converted only for the tier to take */
+    if (copy && !XT(wants)(layer, expert)) return;   /* converted only for the tier to take */
     VktExpertSrc src;
     unsigned char *buffer;
     if (v4_vkt_rows(view, &src, &buffer)) return;
-    vkt_note(layer, expert, &src);
+    XT(note)(layer, expert, &src);
     free(buffer);
 }
 
@@ -13752,9 +13796,9 @@ static void v4_vkt_unhold(void *ctx, void *h) {
 static void v4_vk_tier_start(const ColiV4Engine *engine) {
     const ColiDeepSeekV4Config *c = &engine->config;
     ColiExpertStore *store = engine->experts;
-    if (!g_v4_vk_ready || !store || c->n_routed_experts < 1 || !vkt_wanted()) return;
+    if (!(xt_cuda() ? v4_cu_ready() : g_v4_vk_ready) || !store || c->n_routed_experts < 1 || !XT(wanted)()) return;
     if (store->gpu) {
-        fprintf(stderr, "[VK] tier deepseek_v4: the CUDA expert tier is on and wins; the Vulkan tier stays off\n");
+        fprintf(stderr, "%s tier deepseek_v4: the CUDA expert tier is on and wins; the Vulkan tier stays off\n", XT_TAG);
         return;
     }
     uint64_t record = coli_v4_expert_store_record_bytes(store);
@@ -13777,7 +13821,7 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
         for (int l = 0; !no && l < L; l++) {
             if (coli_v4_expert_store_gguf_form(store, l, types, &mx) != 1) { no = "a layer without GGUF experts"; break; }
             if (mx) { lgu[l] = ldn[l] = f; continue; }
-            const int bg = coli_vk_block_elems(100 + types[0]), bd = coli_vk_block_elems(100 + types[2]);
+            const int bg = v4_tier_block_elems(100 + types[0]), bd = v4_tier_block_elems(100 + types[2]);
             if (types[0] != types[1]) no = "gate and up differ in type";
             else if (!bg || !bd || c->hidden_size % bg || c->moe_intermediate_size % bd)
                 no = "a type without a device form";
@@ -13796,13 +13840,13 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
         }
         if (!no && forms > VKT_FORMS - 1) no = "more distinct types than the tier holds";
         if (no) {
-            fprintf(stderr, "[VK] tier deepseek_v4: the GGUF's experts: %s; the tier stays off\n", no);
+            fprintf(stderr, "%s tier deepseek_v4: the GGUF's experts: %s; the tier stays off\n", XT_TAG, no);
             free(lgu); free(ldn);
             return;
         }
         mixed = forms > 1;
         gu = lgu[best]; dn = ldn[best];
-        fprintf(stderr, "[VK] tier deepseek_v4: the GGUF experts' blocks go to the device as the file has them (%s",
+        fprintf(stderr, "%s tier deepseek_v4: the GGUF experts' blocks go to the device as the file has them (%s", XT_TAG,
                 gu.kind == VKT_SRC_MXFP4_E8M0 ? "MXFP4" : gq_type_name((int)gu.kind - VKT_SRC_GGML));
         fprintf(stderr, " gate/up, %s down", dn.kind == VKT_SRC_MXFP4_E8M0 ? "MXFP4" : gq_type_name((int)dn.kind - VKT_SRC_GGML));
         if (mixed) fprintf(stderr, " on %d of %d layers, the others their own types", bestn, L);
@@ -13819,23 +13863,23 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
                         ? (size_t)(st.capacity_bytes - st.resident_bytes) : 0,
                     /* what the device has still to take: matrices placed already
                      * (the dense weights on the device only) are in its usage */
-                    .dense_bytes = coli_vk_dense() && !v4c_partial() && !v4c_whole()   /* a chain placed all it places */
+                    .dense_bytes = v4_tier_dense() && !v4c_partial() && !v4c_whole()   /* a chain placed all it places */
                         ? (size_t)(engine->dense_resident.total_bytes - engine->dense_resident.dropped_bytes + engine->head_cache.bytes) : 0,
                     .in_ram = v4_vkt_in_ram, .ram_ctx = store,
                     .load = v4_vkt_load, .release = v4_vkt_unhold, .load_ctx = store};
     /* The device goes before the drivers unload, after the tier's teardown (atexit runs
-     * last-registered first), and whether or not the tier starts: vkt_init makes the
+     * last-registered first), and whether or not the tier starts: XT(init) makes the
      * expert batch's pipelines before it can refuse (no room). */
-    atexit(coli_vk_shutdown);
-    const int tier_on = vkt_init(&vc, coli_v4_expert_store_history(store));
-    free(lgu); free(ldn);   /* read during vkt_init only */
+    v4_tier_atexit_device();
+    const int tier_on = XT(init)(&vc, coli_v4_expert_store_history(store));
+    free(lgu); free(ldn);   /* read during XT(init) only */
     if (!tier_on) return;
-    atexit(vkt_shutdown);
+    atexit(XT(shutdown));
     g_v4_vkt = (ColiV4VkTier){store, v4_vkt_issue, v4_vkt_join, v4_vkt_note, v4_vkt_routed};
     int all = c->num_hidden_layers * c->n_routed_experts;
     int *pl = malloc((size_t)all * sizeof(int)), *pe = malloc((size_t)all * sizeof(int));
     const char *warm = getenv("COLI_VK_TIER_WARM");   /* 0: no warm start, the tier fills as experts pass by */
-    int n = pl && pe && !(warm && *warm == '0') ? vkt_plan(pl, pe, all) : 0;
+    int n = pl && pe && !(warm && *warm == '0') ? XT(plan)(pl, pe, all) : 0;
     if (n > 0) {
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -13849,19 +13893,19 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
             if (buffer && !coli_v4_expert_store_read_private(
                               store, (ColiExpertKey){pl[i], pe[i]}, buffer, &view) &&
                 !v4_vkt_rows(&view, &src, &rows))
-                vkt_put(pl[i], pe[i], &src);
-            else vkt_put(pl[i], pe[i], NULL);   /* no read: the planned slot is given back */
+                XT(put)(pl[i], pe[i], &src);
+            else XT(put)(pl[i], pe[i], NULL);   /* no read: the planned slot is given back */
             free(rows);
             compat_aligned_free(buffer);   /* posix_memalign is _aligned_malloc on Windows (compat.h) */
         }
-        vkt_put_done();
+        XT(put_done)();
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        vkt_warm_report("deepseek_v4", n, (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9);
+        XT(warm_report)("deepseek_v4", n, (double)(t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9);
     }
     free(pl); free(pe);
     coli_v4_expert_store_device_tier = v4_vkt_device_tier;
-    coli_v4_expert_store_ram_first = vkt_ram_first;   /* exclusive RAM/VRAM (COLI_VK_TIER_EXCLUSIVE) */
-    coli_v4_expert_store_ram_gave = vkt_ram_gave;
+    coli_v4_expert_store_ram_first = XT(ram_first);   /* exclusive RAM/VRAM (COLI_VK_TIER_EXCLUSIVE) */
+    coli_v4_expert_store_ram_gave = XT(ram_gave);
     coli_v4_vk_tier = &g_v4_vkt;
 }
 
@@ -13869,9 +13913,9 @@ static void v4_vk_tier_start(const ColiV4Engine *engine) {
  * store's counters over the same span. */
 static void v4_vk_tier_report(const char *scope, unsigned long long hits,
                               unsigned long long misses) {
-    if (coli_v4_vk_tier) vkt_report(scope, hits, misses);
+    if (coli_v4_vk_tier) XT(report)(scope, hits, misses);
 }
-#endif
+#endif /* COLI_VULKAN || COLI_CUDA */
 
 #ifdef COLI_VULKAN
 /* the dense chain (deepseek_v4_chain.h, included below) */
@@ -14030,6 +14074,39 @@ static int v4_dho_place(ColiV4Engine *engine, int layer) {
 }
 #endif
 
+#ifdef COLI_CUDA
+/* ---- the routed-expert tier on a CUDA device (cu_tier.h: vk_tier.c over the CUDA backend) ----
+ * COLI_CUDA=1 with no Vulkan tier running: the CUDA device opens for the experts the tier
+ * holds, the dense part stays on the CPU, and the tier is the Vulkan one's code (XT): the same
+ * history, warm start, promotions and host pool. The FP4 checkpoint's own CUDA tier
+ * (store->gpu, DSV4_CUDA) wins when it is on, as it does over the Vulkan tier. */
+static void v4_cu_open(const ColiV4Engine *engine) {
+    const char *cu = getenv("COLI_CUDA");
+    if (coli_v4_vk_tier || !(cu && atoi(cu)) || !engine->experts || engine->experts->gpu) return;
+    int dev = 0;
+    if (!coli_cuda_init(&dev, 1)) {
+        fprintf(stderr, "[CUDA] deepseek_v4: no CUDA device, the experts stay on the CPU\n");
+        return;
+    }
+    g_v4_cu_on = 1;
+    g_v4_vk_thread = pthread_self();
+    xt_use_cuda(1);
+    v4_vk_tier_start(engine);
+    if (!coli_v4_vk_tier) { xt_use_cuda(0); g_v4_cu_on = 0; }
+}
+static void v4_cu_close(void) {
+    if (!xt_cuda() || !coli_v4_vk_tier) return;
+    ColiExpertStoreStats st = {0};
+    ColiExpertStore *store = coli_v4_vk_tier->store;
+    if (store && store->ops && store->ops->stats) store->ops->stats(store, &st);
+    v4_vk_tier_report("run", (unsigned long long)st.hits, (unsigned long long)st.misses);
+    coli_v4_vk_tier = NULL;
+    coli_v4_expert_store_device_tier = NULL;
+    coli_v4_expert_store_ram_first = NULL;
+    coli_v4_expert_store_ram_gave = NULL;
+}
+#endif
+
 static void v4_vk_open(const ColiV4Engine *engine) {
 #ifdef COLI_VULKAN
     v4_vk_device_open(engine);      /* opened already when the RAM plan asked */
@@ -14067,6 +14144,9 @@ static void v4_vk_open(const ColiV4Engine *engine) {
 #else
     (void)engine;
 #endif
+#ifdef COLI_CUDA
+    v4_cu_open(engine);
+#endif
 }
 
 /* Before the engine opens: the RAM plan may put the dense layers on the device only. */
@@ -14082,6 +14162,9 @@ static void v4_vk_hooks(void) {
 /* Once, at the end: what ran on the device, then the device copies go before the
  * engine frees the weights they mirror. */
 static void v4_vk_close(void) {
+#ifdef COLI_CUDA
+    v4_cu_close();
+#endif
 #ifdef COLI_VULKAN
     if (!g_v4_vk_ready) return;
     v4c_close();                    /* the chain's line, its frames through before the matrices go */
@@ -17164,8 +17247,10 @@ static void v4_serve_finish(ColiV4Engine *engine, ColiV4Session *session,
                 g_v4_hyb_gpu_n, g_v4_hyb_cpu_n, g_v4_hyb_upload_n,
                 g_v4_hyb_skip_n, g_v4_hyb_fill_bw, g_v4_hyb_host_bw);
 #endif
-#ifdef COLI_VULKAN
+#if defined(COLI_VULKAN) || defined(COLI_CUDA)
     v4_vk_tier_report("turn", (unsigned long long)hits, (unsigned long long)misses);
+#endif
+#ifdef COLI_VULKAN
     v4c_report();   /* the dense chain's line, when it ran */
 #endif
     coli_v4_expert_store_emit_hits(engine->experts);

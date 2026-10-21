@@ -829,8 +829,11 @@ ifeq ($(COLI_V4_SUPPORTED),1)
 # Makefile.deepseek-v4's own list stopped at the chain's first shaders. Without
 # qmatmul_bd.spv and qmatmul_gate_up_bd.spv a GGUF had no device form at all: the
 # chain and the tier of DeepSeek V4 Flash UD-IQ1_S stayed off, 0 matmuls on the GPU.
-deepseek-v4: $(VK_SPV)
-	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
+# CUDA=1 on Linux: the routed-expert tier on the CUDA device too (cu_tier.h), from this
+# Makefile's CUDA objects, which Makefile.deepseek-v4 links (V4_CUT_OBJS).
+V4_CUT_OBJS = $(if $(filter 1,$(CUDA)),$(if $(IS_WIN),,$(CUDA_OBJ)))
+deepseek-v4: $(VK_SPV) $(V4_CUT_OBJS)
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) V4_CUT_OBJS="$(V4_CUT_OBJS)" deepseek-v4
 
 deepseek-v4-clean:
 	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
