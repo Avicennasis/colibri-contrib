@@ -141,7 +141,25 @@ The routed-expert tier the Vulkan engines share (`c/vk_tier.c`, [vulkan.md](vulk
 - **Not on CUDA yet:** the dense chain's expert table, a second device, streaming a prompt's cold experts, and the low-bit formats (fmt 200-203).
 - **GLM-5.3 Flash, DeepSeek V4.1 and MiMo** (`COLI_CUDA=1`, no Vulkan tier): the CUDA device opens for the routed experts, as their checkpoint or a GGUF holds them, and the dense part stays on the CPU. `tests/cuda_tier_engines.sh` runs each of these engines and Kimi K3 on its tiny fixture against its CPU run on a CUDA card (the tokens, DeepSeek V4.1's oracle, Kimi K3's logits).
 - **Kimi K3** (`COLI_CUDA=1`, `K3_CUDA=1`, no Vulkan tier): the routed experts, a checkpoint's MXFP4 or a GGUF's blocks, resident in the tier from the history, with SiTU on the card. The per-call path that uploaded every routed MXFP4 expert at every decode step stays off once the tier is on; the experts it has not taken run on the CPU, and the dense part stays there.
-- **DeepSeek V4** (`make deepseek-v4 CUDA=1`, `COLI_CUDA=1` with no Vulkan tier) uses it for a GGUF's experts, which the FP4 checkpoint's own CUDA tier cannot take; that tier keeps the dense part on the card. DeepSeek V4 Flash UD-IQ1_S (82.5 GB) on an RTX PRO 4000 (24 GB) with 62 GB of RAM, a 163-token prompt and 128 tokens: 14.0-14.3 tok/s of prompt and 4.08-4.17 of decode, against 7.8-8.4 and 2.67-2.68 with the experts on the CPU. The card holds 3280 experts and the host pool the other 7710, so nothing comes from the disk; Vulkan, whose dense chain also puts the trunk on the card, does 20-22 and 6.6-6.9.
+- **DeepSeek V4** (`make deepseek-v4 CUDA=1`, `COLI_CUDA=1` with no Vulkan tier) uses it for a GGUF's experts, and puts the GGUF's dense matrices on the same card (below).
+
+### DeepSeek V4 with a GGUF on CUDA
+
+The FP4 checkpoint's own CUDA path mirrors native FP4 experts and FP8 and bf16 matrices only, so under it a GGUF's experts and its dense part stayed on the CPU. With `COLI_CUDA=1` the tier above takes the experts, and the dense matrices the engine keeps resident (attention, the compressors and the indexer, the shared expert, the head) go to the same card as the file's blocks: `cuda_bd.cuh`'s GEMV for a decode step, the tensor cores' tiles for a prompt chunk's rows. The engine reads its layers at start, so that the tier's budget leaves them their room, and each matrix goes up the first time it is used. `COLI_CUDA_DENSE=0` keeps them on the CPU.
+
+DeepSeek V4 Flash UD-IQ1_S (82.5 GB) on an RTX PRO 4000 (24 GB, PCIe 4.0 x8) with 62 GB of RAM and an i5-13500, a 120-word prompt (163 tokens) and 128 tokens, a warm-up and four runs, each server on a copy of one expert history:
+
+| | prompt | decode |
+|---|---|---|
+| CUDA, the experts on the CPU (the tier off) | 7.8-8.4 tok/s | 2.67-2.68 tok/s |
+| CUDA, the tier, the dense part on the CPU (`COLI_CUDA_DENSE=0`) | 14.0-14.1 tok/s | 4.11-4.19 tok/s |
+| CUDA, the tier and the dense part on the card | 17.4-18.8 tok/s | 7.23-7.70 tok/s |
+| Vulkan (the tier and the dense chain) | 20-22 tok/s | 6.6-6.9 tok/s |
+
+- The CPU read the dense part (791 matrices, 5.98 GiB) every token: half of a decode step went to it.
+- On the card it leaves the tier 2333 experts instead of 3280, and the host pool 614 (4.25 GiB) instead of 7709: the pool takes what RAM has free less the room of the engine's expert cache, and the CPU computes the other experts from that cache (78.5% of the routed experts on the card, 95.6% before).
+- A pool that takes the cache's room instead (the cache down to its least, 22 slots a layer: 6215 experts in the pool, 509 disk reads against 4612) measured the same decode (7.60-7.69) and a slower prompt (15.1-15.4), so the cache keeps its room.
+- In the float forms (`GQ_EXACT=1 COLI_CUDA_BD_FLOAT=1 COLI_CUDA_BD_TILES=0`, and `COLI_VK_TIER_WARM=0`: the warm start places experts from many threads, so its pool can leave out a different few each run) the 40-token greedy text is the CPU's.
 
 ## Notes and limitations
 
