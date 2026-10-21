@@ -48,7 +48,10 @@ jobs:
     # at 35 three times with every test passed so far (#1907, #1911 and a dev
     # run), after #1901 added its suites. 60 leaves room for the suites still
     # coming; a real hang still ends the job.
-    timeout-minutes: 60
+    # 2026-10-20: reached again. The job took 45 to 57 minutes when it passed
+    # (#2265 twice, #2266), and was cancelled at 60 twice, once 5 seconds after
+    # its 2695 tests had passed (#2267). 90.
+    timeout-minutes: 90
     defaults:
       run:
         shell: msys2 {0}

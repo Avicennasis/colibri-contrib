@@ -77,10 +77,14 @@ static const st_gg_name st_gg_dsv4_layer[] = {
 /* DeepSeek V4.1 (deepseek41, antirez's format): V4's names plus the engram's and the
  * router's second bias, under the names of DeepSeek's checkpoint, which deepseek_v41.c reads.
  * An engram table comes as one tensor of 264-byte rows (256 e4m3 then 8 e8m0), the
- * checkpoint's embed.weight and embed.scale side by side; the engine reads both forms. */
+ * checkpoint's embed.weight and embed.scale side by side; the engine reads both forms.
+ * The published deepseek41 GGUFs (K-quant and IQ types) have the same names, with
+ * every engram table in one per_layer_token_embd of a ggml type and the engram's
+ * q_weight * k_weight as one engram_gate. */
 static const st_gg_name st_gg_dsv41_glob[] = {
     {"token_embd.weight", "embed.weight"}, {"output_norm.weight", "norm.weight"},
     {"output.weight", "head.weight"},
+    {"per_layer_token_embd.weight", "engram.embed.weight"},   /* the published GGUFs': every engram table in one */
     {NULL, NULL}};
 static const st_gg_name st_gg_dsv41_layer[] = {
     {"hc_attn_fn.weight", "hc_attn_fn"}, {"hc_attn_base.weight", "hc_attn_base"},
@@ -108,6 +112,17 @@ static const st_gg_name st_gg_dsv41_layer[] = {
     {"ffn_up_exps.weight", "ffn.experts.%d.w3.weight"},
     {"engram_q_norm.weight", "engram.q_weight"}, {"engram_k_norm.weight", "engram.k_weight"},
     {"engram_kv.weight", "engram.wkv.weight"}, {"engram_embd.weight", "engram.embed.weight"},
+    {"engram_gate.weight", "engram.q_weight|engram.gate"},   /* the published GGUFs': q_weight * k_weight */
+    {NULL, NULL}};
+
+/* DeepSeek V4.1's DSpark head, which the published files ship as a GGUF of its own (arch
+ * dflash, gguf.json "dspark"): its stages are blk.<s> under V4.1's layer names, here
+ * mtp.<s>.; its own tensors are the first stage's (fc, enc.output_norm) or the last's,
+ * '@' standing for that stage's number. */
+static const st_gg_name st_gg_dflash_glob[] = {
+    {"fc.weight", "mtp.0.main_proj.weight"}, {"enc.output_norm.weight", "mtp.0.main_norm.weight"},
+    {"output_norm.weight", "mtp.@.norm.weight"}, {"conf_proj.weight", "mtp.@.confidence_head.proj.weight"},
+    {"markov_w1.weight", "mtp.@.markov_head.embed.weight"}, {"markov_w2.weight", "mtp.@.markov_head.head.weight"},
     {NULL, NULL}};
 
 /* Inkling (inkling): conversion/inkling.py of llama.cpp's PR (TML checkpoint names), here
@@ -244,6 +259,7 @@ static const st_gg_map st_gguf_maps[] = {
     {"glm5-next", "model.language_model.layers.%d.", st_gg_g5n_glob, st_gg_g5n_layer},
     {"deepseek4", "layers.%d.", st_gg_dsv4_glob, st_gg_dsv4_layer},
     {"deepseek41", "layers.%d.", st_gg_dsv41_glob, st_gg_dsv41_layer},
+    {"dflash", "mtp.%d.", st_gg_dflash_glob, st_gg_dsv41_layer},
     {"inkling", "model.layers.%d.", st_gg_ink_glob, st_gg_ink_layer},
 };
 
@@ -256,6 +272,7 @@ static const st_gg_map *st_gguf_map(const char *arch) {
 /* The GGUF metadata of the model st_init_gguf opened (architecture, tokenizer, ...): the
  * engine reads its config from here or from the config.json the importer wrote. */
 static gguf_ctx st_gguf_meta;
+static gguf_ctx st_gguf_head;   /* gguf.json "dspark": a draft head's own GGUF, when there is one */
 static int st_gguf_active;
 
 static int st_gguf_dtype(int type) {
@@ -304,31 +321,13 @@ static int st_gguf_packed(const gguf_ctx *G, st_gg_packed *p) {
     return 1;
 }
 
-/* 1 when snap_dir is a gguf_import folder and S now indexes its GGUF, 0 when it is not one.
- * A broken GGUF or one of an architecture without a map is fatal (the folder says GGUF). */
-static int st_init_gguf(shards *S, const char *snap_dir) {
-    char gj[4096]; snprintf(gj, sizeof gj, "%s/gguf.json", snap_dir);
-    FILE *f = fopen(gj, "rb");
-    if (!f) return 0;
-    char buf[16384]; size_t nb = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[nb] = 0;
-    char *arena = NULL; jval *root = json_parse(buf, &arena);
-    jval *gv = root ? json_get(root, "gguf") : NULL;
-    const char *g = gv && gv->t == J_STR ? gv->str : NULL;
-    if (!g || !*g) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: no \"gguf\" path", gj);
-    char path[4096];
-    gguf_path_join(path, sizeof path, snap_dir, g);
-    free(arena);
-    if (getenv("GGUF_CHECK")) gguf_header_only = 1;
-    gguf_ctx *G = &st_gguf_meta;
-    if (gguf_open(G, path)) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF: %s", G->err);
-    const char *arch = gguf_get_str(G, "general.architecture");
-    const st_gg_map *map = st_gguf_map(arch);
-    if (!map) coli_load_fail(COLI_LOAD_FAIL_UNSUPPORTED, "%s: GGUF architecture '%s' has no tensor map in st_gguf.h", path, arch ? arch : "?");
+/* One GGUF's tensors into S under the checkpoint's names (map). `last`: the number '@' stands
+ * for in a draft head's names (st_gg_dflash_glob). 1 when the file is a colibri container. */
+static int st_gguf_index(shards *S, const gguf_ctx *G, const st_gg_map *map, const char *path,
+                         const char *arch, int last, int *experts_out, int *renamed_out, int *kept_out) {
     int fds[ST_MAX_SHARDS];
     if (G->n_files > ST_MAX_SHARDS) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: %d parts", path, G->n_files);
     for (int p = 0; p < G->n_files; p++) fds[p] = st_open_fd(S, G->paths[p]);
-    S->cap = G->n_tensors + 16; S->t = (st_tensor *)calloc((size_t)S->cap, sizeof(st_tensor));
-    if (!S->t) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "out of memory indexing the GGUF");
     int experts = 0, renamed = 0, kept = 0;
     char nm[512];
     st_gg_packed pk = {0};
@@ -390,6 +389,8 @@ again:;
                 if (per_expert) snprintf(rest, sizeof rest, hf, x); else snprintf(rest, sizeof rest, "%s", hf);
                 if (L >= 0) { char pre[64]; snprintf(pre, sizeof pre, map->layer_fmt, L); snprintf(nm, sizeof nm, "%s%s", pre, rest); }
                 else snprintf(nm, sizeof nm, "%s", rest);
+                char *at = strchr(nm, '@');   /* a draft head's last stage */
+                if (at) { char tail[256]; snprintf(tail, sizeof tail, "%s", at + 1); snprintf(at, sizeof nm - (size_t)(at - nm), "%d%s", last, tail); }
             }
             st_tensor *s = st_gguf_add(S, nm);
             s->fd = fds[t->file]; s->off = (int64_t)t->off + slice * x; s->nbytes = slice;
@@ -404,6 +405,49 @@ again:;
             hf = rest_names; rest_names = bar ? bar + 1 : NULL;
             goto again;
         }
+    }
+    *experts_out += experts; *renamed_out += renamed; *kept_out += kept;
+    return packed;
+}
+
+/* 1 when snap_dir is a gguf_import folder and S now indexes its GGUF (and the draft head's,
+ * gguf.json "dspark"), 0 when it is not one. A broken GGUF or one of an architecture without
+ * a map is fatal (the folder says GGUF). */
+static int st_init_gguf(shards *S, const char *snap_dir) {
+    char gj[4096]; snprintf(gj, sizeof gj, "%s/gguf.json", snap_dir);
+    FILE *f = fopen(gj, "rb");
+    if (!f) return 0;
+    char buf[16384]; size_t nb = fread(buf, 1, sizeof buf - 1, f); fclose(f); buf[nb] = 0;
+    char *arena = NULL; jval *root = json_parse(buf, &arena);
+    jval *gv = root ? json_get(root, "gguf") : NULL, *hv = root ? json_get(root, "dspark") : NULL;
+    const char *g = gv && gv->t == J_STR ? gv->str : NULL;
+    if (!g || !*g) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: no \"gguf\" path", gj);
+    char path[4096], hpath[4096] = "";
+    gguf_path_join(path, sizeof path, snap_dir, g);
+    if (hv && hv->t == J_STR && hv->str[0]) gguf_path_join(hpath, sizeof hpath, snap_dir, hv->str);
+    free(arena);
+    if (getenv("GGUF_CHECK")) gguf_header_only = 1;
+    gguf_ctx *G = &st_gguf_meta;
+    if (gguf_open(G, path)) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF: %s", G->err);
+    const char *arch = gguf_get_str(G, "general.architecture");
+    const st_gg_map *map = st_gguf_map(arch);
+    if (!map) coli_load_fail(COLI_LOAD_FAIL_UNSUPPORTED, "%s: GGUF architecture '%s' has no tensor map in st_gguf.h", path, arch ? arch : "?");
+    S->cap = G->n_tensors + 16; S->t = (st_tensor *)calloc((size_t)S->cap, sizeof(st_tensor));
+    if (!S->t) coli_load_fail(COLI_LOAD_FAIL_NOMEM, "out of memory indexing the GGUF");
+    int experts = 0, renamed = 0, kept = 0;
+    const int packed = st_gguf_index(S, G, map, path, arch, 0, &experts, &renamed, &kept);
+    int head = 0;
+    if (hpath[0]) {   /* the draft head: its stages and its own tensors beside the model's */
+        gguf_ctx *H = &st_gguf_head;
+        if (gguf_open(H, hpath)) coli_load_fail(COLI_LOAD_FAIL_FORMAT, "GGUF %s: %s", hpath, H->err);
+        const char *ha = gguf_get_str(H, "general.architecture");
+        const int64_t stages = gguf_get_int(H, "dflash.block_count", 0);
+        if (!ha || strcmp(ha, "dflash") || stages < 1 || stages > 16)
+            coli_load_fail(COLI_LOAD_FAIL_FORMAT, "%s: not a DSpark head (architecture '%s', %lld stages)", hpath,
+                           ha ? ha : "?", (long long)stages);
+        const int was = S->n;
+        st_gguf_index(S, H, st_gguf_map("dflash"), hpath, ha, (int)stages - 1, &experts, &renamed, &kept);
+        head = S->n - was;
     }
     S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
     S->hidx = (int *)malloc((size_t)S->hcap * sizeof(int));
@@ -420,6 +464,7 @@ again:;
                     "%d kept as named), read in place\n",
             path, arch, G->n_files, S->n, renamed, experts,
             packed ? "matrices of the container's expert slots" : "fused expert tensors split", kept);
+    if (head) fprintf(stderr, "[gguf] the DSpark head from %s: %d of those tensors\n", hpath, head);
     return 1;
 }
 

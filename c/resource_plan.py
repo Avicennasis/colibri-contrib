@@ -1636,6 +1636,32 @@ def _gguf_tensor_sizes(parts, layers=None):
             reader.close()
 
 
+def _gguf_head(model_dir):
+    """gguf.json's "dspark": the path of a draft head's own GGUF (DeepSeek V4.1's DSpark), or None."""
+    link = Path(model_dir) / "gguf.json"
+    try:
+        head = json.loads(link.read_text(encoding="utf-8")).get("dspark")
+    except (OSError, ValueError):
+        return None
+    if not head:
+        return None
+    path = Path(head)
+    return path if path.is_absolute() else Path(model_dir) / path
+
+
+def _gguf_head_sizes(path, layers):
+    """(name, bytes, dtype, shape) for a draft head's own GGUF: its stages' routed experts
+    filed after the model's `layers` (the engine gives a stage an expert cache as it does a
+    layer, and _dsv41_expert_inventory files a checkpoint's mtp.* experts there too), the
+    rest under the head's names."""
+    for name, size, dtype, shape in _gguf_tensor_sizes([path], layers=1 << 30):
+        m = re.match(r"^model\.layers\.(\d+)\.mlp\.experts\.(.*)$", name)
+        if m:
+            yield f"model.layers.{layers + int(m.group(1))}.mlp.experts.{m.group(2)}", size, dtype, shape
+        else:
+            yield f"dspark.{name}", size, dtype, shape
+
+
 def analyze_model(model):
     resolved = resolve_model(model)
     model = Path(resolved.model_dir)
@@ -1700,6 +1726,9 @@ def analyze_model(model):
         try:
             sizes = (list(_gguf_tensor_sizes(shards, own_layers if isinstance(own_layers, int) else None)) if gguf
                      else list(_tensor_sizes(shard, with_shape=True)))
+            head = _gguf_head(model) if gguf and isinstance(own_layers, int) else None
+            if head is not None:
+                sizes += list(_gguf_head_sizes(head, own_layers))
         except OSError as error:
             # Name the file. An OSError raised by read() on an already-open
             # stream carries no filename, so `coli doctor` reported bare
@@ -3254,6 +3283,12 @@ CHAT_CONTEXT_STEPS = (16384, 32768, 65536, 131072, 262144)
 CHAT_CONTEXT_SHARE = 0.10
 CHAT_CONTEXT_AGENT = 65536
 CHAT_CONTEXT_AGENT_SHARE = 0.25
+# The engines that size their expert cache from the plan and cannot start without a
+# slot a layer (cap_for_arch): the plan reserves their workspace at the full context,
+# so the step counts it beside the state. DeepSeek V4.1 prefills a prompt in one
+# forward, about 200 KB a token: on a 64 GB box the 262144 the state alone allowed
+# took 53.7 GB of workspace, left the cache no slot, and `coli serve` did not start.
+CHAT_CONTEXT_WORKSPACE = ("deepseek_v41", "mimo")
 
 
 def chat_context(model, env=None, kv_slots=1, available=None):
@@ -3288,18 +3323,22 @@ def chat_context(model, env=None, kv_slots=1, available=None):
         if step <= chosen or step > limits.max_context:
             continue
         try:
-            state = planner_geometry(resolved, step).context_state_bytes
+            geometry = planner_geometry(resolved, step)
         except ValueError:
             break
+        workspace = geometry.workspace_bytes if family.id in CHAT_CONTEXT_WORKSPACE else 0
         share = CHAT_CONTEXT_AGENT_SHARE if step <= CHAT_CONTEXT_AGENT else CHAT_CONTEXT_SHARE
-        if state * kv_slots > share * budget:
+        if geometry.context_state_bytes * kv_slots + workspace > share * budget:
             break
         chosen = step
     if chosen == base:
         return None, f"{base} tokens is what {budget / GB:.1f} GB allows"
-    state = planner_geometry(resolved, chosen).context_state_bytes * kv_slots
-    return chosen, (f"{chosen} tokens of context ({state / GB:.1f} GB of conversation state "
-                    f"of {budget / GB:.1f} GB); --ctx sets it")
+    geometry = planner_geometry(resolved, chosen)
+    state = geometry.context_state_bytes * kv_slots
+    workspace = (f" and {geometry.workspace_bytes / GB:.1f} GB of prompt workspace"
+                 if family.id in CHAT_CONTEXT_WORKSPACE else "")
+    return chosen, (f"{chosen} tokens of context ({state / GB:.1f} GB of conversation state"
+                    f"{workspace} of {budget / GB:.1f} GB); --ctx sets it")
 
 
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,

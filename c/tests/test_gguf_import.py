@@ -210,6 +210,172 @@ def write_glmdsa(path, rng):
     w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
 
 
+def write_deepseek41(path, rng):
+    """A published deepseek41 GGUF (DeepSeek V4.1 Flash), small: no deepseek41.config, the
+    config as keys; the compressors (KV sources 1 and 3, a gate where the ratio is 2) and
+    the indexer (1, 3 and 4) in BF16; the experts in IQ1_S as the UD-IQ1_S file has them,
+    with IQ2_XXS, Q4_K and Q5_K in other layers; the trunk in Q5_K, Q6_K and Q8_0; every
+    engram table in one IQ4_NL per_layer_token_embd under global head offsets, and each
+    engram layer's gate as one engram_gate (deepseek_v41's GGUF gates)."""
+    w = gguf.GGUFWriter(str(path), "deepseek41")
+    p = "deepseek41."
+    VT = gguf.GGUFValueType
+    layers, h, mi, e, k, heads, hd, rope, ql, ol, og = 6, 256, 256, 8, 2, 4, 64, 16, 64, 32, 2
+    hc, ih, ihd, ngram, eh, ehd, evocab = 4, 4, 32, 4, 2, 32, 97
+    ratios, kv_src, idx_src, eng = [0, 2, 2, 1, 1, 0], [1, 3], [1, 3, 4], [1, 4]
+    for key, v in (("block_count", layers), ("context_length", 4096), ("embedding_length", h),
+                   ("attention.head_count", heads), ("attention.head_count_kv", 1), ("expert_count", e),
+                   ("expert_used_count", k), ("expert_gating_func", 4), ("attention.key_length", hd),
+                   ("attention.value_length", hd), ("rope.dimension_count", rope), ("attention.q_lora_rank", ql),
+                   ("attention.sliding_window", 8), ("expert_feed_forward_length", mi), ("expert_shared_count", 1),
+                   ("attention.indexer.head_count", ih), ("attention.indexer.key_length", ihd),
+                   ("attention.indexer.top_k", 4), ("attention.output_group_count", og),
+                   ("attention.output_lora_rank", ol), ("hyper_connection.count", hc),
+                   ("hyper_connection.sinkhorn_iterations", 20), ("attention.indexer.candidate_source_layer", 3),
+                   ("attention.indexer.candidate_top_k_blocks", 2), ("attention.indexer.candidate_block_size", 2),
+                   ("rope.scaling.original_context_length", 32), ("ple.ngram_size", ngram),
+                   ("ple.heads_per_ngram", eh), ("embedding_length_per_layer_input", ehd),
+                   ("engram.vocab_size", evocab), ("engram.pad_token_id", 2), ("engram.compressed_vocab_size", 64)):
+        w.add_uint32(p + key, v)
+    for key, v in (("rope.freq_base", 10000.0), ("rope.scaling.factor", 16.0), ("attention.layer_norm_rms_epsilon", 1e-20),
+                   ("expert_weights_scale", 1.5), ("attention.compress_rope_freq_base", 40000.0),
+                   ("hyper_connection.epsilon", 1e-6), ("rope.scaling.yarn_beta_fast", 32.0),
+                   ("rope.scaling.yarn_beta_slow", 1.0)):
+        w.add_float32(p + key, v)
+    w.add_string(p + "rope.scaling.type", "yarn"); w.add_bool(p + "expert_weights_norm", True)
+    w.add_array(p + "swiglu_clamp_exp", [10.0] * layers); w.add_array(p + "swiglu_clamp_shexp", [10.0] * layers)
+    w.add_array(p + "attention.compress_ratios", ratios); w.add_array(p + "attention.kv_source_layers", kv_src)
+    w.add_array(p + "attention.indexer.source_layers", idx_src); w.add_array(p + "ple.layers", eng)
+    for key, v in (("dspark.block_size", 3), ("dspark.noise_token_id", 7), ("dspark.markov_rank", 32),
+                   ("dspark.expert_count", 4), ("dspark.expert_used_count", 2)):   # write_dflash's head
+        w.add_uint32(p + key, v)
+    w.add_array(p + "dspark.target_layers", [3, 4, 5])
+    # The engram: per layer, (ngram - 1) * heads buckets of distinct primes above the
+    # engram vocabulary, their offsets running over every layer's (one tensor holds all),
+    # and a layer's ngram odd hash multipliers, past 32 bits as the file's are.
+    primes, c = [], evocab - 1
+    while len(primes) < len(eng) * (ngram - 1) * eh:
+        c += 1
+        if all(c % d for d in range(2, int(c ** 0.5) + 1)):
+            primes.append(c)
+    offsets = [sum(primes[:i]) for i in range(len(primes))]
+    mult = [int(x) * 2 + 1 for x in rng.integers(1 << 40, 1 << 50, size=len(eng) * ngram)]
+    w.add_key_value(p + "ple.head_vocab_sizes", primes, VT.ARRAY, sub_type=VT.UINT32)
+    w.add_key_value(p + "ple.head_offsets", offsets, VT.ARRAY, sub_type=VT.UINT64)
+    w.add_key_value(p + "ple.layer_multipliers", mult, VT.ARRAY, sub_type=VT.UINT64)
+    w.add_array(p + "engram.token_map", [i % 64 for i in range(VOCAB)])
+    toks = [f"<0x{b:02X}>" if b < 256 else f"t{b}" for b in range(VOCAB - 3)] + ["<|begin_of_sentence|>", "<|end_of_sentence|>", "<|pad|>"]
+    w.add_tokenizer_model("gpt2"); w.add_token_list(toks)
+    w.add_token_types([1] * (VOCAB - 3) + [3, 3, 3]); w.add_token_merges([])
+    w.add_bos_token_id(VOCAB - 3); w.add_eos_token_id(VOCAB - 2)
+
+    def f32(name, shape, std=0.02, base=0.0):
+        w.add_tensor(name, (base + rng.standard_normal(shape) * std).astype(np.float32))
+    def bf16(name, shape, std=0.02, base=0.0):
+        v = (base + rng.standard_normal(shape) * std).astype(np.float32)
+        raw = (v.view(np.uint32) >> 16).astype(np.uint16).view(np.uint8).reshape(*shape[:-1], shape[-1] * 2)
+        w.add_tensor(name, raw, raw_dtype=QT.BF16)
+    def q(name, shape, t): w.add_tensor(name, blocks(t, shape, rng), raw_dtype=QT[t])
+    q("token_embd.weight", (VOCAB, h), "Q8_0"); q("output.weight", (VOCAB, h), "Q6_K")
+    w.add_tensor("output_norm.weight", np.ones(h, np.float32))
+    q("per_layer_token_embd.weight", (sum(primes), ehd), "IQ4_NL")
+    mix = (2 + hc) * hc
+    for L in range(layers):
+        b = f"blk.{L}."
+        f32(b + "attn_norm.weight", (h,), 0.01, 1.0); f32(b + "ffn_norm.weight", (h,), 0.01, 1.0)
+        for which in ("attn", "ffn"):
+            f32(b + f"hc_{which}_fn.weight", (mix, hc * h), 0.01); f32(b + f"hc_{which}_base.weight", (mix,), 0.1)
+            w.add_tensor(b + f"hc_{which}_scale.weight", np.full(3, 0.5, np.float32))
+        f32(b + "attn_sinks.weight", (heads,), 0.1)
+        q(b + "attn_q_a.weight", (ql, h), "Q5_K" if L % 2 else "Q6_K")
+        w.add_tensor(b + "attn_q_a_norm.weight", np.ones(ql, np.float32))
+        q(b + "attn_q_b.weight", (heads * hd, ql), "Q8_0")
+        q(b + "attn_kv.weight", (hd, h), "Q6_K")
+        w.add_tensor(b + "attn_kv_a_norm.weight", np.ones(hd, np.float32))
+        q(b + "attn_output_a.weight", (og * ol, heads * hd // og), "Q8_0")
+        q(b + "attn_output_b.weight", (h, og * ol), "Q8_0")
+        if L in kv_src:
+            bf16(b + "attn_compressor_kv.weight", (hd, h))
+            w.add_tensor(b + "attn_compressor_norm.weight", np.ones(hd, np.float32))
+            if ratios[L] > 1:
+                bf16(b + "attn_compressor_gate.weight", (hd, h))
+        if L in idx_src:
+            bf16(b + "indexer.attn_q_b.weight", (ih * ihd, ql)); bf16(b + "indexer.proj.weight", (ih, h))
+            if L in kv_src:
+                bf16(b + "indexer.attn_k.weight", (ihd, hd))
+                w.add_tensor(b + "indexer.k_norm.weight", np.ones(ihd, np.float32))
+        f32(b + "ffn_gate_inp.weight", (e, h), 0.05)
+        f32(b + "exp_probs_b.bias", (e,), 0.1); f32(b + "exp_probs_b_vl.bias", (e,), 0.1)
+        q(b + "ffn_gate_shexp.weight", (mi, h), "Q6_K" if L % 2 else "Q8_0")
+        q(b + "ffn_up_shexp.weight", (mi, h), "Q6_K" if L % 2 else "Q8_0")
+        q(b + "ffn_down_shexp.weight", (h, mi), "Q6_K")
+        gu = {0: "IQ2_XXS", 5: "Q4_K"}.get(L, "IQ1_S")
+        q(b + "ffn_gate_exps.weight", (e, mi, h), gu); q(b + "ffn_up_exps.weight", (e, mi, h), gu)
+        q(b + "ffn_down_exps.weight", (e, h, mi), {0: "IQ2_XXS", 5: "Q5_K"}.get(L, "IQ1_S"))
+        if L in eng:
+            f32(b + "engram_gate.weight", (hc, h), 0.05, 1.0)
+            q(b + "engram_kv.weight", (h * (hc + 1), (ngram - 1) * eh * ehd), "Q8_0")
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+
+
+def write_dflash(path, rng, targets=(3, 4, 5)):
+    """write_deepseek41's DSpark head as the published files ship it, a GGUF of its own (arch
+    dflash): two stages as blk.<s> under V4.1's layer names, MXFP4 routed experts (4, 2 a
+    token) and Q8_0 projections, and beside them fc (the target layers 3, 4 and 5 into the
+    width), enc.output_norm, output_norm, conf_proj and the BF16 Markov head (rank 32). The
+    experts' e8m0 scales are 2^-7 to 2^-4 (make_blocks draws any byte, 2^127 among them)."""
+    w = gguf.GGUFWriter(str(path), "dflash")
+    p = "dflash."
+    stages, h, mi, e, k, heads, hd, ql, ol, og, hc, rank = 2, 256, 256, 4, 2, 4, 64, 64, 32, 2, 4, 32
+    for key, v in (("block_count", stages), ("context_length", 4096), ("embedding_length", h),
+                   ("feed_forward_length", mi), ("attention.head_count", heads), ("attention.head_count_kv", 1),
+                   ("attention.key_length", hd), ("attention.value_length", hd), ("rope.dimension_count", 16),
+                   ("attention.q_lora_rank", ql), ("attention.sliding_window", 8), ("expert_count", e),
+                   ("expert_used_count", k), ("expert_feed_forward_length", mi), ("expert_shared_count", 1),
+                   ("expert_gating_func", 4), ("attention.output_group_count", og), ("attention.output_lora_rank", ol),
+                   ("hyper_connection.count", hc), ("hyper_connection.sinkhorn_iterations", 20), ("block_size", 3)):
+        w.add_uint32(p + key, v)
+    w.add_array(p + "target_layers", list(targets)); w.add_array(p + "attention.compress_ratios", [0] * stages)
+
+    def f32(name, shape, std=0.02, base=0.0):
+        w.add_tensor(name, (base + rng.standard_normal(shape) * std).astype(np.float32))
+    def bf16(name, shape, std=0.05):
+        v = (rng.standard_normal(shape) * std).astype(np.float32)
+        w.add_tensor(name, (v.view(np.uint32) >> 16).astype(np.uint16).view(np.uint8).reshape(*shape[:-1], shape[-1] * 2),
+                     raw_dtype=QT.BF16)
+    def q(name, shape, t):
+        if t == "MXFP4":   # each block's e8m0 byte first, then its 16 bytes of codes
+            rows, nb = int(np.prod(shape[:-1])), shape[-1] // 32
+            raw = make_blocks("MXFP4", rows * nb, rng)
+            raw[:, 0] = rng.integers(120, 124, size=rows * nb, dtype=np.uint8)
+            raw = raw.reshape(*shape[:-1], nb * 17)
+        else:
+            raw = blocks(t, shape, rng)
+        w.add_tensor(name, raw, raw_dtype=QT[t])
+    mix = (2 + hc) * hc
+    for S in range(stages):
+        b = f"blk.{S}."
+        f32(b + "attn_norm.weight", (h,), 0.01, 1.0); f32(b + "ffn_norm.weight", (h,), 0.01, 1.0)
+        for which in ("attn", "ffn"):
+            f32(b + f"hc_{which}_fn.weight", (mix, hc * h), 0.01); f32(b + f"hc_{which}_base.weight", (mix,), 0.1)
+            w.add_tensor(b + f"hc_{which}_scale.weight", np.full(3, 0.5, np.float32))
+        f32(b + "attn_sinks.weight", (heads,), 0.1)
+        q(b + "attn_q_a.weight", (ql, h), "Q8_0"); w.add_tensor(b + "attn_q_a_norm.weight", np.ones(ql, np.float32))
+        q(b + "attn_q_b.weight", (heads * hd, ql), "Q8_0")
+        q(b + "attn_kv.weight", (hd, h), "Q8_0"); w.add_tensor(b + "attn_kv_a_norm.weight", np.ones(hd, np.float32))
+        q(b + "attn_output_a.weight", (og * ol, heads * hd // og), "Q8_0"); q(b + "attn_output_b.weight", (h, og * ol), "Q8_0")
+        f32(b + "ffn_gate_inp.weight", (e, h), 0.05); f32(b + "exp_probs_b.bias", (e,), 0.1)
+        q(b + "ffn_gate_shexp.weight", (mi, h), "Q8_0"); q(b + "ffn_up_shexp.weight", (mi, h), "Q8_0")
+        q(b + "ffn_down_shexp.weight", (h, mi), "Q8_0")
+        q(b + "ffn_gate_exps.weight", (e, mi, h), "MXFP4"); q(b + "ffn_up_exps.weight", (e, mi, h), "MXFP4")
+        q(b + "ffn_down_exps.weight", (e, h, mi), "MXFP4")
+    q("fc.weight", (h, len(targets) * h), "Q8_0")
+    w.add_tensor("enc.output_norm.weight", np.ones(h, np.float32)); w.add_tensor("output_norm.weight", np.ones(h, np.float32))
+    f32("conf_proj.weight", (1, h + rank), 0.05)
+    bf16("markov_w1.weight", (VOCAB, rank)); bf16("markov_w2.weight", (VOCAB, rank))
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+
+
 def engine_tokens(snap, ref, env=None):
     p = subprocess.run([str(ENGINE), "2", "8", str(ref)], env=dict(os.environ, SNAP=str(snap), OMP_NUM_THREADS="2",
                        COLI_NO_OMP_TUNE="1", **(env or {})), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -706,6 +872,119 @@ class DeepSeek41Config(unittest.TestCase):
         self.assertEqual(resident("blk.1.engram_embd.weight", 10 ** 11, {}), 0)          # a GGUF's table
         self.assertEqual(resident("layers.1.engram.embed.weight", 10 ** 11, {}), 0)      # the checkpoint's
         self.assertEqual(resident("blk.1.engram_kv.weight", 1000, {}), 1000)             # its projection is resident
+
+
+@unittest.skipIf(gguf is None, "gguf-py (pip install gguf) is not installed")
+class DeepSeek41DSparkHead(unittest.TestCase):
+    """The published files' DSpark head, a dflash GGUF: --mtp links it (checked against the
+    model's keys, named in gguf.json); one next to the model is only named, since its
+    drafts measured slower on UD-IQ1_S."""
+    def test_the_head_next_to_the_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_deepseek41(d / "ds41.gguf", np.random.default_rng(3))
+            head = d / "dspark-ds41-Q8_0.gguf"
+            write_dflash(head, np.random.default_rng(4))
+            for flag, want in ((["--mtp", str(head)], True), ([], False)):
+                out = d / ("dir" if want else "plain")
+                p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(d / "ds41.gguf"), str(out), *flag],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                self.assertEqual(p.returncode, 0, p.stdout.decode())
+                link = json.loads((out / "gguf.json").read_text())
+                text = json.loads((out / "config.json").read_text())["text_config"]
+                if not want:
+                    self.assertNotIn("dspark", link); self.assertNotIn("n_mtp_layers", text)
+                    self.assertIn(f"none linked; {head} is this model's, --mtp links it", p.stdout.decode())
+                    continue
+                self.assertEqual(Path(link["dspark"]), (d / "dspark-ds41-Q8_0.gguf").resolve())
+                self.assertEqual({k: v for k, v in text.items() if k == "n_mtp_layers" or k.startswith("dspark_")},
+                                 {"n_mtp_layers": 2, "dspark_block_size": 3, "dspark_noise_token_id": 7,
+                                  "dspark_target_layer_ids": [3, 4, 5], "dspark_markov_rank": 32,
+                                  "dspark_n_routed_experts": 4, "dspark_n_activated_experts": 2})
+
+    def test_a_head_of_another_model_is_passed_over(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_deepseek41(d / "ds41.gguf", np.random.default_rng(3))
+            other = d / "dspark-other-Q8_0.gguf"
+            write_dflash(other, np.random.default_rng(4), targets=(2, 4, 5))
+            p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(d / "ds41.gguf"), str(d / "out")],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertEqual(p.returncode, 0, p.stdout.decode())
+            self.assertIn("DSpark head: none found", p.stdout.decode())   # not named: not this model's
+            p = subprocess.run([sys.executable, str(HERE / "tools" / "gguf_import.py"), str(d / "ds41.gguf"), str(d / "out2"),
+                                "--mtp", str(other)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("its target layers are not the model's", p.stdout.decode())
+
+
+class DeepSeek41PublishedConfig(unittest.TestCase):
+    """The published deepseek41 GGUFs (K-quant and IQ types): no deepseek41.config, so the
+    checkpoint's text_config from the keys, and the sidecar from the ple keys, whose head offsets
+    run over every table in one tensor (per_layer_token_embd); the planner keeps it on disk."""
+    P = "deepseek41."
+
+    def meta(self, **over):
+        p = self.P
+        m = {p + k: v for k, v in {
+            "block_count": 2, "context_length": 1048576, "embedding_length": 256, "attention.head_count": 4,
+            "attention.head_count_kv": 1, "attention.key_length": 64, "rope.dimension_count": 16,
+            "attention.q_lora_rank": 32, "attention.output_lora_rank": 32, "attention.output_group_count": 2,
+            "attention.layer_norm_rms_epsilon": 1e-20, "expert_count": 8, "expert_used_count": 2,
+            "expert_feed_forward_length": 64, "expert_shared_count": 1, "expert_weights_scale": 1.5,
+            "expert_weights_norm": True, "expert_gating_func": 4, "swiglu_clamp_exp": [10.0, 10.0],
+            "attention.sliding_window": 128, "attention.compress_ratios": [0, 2, 0], "attention.compress_rope_freq_base": 160000.0,
+            "attention.kv_source_layers": [1], "attention.indexer.source_layers": [1],
+            "attention.indexer.head_count": 2, "attention.indexer.key_length": 32, "attention.indexer.top_k": 16,
+            "attention.indexer.candidate_source_layer": 1, "attention.indexer.candidate_top_k_blocks": 4,
+            "attention.indexer.candidate_block_size": 8, "hyper_connection.count": 4,
+            "hyper_connection.sinkhorn_iterations": 20, "hyper_connection.epsilon": 1e-6,
+            "rope.scaling.type": "yarn", "rope.scaling.factor": 16.0, "rope.scaling.original_context_length": 65536,
+            "ple.layers": [0, 1], "ple.ngram_size": 3, "ple.heads_per_ngram": 2, "embedding_length_per_layer_input": 32,
+            "ple.head_vocab_sizes": [97, 101, 103, 107, 109, 113, 127, 131],
+            "ple.head_offsets": [0, 97, 198, 301, 408, 517, 630, 757],
+            "ple.layer_multipliers": [76632096046245, 4839876093313, 35959672319349, 73987337458391, 67716810739261, 51510806800915],
+            "engram.pad_token_id": 2, "engram.token_map": [0, 1, 5, 3]}.items()}
+        m.update({p + k: v for k, v in over.items()})
+        return m
+
+    TENSORS = {"token_embd.weight": {"dims": [256, 1000]}, "output.weight": {"dims": [256, 1000]},
+               **{f"blk.{b}.attn_q_a.weight": {} for b in range(2)}}
+
+    def test_config_and_sidecar(self):
+        import tools.gguf_import as gi
+        cfg, layers = gi.deepseek41_config(self.meta(), self.TENSORS)
+        t = cfg["text_config"]
+        self.assertEqual((layers, cfg["model_type"], t["num_hidden_layers"], t["vocab_size"]), (2, "deepseek_v41", 2, 1000))
+        self.assertEqual((t["hidden_size"], t["head_dim"], t["qk_rope_head_dim"], t["o_groups"], t["o_lora_rank"]), (256, 64, 16, 2, 32))
+        self.assertEqual((t["n_routed_experts"], t["num_experts_per_tok"], t["routed_scaling_factor"], t["swiglu_limit"]), (8, 2, 1.5, 10.0))
+        self.assertEqual((t["kv_source_layer_ids"], t["index_source_layer_ids"], t["candidate_source_layer_id"]), ([1], [1], 1))
+        self.assertEqual((t["rms_norm_eps"], t["hc_mult"], t["compress_ratios"]), (1e-20, 4, [0, 2, 0]))
+        self.assertEqual(t["rope_scaling"]["factor"], 16.0)
+        self.assertEqual((t["engram_layer_ids"], t["engram_max_ngram_size"], t["engram_n_heads"], t["engram_head_dim"]), ([0, 1], 3, 2, 32))
+        e = gi.deepseek41_engram(self.meta(), cfg)
+        self.assertEqual(e["primes"], [[[97, 101], [103, 107]], [[109, 113], [127, 131]]])
+        self.assertEqual(e["offsets"], [[0, 97, 198, 301], [408, 517, 630, 757]])   # the one tensor's rows
+        self.assertEqual(e["num_embeddings"], [408, 480])
+        self.assertEqual(e["multipliers"], [["76632096046245", "4839876093313", "35959672319349"],
+                                            ["73987337458391", "67716810739261", "51510806800915"]])
+        self.assertEqual(e["pad_id"], 5)
+
+    def test_inconsistent_metadata_is_refused(self):
+        import tools.gguf_import as gi
+        cfg, _ = gi.deepseek41_config(self.meta(), self.TENSORS)
+        for over in ({"ple.head_offsets": [0, 97, 198, 301, 408, 517, 630, 758]}, {"ple.head_vocab_sizes": [97, 101, 103]},
+                     {"ple.layer_multipliers": [1, 3, 5]}):
+            with self.assertRaises(SystemExit, msg=over):
+                gi.deepseek41_engram(self.meta(**over), cfg)
+        with self.assertRaises(SystemExit):
+            gi.deepseek41_config(self.meta(expert_gating_func=1), self.TENSORS)
+
+    def test_planner_keeps_the_table_on_disk(self):
+        from family_registry import _dsv41_resident_inventory as resident
+        self.assertEqual(resident("per_layer_token_embd.weight", 10 ** 11, {}), 0)
+        self.assertEqual(resident("engram.embed.weight", 10 ** 11, {}), 0)
+        self.assertEqual(resident("blk.1.engram_gate.weight", 1000, {}), 1000)
 
 
 class OlmoeConfig(unittest.TestCase):
