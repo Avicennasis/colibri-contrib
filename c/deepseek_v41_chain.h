@@ -381,13 +381,15 @@ static size_t v41c_layer_bytes(const Model *m, int i, int rows, int dho, int vie
     size_t b = 0, mm = 0;
     #define T(fmt, I, O, gs) do { b += vkc_fit_tensor(fmt, I, O, gs); mm += coli_vk_tensor_payload(fmt, I, O, gs); } while (0)
     /* fp8 (or a GGUF's W8: its form, from the loaded layer, as v41c_gq puts it up) */
-    #define T8(w, I, O, hg) do { const W8 *w_ = (w); \
-        if (m->gguf && w_->gx) { int f_ = v41c_gq_fmt(w_->gt, I, hg); if (f_ >= 0) T(f_, I, O, f_ == 13 ? 32 : 0); } \
+    /* l: the loaded layer, a GGUF's only (the checkpoint's fit with the dense weights on
+     * the device runs before the layers are read, when m->L is not there yet) */
+    #define T8(w, I, O, hg) do { const W8 *w_ = l ? (w) : NULL; \
+        if (w_ && w_->gx) { int f_ = v41c_gq_fmt(w_->gt, I, hg); if (f_ >= 0) T(f_, I, O, f_ == 13 ? 32 : 0); } \
         else T(12, I, O, FP8_TILE); } while (0)
-    #define TB(w, I, O) do { const WB *w_ = (w); \
-        if (m->gguf && w_->gx) { int f_ = v41c_gq_fmt(w_->gt, I, 0); if (f_ >= 0) T(f_, I, O, 0); } \
+    #define TB(w, I, O) do { const WB *w_ = l ? (w) : NULL; \
+        if (w_ && w_->gx) { int f_ = v41c_gq_fmt(w_->gt, I, 0); if (f_ >= 0) T(f_, I, O, 0); } \
         else T(11, I, O, 0); } while (0)
-    const Layer *l = &m->L[i];
+    const Layer *l = m->gguf && m->L ? &m->L[i] : NULL;
     T(10, H * D, nm, 0); T(10, H * D, nm, 0);                          /* the mHC mix matrices */
     T8(&l->wq_a, D, QL, 0); T8(&l->wq_b, QL, nh * hd, 0); T8(&l->wkv, D, hd, 0);
     T8(&l->wo_a, nh * hd / og, og * ol, 1);                            /* wo_a whole, the chain's */
