@@ -31,6 +31,10 @@
 #include "backend_vulkan.h"
 #include "tier.h"
 #include "ggml_quants.h"
+/* the tag of the tier's lines: cu_tier.c compiles this file again for a CUDA device as "[CUDA]" */
+#ifndef VKT_TAG
+#define VKT_TAG "[VK]"
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -680,7 +684,7 @@ static void d2_stop(const char *why) {
         v->state = VS_NONE; v->dev = 0; T.resident--; T.dres[1]--;
     }
     T.max_resident -= T.dmax[1]; T.dmax[1] = 0; T.pend_all = 1; publish();
-    fprintf(stderr, "[VK] tier %s: %s, its experts go back to the CPU and the tier goes on with %s\n",
+    fprintf(stderr, VKT_TAG " tier %s: %s, its experts go back to the CPU and the tier goes on with %s\n",
             T.engine, why, coli_vk_device_name());
 }
 
@@ -936,7 +940,7 @@ void vkt_warm_report(const char *engine, int n, double seconds) {
     if (!T.on || n <= 0) return;
     int all = 0;   /* the experts of the layers that have them */
     for (int l = 0; l < T.main_layers; l++) if (g_heat_hist && g_heat_hist[l]) all += T.c.experts;
-    fprintf(stderr, "[VK] tier %s: warm start, %d experts in %.1fs (%d from the history, %d more to fill the device%s)\n",
+    fprintf(stderr, VKT_TAG " tier %s: warm start, %d experts in %.1fs (%d from the history, %d more to fill the device%s)\n",
             engine, n, seconds, T.plan_hist < n ? T.plan_hist : n, n > T.plan_hist ? n - T.plan_hist : 0,
             all && n >= all ? ": every expert of the model" : "");
 }
@@ -1066,11 +1070,11 @@ static int st_alloc(void) {
     }
     T.st_n = n;
     if (n < 2) {
-        fprintf(stderr, "[VK] tier %s: no device memory for the streaming slots, cold experts stay on the CPU\n", T.engine);
+        fprintf(stderr, VKT_TAG " tier %s: no device memory for the streaming slots, cold experts stay on the CPU\n", T.engine);
         T.st_ok = 0;
         return 0;
     }
-    if (n < T.st_slots) fprintf(stderr, "[VK] tier %s: %d of %d streaming slots\n", T.engine, n, T.st_slots);
+    if (n < T.st_slots) fprintf(stderr, VKT_TAG " tier %s: %d of %d streaming slots\n", T.engine, n, T.st_slots);
     T.st_per = n / 2;
     return 1;
 }
@@ -1350,7 +1354,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     if (!T.said_fwd) {
         T.said_fwd = 1;
         char hb[32];
-        fprintf(stderr, "[VK] tier %s stream: a step of %d rows; cold experts with %d rows or more go to the device (",
+        fprintf(stderr, VKT_TAG " tier %s stream: a step of %d rows; cold experts with %d rows or more go to the device (",
                 T.engine, S, R);
         if (T.st_rows_env > 0) fprintf(stderr, "COLI_VK_TIER_STREAM_ROWS");
         else if (T.bw_up > 0 && T.cpu_row_ms > 0)
@@ -1373,7 +1377,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         size_t ram = (size_t)(compat_mem_available_gb() * 1e9);
         half = coli_vk_xb_sub_fit(half, E + 1, ram ? ram / 2 : SIZE_MAX);
         if (half < 1 || !coli_vk_xb_sub_reserve(half, E + 1)) {
-            fprintf(stderr, "[VK] tier %s: no scratch for a step of %d rows, its experts stay on the CPU\n", T.engine, S);
+            fprintf(stderr, VKT_TAG " tier %s: no scratch for a step of %d rows, its experts stay on the CPU\n", T.engine, S);
             return 0;
         }
     }
@@ -1529,7 +1533,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
         T.big = 0;
         if (T.sy_step) { coli_vk_xb_step_end(); T.sy_step = NULL; }
         if (T.big_fail) {
-            fprintf(stderr, "[VK] tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
+            fprintf(stderr, VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
             T.on = 0;
         }
         return 0;
@@ -1578,7 +1582,7 @@ static int join_big(const float **rows) {
                 : hn && T.hy_of[i] >= 0 ? T.hy_out + (size_t)T.hy_of[i] * T.c.hidden : NULL;
     for (int i = 0; T.st && i < T.st_n; i++) if (T.st[i].state == SS_BUSY) { T.st[i].state = SS_FREE; T.st[i].pending = 0; }
     if (!ok) {
-        fprintf(stderr, "[VK] tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
+        fprintf(stderr, VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
         T.on = 0;
         return 0;
     }
@@ -1588,7 +1592,7 @@ static int join_big(const float **rows) {
     }
     quiesce();
     if (!hok) {   /* the CPU computes the step's pairs from its own copies */
-        fprintf(stderr, "[VK] tier %s: a prompt step's host pool pairs could not be computed in place, the step goes to the CPU\n", T.engine);
+        fprintf(stderr, VKT_TAG " tier %s: a prompt step's host pool pairs could not be computed in place, the step goes to the CPU\n", T.engine);
         return 0;
     }
     return 1;
@@ -2027,7 +2031,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     if (S > 0 && K > 0) memset(taken, 0, (size_t)S * K);
     if (!T.on || T.inflight || layer < 0 || layer >= T.c.layers || S < 1 || K < 1) return 0;
     if (!coli_vk_xb_ready()) {
-        if (T.on) { fprintf(stderr, "[VK] tier %s: the device stopped answering, the experts stay on the CPU\n", T.engine); T.on = 0; }
+        if (T.on) { fprintf(stderr, VKT_TAG " tier %s: the device stopped answering, the experts stay on the CPU\n", T.engine); T.on = 0; }
         return 0;
     }
     if (T.d2 && !coli_vk_xb_ready_dev(1)) d2_stop("the second device stopped answering");
@@ -2232,7 +2236,7 @@ int vkt_join(const float **rows) {
         rows[i] = !(ok && ok1 && hok) ? NULL : T.map[i] >= 0 ? T.by[T.map[i]]
                 : hn && T.hy_of[i] >= 0 ? T.hy_out + (size_t)T.hy_of[i] * T.c.hidden : NULL;
     if (!ok) {
-        fprintf(stderr, "[VK] tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
+        fprintf(stderr, VKT_TAG " tier %s: a batch failed, its experts are recomputed on the CPU and the tier stops\n", T.engine);
         T.on = 0;
         return 0;
     }
@@ -2242,7 +2246,7 @@ int vkt_join(const float **rows) {
     }
     quiesce();
     if (!hok) {   /* the same: the CPU computes the step's pairs from its own copies */
-        fprintf(stderr, "[VK] tier %s: a hybrid step's host pool pairs could not be computed in place, the step goes to the CPU\n", T.engine);
+        fprintf(stderr, VKT_TAG " tier %s: a hybrid step's host pool pairs could not be computed in place, the step goes to the CPU\n", T.engine);
         return 0;
     }
     return 1;
@@ -2371,13 +2375,13 @@ static void d2_init(long long fit0, long long all, int act) {
     if (!getenv("COLI_VK_DEV2") || !*getenv("COLI_VK_DEV2")) return;
     const char *eng = T.engine;
     if (!coli_vk_dev2_open_env()) {
-        fprintf(stderr, "[VK] tier %s: COLI_VK_DEV2=%s brought no second device up, the tier stays on %s\n",
+        fprintf(stderr, VKT_TAG " tier %s: COLI_VK_DEV2=%s brought no second device up, the tier stays on %s\n",
                 eng, getenv("COLI_VK_DEV2"), coli_vk_device_name());
         return;
     }
     ColiVkDevInfo di;
     if (!coli_vk_dev_info(1, &di) || !coli_vk_xb_init_dev(1, T.c.hidden, T.c.inter, act, T.c.act_limit, T.c.act_a, T.c.act_b)) {
-        fprintf(stderr, "[VK] tier %s: no expert batch on the second device (shaders?), the tier stays on %s\n",
+        fprintf(stderr, VKT_TAG " tier %s: no expert batch on the second device (shaders?), the tier stays on %s\n",
                 eng, coli_vk_device_name());
         return;
     }
@@ -2405,7 +2409,7 @@ static void d2_init(long long fit0, long long all, int act) {
     if (fit > left) fit = left;
     char hb[32], he[32];
     if (fit < 1) {
-        fprintf(stderr, "[VK] tier %s: second device %s: %s, the tier stays on %s\n", eng, T.d2_name,
+        fprintf(stderr, VKT_TAG " tier %s: second device %s: %s, the tier stays on %s\n", eng, T.d2_name,
                 left < 1 ? "the primary device holds every expert" : "no room for experts (COLI_VK_RESERVE2_GB sets its reserve)",
                 coli_vk_device_name());
         return;
@@ -2418,7 +2422,7 @@ static void d2_init(long long fit0, long long all, int act) {
     /* a big step's rows on it: their x rows within 128 MiB */
     long hr = (128L << 20) / ((long)T.c.hidden * 4);
     T.d2_rows = hr < 64 ? 64 : hr > 65535 ? 65535 : (int)hr;
-    fprintf(stderr, "[VK] tier %s: second device %s, budget %s = %d experts of %s (%s), the experts after the primary device's\n",
+    fprintf(stderr, VKT_TAG " tier %s: second device %s, budget %s = %d experts of %s (%s), the experts after the primary device's\n",
             eng, T.d2_name, human((double)T.d2_budget, hb, sizeof hb), T.dmax[1], human((double)T.d2_exp_bytes, he, sizeof he),
             di.shares_ram ? "shared RAM" : "device memory");
 }
@@ -2479,12 +2483,12 @@ static void host_init(long long all) {
     if (given) T.c.ram_given(T.c.ram_ctx, lim);
     char hb[32];
     if (T.full)
-        fprintf(stderr, "[VK] tier %s: host pool on, %lld experts in %s of system RAM the device reads over PCIe (every expert "
+        fprintf(stderr, VKT_TAG " tier %s: host pool on, %lld experts in %s of system RAM the device reads over PCIe (every expert "
                         "of the model: the %lld its memory leaves and a copy of its own, from which the routed ones move up, up "
                         "to %d a forward; COLI_VK_TIER_PROMOTE sets it, COLI_VK_TIER_HOST=0 off)\n",
                 T.engine, held, human((double)lim, hb, sizeof hb), left, T.promote_rate);
     else
-        fprintf(stderr, "[VK] tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
+        fprintf(stderr, VKT_TAG " tier %s: host pool on, %d experts in %s of system RAM the device reads over PCIe "
                         "(the %lld its memory leaves%s; COLI_VK_TIER_HOST=0 off, COLI_VK_TIER_HOST_GB sets it)\n",
                 T.engine, T.dmax[2], human((double)lim, hb, sizeof hb), left, fit < left ? ", not all of them" : "");
 }
@@ -2503,19 +2507,19 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     if (T.c.layers < 1 || T.c.experts < 1 || T.c.hidden < 1 || T.c.inter < 1 || T.c.topk < 1) return 0;
     T.main_layers = T.c.layers;
     if (!form_init(0, T.c.gate_up, T.c.down)) {
-        fprintf(stderr, "[VK] tier %s: expert format %d/%d (gs %d/%d) has no device form, the experts stay on the CPU\n",
+        fprintf(stderr, VKT_TAG " tier %s: expert format %d/%d (gs %d/%d) has no device form, the experts stay on the CPU\n",
                 eng, T.c.gate_up.kind, T.c.down.kind, T.c.gate_up.gs, T.c.down.gs);
         return 0;
     }
     int act = T.c.act == VKT_ACT_SITU ? COLI_VK_ACT_SITU
             : T.c.act == VKT_ACT_SWIGLU_V4 ? COLI_VK_ACT_SWIGLU_V4 : COLI_VK_ACT_SWIGLU;
     if (!coli_vk_xb_init(T.c.hidden, T.c.inter, act, T.c.act_limit, T.c.act_a, T.c.act_b)) {
-        fprintf(stderr, "[VK] tier %s: no expert batch on this device (shaders?), the experts stay on the CPU\n", eng);
+        fprintf(stderr, VKT_TAG " tier %s: no expert batch on this device (shaders?), the experts stay on the CPU\n", eng);
         return 0;
     }
     int H = T.c.hidden, F = T.c.inter;
     if (!forms_per_layer()) {
-        fprintf(stderr, "[VK] tier %s: the layers' expert formats (more than %d forms, or one with no device form) do not "
+        fprintf(stderr, VKT_TAG " tier %s: the layers' expert formats (more than %d forms, or one with no device form) do not "
                         "all go to the device, the experts stay on the CPU\n", eng, VKT_FORMS - 1);
         return 0;
     }
@@ -2526,7 +2530,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
             (T.x_bytes = vkt_expert_bytes(H, F, T.c.extra_gate_up, T.c.extra_down)))
             T.c.layers += T.c.extra_layers;
         else
-            fprintf(stderr, "[VK] tier %s: the extra layers' expert format %d/%d (gs %d/%d) has no device form, their experts stay on the CPU\n",
+            fprintf(stderr, VKT_TAG " tier %s: the extra layers' expert format %d/%d (gs %d/%d) has no device form, their experts stay on the CPU\n",
                     eng, T.c.extra_gate_up.kind, T.c.extra_down.kind, T.c.extra_gate_up.gs, T.c.extra_down.gs);
     }
     if (T.main_layers == T.c.layers) T.c.extra_layers = 0;
@@ -2576,7 +2580,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
         if (xn > xall) xn = xall;
         if (xn < 1) {
             char hx[32];
-            fprintf(stderr, "[VK] tier %s: no room for an extra layer's expert (%s), they stay on the CPU\n",
+            fprintf(stderr, VKT_TAG " tier %s: no room for an extra layer's expert (%s), they stay on the CPU\n",
                     eng, human((double)T.x_bytes, hx, sizeof hx));
             T.c.layers = T.main_layers; T.c.extra_layers = 0;
         } else {
@@ -2605,14 +2609,14 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
          * two it turned the tier off, below four it left the cold experts on the CPU) */
         char hb[32], hn[32];
         double least = 4.0 * (double)T.exp_bytes;
-        fprintf(stderr, "[VK] tier %s: the budget (%s) holds fewer experts than streaming needs; %s for two residents "
+        fprintf(stderr, VKT_TAG " tier %s: the budget (%s) holds fewer experts than streaming needs; %s for two residents "
                         "and two staging slots, every other expert streamed\n",
                 eng, human(want, hb, sizeof hb), human(least, hn, sizeof hn));
         want = least; fit = fit_raw = 4;
     }
     if (fit < 2) {
         char hb[32], he[32];
-        fprintf(stderr, "[VK] tier %s: no room for experts (budget %s, %s each; COLI_VK_TIER_GB sets it), the experts stay on the CPU\n",
+        fprintf(stderr, VKT_TAG " tier %s: no room for experts (budget %s, %s each; COLI_VK_TIER_GB sets it), the experts stay on the CPU\n",
                 eng, human(want, hb, sizeof hb), human((double)T.exp_bytes, he, sizeof he));
         return 0;
     }
@@ -2668,7 +2672,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
             T.pred = calloc((size_t)T.c.layers * T.c.experts, sizeof(uint32_t)); T.pred_ok = calloc((size_t)T.c.layers, 1);
             if (!T.bcnt || !T.bofs || !T.bcls || !T.pred || !T.pred_ok) T.st_ok = 0;
         } else if (want_st)
-            fprintf(stderr, "[VK] tier %s: no room for streaming slots beside the residents, cold experts stay on the CPU\n", eng);
+            fprintf(stderr, VKT_TAG " tier %s: no room for streaming slots beside the residents, cold experts stay on the CPU\n", eng);
     }
     T.max_resident = (int)fit;
     T.dmax[0] = (int)fit;
@@ -2719,7 +2723,7 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     T.th_on = 1;
     T.on = 1;
     char hb[32], he[32];
-    fprintf(stderr, "[VK] tier %s: on, %s, budget %s = %d experts of %s (fmt %d", eng,
+    fprintf(stderr, VKT_TAG " tier %s: on, %s, budget %s = %d experts of %s (fmt %d", eng,
             coli_vk_device_name(), human((double)T.budget, hb, sizeof hb), T.dmax[0],
             human((double)T.exp_bytes, he, sizeof he), T.form[0].gu_fmt);
     if (T.form[0].gu_gs) fprintf(stderr, " gs %d", T.form[0].gu_gs);
@@ -2777,7 +2781,7 @@ void vkt_report(const char *scope, unsigned long long ram_hits, unsigned long lo
     T.rep_routed = T.routed; T.rep_served = T.served;
     double hidden = T.dev_ms > T.wait_ms ? T.dev_ms - T.wait_ms : 0;
     char hu[32], hb[32], hl[32];
-    fprintf(stderr, "[VK] tier %s %s: device %llu of %llu routed experts (%.1f%%; this %s %llu of %llu) | "
+    fprintf(stderr, VKT_TAG " tier %s %s: device %llu of %llu routed experts (%.1f%%; this %s %llu of %llu) | "
             "CPU RAM hits %llu, disk loads %llu | resident %d (budget %d, %s of %s, %d blocks, frag %.2f) | "
             "uploads %llu (%s, %llu warm), evictions %llu, skipped %llu queue + %llu rate, failed %llu | "
             "device %.1f ms, CPU share %.1f ms, waited %.1f ms (%.0f%% of device time hidden)",

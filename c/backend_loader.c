@@ -39,6 +39,7 @@
 
 #include "backend_cuda.h"
 #include "cuda_chain.h"   /* the dense chain's table (one optional export) */
+#include "cu_tier_ops.h"   /* the routed-expert tier's table (one optional export) */
 
 /* Which backend DLL this host looks for, and how it labels its own messages.
  * The Makefile defines COLI_HIP_DLL for a HIP_DLL=1 host and leaves it undefined
@@ -108,6 +109,7 @@ typedef int            (*fn_planar_rows)(int device, int D, int I);
 typedef int            (*fn_block_elems)(int fmt);
 typedef int            (*fn_tensor_upload_at)(ColiCudaTensor **tensor, void *dev, size_t cap, const void *weights, int fmt, int I, int O, int device);
 typedef const ColiCudaChainOps *(*fn_chain_ops)(void);
+typedef const CuTierOps *(*fn_tier_ops)(void);
 typedef int            (*fn_e8_set_grid)(const void *grid);
 typedef int            (*fn_fp8_set_lut)(const float *lut);
 typedef int            (*fn_matmul)(ColiCudaTensor **tensor, float *y, const float *x,
@@ -199,6 +201,7 @@ static struct {
     fn_block_elems block_elems;   /* optional: a GGUF's block formats on the device */
     fn_tensor_upload_at tensor_upload_at;   /* optional: a block-format tensor in an arena's slot */
     fn_chain_ops chain_ops;                 /* optional: the dense chain (cuda_chain.h); NULL = none */
+    fn_tier_ops tier_ops;                   /* optional: the routed-expert tier (cu_tier_ops.h); NULL = none */
     fn_e8_set_grid     e8_set_grid;
     fn_fp8_set_lut     fp8_set_lut;
     fn_matmul          matmul;
@@ -1463,6 +1466,7 @@ static int coli_cuda_load(void){
     RESOLVE_OPT(block_elems, fn_block_elems)
     RESOLVE_OPT(tensor_upload_at, fn_tensor_upload_at)
     RESOLVE_OPT(chain_ops, fn_chain_ops)
+    RESOLVE_OPT(tier_ops, fn_tier_ops)
     RESOLVE_OPT(e8_set_grid, fn_e8_set_grid)
     RESOLVE_OPT(fp8_set_lut, fn_fp8_set_lut)
     RESOLVE(matmul,         fn_matmul)
@@ -1710,6 +1714,10 @@ int coli_cuda_block_elems(int fmt){
 const ColiCudaChainOps *coli_cuda_chain_ops(void){
     if(!g_cuda.available || !g_cuda.chain_ops) return NULL;   /* older DLL: no chain, the per-matrix path */
     return g_cuda.chain_ops();
+}
+const CuTierOps *coli_cuda_tier_ops(void){
+    if(!g_cuda.available || !g_cuda.tier_ops) return NULL;   /* older DLL: no CUDA tier, the experts on the CPU */
+    return g_cuda.tier_ops();
 }
 
 int coli_cuda_e8_set_grid(const void *grid){

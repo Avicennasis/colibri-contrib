@@ -545,6 +545,8 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
 TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
+# needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
+TEST_EXCLUDE += test_cu_tier
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
@@ -575,7 +577,7 @@ endif
 ifneq ($(IS_WIN),)
 ifeq ($(CUDA_DLL),1)
 CFLAGS  += -DCOLI_CUDA
-CUDA_OBJ = backend_loader.o
+CUDA_OBJ = backend_loader.o cu_tier.o
 endif
 ifeq ($(HIP_DLL),1)
 # -DCOLI_CUDA keeps the existing shared GPU ABI (Linux HIP already reuses the
@@ -583,7 +585,7 @@ ifeq ($(HIP_DLL),1)
 # later phase can point the loader at coli_hip.dll. No LDFLAGS change: linking
 # amdhip64 into the MinGW host is exactly what the DLL split exists to avoid.
 CFLAGS  += -DCOLI_CUDA -DCOLI_HIP_DLL
-CUDA_OBJ = backend_loader.o
+CUDA_OBJ = backend_loader.o cu_tier.o
 endif
 endif
 
@@ -601,7 +603,7 @@ $(error choose CUDA=1 or HIP=1, not both)
 endif
 CFLAGS   += -DCOLI_CUDA
 LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lcublasLt -lcublas -lstdc++
-CUDA_OBJ  = backend_cuda.o cuda_chain.o
+CUDA_OBJ  = backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o
 INK_CUDA_OBJ = backend_cuda_ink.o
 ifeq ($(COLI_ANS),1)
 ifeq ($(strip $(DIETGPU_ROOT)),)
@@ -656,7 +658,7 @@ $(error HIP=1 is supported only on Linux)
 endif
 CFLAGS    += -DCOLI_CUDA
 LDFLAGS   += -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lamdhip64 -lstdc++
-CUDA_OBJ   = backend_cuda.o cuda_chain.o
+CUDA_OBJ   = backend_cuda.o cuda_chain.o cu_xb.o cu_tier.o
 GPUCC      = $(HIPCC)
 GPUFLAGS   = $(HIPCCFLAGS)
 GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
@@ -829,8 +831,11 @@ ifeq ($(COLI_V4_SUPPORTED),1)
 # Makefile.deepseek-v4's own list stopped at the chain's first shaders. Without
 # qmatmul_bd.spv and qmatmul_gate_up_bd.spv a GGUF had no device form at all: the
 # chain and the tier of DeepSeek V4 Flash UD-IQ1_S stayed off, 0 matmuls on the GPU.
-deepseek-v4: $(VK_SPV)
-	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4
+# CUDA=1 on Linux: the routed-expert tier on the CUDA device too (cu_tier.h), from this
+# Makefile's CUDA objects, which Makefile.deepseek-v4 links (V4_CUT_OBJS).
+V4_CUT_OBJS = $(if $(filter 1,$(CUDA)),$(if $(IS_WIN),,$(CUDA_OBJ)))
+deepseek-v4: $(VK_SPV) $(V4_CUT_OBJS)
+	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) V4_CUT_OBJS="$(V4_CUT_OBJS)" deepseek-v4
 
 deepseek-v4-clean:
 	$(MAKE) -f Makefile.deepseek-v4 deepseek-v4-clean
@@ -1012,14 +1017,14 @@ backend_xdna.o: backend_xdna.c .build-config
 # shell that has the MSVC environment set (e.g. after vcvars64.bat, or from a
 # "x64 Native Tools Command Prompt"). COLI_CUDA_BUILDING_DLL enables
 # __declspec(dllexport) so the 15 API symbols are exported.
-cuda-dll: backend_cuda.cu cuda_chain.cu backend_cuda.h cuda_chain.h fp8_format.h
+cuda-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	# The banner is localized ("for x64" / "per x64" / "pour x64"): match the arch token only (#1531).
 	@cl 2>&1 | grep -qE "x64|AMD64" || { echo "cl.exe is the 32-bit (x86) compiler: nvcc then fails inside cuda_fp16.hpp with 'asm operand type size(8)'. Open 'x64 Native Tools Command Prompt for VS 2022' (or run vcvars64.bat), not the generic Developer Command Prompt (#1405)" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -shared -DCOLI_CUDA_BUILDING_DLL \
 		-L"$(CUDA_HOME)/lib/x64" -lcudart \
-		backend_cuda.cu cuda_chain.cu -o coli_cuda.dll
+		backend_cuda.cu cuda_chain.cu cu_xb.cu -o coli_cuda.dll
 
 # Windows HIP DLL: the AMD sibling of cuda-dll above. hipcc compiles the SAME
 # backend_cuda.cu (through backend_gpu_compat.h) into coli_hip.dll, exporting
@@ -1042,7 +1047,7 @@ cuda-dll: backend_cuda.cu cuda_chain.cu backend_cuda.h cuda_chain.h fp8_format.h
 # survives. No path is hardcoded — see the HIP SDK contract above.
 #
 #   make hip-dll HIP_DLL=1 HIP_SDK_ROOT=<sdk> HIP_ARCH=gfx1151
-hip-dll: backend_cuda.cu cuda_chain.cu backend_cuda.h cuda_chain.h fp8_format.h backend_gpu_compat.h
+hip-dll: backend_cuda.cu cuda_chain.cu cu_xb.cu backend_cuda.h cuda_chain.h cu_tier_ops.h fp8_format.h backend_gpu_compat.h
 	@test -x "$(HIPCC)" || command -v "$(HIPCC)" >/dev/null 2>&1 || { echo "hipcc not found at \"$(HIPCC)\": set HIP_SDK_ROOT=<path>, HIP_BIN_DIR=<path> or HIPCC=<path>" >&2; exit 1; }
 	@test -d "$(HIP_INCLUDE_DIR)" || { echo "HIP include dir not found: \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
 	@test -f "$(HIP_INCLUDE_DIR)/hip/hip_runtime.h" || { echo "hip/hip_runtime.h missing under \"$(HIP_INCLUDE_DIR)\" — set HIP_INCLUDE_DIR=<path>" >&2; exit 1; }
@@ -1055,7 +1060,7 @@ hip-dll: backend_cuda.cu cuda_chain.cu backend_cuda.h cuda_chain.h fp8_format.h 
 		-I"$(HIP_INCLUDE_DIR)" \
 		--rocm-device-lib-path="$(HIP_DEVICE_LIB_PATH)" \
 		-L"$(HIP_LIB_DIR)" -lamdhip64 \
-		backend_cuda.cu cuda_chain.cu -o coli_hip.dll
+		backend_cuda.cu cuda_chain.cu cu_xb.cu -o coli_hip.dll
 
 backend_cuda_ink.o: backend_cuda_ink.cu backend_cuda_ink.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
@@ -1070,6 +1075,14 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h fp8_format.h backend_gpu_compat.h
 cuda_chain.o: cuda_chain.cu cuda_chain.h backend_cuda.h backend_gpu_compat.h .build-config
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c cuda_chain.cu -o $@
+
+# The routed-expert tier on a CUDA device: vk_tier.c's logic (cu_tier.c compiles it again,
+# cu_tier.h) over the device side in cu_xb.cu (cu_tier_ops.h).
+cu_xb.o: cu_xb.cu cu_tier_ops.h cuda_bd.cuh vk_alloc.h backend_cuda.h backend_gpu_compat.h .build-config
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) -c cu_xb.cu -o $@
+cu_tier.o: cu_tier.c vk_tier.c vk_tier.h cu_tier.h cu_tier_ops.h .build-config
+	$(CC) $(CFLAGS) -c cu_tier.c -o $@
 
 
 backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h .build-config $(DSV4_DEEPGEMM_DEP)
@@ -2378,6 +2391,10 @@ tests/test_vk_alloc$(EXE): tests/test_vk_alloc.c
 # format, warm start, eviction, partial batches. It needs VK=1 and a Vulkan device
 # (CI: Lavapipe), so it stays out of `check` (TEST_EXCLUDE) and runs from
 # vk-tier-check.
+# The routed-expert tier on a CUDA device (cu_tier.h) against a CPU reference.
+tests/test_cu_tier$(EXE): tests/test_cu_tier.c $(CUDA_OBJ)
+	@case "$(CUDA_OBJ)" in *cu_tier.o*) ;; *) echo "tests/test_cu_tier needs CUDA=1 (or HIP=1)" >&2; exit 1 ;; esac
+	$(CC) $(CFLAGS) $< $(CUDA_OBJ) -o $@ $(LDFLAGS)
 tests/test_vk_tier$(EXE): tests/test_vk_tier.c $(VK_OBJ) $(VK_SPV)
 	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_tier needs VK=1" >&2; exit 1; }
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
