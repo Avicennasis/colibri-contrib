@@ -13,7 +13,7 @@ What runs where:
 |---|---|---|
 | `qwen38` (Qwen3.8 Flash Next) | the checkpoint's MTP head, up to 3 drafts (on by default when the checkpoint has it; `Q38_MTP=0` off, `Q38_MTP_DRAFTS`); prompt lookup, up to 5 (on by default; `COLI_LOOKUP=0` off) | up to 6 rows, on the CPU or in the Vulkan dense chain |
 | `qwen36` (Qwen3.6, Qwen3-Coder, Qwen3.8-27B) | prompt lookup, up to 5 (on by default; `COLI_LOOKUP=0` off) | up to 6 rows, on the CPU or in the Vulkan dense chain |
-| `colibri` (GLM-5.2) | its MTP head as before; without a head, the n-gram drafts come from the prompt lookup below and its gate by default (`COLI_LOOKUP=0`: its own n-gram drafts as before) | as before |
+| `colibri` (GLM-5.2) | its MTP head (`DRAFT`), carried by the gate below (`COLI_SPEC_GATE=0`: the acceptance guard of `COLI_MTP_GUARD_PCT` instead); without a head, the n-gram drafts come from the prompt lookup below and its gate by default (`COLI_LOOKUP=0`: its own n-gram drafts as before) | as before |
 
 ## How a verify works
 
@@ -168,8 +168,17 @@ measured yet costs `T(1) (1 + (n-1) rho)`, with `rho` fitted from the multi-row 
 that ran (0.5 until one has). Every 16 picks it tries one draft deeper than its best,
 so an estimate it stopped feeding can recover. After 64 forwards without a plain step it
 takes one, so `T(1)` stays measured. Prompt lookup is always gated. The MTP head is
-gated under `Q38_MTP_DRAFTS=0`. `COLI_SPEC_GATE=0` drafts every proposal in full
-(the tests use it).
+gated under `Q38_MTP_DRAFTS=0`. colibri's MTP head (GLM-5.2) is always gated: its head
+runs a layer of its own for each draft and absorbs the drafts that stood, so a verify's
+`T(n)` counts the forward, the head's drafts and that absorb. `COLI_SPEC_GATE=0` drafts
+every proposal in full (the tests use it), and on colibri brings back the acceptance
+guard that pauses the head for 256 tokens under 70% (`COLI_MTP_GUARD_PCT`,
+`COLI_MTP_GUARD_WINDOW`).
+
+A step that does not run colibri's head (a plain step, or another source's verify)
+leaves the head's KV row for that position unwritten. The head's window then restarts
+at its next draft, or at the next rows it absorbs, instead of attending a row that
+holds nothing of this text.
 
 When the gate decided anything, a run prints what it measured on a `[qwen38 spec gate]`
 or `[qwen36 spec gate]` line: `T(1)`, the cost of each row count it saw in units of
@@ -303,6 +312,20 @@ does not include that layer. This is not a fully device-resident drafter.
 
 Not measured: a long context with speculation, a model whose routed experts all fit
 in RAM, and any discrete GPU (none was available).
+
+**GLM-5.2's MTP head under the gate.** GLM-5.2 UD-IQ1_S (202 GB) on an RTX PRO 4000
+(24 GB) with 62 GB of RAM, the Vulkan chain and tier, most experts from the disk, a
+96-token answer, servers alternated:
+
+| | decode tok/s | |
+|---|---|---|
+| the gate | 0.681, 0.704 | drafting all along: 75-81% accepted, a verify of 2 rows 1.50-1.65 plain steps |
+| `MTP=0` | 0.678, 0.712 | |
+| the acceptance guard (before) | 0.638, 0.646 | 67% over the first 24 proposals, then paused |
+
+On this machine a verify's second row brings experts of its own from the disk, so a draft
+returns about what it costs: the head comes out even with plain decoding, where the
+guard's first window lost 4%.
 
 ## Another engine with a verify path
 

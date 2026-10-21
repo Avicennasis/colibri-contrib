@@ -1530,6 +1530,10 @@ static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo 
  * the measured forward time by rows (COLI_SPEC_GATE=0 drafts every proposal in full).
  * Unset: the bigram source as before. */
 static int g_lookup=0; static SpecGate g_lookup_gate;
+/* A decode step that did not run the MTP head (a plain step, another draft source's verify)
+ * left the head's KV row at kv-1 unwritten: the head's window restarts after it (mtp_draft,
+ * mtp_absorb) rather than attend a row that holds nothing of this text. */
+static int g_mtp_gap;
 static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
                           * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
                           * misurato sul run reale (2026-07-03) acceptance ~5% -> ogni draft
@@ -8156,6 +8160,7 @@ static int mtp_argmax(const float *lo, int V){
 static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
     Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
     int p=kv-1; if(p<0||G<1) return 0;
+    if(g_mtp_gap){ m->kv_start[li]=p; g_mtp_gap=0; }   /* rows before p hold a gap */
     if(m->kv_start[li]<0 || m->kv_start[li]>p) m->kv_start[li]=p;
     float *x=falloc(D), *cat=falloc(2*D), *hx=falloc(D), *nrm=falloc(D), *tmp=falloc(D);
     float *row=falloc(D), *logit=falloc(c->vocab), *h=falloc(D);
@@ -8196,6 +8201,7 @@ static int mtp_draft(Model *m, int next_tok, int kv, int G, int *draft){
 static void mtp_absorb(Model *m, const int *next_ids, const float *x, int S, int pos_base){
     if(!m->has_mtp || S<1) return;
     Cfg *c=&m->c; int D=c->hidden, li=c->n_layers;
+    if(g_mtp_gap){ m->kv_start[li]=pos_base; g_mtp_gap=0; }   /* rows before pos_base hold a gap */
     if(m->kv_start[li]<0 || m->kv_start[li]>pos_base) m->kv_start[li]=pos_base;
     float *hx=falloc((int64_t)S*D), *cat=falloc(2*D), *e=falloc(D), *hn=falloc(D), *hf=falloc(D);
     int prenorm = getenv("MTP_PRENORM")!=NULL;
@@ -8443,7 +8449,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                 if(g>0){ gsrc=3; g_corp_prop+=(uint64_t)g; }
             }
         }
-        if(!g && g_draft>0 && m->has_mtp){
+        if(!g && g_draft>0 && m->has_mtp && g_lookup_gate.off){   /* COLI_SPEC_GATE=0: the acceptance guard */
             /* pausa adattiva: draft che non vengono mai accettati = solo tassa disco,
              * ma il vecchio g_draft=0 era permanente. EN: adaptive pause; the old
              * g_draft=0 latch was permanent. */
@@ -8456,8 +8462,16 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                 gd_pause=GUARD_PAUSE_TOKENS;
             }
         }
+        double tdraft=0;
         if(!g && g_draft>0 && !(m->has_mtp && gd_pause>0)){
-            if(m->has_mtp){ g=mtp_draft(m,next,kv,g_draft,draft); m->mtp_prop+=g; if(g)gsrc=2; }
+            if(m->has_mtp){
+                /* as many drafts as pay for their verify, the head's steps and its absorb, from the
+                 * measured times and acceptance (spec_draft.h): on a model read from the disk a
+                 * verify's second row brings its own experts, and drafting can cost more than it returns */
+                int want=spec_gate_pick(&g_lookup_gate,SPEC_SRC_MTP,g_draft,NULL);
+                if(want>0){ double td0=now_s(); g=mtp_draft(m,next,kv,want,draft); tdraft=now_s()-td0;
+                            m->mtp_prop+=g; if(g)gsrc=2; }
+            }
             else if(g_lookup){
                 int n=spec_lookup(all,kv+1,2,4,g_draft,draft);
                 g=n>0?spec_gate_pick(&g_lookup_gate,SPEC_SRC_LOOKUP,n,NULL):0;
@@ -8468,13 +8482,15 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         if(g>n_new-emitted) g=n_new-emitted;
         if(kv+1+g+1>m->max_t) g=m->max_t-kv-2;
         if(g<0) g=0;
+        if(m->has_mtp && g_draft>0 && gsrc!=2) g_mtp_gap=1;   /* the head's row at kv-1 stays unwritten */
         if(gsrc==1) g_grd.prop+=(uint64_t)g;
         int S=1+g; int batch[64]; batch[0]=next; memcpy(batch+1,draft,g*sizeof(int));
-        int lk=g_lookup&&!m->has_mtp;
-        double tf0=g_prof||lk?now_s():0;
+        int lk=g_lookup&&!m->has_mtp, mt=m->has_mtp&&g_draft>0&&!g_lookup_gate.off&&(gsrc==2||g==0);
+        double tf0=g_prof||lk||mt?now_s():0;
         float *lo=step_all(m,batch,S,kv); m->n_fw++;
-        if(g_prof) prof_lat(now_s()-tf0);
-        if(lk) spec_gate_forward(&g_lookup_gate,S,now_s()-tf0);
+        double tstep=g_prof||lk||mt?now_s()-tf0:0;
+        if(g_prof) prof_lat(tstep);
+        if(lk) spec_gate_forward(&g_lookup_gate,S,tstep);
         int k=0;                                        /* verifica: accetta finche' coincide */
         if(g>0 && getenv("MTP_DEBUG")){ int veri=argmax_v(lo,V);
             fprintf(stderr,"[mtpdbg] draft0=%d verified=%d %s\n", draft[0], veri, draft[0]==veri?"HIT":"miss"); }
@@ -8490,9 +8506,13 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         }
         if(gsrc==1) g_grd.acc+=(uint64_t)k;
         else if(gsrc==4) spec_gate_result(&g_lookup_gate,SPEC_SRC_LOOKUP,k<g&&emitted<n_new&&!done?k+1:k,k);
-        else if(gsrc==2 && m->has_mtp) m->mtp_acc+=k;
+        else if(gsrc==2 && m->has_mtp){ m->mtp_acc+=k;
+            spec_gate_result(&g_lookup_gate,SPEC_SRC_MTP,k<g&&emitted<n_new&&!done?k+1:k,k); }
         else if(gsrc==3) g_corp_acc+=(uint64_t)k;
+        double tab0=mt&&k>=1?now_s():0;
         if(m->has_mtp && k>=1) mtp_absorb(m, all+kv+1, m->h_all, k, kv);   /* KV MTP in sync coi verificati */
+        /* a verify's time is its forward, the head's drafts and the absorb of what stood */
+        if(mt) spec_gate_forward(&g_lookup_gate,S,tstep+tdraft+(k>=1?now_s()-tab0:0));
         /* hlast deve corrispondere all'ultima posizione ACCETTATA (kv+k), non a fine batch */
         if(m->h_all && k<S-1) memcpy(m->hlast, m->h_all+(int64_t)k*m->c.hidden, m->c.hidden*sizeof(float));
         kv += 1+k;                                      /* KV oltre kv e' stantia: verra' sovrascritta */
@@ -8500,6 +8520,13 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         repin_pass(m);                                  /* safe point: all device work is synchronized */
     }
     g_spec_live = 0;                     /* prefill/decode successivi: gate normali / next prefill: normal gates */
+    if(m->has_mtp && g_draft>0 && !g_lookup_gate.off && !logit_out){
+        char gd[384]; spec_gate_describe(&g_lookup_gate,SPEC_SRC_MTP,gd,sizeof gd);
+        fprintf(stderr,"[MTP] gate: %llu verifies, %llu plain steps chosen, %llu probes, acceptance %.0f%% (%llu/%llu) | %s\n",
+                (unsigned long long)g_lookup_gate.verifies[SPEC_SRC_MTP],(unsigned long long)g_lookup_gate.declined[SPEC_SRC_MTP],
+                (unsigned long long)g_lookup_gate.probes[SPEC_SRC_MTP],
+                m->mtp_prop?100.0*m->mtp_acc/m->mtp_prop:0.0,(unsigned long long)m->mtp_acc,(unsigned long long)m->mtp_prop,gd);
+    }
     /* logit_out (mux chunking): hand the continuation logits to the caller.
      * NULL here means the loop exited right after emitting a token that was
      * never forwarded — it sits at all[kv], and the caller must forward it

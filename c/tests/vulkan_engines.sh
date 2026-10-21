@@ -1636,11 +1636,11 @@ family_glm() {
   # discrete GPU): its experts f32 and quantized at load, two drafts; Lavapipe shares the
   # RAM, where the default keeps them on the CPU
   $PY tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp > /dev/null && cp ref_glm.json glm_tiny_mtp/
-  glm_tier "colibri MTP head on the tier, f32" glm_tiny_mtp glm_tiny_mtp/ref_glm.json DRAFT=2 COLI_VK_TIER_MTP=1 -- 64 16 16
+  glm_tier "colibri MTP head on the tier, f32" glm_tiny_mtp glm_tiny_mtp/ref_glm.json COLI_SPEC_GATE=0 DRAFT=2 COLI_VK_TIER_MTP=1 -- 64 16 16
   mtp_on_device "colibri MTP head on the tier, f32"
-  glm_tier "colibri MTP head on the tier, 4-bit" glm_tiny_mtp glm_tiny_mtp/ref_glm.json DRAFT=2 IDOT=0 COLI_VK_TIER_MTP=1 -- 2 4 4
+  glm_tier "colibri MTP head on the tier, 4-bit" glm_tiny_mtp glm_tiny_mtp/ref_glm.json COLI_SPEC_GATE=0 DRAFT=2 IDOT=0 COLI_VK_TIER_MTP=1 -- 2 4 4
   mtp_on_device "colibri MTP head on the tier, 4-bit"
-  glm_tier "colibri MTP head, shared RAM default" glm_tiny_mtp glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
+  glm_tier "colibri MTP head, shared RAM default" glm_tiny_mtp glm_tiny_mtp/ref_glm.json COLI_SPEC_GATE=0 DRAFT=2 -- 64 16 16
   ! grep -aq 'extra layers' vk.log || { grep -a '\[VK\] tier' vk.log; fail "colibri: the MTP head's layer went on the tier by default on shared RAM"; }
   echo "OK colibri shared RAM: the MTP head's experts on the CPU by default"
 
@@ -1694,7 +1694,7 @@ family_glm_sanitize() {
   gsan colibri "asan colibri int4 at load, PIPE=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json PIPE=1 ./colibri 1 4 4
   gsan colibri "asan colibri int8 at load, PILOT=1" glm_tiny SNAP=glm_tiny REF=ref_glm.json PILOT=1 ./colibri 2 8 8
   $PY tools/make_glm_mtp_tiny.py --src glm_tiny --out glm_tiny_mtp > /dev/null && cp ref_glm.json glm_tiny_mtp/
-  gsan colibri "asan colibri MTP head on the tier" glm_tiny_mtp SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 IDOT=0 COLI_VK_TIER_MTP=1 ./colibri 2 4 4
+  gsan colibri "asan colibri MTP head on the tier" glm_tiny_mtp COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 IDOT=0 COLI_VK_TIER_MTP=1 ./colibri 2 4 4
   mtp_on_device "asan colibri MTP head on the tier" san.log
   local ids
   ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
@@ -2472,7 +2472,7 @@ family_glm_chain() {
   mla_gate colibri "chain colibri DSA_FORCE" 1 SNAP=glm_tiny REF=ref_glm.json DSA_FORCE=1 -- 64 16 16
   # drafts: n-gram, and the MTP head at depths 1 to 3 (accepted and rejected)
   mla_gate colibri "chain colibri n-gram drafts" 1 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 -- 64 16 16
-  for d in 1 2 3; do mla_gate colibri "chain colibri MTP depth $d" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=$d -- 64 16 16; done
+  for d in 1 2 3; do mla_gate colibri "chain colibri MTP depth $d" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=$d -- 64 16 16; done
   # a GGUF's block types, the experts on the tier as the file has them
   glm_gguf_tiny
   local gg=(SNAP=glm_gguf_tiny REF=glm_gguf_tiny/ref.json GQ_EXACT=1 COLI_VK_IDOT=0 COLI_VK_CHAIN_GEMM=0)
@@ -2480,8 +2480,8 @@ family_glm_chain() {
   grep -q "tier colibri: the GGUF experts' blocks go to the device" vk.log && [ "$(tier_count colibri vk.log)" -gt 0 ] ||
     { cat vk.log; fail "chain colibri GGUF: the tier took no expert as the file has it"; }
   mla_gate colibri "chain colibri GGUF, DSA top-4" 1 "${gg[@]}" DSA_TOPK=4 -- 64 16 16
-  mla_gate colibri "chain colibri MTP with DSA top-4" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DSA_TOPK=4 -- 64 16 16
-  mla_gate colibri "chain colibri MTP, 4-bit" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
+  mla_gate colibri "chain colibri MTP with DSA top-4" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DSA_TOPK=4 -- 64 16 16
+  mla_gate colibri "chain colibri MTP, 4-bit" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
   # around the chain: the tier off, the per-matrix trunk and core, the GEMM and GEMV choices
   mla_gate colibri "chain colibri tier off" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_TIER=0 -- 64 16 16
   mla_gate colibri "chain colibri beside COLI_VK_DENSE=1 COLI_VK_ATTN=1" 1 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 COLI_VK_DENSE=1 COLI_VK_ATTN=1 -- 2 4 4
@@ -2497,7 +2497,7 @@ family_glm_chain() {
   # between MTP drafts
   FAULT_BACK=12 mla_gate colibri "chain colibri device lost mid-decode" 1 SNAP=glm_tiny REF=ref_glm.json -- 64 16 16
   FAULT_BACK=3 mla_gate colibri "chain colibri device lost in the prompt" 1 SNAP=glm_tiny REF=ref_glm.json TF=1 -- 64 16 16
-  FAULT_BACK=12 mla_gate colibri "chain colibri device lost with MTP" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json -- 64 16 16
+  FAULT_BACK=12 mla_gate colibri "chain colibri device lost with MTP" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json -- 64 16 16
   # serve sessions frame for frame: pins, the prompt cache, the prefill read-out, two KV slots
   CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0
   CHAIN_SERVE_DIALECT=colibri $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 DSA_TOPK=4 DRAFT=3
@@ -2569,7 +2569,7 @@ family_glm_chain_sanitize() {
   msan colibri "asan chain colibri f32 decode" SNAP=glm_tiny REF=ref_glm.json ./colibri 1 16 16
   msan colibri "asan chain colibri DSA top-4 prefill, chunks of 3" SNAP=glm_tiny REF=ref_glm.json TF=1 DSA_TOPK=4 COLI_VK_CHAIN_ROWS=3 ./colibri 64 16 16
   msan colibri "asan chain colibri i4 container" SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 ./colibri 2 4 4
-  msan colibri "asan chain colibri MTP depth 2" SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
+  msan colibri "asan chain colibri MTP depth 2" COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
   msan colibri "asan chain colibri device lost" SNAP=glm_tiny REF=ref_glm.json COLI_VK_CHAIN_FAULT=30 ./colibri 64 16 16
   msan glm53 "asan chain glm53 decode" GLM53_BITS=32 ./glm53 --model glm53_stream-i4 --ids 5,7,9,11,13,17,19,23 --greedy 8
   msan glm53 "asan chain glm53 int4 trunk, chain chunks of 3" GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 4
@@ -4198,7 +4198,7 @@ kv_split_colibri() {
   kv_mla_gate colibri "kv colibri DSA_FORCE" 1 8 4 $G DSA_FORCE=1 -- 64 16 16
   # drafts: the verify rows over the split, rejected rows rewritten
   kv_mla_gate colibri "kv colibri n-gram drafts" 1 8 4 $G DRAFT=3 -- 64 16 16
-  kv_mla_gate colibri "kv colibri MTP depth 2" 1 8 4 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
+  kv_mla_gate colibri "kv colibri MTP depth 2" 1 8 4 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
   kv_mla_gate colibri "kv colibri tier off" 1 8 4 $G COLI_VK_TIER=0 -- 64 16 16
   # prompts only: the prompt and the drafts' verify rows on the device, decode on the CPU
   CHAINMODE=2 kv_mla_gate colibri "kv colibri prompts only, drafts" 1 8 4 $G DRAFT=3 -- 64 16 16
@@ -4228,7 +4228,7 @@ kv_split_colibri_sanitize() {
     kv_san colibri "asan kv colibri decode" $K SNAP=glm_tiny REF=ref_glm.json ./colibri 64 16 16
     COLI_VK_KV_PIN=1 kv_san colibri "asan kv colibri DSA top-4, pinned, chunks of 3" COLI_VK_KV_DEVICE_ROWS=16 COLI_VK_KV_BLOCK=4 USAGE_SAVE=0 SNAP=glm_tiny \
       REF=ref_glm.json DSA_TOPK=4 COLI_VK_CHAIN_ROWS=3 ./colibri 64 16 16
-    kv_san colibri "asan kv colibri MTP depth 2" $K SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
+    kv_san colibri "asan kv colibri MTP depth 2" $K COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
     CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=colibri \
       $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2 $K > san.log 2>&1 \
       || { cat san.log; fail "asan kv colibri serve"; }

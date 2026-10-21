@@ -117,22 +117,22 @@ dho_family_glm() {
   dho_mla_gate colibri "dense-only colibri DSA top-4, prefill in chunks of 5" 1 SNAP=glm_tiny REF=ref_glm.json DSA_TOPK=4 TF=1 COLI_VK_CHAIN_ROWS=5 -- 64 16 16
   dho_mla_gate colibri "dense-only colibri n-gram drafts" 1 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 -- 64 16 16
   # the MTP head runs per matrix: its layer, eh_proj and lm_head take the device here
-  for d in 1 3; do dho_mla_gate colibri "dense-only colibri MTP depth $d" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=$d -- 64 16 16; done
-  dho_mla_gate colibri "dense-only colibri MTP, 4-bit" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
+  for d in 1 3; do dho_mla_gate colibri "dense-only colibri MTP depth $d" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=$d -- 64 16 16; done
+  dho_mla_gate colibri "dense-only colibri MTP, 4-bit" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json IDOT=0 DRAFT=2 -- 2 4 4
   dho_mla_gate colibri "dense-only colibri tier off" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_TIER=0 -- 64 16 16
   dho_mla_gate colibri "dense-only colibri beside COLI_VK_ATTN=1" 1 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 COLI_VK_ATTN=1 -- 2 4 4
   # prompts only: decode runs per matrix on the device; kv_b and the indexer stay on the
   # host (the CPU's attention reads them by row)
   CHAINMODE=2 dho_mla_gate colibri "dense-only colibri prompts only, drafts" 1 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 -- 64 16 16
   CHAINMODE=0 dho_mla_gate colibri "dense-only colibri per-matrix path, absorb core" 1 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 COLI_VK_ATTN=1 -- 2 4 4
-  CHAINMODE=0 dho_mla_gate colibri "dense-only colibri per-matrix path, MTP" 1 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
+  CHAINMODE=0 dho_mla_gate colibri "dense-only colibri per-matrix path, MTP" 1 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 -- 64 16 16
   # staged uploads (a card without Resizable BAR): the drop happens after the copy returned
   COLI_VK_STAGED=1 dho_mla_gate colibri "dense-only colibri staged" 1 SNAP=glm_tiny REF=ref_glm.json DSA_TOPK=4 -- 64 16 16
   grep -q '^\[VK\] memory: staged uploads' vk.log || { grep '^\[VK\]' vk.log; fail "dense-only colibri staged: not staged"; }
   # the device lost: mid-decode, in the prompt (one teacher-forced forward), with MTP drafts
   dho_mla_lost colibri "dense-only colibri device lost mid-decode" 12 SNAP=glm_tiny REF=ref_glm.json -- 64 16 16
   dho_mla_lost colibri "dense-only colibri device lost in the prompt" 3 SNAP=glm_tiny REF=ref_glm.json TF=1 -- 64 16 16
-  dho_mla_lost colibri "dense-only colibri device lost with MTP" 12 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json -- 64 16 16
+  dho_mla_lost colibri "dense-only colibri device lost with MTP" 12 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json -- 64 16 16
   COLI_VK_STAGED=1 dho_mla_lost colibri "dense-only colibri device lost, staged" 12 SNAP=glm_tiny REF=ref_glm.json -- 64 16 16
   # serve sessions: pins, the prompt cache, the prefill read-out, drafts, two KV slots,
   # several conversations at once
@@ -241,7 +241,7 @@ dho_family_glm_sanitize() {
   ids=$($PY -c "print(','.join(str((i*37+5)%120+2) for i in range(100)))")
   dsan colibri "asan dense-only colibri f32, DSA top-4 prefill" 0 SNAP=glm_tiny REF=ref_glm.json TF=1 DSA_TOPK=4 COLI_VK_CHAIN_ROWS=3 ./colibri 64 16 16
   dsan colibri "asan dense-only colibri i4 container" 0 SNAP=glm_tiny_i4 REF=glm_tiny_i4/ref_glm.json IDOT=0 ./colibri 2 4 4
-  dsan colibri "asan dense-only colibri MTP depth 2" 0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
+  dsan colibri "asan dense-only colibri MTP depth 2" 0 COLI_SPEC_GATE=0 SNAP=glm_tiny_mtp REF=glm_tiny_mtp/ref_glm.json DRAFT=2 ./colibri 64 16 16
   CHAINMODE=2 dsan colibri "asan dense-only colibri prompts only" 0 SNAP=glm_tiny REF=ref_glm.json DRAFT=3 ./colibri 64 16 16
   dsan colibri "asan dense-only colibri device lost" 1 SNAP=glm_tiny REF=ref_glm.json COLI_VK_CHAIN_FAULT=30 ./colibri 64 16 16
   dsan glm53 "asan dense-only glm53 int4 trunk, chain chunks of 3" 0 GLM53_BITS=4 COLI_VK_CHAIN_ROWS=3 ./glm53 --model glm53_stream-i4 --ids $ids --greedy 4
