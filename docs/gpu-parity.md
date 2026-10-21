@@ -44,7 +44,9 @@ tier (`cu_tier`), with its dense matrices on the card a matrix at a time (`cu_de
 - **OLMoE** has no CUDA path; Vulkan's chain runs it at 206 tok/s.
 - **Kimi K3** UD-IQ1_S (594 GB) was measured in two other sessions on this machine, with the
   same method: 0.4-0.5 / 0.18-0.22 on the CPU, 1.0 / 0.28 on Vulkan and 0.6 / 0.26 on CUDA.
-  Most of its experts come from the disk, which sets the pace.
+  Most of its experts come from the disk, which sets the pace. The experts' shards now read
+  without the kernel's readahead, which had tripled what a token read from this disk. On a
+  96-token answer, Vulkan's decode went from 0.269 to 0.349 tok/s.
 
 ## Which backend a build with both picks
 
