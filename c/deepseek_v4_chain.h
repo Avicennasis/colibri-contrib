@@ -330,6 +330,13 @@ static ColiVkTensor *v4c_gq_tensor(int fmt, int dtype, const unsigned char *data
 }
 /* an fp8 matrix "<prefix>.weight" with its ".scale", a group of rows of it when rows > 0; a
  * GGUF's in its own types (v4c_gq_fmt: the group's rows for the per-head reader) */
+static char g_v4c_refused[COLI_V4_MAX_TENSOR_NAME + 64];   /* the last matrix the device did not take, and why */
+static ColiVkTensor *v4c_refused(const char *name, int dtype, int fmt, ColiVkTensor *t) {
+    if (!t) snprintf(g_v4c_refused, sizeof g_v4c_refused, "%s (%s, %s)", name,
+                     st_is_ggml(dtype) ? gq_type_name(st_ggml_type(dtype)) : "the checkpoint's",
+                     fmt < 0 ? "no device form" : "the upload failed");
+    return t;
+}
 static ColiVkTensor *v4c_fp8(const ColiDeepSeekV4LayerWeights *w, const char *prefix, int group, int rows) {
     char name[COLI_V4_MAX_TENSOR_NAME], sname[COLI_V4_MAX_TENSOR_NAME];
     const ColiDeepSeekV4TensorSpec *ws = NULL;
@@ -338,12 +345,12 @@ static ColiVkTensor *v4c_fp8(const ColiDeepSeekV4LayerWeights *w, const char *pr
     const unsigned char *data = coli_v4_layer_data(w, name, &ws);
     if (data && ws && ws->rank == 2 && st_is_ggml(ws->dtype)) {   /* a GGUF's: no .scale beside it */
         const int O = (int)ws->shape[0], I = (int)ws->shape[1], f = v4c_gq_fmt(ws->dtype, I, rows > 0);
-        if (f < 0) return NULL;
-        if (rows <= 0) return v4c_gq_tensor(f, ws->dtype, data, O, I);
+        if (f < 0) return v4c_refused(name, ws->dtype, f, NULL);
+        if (rows <= 0) return v4c_refused(name, ws->dtype, f, v4c_gq_tensor(f, ws->dtype, data, O, I));
         const int t = st_ggml_type(ws->dtype), fl = t == GQ_F32 || t == GQ_F16 || t == GQ_BF16;
         const int64_t rb = fl ? (int64_t)I * (t == GQ_F32 ? 4 : 2) : gq_row_bytes(t, I);
-        if (rb <= 0 || (int64_t)(group + 1) * rows > O) return NULL;
-        return v4c_gq_tensor(f, ws->dtype, data + (size_t)group * rows * rb, rows, I);
+        if (rb <= 0 || (int64_t)(group + 1) * rows > O) return v4c_refused(name, ws->dtype, -1, NULL);
+        return v4c_refused(name, ws->dtype, f, v4c_gq_tensor(f, ws->dtype, data + (size_t)group * rows * rb, rows, I));
     }
     const float *scales = coli_v4_layer_data(w, sname, NULL);
     if (!data || !scales || !ws || ws->rank != 2 || ws->dtype != COLI_ST_F8_E4M3) return NULL;
@@ -360,8 +367,10 @@ static ColiVkTensor *v4c_plain(const ColiDeepSeekV4LayerWeights *w, const char *
     snprintf(name, sizeof name, "layers.%d.%s", w->plan.layer, suffix);
     const void *data = coli_v4_layer_data(w, name, &ws);
     if (!data || !ws || ws->rank != 2) return NULL;
-    if (st_is_ggml(ws->dtype))   /* a GGUF's, in its own type */
-        return v4c_gq_tensor(v4c_gq_fmt(ws->dtype, (int)ws->shape[1], 0), ws->dtype, data, (int)ws->shape[0], (int)ws->shape[1]);
+    if (st_is_ggml(ws->dtype)) {   /* a GGUF's, in its own type */
+        const int f = v4c_gq_fmt(ws->dtype, (int)ws->shape[1], 0);
+        return v4c_refused(name, ws->dtype, f, v4c_gq_tensor(f, ws->dtype, data, (int)ws->shape[0], (int)ws->shape[1]));
+    }
     return v4c_tensor(fmt, data, NULL, 0, (int)ws->shape[0], (int)ws->shape[1]);
 }
 
@@ -602,7 +611,12 @@ static int v4c_layer_up(V4Chain *ch, int i, const char **why) {
         ok = (ly->iwkv = v4c_plain(w, "attn.indexer.compressor.wkv.weight", 11)) &&
              (ly->iwg = v4c_plain(w, "attn.indexer.compressor.wgate.weight", 11)) &&
              (ly->iwp = v4c_plain(w, "attn.indexer.weights_proj.weight", 11)) && (ly->iwq = v4c_fp8(w, "attn.indexer.wq_b", 0, 0));
-    if (!ok) return 0;
+    if (!ok) {
+        static char msg[sizeof g_v4c_refused + 32];
+        snprintf(msg, sizeof msg, "a matrix the device refused: %s", g_v4c_refused[0] ? g_v4c_refused : "?");
+        *why = msg;
+        return 0;
+    }
     *why = "device memory for its state refused";
     if (ly->ratio > 0 && !(ly->ring = vkc_buf((size_t)2 * ly->crows * ly->cproj * sizeof(float), VKC_DEV))) return 0;
     if (ly->idx && !(ly->iring = vkc_buf((size_t)2 * 8 * 2 * ch->ID * sizeof(float), VKC_DEV))) return 0;
