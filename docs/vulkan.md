@@ -2301,8 +2301,12 @@ tier now leaves those of a GGUF's block types or of colibri's formats above out 
 them in place at the join (`vkt_host_pairs`, the same code as the chain's worker), while the
 device computes the ones it holds; the join hands their rows back as the device's, so no
 engine changes. The same share stays with the device over PCIe, a prompt step keeps them
-all on the device, and `COLI_VK_HYBRID=0` turns it off. SwiGLU only: DeepSeek V4's expert
-rounds as its own kernel does, and Kimi K3's is SiTU. The run's line adds `hybrid: N steps,
+all on the device, and `COLI_VK_HYBRID=0` turns it off. DeepSeek V4's expert takes it with
+the device's roundings (`hy_act_v4`, as `shaders/expert_act_v4.comp`: gate and up to bf16,
+the clamped SwiGLU, times the route weight and to bf16, E4M3 per 128, then down), the weight
+in the row as in the device's; the tier copies a CPU pair's input row at the issue, since
+that engine frees its rounded rows as the issue returns. Kimi K3's SiTU stays on the device.
+The run's line adds `hybrid: N steps,
 P host pool pairs computed by the CPU in place (T ms, U us a pair)`. Measured on the RTX PRO
 4000 with the i5-13500, each server on a copy of one history, 128 tokens, a warm-up and a run:
 
