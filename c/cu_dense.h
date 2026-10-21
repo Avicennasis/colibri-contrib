@@ -11,11 +11,15 @@
  * the order they are first used, the layers' order, so a budget below the whole dense part
  * holds its first layers.
  *
- * The budget (cud_open): the whole dense part where it fits in three quarters of what the
- * device has free less the tier's reserve (COLI_VK_TIER_RESERVE_GB), else those three
- * quarters, so that the tier keeps a quarter for the routed experts. The engine passes it to
- * the tier as its dense bytes (VktConfig.dense_bytes): the tier's budget leaves the room.
- * COLI_CUDA_DENSE=0 keeps the dense part on the CPU, COLI_CUDA_DENSE_GB sets the budget.
+ * The budget (cud_open): the whole dense part where it fits in half of what the device has
+ * free less the tier's reserve (COLI_VK_TIER_RESERVE_GB), else none: the routed experts keep
+ * the card. Measured on an RTX PRO 4000 (24 GB): DeepSeek V4 Flash UD-IQ1_S's 6.2 GiB went up
+ * whole, decode 4.1 -> 7.2-7.7 tok/s; Kimi K3 UD-IQ1_S's first 16.7 of 41.6 GiB took the
+ * tier from 3463 experts to 865 (the card's share of the routed experts 36% -> 16.5%, more of
+ * them from the disk), and a request had not finished in the time it took before. The engine
+ * passes the budget to the tier as its dense bytes (VktConfig.dense_bytes): the tier's budget
+ * leaves the room. COLI_CUDA_DENSE=0 keeps the dense part on the CPU, COLI_CUDA_DENSE_GB sets
+ * the budget (a part of it too: its first layers).
  *
  * Calls come from the engine thread (the one that called cud_open) outside OpenMP regions;
  * any other call returns 0 and the CPU computes. Include it once, in a COLI_CUDA build. */
@@ -65,10 +69,14 @@ static size_t cud_open(const char *engine, int dev, size_t dense) {
     if (!coli_cuda_mem_info(dev, &free_b, &total)) return 0;
     const char *r = getenv("COLI_VK_TIER_RESERVE_GB");
     const double reserve = (r && *r ? atof(r) : 1.0) * GiB;
-    const double room = (double)free_b > reserve ? ((double)free_b - reserve) * 0.75 : 0;
-    double budget = g && *g ? atof(g) * GiB : (double)dense <= room ? (double)dense : room;
+    const double room = (double)free_b > reserve ? ((double)free_b - reserve) * 0.5 : 0;
+    double budget = g && *g ? atof(g) * GiB : (double)dense <= room ? (double)dense : 0;
     if (budget > (double)dense) budget = (double)dense;
-    if (budget < 1) return 0;
+    if (budget < 1) {
+        fprintf(stderr, "[CUDA] %s: the dense matrices (%.2f GiB) stay on the CPU: more than half of the device's free "
+                        "memory, which the routed experts keep (COLI_CUDA_DENSE_GB sets a budget)\n", engine, dense / GiB);
+        return 0;
+    }
     g_cud.on = 1;
     g_cud.dev = dev;
     g_cud.budget = (size_t)budget;
