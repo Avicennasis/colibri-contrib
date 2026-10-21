@@ -156,8 +156,12 @@ static int pool_of(int dev) { return dev == 0 ? 1 : dev == 2 ? 5 : -1; }
 static int pool_take(int k, size_t bytes, VkaRange *r) {
     CuPool *P = &C.pool[k];
     if (vka_alloc(&P->p, bytes, CU_ALIGN, r)) return 1;
+    /* the usual size, or what is left under the limit when that is smaller but still holds
+     * this request (a budget is rarely a block multiple): backend_vulkan.c's rule */
     uint64_t cap = vka_block_size_for(&P->p, bytes);
-    if (!vka_pool_can_grow(&P->p, cap)) { P->p.refusals++; return 0; }
+    if (P->p.limit && P->p.total + cap > P->p.limit && P->p.limit > P->p.total && P->p.limit - P->p.total >= bytes + CU_ALIGN)
+        cap = (P->p.limit - P->p.total) & ~(uint64_t)4095;
+    if (!vka_pool_can_grow(&P->p, cap) || cap < bytes) { P->p.refusals++; return 0; }
     void *m = NULL;
     if (P->host ? cudaHostAlloc(&m, cap, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess
                 : cudaMalloc(&m, cap) != cudaSuccess) {
@@ -536,8 +540,13 @@ __global__ void __launch_bounds__(128) cu_act_v4_k(float *__restrict__ h, const 
 
 /* ---------------------------------------------------------------- the expert batch */
 static int cu_xb_init(int D, int I, int act, float limit, float a, float b) {
-    if (!cu_open() || D < 1 || I < 1) return 0;
-    if (C.xb && (D != C.D || I != C.I)) return 0;   /* one geometry a process */
+    if (!cu_open() || D < 1 || I < 1 || C.inflight) return 0;
+    if (C.xb && (D != C.D || I != C.I)) {   /* another geometry (a tier started again): the scratch anew */
+        cudaSetDevice(C.dev);
+        cudaFree(C.dX); cudaFree(C.dG); cudaFree(C.dU); cudaFree(C.dY); cudaFree(C.dW);
+        cudaFreeHost(C.hX); cudaFreeHost(C.hY); cudaFreeHost(C.hW);
+        C.dX = C.dG = C.dU = C.dY = C.dW = C.hX = C.hY = C.hW = NULL; C.cap = 0;
+    }
     C.D = D; C.I = I; C.act = act; C.limit = limit; C.a = a; C.b = b; C.xb = 1;
     const char *e = getenv("GQ_EXACT");
     g_exact = e && *e == '1';
