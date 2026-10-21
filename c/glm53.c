@@ -1671,6 +1671,7 @@ static void expert_table_init(GModel *m) {
                     if (!t || t->nbytes != m->gx_len[3 * i + k]) { fprintf(stderr, "missing or resized %s\n", name); exit(1); }
                     ref->fd[2 * k] = ref->fd[2 * k + 1] = t->fd;
                     ref->off[2 * k] = ref->off[2 * k + 1] = t->off;
+                    if (e == 0) st_no_readahead(&m->S, t->fd);   /* three slices an expert: no readahead */
                 }
                 ref->contig = 0;
             }

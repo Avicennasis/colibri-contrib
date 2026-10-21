@@ -3887,7 +3887,20 @@ static void q38_tier_start(Model *m,int cap) {
     }
     if(m->x4){
         /* The tier streams e4m3 bytes (fmt 8) and copies them at qt_note; its
-         * int4 mode wants every expert resident in RAM. Neither is this. */
+         * int4 mode wants every expert resident in RAM. Neither is this. A build with
+         * Vulkan too hands these experts to the Vulkan tier, which takes colibri's int4
+         * and low-bit records (blockdec.glsl), and its dense chain: the same card, unless
+         * COLI_VULKAN=0 keeps them on the CPU (the other engines' way, #2248). */
+#ifdef COLI_VULKAN
+        const char *vk=getenv("COLI_VULKAN");
+        if(!(vk&&*vk)){
+            setenv("COLI_VULKAN","1",1);
+            fprintf(stderr,"[qtier] qwen38: the expert tier streams native FP8 experts only; the %s experts go to "
+                           "the Vulkan tier, the same card (COLI_VULKAN=0 keeps them on the CPU)\n",
+                    m->x4->lb?m->x4->lb->name:"int4-g64");
+            return;
+        }
+#endif
         fprintf(stderr,"[qtier] qwen38: the expert tier streams native FP8 experts only; the %s "
                        "experts stay on the CPU and the tier stays off (Q38_EXPERT_INT4=0 gives it the FP8 ones)\n",
                 m->x4->lb?m->x4->lb->name:"int4-g64");

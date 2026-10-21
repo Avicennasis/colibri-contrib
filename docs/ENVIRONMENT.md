@@ -349,8 +349,8 @@ See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=
 | `COLI_CUDA_ATTN_PREFIX` | off | Reuse one uploaded decode activation across `q_a` and `kv_a` while preserving the stock CPU RMSNorm path. |
 | `COLI_CUDA_ATTN_SHARD` | off | `=1` splits KV-b heads across devices during attention load (multi-GPU). |
 | `COLI_CUDA_PROFILE` | off | Emit CUDA timing. |
-| `COLI_MTP_GUARD_PCT` | `70` | Pause MTP after the guard window when recent acceptance falls below this percentage. |
-| `COLI_MTP_GUARD_WINDOW` | `24` | Number of MTP proposals used by the soft acceptance guard. |
+| `COLI_MTP_GUARD_PCT` | `70` | With `COLI_SPEC_GATE=0` only (the gate of [speculative.md](speculative.md#the-gate) decides otherwise): pause MTP after the guard window when recent acceptance falls below this percentage. |
+| `COLI_MTP_GUARD_WINDOW` | `24` | With `COLI_SPEC_GATE=0` only: number of MTP proposals used by the soft acceptance guard. |
 | `COLI_CUDA_PIPE` | `0` (off) | `1` engages the multi-step attention pipeline; `2` enables the pipe2 path. |
 | `COLI_CUDA_PIPE_SHARD` | off | `=1` runs the multi-device P2P head-shard attention path (opt-in for NVLink topologies; serializes ~95 MB/layer over a star PCIe topology). |
 | `COLI_CUDA_PIPE_S_MIN` | `1` single-GPU, `8` multi-GPU | Minimum prefill batch S to engage the pipe2 CUDA path. |
@@ -548,7 +548,7 @@ and the CPU/GPU execution split.
 | `Q36_MTP_FORCE` | unset | Tests: `reject`, `accept`, `mixed`, `cycle`, `row1`..`row7`. In `ref.json` mode, replace proposals with reference tokens except forced wrong rows; `reject` also rejects every draft in text/serve mode. |
 | `Q36_MTP_DUMP` | unset | Tests: append `(int32 backbone row, int32 next token, float32[vocab] draft logits)` for each first draft to this file. |
 | `COLI_LOOKUP_DRAFTS` | `5` | Lookup drafts per verify at most (1..5); a verify of `k` drafts copies the DeltaNet state after `k` rows (63 MiB each on the 35B). |
-| `COLI_SPEC_GATE` | `1` (on) | `=0`: every proposal drafted in full, the gate's estimates ignored (tests). |
+| `COLI_SPEC_GATE` | `1` (on) | `=0`: every proposal drafted in full, the gate's estimates ignored (tests); colibri's MTP head then pauses under the acceptance guard (`COLI_MTP_GUARD_PCT`). |
 | `COLI_LOOKUP_FORCE` | unset | Tests only, `ref.json` mode: the reference's tokens as the proposal; `accept`, `mixed`, `cycle`, `row1`..`row5` as for `Q38_MTP_FORCE`. |
 | `Q36_MAXT` | conservative engine default (16384 for a Clef checkpoint, its own `max_length`) | Lower the served/context capacity; it cannot raise the model's compiled safety ceiling. |
 | `COLI_VULKAN` | `0` | `VK=1` build: the dense trunk on the Vulkan device, and the routed experts on the shared expert tier (`COLI_VK_TIER*`, `COLI_VK_DENSE`, see [Vulkan](#vulkan-any-gpu-with-a-vulkan-12-driver)). With the tier on, the engine keeps the expert history `COLI_USAGE` (default `<snap>/.coli_usage`), saved at every run and serve turn end; it keeps none otherwise. |

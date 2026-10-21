@@ -744,6 +744,7 @@ static void gxq_table_init(Model *m) {
                     exit(1);
                 }
                 er->fd[k] = t->fd; er->off[k] = t->off;
+                if (e == 0) st_no_readahead(&m->S, t->fd);   /* three slices an expert: no readahead */
             }
             er->contig = 0;
         }
@@ -798,6 +799,7 @@ static void expert_table_init(Model *m) {
                         exit(1);
                     }
                     er->fd[k] = t->fd; er->off[k] = t->off;
+                    if (e == 0) st_no_readahead(&m->S, t->fd);   /* three slices an expert: no readahead */
                 }
                 er->contig = 0;
             }

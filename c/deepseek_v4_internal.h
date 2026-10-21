@@ -1025,6 +1025,7 @@ int coli_v4_gpu_matvec_grouped(const ColiTensorView *w, float *output,
  * Every entry returns non-zero on any refusal so the caller can fall back to
  * the CPU reference for the whole chunk. */
 int coli_v4_gpu_attn_batch_wanted(void);
+extern int coli_v4_gpu_attn_default;   /* COLI_CUDA_ATTN_BATCH unset: on for a GGUF on the CUDA tier */
 /* Runs both bf16 projection matrices (wkv_key/wgate_key mirrors) over the
  * whole chunk: kv_proj/gate_proj receive [batch][rows-of-mirror]. */
 int coli_v4_gpu_compressor_project_batch(
