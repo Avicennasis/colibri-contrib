@@ -62,6 +62,9 @@ class Protocol(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"COLI_SETUP_HOME": self.tmp.name})
         patcher.start()
         self.addCleanup(patcher.stop)
+        owner = mock.patch.object(mcp_server, "_INSTALL_PROCESS", None)
+        owner.start()
+        self.addCleanup(owner.stop)
         self.x = Exchange()
 
     def test_initialize_negotiates_the_version(self):
@@ -159,7 +162,8 @@ class Protocol(unittest.TestCase):
                       "--background", "--no-browser"):
             self.assertIn(piece, command)
         self.assertEqual(result["structuredContent"]["job"]["pid"], 4242)
-        self.assertEqual(setup_flow.read_state()["pid"], 4242)
+        self.assertEqual(result["structuredContent"]["install"]["pid"], 4242)
+        self.assertIsNone(setup_flow.read_state(), "the fake child has not published durable state")
 
     def test_install_refuses_unknown_models_and_a_second_job(self):
         self.x.send(request(1, "tools/call", {"name": "install", "arguments": {"model": "gpt-9"}}))
