@@ -2316,8 +2316,9 @@ P host pool pairs computed by the CPU in place (T ms, U us a pair)`. Measured on
 | the same, 199 tokens after a 59-token prompt, two runs | 3.22, 3.20 tok/s | 5.06, 5.24 tok/s | 494 us |
 | Inkling-Small UD-IQ2_XXS (77 GB) | 11.10, 10.54 tok/s | 15.06, 15.75 tok/s | 862 us |
 | GLM-5.3 int4-g64, colibri's (391 GB), a warm-up and three runs, twice in each order | 0.50 to 0.63 tok/s (0.56 on average) | 0.59 to 0.66 tok/s (0.62) | 852 to 882 us |
+| DeepSeek V4 Flash UD-IQ1_S (82.5 GB), a warm-up and four runs, twice in each order | 6.62 to 6.88 tok/s | 6.62 to 6.94 tok/s | 382 to 385 us |
 
-The prompts are unchanged (GLM-5.3 int4-g64: 1.4 to 1.7 tok/s off, 1.6 to 1.8 on, the model three times the RAM, so the disk decides); GLM-5.3 Flash's warm-up still overlaps the warm start's uploads. With GLM-5.3 int4-g64 the device's time over the runs went from 277 to 108 s. GLM-5.3
+The prompts are unchanged (GLM-5.3 int4-g64: 1.4 to 1.7 tok/s off, 1.6 to 1.8 on, the model three times the RAM, so the disk decides); GLM-5.3 Flash's warm-up still overlaps the warm start's uploads. With GLM-5.3 int4-g64 the device's time over the runs went from 277 to 108 s. DeepSeek V4 Flash's host pool is 4 GiB of its 76 GB of experts, its pairs one or two a step: the same either way. GLM-5.3
 gave the same greedy text (40 tokens) on and off, in 17.7 s against 26.7 s; with the device's
 share of the pool at 0, 0.3 and 0.5 its 199-token runs decoded at 5.01/4.96, 5.06/5.24 and
 3.92/4.02 tok/s. Alone (the bench
