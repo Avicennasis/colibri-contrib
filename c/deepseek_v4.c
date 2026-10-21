@@ -11396,6 +11396,10 @@ fail:
 #include <stdlib.h>
 #include <math.h>
 
+/* the device the engine opened for this path (coli_v4_gpu_engine_open), -1 before: the
+ * batched attention's helpers take it where a layer has no FP8 mirror to find it by (a GGUF) */
+static int g_v4_gpu_open_device = -1;
+
 static int v4_gpu_wanted(void) {
     const char *setting = getenv("DSV4_CUDA");
     if (setting && atoi(setting) == 0) return 0;
@@ -11453,6 +11457,7 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     }
     engine->gpu.enabled = 1;
     engine->gpu.device = device;
+    g_v4_gpu_open_device = device;
     /* Routed-expert fp4 mirror cache hangs off the expert store; attach it at
      * open so moe_token_pipeline can mirror expert weights on demand. Default
      * capacity covers the pinned (hot) experts per layer so autopin never
@@ -12830,13 +12835,28 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
  * evaluates the stateless heavy math — compressor/indexer projections, the
  * sparse window attention itself, and the grouped wo_a / wo_b output GEMMs.
  * Any refusal returns non-zero and the caller runs the CPU reference. */
+/* The device a layer's batched attention runs on: its wq_a mirror's, or, where the layer has
+ * none (a GGUF: this path mirrors FP8 and bf16 matrices only, and the activations are all these
+ * kernels read), the device the engine opened; -1 when there is neither. */
+static int v4_gpu_layer_device(const ColiDeepSeekV4LayerWeights *weights) {
+    Dsv4CudaTensor *anchor = (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "attn.wq_a");
+    return anchor ? dsv4_cuda_tensor_device(anchor) : g_v4_gpu_open_device;
+}
+
+/* Unset: off, except for a GGUF whose dense matrices the CUDA tier's device holds
+ * (coli_v4_gpu_attn_default, set where that device opens): there these kernels read only the
+ * activations, the matrices around them are already on the card, and on V4 Flash UD-IQ1_S
+ * (RTX PRO 4000) they took the prompt from 18.4-18.9 to 25-26 tok/s and the decode from
+ * 7.5-7.6 to 8.1-8.2. Their sums run in another order than the CPU's, so in the float forms
+ * the greedy text can part from the CPU's after a few words. */
+int coli_v4_gpu_attn_default;
 int coli_v4_gpu_attn_batch_wanted(void) {
-    static int wanted = -1;
-    if (wanted < 0) {
-        const char *setting = getenv("COLI_CUDA_ATTN_BATCH");
-        wanted = setting && atoi(setting) != 0;
+    static int setting = -2;   /* -2 unread, -1 unset, else the value */
+    if (setting == -2) {
+        const char *e = getenv("COLI_CUDA_ATTN_BATCH");
+        setting = e && *e ? atoi(e) != 0 : -1;
     }
-    return wanted;
+    return setting >= 0 ? setting : coli_v4_gpu_attn_default;
 }
 
 int coli_v4_gpu_compressor_project_batch(
@@ -12862,10 +12882,7 @@ int coli_v4_gpu_sparse_attention_batch(
     int value_rows, int comp_base, int heads, int head_dim, int batch) {
     if (!coli_v4_gpu_attn_batch_wanted() || !weights || !attended || !q ||
         !values || !sinks || !meta || batch < 1) return -1;
-    Dsv4CudaTensor *anchor =
-        (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "attn.wq_a");
-    if (!anchor) return -1;
-    int device = dsv4_cuda_tensor_device(anchor);
+    int device = v4_gpu_layer_device(weights);
     if (device < 0) return -1;
     return dsv4_cuda_sparse_attn_batch(
         device, q, values, sinks, meta, value_rows, comp_base, heads,
@@ -12961,10 +12978,7 @@ int coli_v4_gpu_kv_ring_append(const ColiDeepSeekV4LayerWeights *weights,
                                const float *rows, int start_pos, int count,
                                int window, int dim) {
     if (!coli_v4_gpu_attn_batch_wanted() || !weights || !rows) return -1;
-    Dsv4CudaTensor *anchor =
-        (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "attn.wq_a");
-    if (!anchor) return -1;
-    int device = dsv4_cuda_tensor_device(anchor);
+    int device = v4_gpu_layer_device(weights);
     if (device < 0) return -1;
     return dsv4_cuda_kv_ring_append(device, weights->plan.layer, rows,
                                     start_pos, count, window, dim) ? 0 : -1;
@@ -12974,10 +12988,7 @@ int coli_v4_gpu_kv_comp_append(const ColiDeepSeekV4LayerWeights *weights,
                                const float *rows, int start_idx, int count,
                                int dim) {
     if (!coli_v4_gpu_attn_batch_wanted() || !weights || !rows) return -1;
-    Dsv4CudaTensor *anchor =
-        (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "attn.wq_a");
-    if (!anchor) return -1;
-    int device = dsv4_cuda_tensor_device(anchor);
+    int device = v4_gpu_layer_device(weights);
     if (device < 0) return -1;
     return dsv4_cuda_kv_comp_append(device, weights->plan.layer, rows,
                                     start_idx, count, dim) ? 0 : -1;
@@ -12990,10 +13001,7 @@ int coli_v4_gpu_sparse_attention_batch_cached(
     int batch) {
     if (!coli_v4_gpu_attn_batch_wanted() || !weights || !attended || !q ||
         !chunk || !sinks || !meta || batch < 1) return -1;
-    Dsv4CudaTensor *anchor =
-        (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "attn.wq_a");
-    if (!anchor) return -1;
-    int device = dsv4_cuda_tensor_device(anchor);
+    int device = v4_gpu_layer_device(weights);
     if (device < 0) return -1;
     return dsv4_cuda_sparse_attn_batch_cached(
         device, weights->plan.layer, q, chunk, chunk_start, sinks, meta,
@@ -13010,10 +13018,7 @@ int coli_v4_gpu_sparse_attention_batch_cached_idx(
     if (!coli_v4_gpu_attn_batch_wanted() || !weights || !attended || !q ||
         !chunk || !sinks || !meta || !sel || selstride < 1 || batch < 1)
         return -1;
-    Dsv4CudaTensor *anchor =
-        (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "attn.wq_a");
-    if (!anchor) return -1;
-    int device = dsv4_cuda_tensor_device(anchor);
+    int device = v4_gpu_layer_device(weights);
     if (device < 0) return -1;
     return dsv4_cuda_sparse_attn_batch_cached_idx(
         device, weights->plan.layer, q, chunk, chunk_start, sinks, meta, sel,
@@ -13030,10 +13035,7 @@ int coli_v4_gpu_fp8_ref_matmul(const ColiDeepSeekV4LayerWeights *weights,
         w->scale_format != COLI_SCALE_F32 ||
         (w->block_rows != 128 && w->block_rows != 8) ||
         w->block_columns != 128 || w->columns % 128) return -1;
-    Dsv4CudaTensor *anchor =
-        (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "attn.wq_a");
-    if (!anchor) return -1;
-    int device = dsv4_cuda_tensor_device(anchor);
+    int device = v4_gpu_layer_device(weights);
     if (device < 0) return -1;
     return dsv4_cuda_fp8_ref_matmul(device, (const uint8_t *)w->data,
                                     (const float *)w->scales, (int)w->rows,
@@ -13048,10 +13050,7 @@ int coli_v4_gpu_indexer_score_batch(
     const int *counts, int tokens, int heads, int dim, int count) {
     if (!coli_v4_gpu_attn_batch_wanted() || !weights || !scores || !queries ||
         !keys || !head_w || !counts || tokens < 1 || count < 1) return -1;
-    Dsv4CudaTensor *anchor =
-        (Dsv4CudaTensor *)coli_v4_layer_gpu(weights, "attn.wq_a");
-    if (!anchor) return -1;
-    int device = dsv4_cuda_tensor_device(anchor);
+    int device = v4_gpu_layer_device(weights);
     if (device < 0) return -1;
     return dsv4_cuda_indexer_score_batch(device, queries, keys, head_w, counts,
                                          tokens, heads, dim, count, scores)
@@ -14181,7 +14180,12 @@ static void v4_cu_open(const ColiV4Engine *engine) {
     xt_use_cuda(1);
     v4_vk_tier_start(engine);   /* its budget leaves the dense matrices their room (v4_tier_dense_bytes) */
     if (!coli_v4_vk_tier) { xt_use_cuda(0); g_v4_cu_on = g_v4_cu_dense = 0; g_cud.on = 0; return; }
-    if (g_v4_cu_dense) coli_v4_cu_ggml = v4_cu_ggml;
+    if (g_v4_cu_dense) {
+        coli_v4_cu_ggml = v4_cu_ggml;
+#ifdef COLI_V4_GPU_TIER
+        coli_v4_gpu_attn_default = 1;   /* the batched attention on the same card (COLI_CUDA_ATTN_BATCH=0: off) */
+#endif
+    }
 }
 static void v4_cu_close(void) {
     v4_cu_dense_close();
