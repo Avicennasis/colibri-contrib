@@ -11417,15 +11417,20 @@ int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     engine->gpu.device = 0;
     if (!v4_gpu_wanted()) return 0;
 #ifdef COLI_VULKAN
-    {   /* The CUDA tier mirrors native FP4 experts only (v4_gpu_expert_attach_cached_ex): a GGUF's
-         * routed experts stayed on the CPU under it, where Vulkan's tier reads the file's blocks.
-         * A build with both backends runs a GGUF on Vulkan, the same card, unless COLI_VULKAN
-         * was set (qwen38.c's way); COLI_VULKAN=0 keeps CUDA. */
+    {   /* This path mirrors native FP4 experts and FP8 and bf16 matrices only
+         * (v4_gpu_expert_attach_cached_ex): a GGUF's experts and dense part stayed on the CPU
+         * under it, where Vulkan's tier and chain read the file's blocks. A build with both
+         * backends runs a GGUF on Vulkan, the same card, unless COLI_VULKAN=0 asks for CUDA
+         * (qwen38.c's way), whose expert tier then takes the experts (v4_cu_open). A COLI_VULKAN=1
+         * said outright used to leave this path open: its experts' mirror then held the Vulkan
+         * tier off and the chain's layers on the CPU, which ran the model at its own speed. */
         const char *vk = getenv("COLI_VULKAN");
-        if (coli_v4_index_gguf(engine->target_index) && !(vk && *vk)) {
-            setenv("COLI_VULKAN", "1", 1);
-            fprintf(stderr, "v4_gpu: the CUDA tier takes native FP4 experts only: this GGUF runs on Vulkan, the same card "
-                            "(COLI_VULKAN=0 keeps CUDA, the routed experts then on the CPU)\n");
+        if (coli_v4_index_gguf(engine->target_index) && !(vk && *vk == '0')) {
+            if (!(vk && *vk)) {
+                setenv("COLI_VULKAN", "1", 1);
+                fprintf(stderr, "v4_gpu: a GGUF runs on Vulkan in a build with both backends, the same card "
+                                "(COLI_VULKAN=0 keeps CUDA and its expert tier)\n");
+            }
             return 0;
         }
     }
