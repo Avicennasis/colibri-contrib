@@ -184,3 +184,39 @@ class InstallStateOwnerTests(unittest.TestCase):
             status = mcp_server.tool_status({}, lambda *_: None)
             self.assertEqual(status["install"]["result"], "external")
             self.assertFalse(status["install"]["running"])
+
+    def test_reused_setup_publishes_ready_before_no_start_exit(self):
+        for json_mode in (False, True):
+            with self.subTest(json=json_mode), tempfile.TemporaryDirectory() as home, \
+                    patch.dict(os.environ, {"COLI_SETUP_HOME": home}):
+                folder = Path(home)
+                model = folder / "model"
+                model.mkdir()
+                engine = folder / "prebuilt-engine"
+                # A configured external/prebuilt engine needs no rebuild and
+                # --no-start must not execute it.
+                engine.write_bytes(b"not executed: no-start")
+                cfg = {
+                    "status": "ready", "family": "glm", "model_dir": str(model),
+                    "model": {"id": None, "name": "local fixture", "repo": None},
+                    "engine": str(engine), "launcher": str(C_DIR / "coli"),
+                    "env": {}, "args": [], "host": "127.0.0.1", "port": None,
+                    "backend": "cpu", "requested_backend": "cpu",
+                    "urls": setup_flow.urls("127.0.0.1", 8000),
+                }
+                setup_flow.save_config(cfg)
+                command = [sys.executable, str(C_DIR / "coli"), "setup", "--yes",
+                           "--no-browser", "--no-start"]
+                if json_mode:
+                    command.append("--json")
+                result = subprocess.run(command, env=dict(os.environ, HOME=home, USERPROFILE=home),
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if json_mode:
+                    self.assertEqual(json.loads(result.stdout)["config"]["model_dir"], str(model))
+                else:
+                    self.assertIn("Already set up", result.stdout)
+                state = setup_flow.read_state()
+                self.assertEqual(state["phase"], "ready")
+                self.assertEqual(state["model_dir"], str(model))
+                self.assertNotEqual(state["pid"], os.getpid())

@@ -2065,6 +2065,8 @@ def cmd_setup(a, ui=None):
                 save_config(cfg)
                 ui.say(f"  context: {requested_ctx or 'automatic'} from now on")
             refresh_configured(cfg, out=ui.say)
+            write_state("ready", model=(cfg.get("model") or {}).get("id"),
+                        model_dir=cfg["model_dir"])
             return _finish(ui, cfg, a)
     # A setup that stopped half way (pending), or a finished one whose engine or
     # files went missing (ready, but not runnable): continue with the same choice.
