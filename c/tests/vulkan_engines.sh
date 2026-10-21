@@ -2681,7 +2681,9 @@ k3g_gate() {
   { [ -s cpu.tok ] && cmp -s cpu.tok vk.tok; } || { cat cpu.tok vk.tok; tail -20 vk.log; fail "$tag: the chain's tokens differ from the CPU"; }
   [ "$(chain_count kimi_k3 vk.log)" -gt 0 ] || { cat vk.log; fail "$tag: the chain never ran"; }
   local lg; lg=$(k3c_close cpu.f32 vk.f32) || { echo "$lg"; fail "$tag: logits"; }
-  echo "OK $tag: tokens = CPU, $lg, $(chain_count kimi_k3 vk.log) chain forwards"
+  # the fit counts a GGUF's blocks: what the chain placed is what it counted
+  ptl_check_placed kimi_k3 vk.log "$tag"
+  echo "OK $tag: tokens = CPU, $lg, $(chain_count kimi_k3 vk.log) chain forwards, $(ptl_n kimi_k3 vk.log) of $(ptl_L kimi_k3 vk.log) layers on the device"
 }
 k3c_serve_fixture() {   # the tiny fixture with the tokenizer the serve tests speak through
   rm -rf kimi_k3_serve && mkdir kimi_k3_serve
@@ -2747,6 +2749,9 @@ family_kimi_chain() {
   k3g_gate "chain kimi_k3 GGUF, tier off" $G COLI_VK_TIER=0
   k3g_gate "chain kimi_k3 GGUF, chain chunks of 3" $G COLI_VK_CHAIN_ROWS=3
   k3g_gate "chain kimi_k3 GGUF, the dense weights on the device only" $G COLI_VK_DENSE_HOST=0
+  # a partial chain: two layers on the device, the rest and the head on the CPU's blocks
+  k3g_gate "chain kimi_k3 GGUF, a partial chain" $G COLI_VK_CHAIN_LAYERS=2
+  ptl_check_n kimi_k3 vk.log 2 "chain kimi_k3 GGUF, a partial chain"
   # serve sessions frame for frame, the KDA state across turns
   local S="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 K3_PREFIX_LOG=1 USAGE_SAVE=0"
   export CHAIN_SERVE_TOL=2e-2

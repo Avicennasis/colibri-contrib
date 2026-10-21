@@ -3060,6 +3060,9 @@ void vkc_fit_placed(const char *engine, const VkcFit *fit) {
     if (!fit) return;
     size_t w = 0, nt = 0, m = 0;
     coli_vk_mem_info_dev(g_kd, &w, &nt);
+    /* matrices only: the block formats' decode table goes up with the first of them, beside them */
+    size_t tab = coli_vk_block_table_bytes(g_kd);
+    w = w > tab ? w - tab : 0;
     for (int i = 0; i < fit->n && fit->mat; i++) m += fit->mat[i];
     fprintf(stderr, "[VK] %s chain: %d of %d layers placed: %zu B of matrices on the device (the fit counted %zu B for these "
                     "layers), chain buffers %zu B, device memory held %zu B", engine ? engine : "engine", fit->n, fit->L, w, m,

@@ -320,10 +320,10 @@ static const char *k3c_unsupported(const Model *m) {
     if (nbmax > 15) return "more AttnRes blocks than its shader takes";
     return NULL;
 }
-/* a W as k3c_w puts it on the device: its bytes there and its payload */
+/* a W as k3c_w puts it on the device: its bytes there and its payload (a GGUF's blocks too) */
 static void k3c_fit_w(const W *w, size_t *b, size_t *mm) {
     int fmt = k3_vk_dev_fmt(w);
-    if (fmt < 0 || w->mapped || !(w->f || w->q8 || w->q4) || w->O < 1 || w->I < 1) return;
+    if (fmt < 0 || w->mapped || !(w->f || w->q8 || w->q4 || w->gg) || w->O < 1 || w->I < 1) return;
     int gs = fmt == 4 ? w->gs : 0;
     *b += vkc_fit_tensor(fmt, w->I, w->O, gs); *mm += coli_vk_tensor_payload(fmt, w->I, w->O, gs);
 }
