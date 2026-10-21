@@ -24,6 +24,16 @@ write_kimik3("k3_gguf_tiny.gguf", np.random.default_rng(6))
 PY
   $PY tools/gguf_import.py k3_gguf_tiny.gguf k3_gguf_tiny > /dev/null || exit 1
 fi
+if [ ! -d ds41_gguf_tiny ]; then   # a published deepseek41 GGUF, small (tests/test_gguf_import.py)
+  $PY - <<'PY' || exit 1
+import sys
+sys.path.insert(0, "tests")
+import numpy as np
+from test_gguf_import import write_deepseek41
+write_deepseek41("ds41_gguf_tiny.gguf", np.random.default_rng(3))
+PY
+  $PY tools/gguf_import.py ds41_gguf_tiny.gguf ds41_gguf_tiny > /dev/null || exit 1
+fi
 fails=0
 ok() { echo "OK $*"; }
 bad() { echo "FAIL $*"; fails=$((fails + 1)); }
@@ -48,6 +58,19 @@ for cap in 1 2 8; do
   if [ $rc0 = 0 ] && [ $rc = 0 ] && cmp -s v41-cpu.txt v41-cu.txt && [ "$d" -gt 0 ]; then ok "deepseek_v41 cap=$cap: output = CPU, oracle passed, device $d"
   else bad "deepseek_v41 cap=$cap (rc $rc0/$rc, device $d)"; diff v41-cpu.txt v41-cu.txt | head -4; tail -3 v41-cu.err; fi
 done
+rm -f tier.usage
+
+# deepseek_v41 from a GGUF: the routed experts on the tier and the dense matrices on the card
+# (cu_dense.h), in the float forms; the tokens the CPU's
+ids="5, 6, 7, 8, 20, 21, 22, 23, 30, 31, 32, 33"
+echo "{\"prompt_ids\": [$ids], \"output_ids\": [0, 0, 0, 0, 0, 0, 0, 0]}" > ds41_gguf_tiny/ref.json
+env GQ_EXACT=1 V41_DSPARK=0 SNAP=ds41_gguf_tiny ./deepseek_v41 8 ds41_gguf_tiny/ref.json > v41g-cpu.txt 2> v41g-cpu.err
+env GQ_EXACT=1 V41_DSPARK=0 SNAP=ds41_gguf_tiny $X COLI_USAGE=tier.usage ./deepseek_v41 8 ds41_gguf_tiny/ref.json > v41g-cu.txt 2> v41g-cu.err
+d=$(dev_count deepseek_v41 v41g-cu.err)
+mats=$(grep -aoE "deepseek_v41: [0-9]+ dense matrices on the device" v41g-cu.err | sed -E 's/.*: ([0-9]+) dense.*/\1/' | head -1)
+if [ -s v41g-cpu.txt ] && cmp -s v41g-cpu.txt v41g-cu.txt && [ "$d" -gt 0 ] && [ "${mats:-0}" -gt 0 ]; then
+  ok "deepseek_v41 GGUF: tokens = CPU, device $d, $mats dense matrices on the card"
+else bad "deepseek_v41 GGUF (device $d, dense ${mats:-0})"; diff v41g-cpu.txt v41g-cu.txt | head -4; tail -3 v41g-cu.err; fi
 rm -f tier.usage
 
 # mimo: the greedy tokens, MXFP4 experts with an f32 trunk and with the release's
