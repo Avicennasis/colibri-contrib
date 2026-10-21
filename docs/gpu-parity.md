@@ -45,13 +45,18 @@ tier (`cu_tier`), with its dense matrices on the card a matrix at a time (`cu_de
 - **Kimi K3** UD-IQ1_S (594 GB) was measured in two other sessions on this machine, with the
   same method: 0.4-0.5 / 0.18-0.22 on the CPU, 1.0 / 0.28 on Vulkan and 0.6 / 0.26 on CUDA.
   Most of its experts come from the disk, which sets the pace. The experts' shards now read
-  without the kernel's readahead, which had tripled what a token read from this disk. On a
-  96-token answer, Vulkan's decode went from 0.269 to 0.349 tok/s.
+  without the kernel's readahead, which had tripled what a token read from this disk: on a
+  96-token answer, Vulkan's decode went from 0.269 to 0.349 tok/s, and the table's method
+  gives 1.1 / 0.35-0.36 on Vulkan.
 
 ## Which backend a build with both picks
 
 A build with both backends runs Qwen3.6 and Qwen3.8 on CUDA when `COLI_CUDA=1`, except a GGUF
-whose expert types the CUDA chain does not take, which runs on Vulkan. It runs the engines
+whose expert types the CUDA chain does not take, and Qwen3.8 with colibri's int4-g64 or
+low-bit experts, which the CUDA tier does not stream: those run on Vulkan. The Qwen3.8
+release with the int4-g64 sidecar runs there at 100-102 / 23.7-24.9 tok/s, against 9-18 /
+6.3-6.8 with its experts on the CPU and 7.2-7.4 / 3.1-3.2 with its FP8 experts on the CUDA
+tier (176 GB, most of them from the disk). It runs the engines
 whose CUDA path lacks Vulkan's dense chain on Vulkan unless `COLI_VULKAN=0`: a DeepSeek V4
 GGUF, Kimi K3, Inkling, GLM-5.3, DeepSeek V4.1 and MiMo. `coli setup` builds both backends
 for them on an NVIDIA card.
