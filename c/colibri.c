@@ -11637,6 +11637,17 @@ static void mirror_setup(Model *m){
     fprintf(stderr," (%s)\n",how);
 }
 
+/* A GGUF's routed experts, the MTP head's too, read without readahead on every drive
+ * (st_no_readahead); after mirror_setup, so the mirrors' files take it as well. */
+static void gguf_experts_random(Model *m){
+    static const char suf[3][16]={"gate_proj","up_proj","down_proj"};
+    for(int l=0;l<=m->c.n_layers;l++) for(int k=0;k<3;k++){
+        char nm[288]; snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.0.%s.weight",l,suf[k]);
+        st_tensor *t=st_find(&m->S,nm);
+        if(t && st_is_ggml(t->dtype)) st_no_readahead(&m->S,t->fd);
+    }
+}
+
 typedef struct { int l,e; uint32_t c; } PinRec;
 static int pin_rec_cmp(const void *a,const void *b){
     const PinRec *x=a,*y=b; return x->c<y->c?1:x->c>y->c?-1:0;
@@ -13579,6 +13590,7 @@ int main(int argc, char **argv){
     /* DUAL-SSD: register the mirror copy BEFORE any pin/autopin load, so the
      * OMP-parallel pin warmup already streams from both drives. */
     mirror_setup(&m);
+    gguf_experts_random(&m);
     /* HOT-STORE: PIN=<statsfile> [PIN_GB=g] -> top expert per frequenza fissi in RAM.
      * Va PRIMA di cap_for_ram: i pinnati contano nel residente. */
     if(getenv("PIN")){

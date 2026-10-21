@@ -358,6 +358,23 @@ static int st_direct_fd_rep(shards *S, int fd, int rep) {
     int i = st_fidx(S, fd); return i < 0 ? -1 : S->mdfds[rep-1][i];
 }
 
+/* A file read without the kernel's readahead, on every drive that holds it (the primary and its
+ * mirrors registered so far). A GGUF keeps a layer's experts in three tensors, so an expert is
+ * three slices read apart through the page cache, and the readahead read past each one: on a
+ * two-NVMe md array with its 2 MiB readahead, Kimi K3 UD-IQ1_S read 17.3 GB a decoded token for
+ * 6.7 GB of experts (0.27 tok/s; 0.34 without it), GLM-5.2 UD-IQ1_S 6.2-6.6 GB for 3.6. A whole
+ * tensor's pread still reads its whole range, so loading the dense matrices does not change. */
+static void st_no_readahead(shards *S, int fd) {
+#if defined(POSIX_FADV_RANDOM) && !defined(_WIN32)
+    for (int r = 0; r <= S->nrep; r++) {
+        int f = st_fd_rep(S, fd, r);
+        if (f >= 0) posix_fadvise(f, 0, 0, POSIX_FADV_RANDOM);
+    }
+#else
+    (void)S; (void)fd;
+#endif
+}
+
 /* Registers <dir>/<basename> as read replica S->nrep+1 of every already-indexed
  * shard. A file is accepted ONLY if its size and safetensors header are
  * byte-identical to the primary: the data_offsets then match by construction,

@@ -1084,24 +1084,10 @@ static void expert_table_gguf(Model *m){
     }
     if(shown>=0) fprintf(stderr,"[K3] GGUF experts: %s gate/up, %s down (layer %d), %.1f MB a slot\n",
                          gq_type_name(m->gx_t[3*shown]),gq_type_name(m->gx_t[3*shown+2]),shown,m->e_slot/1e6);
-#if defined(POSIX_FADV_RANDOM) && !defined(_WIN32)
-    {   /* A GGUF's experts are read a slice at a time, three slices an expert (expert_read), through
-         * the page cache. The kernel's readahead read past each slice: on a two-NVMe md array with its
-         * 2 MiB readahead, Kimi K3 UD-IQ1_S read 17.3 GB a decoded token for 6.7 GB of experts, and
-         * decoded 0.27 tok/s; without it, 6.7 GB and 0.34 tok/s. So the shards the experts sit in read
-         * without readahead; a whole tensor's pread still reads its whole range. */
-        int seen[64], ns=0;
-        for(int li=0;li<c->n_layers;li++) if(m->L[li].sparse) for(int e2=0;e2<c->n_experts;e2++)
-            for(int k=0;k<3;k++){
-                const int fd=m->eref[(int64_t)li*c->n_experts+e2].fd[k];
-                int known=fd<0;
-                for(int j=0;j<ns&&!known;j++) known=seen[j]==fd;
-                if(known) continue;
-                posix_fadvise(fd,0,0,POSIX_FADV_RANDOM);
-                if(ns<64) seen[ns++]=fd;
-            }
-    }
-#endif
+    /* the experts' files read without readahead (st_no_readahead): a layer's tensors, and so
+     * expert 0's files, hold all of its experts */
+    for(int li=0;li<c->n_layers;li++) if(m->L[li].sparse)
+        for(int k=0;k<3;k++){ const int fd=m->eref[(int64_t)li*c->n_experts].fd[k]; if(fd>=0) st_no_readahead(&m->S,fd); }
 }
 static void expert_table_init(Model *m){
     Cfg *c=&m->c;
