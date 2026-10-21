@@ -545,6 +545,8 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
 TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
+# needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
+TEST_EXCLUDE += test_cu_tier
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
 TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
