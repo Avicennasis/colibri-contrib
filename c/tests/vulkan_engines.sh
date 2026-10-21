@@ -2739,6 +2739,7 @@ family_kimi_chain() {
     { cat vk.log; fail "chain kimi_k3 GGUF: the tier took no expert as the file has it"; }
   k3g_gate "chain kimi_k3 GGUF, tier off" $G COLI_VK_TIER=0
   k3g_gate "chain kimi_k3 GGUF, chain chunks of 3" $G COLI_VK_CHAIN_ROWS=3
+  k3g_gate "chain kimi_k3 GGUF, the dense weights on the device only" $G COLI_VK_DENSE_HOST=0
   # serve sessions frame for frame, the KDA state across turns
   local S="K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 K3_PREFIX_LOG=1 USAGE_SAVE=0"
   export CHAIN_SERVE_TOL=2e-2

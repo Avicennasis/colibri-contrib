@@ -838,6 +838,7 @@ static int k3_has(Model *m, const char *name){ char nm[1100]; snprintf(nm,sizeof
  * reads a matrix back from disk when it needs it after all: w_matmul after a lost
  * device, the CPU MLA path's kv_b rows, the CPU KDA and router matmuls (k3_f32_need). */
 static Model *g_k3_dho_model;
+static int k3_dho_keeps(const W *w);
 static size_t g_k3_dho_bytes;             /* what will be dropped: RAM the expert cache may count on */
 static pthread_mutex_t g_k3_dho_mx=PTHREAD_MUTEX_INITIALIZER;
 static size_t k3_w_host_bytes(const W *w){
@@ -898,11 +899,11 @@ static void k3_dho_each(Model *m, void (*f)(W *, size_t *, int *), size_t *b, in
     }
     if(m->has_head&&g_k3_dho_head) f(&m->lm_head,b,n);
 }
-static void k3_dho_count(W *w, size_t *b, int *n){ size_t x=k3_w_host_bytes(w); if(x&&!w->mapped&&k3_vk_fmt(w)>0&&w->fmt<100){ *b+=x; (*n)++; } }
+static void k3_dho_count(W *w, size_t *b, int *n){ size_t x=k3_w_host_bytes(w); if(x&&!w->mapped&&k3_vk_fmt(w)>0&&!k3_dho_keeps(w)){ *b+=x; (*n)++; } }
 /* the same matrices at the bytes the device will hold (an f32 one as bf16 or f16 where exact) */
 static void k3_dho_count_dev(W *w, size_t *b, int *n){
     size_t x=k3_w_host_bytes(w);
-    if(x&&!w->mapped&&k3_vk_fmt(w)>0&&w->fmt<100){ *b+=w->fmt==0?coli_vk_f32_payload(w->f,w->I,w->O):x; (*n)++; }
+    if(x&&!w->mapped&&k3_vk_fmt(w)>0&&!k3_dho_keeps(w)){ *b+=w->fmt==0?coli_vk_f32_payload(w->f,w->I,w->O):x; (*n)++; }
 }
 /* The f32 matrices the chain multiplies on the device, at the bytes it holds them in (bf16
  * where exact): the routers, the KDA decay pair and beta. */
@@ -2373,13 +2374,16 @@ static int k3_expert_on_disk(const Model *m, int li, int e){
     return 1;
 }
 static void k3_dho_upload(W *w, size_t *b, int *n){ (void)b; if(k3_w_host_bytes(w)&&!w->mapped&&w_vk_upload(w)) (*n)++; }
+/* A GGUF's head stays on the host: a prompt's rows other than the last go through the CPU's
+ * w_matmul (the per-matrix path has no block GEMV), and a dropped head would be read back
+ * from disk for each. The chain's layers' blocks go: only a lost device needs them again. */
+static int k3_dho_keeps(const W *w){ return w->fmt>=100&&g_k3_dho_model&&w==&g_k3_dho_model->lm_head; }
 static void k3_dho_drop(W *w, size_t *b, int *n){
-    if(!w->vk||w->vk_gone||!w->vk_name||w->mapped) return;
-    if(w->fmt>=100) return;   /* a GGUF's blocks: no per-matrix GEMV on the device, the CPU keeps them */
+    if(!w->vk||w->vk_gone||!w->vk_name||w->mapped||k3_dho_keeps(w)) return;
     size_t x=k3_w_host_bytes(w);
     if(!x) return;
-    free(w->f); free(w->q8); free(w->q4); free(w->s);
-    w->f=NULL; w->q8=NULL; w->q4=NULL; w->s=NULL; w->vk_gone=1;
+    free(w->f); free(w->q8); free(w->q4); free(w->s); free(w->gg);
+    w->f=NULL; w->q8=NULL; w->q4=NULL; w->s=NULL; w->gg=NULL; w->vk_gone=1;
     coli_vk_dense_host_dropped(x);
     *b+=x; (*n)++;
 }
