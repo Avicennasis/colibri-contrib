@@ -2838,6 +2838,19 @@ static int is_dir(const char *path) {
 }
 
 int main(int argc, char **argv) {
+#if defined(COLI_CUDA) && defined(COLI_VULKAN)
+    {   /* A build with both backends runs on Vulkan, the same card, when CUDA was asked for
+         * (COLI_CUDA=1) and COLI_VULKAN was not set: the dense chain puts the trunk on the card, where the CUDA tier
+         * leaves it on the CPU. COLI_VULKAN=0 keeps the CUDA tier; without a Vulkan
+         * device the CUDA tier still starts. */
+        const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
+        if (cu && atoi(cu) && !(vk && *vk)) {
+            setenv("COLI_VULKAN", "1", 1);
+            fprintf(stderr, "[CUDA] mimo: a build with Vulkan runs on it, the same card, its dense chain and expert tier "
+                            "(COLI_VULKAN=0 keeps the CUDA tier)\n");
+        }
+    }
+#endif
     coli_omp_tune_threads("mimo");
     /* Two ways in. The gateway: SNAP=<dir> mimo <cap>, SERVE=1. By hand and in
      * the tests: mimo <dir> [--ids "..." | --prompt "..."] [--ngen N] [--cap N]. */

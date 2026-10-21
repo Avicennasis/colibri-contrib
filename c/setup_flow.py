@@ -444,13 +444,20 @@ VULKAN_IGPU_MEASURED = frozenset({"qwen36", "qwen38"})
 #:     "Linux CUDA tier"); and dsv4_cuda_backend_arch_ok turns the tier on from
 #:     compute 6.0, so an older card would sit idle while the CPU did the work.
 #:
-#: glm53 links no CUDA object (its accelerator is Metal) and the remaining
-#: engines are CPU-only: none of them is here, so none of them is built with CUDA.
+#:   backend_cuda.o (glm53, deepseek_v41, mimo): the routed-expert tier on a CUDA
+#:     device (cu_tier.h). A build with Vulkan too runs on Vulkan unless
+#:     COLI_VULKAN=0 (CUDA_WITH_VULKAN), whose dense chain puts the trunk on the card.
+#:
+#: The remaining engines are CPU-only: none of them is here, so none of them is
+#: built with CUDA.
 CUDA_ENGINES = {
     "qwen36": {"object": "backend_cuda.o"},
     "qwen38": {"object": "backend_cuda.o"},
     "glm": {"object": "backend_cuda.o"},
     "kimi": {"object": "backend_cuda.o"},
+    "glm53": {"object": "backend_cuda.o"},
+    "deepseek_v41": {"object": "backend_cuda.o"},
+    "mimo": {"object": "backend_cuda.o"},
     "inkling": {"object": "backend_cuda_ink.o"},
     "deepseek_v4": {"object": "backend_cuda_dsv4.o", "min_compute": 60,
                     "min_toolkit": (12, 0), "no_tc_below": (12, 8)},
@@ -715,7 +722,7 @@ def engine_path(directory, family):
 #: block types; deepseek_v4: its CUDA tier mirrors native FP4 experts only), Kimi K3 (its
 #: CUDA experts upload every routed expert at every call) and Inkling (its CUDA backend
 #: leaves the routed experts on the CPU)
-CUDA_WITH_VULKAN = ("qwen36", "qwen38", "glm", "kimi", "inkling", "deepseek_v4")
+CUDA_WITH_VULKAN = ("qwen36", "qwen38", "glm", "kimi", "inkling", "deepseek_v4", "glm53", "deepseek_v41", "mimo")
 
 
 def make_command(family, backend, tc, make_args=()):

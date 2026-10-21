@@ -3266,9 +3266,10 @@ tests/test_glm53_image_key$(EXE): tests/test_glm53_image_key.c
 tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c kimi_k3.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) tests/test_kimi_request_state.c $(VK_OBJ) -o tests/test_kimi_request_state$(EXE) $(NOCUDA_LDFLAGS)
 
-# Kimi CUDA dispatch/fallback with a fake backend; no CUDA toolkit required.
-tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c $(VK_OBJ)
-	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+# Kimi CUDA dispatch/fallback with a fake backend; no CUDA toolkit required. cu_tier.c is the
+# CUDA tier's half of the engine's calls; with no backend table (the fake's) it stays off.
+tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c kimi_k3.c cu_tier.c vk_tier.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA $< cu_tier.c $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
 # ---------------------------------------------------------------------------
 # Generated header prerequisites (#1741)

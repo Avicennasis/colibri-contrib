@@ -28,7 +28,7 @@ fails=0
 ok() { echo "OK $*"; }
 bad() { echo "FAIL $*"; fails=$((fails + 1)); }
 dev_count() { grep -aoE "\[CUDA\] tier $1 (run|turn): device [0-9]+ of [0-9]+" "$2" | tail -1 | grep -oE "device [0-9]+" | grep -oE "[0-9]+" || echo 0; }
-X="COLI_CUDA=1 COLI_VK_TIER_SYNC=1"
+X="COLI_CUDA=1 COLI_VULKAN=0 COLI_VK_TIER_SYNC=1"   # COLI_VULKAN=0: a build with Vulkan too stays on CUDA
 
 # glm53: the greedy and teacher-forced lines, the int4-g64 streaming container
 for v in "decode:GLM53_BITS=32:5,7,9,11,13,17,19,23:20" "evict:GLM53_BITS=32 COLI_VK_TIER_GB=0.00006:5,7,9,11,13,17,19,23:6"; do

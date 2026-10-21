@@ -5622,6 +5622,19 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
 
 #ifndef GLM53_NO_MAIN
 int main(int argc, char **argv) {
+#if defined(COLI_CUDA) && defined(COLI_VULKAN)
+    {   /* A build with both backends runs on Vulkan, the same card, when CUDA was asked for
+         * (COLI_CUDA=1) and COLI_VULKAN was not set: the dense chain puts the trunk on the card, where the CUDA tier
+         * leaves it on the CPU. COLI_VULKAN=0 keeps the CUDA tier; without a Vulkan
+         * device the CUDA tier still starts. */
+        const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
+        if (cu && atoi(cu) && !(vk && *vk)) {
+            setenv("COLI_VULKAN", "1", 1);
+            fprintf(stderr, "[CUDA] glm53: a build with Vulkan runs on it, the same card, its dense chain and expert tier "
+                            "(COLI_VULKAN=0 keeps the CUDA tier)\n");
+        }
+    }
+#endif
     /* Physical-core team sizing, the same shared helper colibri/inkling/
      * kimi_k3/olmoe/deepseek-v41 call. This engine has no OpenMP sizing of its
      * own, so on an SMT host it ran one thread per logical CPU; #718 measured

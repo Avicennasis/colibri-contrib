@@ -5902,6 +5902,19 @@ static int v41_gguf_report(Model *m, const char *snap) {
 }
 
 int main(int argc, char **argv) {
+#if defined(COLI_CUDA) && defined(COLI_VULKAN)
+    {   /* A build with both backends runs on Vulkan, the same card, when CUDA was asked for
+         * (COLI_CUDA=1) and COLI_VULKAN was not set: the dense chain puts the trunk on the card, where the CUDA tier
+         * leaves it on the CPU. COLI_VULKAN=0 keeps the CUDA tier; without a Vulkan
+         * device the CUDA tier still starts. */
+        const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
+        if (cu && atoi(cu) && !(vk && *vk)) {
+            setenv("COLI_VULKAN", "1", 1);
+            fprintf(stderr, "[CUDA] deepseek_v41: a build with Vulkan runs on it, the same card, its dense chain and expert tier "
+                            "(COLI_VULKAN=0 keeps the CUDA tier)\n");
+        }
+    }
+#endif
     /* Size the team to PHYSICAL cores before anything else touches the model.
      * This engine issues ~720 OpenMP regions per decoded token -- three per
      * expert application, 240 applications a token -- and every one of them is
