@@ -1092,6 +1092,11 @@ PY
   v4_tier "trunk on the device too" deepseek_v4_tiny_t long COLI_VK_DENSE=1
   v4_tier "the GEMM route from 2 rows" deepseek_v4_tiny_t long COLI_VK_TIER_GEMM_ROWS=2
   WARM=1 v4_tier "warm start from the CPU run's history" deepseek_v4_tiny_e8 long
+  # the host pool (a budget of three experts on the device, the rest in system RAM the
+  # device reads): the CPU computes its experts' pairs in place with the device's
+  # roundings (the hybrid), here in the float form (GQ_EXACT=1)
+  v4_tier "the host pool, its pairs on the CPU" deepseek_v4_tiny_t long COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00009 GQ_EXACT=1
+  grep -q "host pool pairs computed by the CPU in place" v4-vk.err || { grep '\[VK\] tier' v4-vk.err; fail "deepseek_v4 tier the host pool: no pair on the CPU"; }
   # A served prompt with every routed expert on the device (warm start from the CPU
   # run's history): its per-position logprob echoes against the CPU's. Measured on
   # Lavapipe they are the same bytes; the gate allows 1e-3, for an exp() that rounds

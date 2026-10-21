@@ -154,12 +154,14 @@ static struct {
      * in place at the join (vkt_host_pairs) while the device computes the ones it holds,
      * instead of the device reading them over PCIe; hy_of[i] pair i's place among them (-1
      * none), hy_v their rows, hy_x their input rows, hy_w their route weights (VKT_ACT_SWIGLU_V4
-     * applies them as the device does), hy_out their outputs */
+     * applies them as the device does), hy_out their outputs; hy_xb the input rows copied at
+     * the issue (hy_keep_x: an engine may free x once the issue returns, as DeepSeek V4 does),
+     * hy_src their sources, hy_nx how many */
     int hybrid, hy_n, chy, cho; int *hy_of;
     int hy_big;                          /* a prompt step's host pool experts of at most hy_big rows on the CPU too (0: none) */
     unsigned long long hyb_steps, hyb_pairs;
     VktHostExpert *hy_v; const VktHostExpert **hy_hx; const float **hy_x;
-    float *hy_gu, *hy_hh, *hy_out, *hy_w;
+    float *hy_gu, *hy_hh, *hy_out, *hy_w, *hy_xb; const float **hy_src; int hy_nx, hy_xcap;
     unsigned long long hy_steps, hy_pairs; double hy_ms;
     int max_dev_rows;
     double t_issued;
@@ -1266,6 +1268,8 @@ static int d2_issue_big(int layer, const float *x, int K, const float *w, const 
 }
 static int host_view_share(int layer, int e, VktHostExpert *hx, int share);   /* below, with the hybrid steps */
 static int grow_hy(int n, int np);
+static int grow_hyx(int S);
+static const float *hy_keep_x(const float *src);
 static int issue_big(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken) {
     const int E = T.c.experts, H = T.c.hidden, n = S * K;
     int *cnt = T.bcnt, *ofs = T.bofs, *cls = T.bcls;
@@ -1310,9 +1314,9 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
      * place at the join (vkt_host_pairs), while it waits for the device anyway, instead of its
      * bytes crossing the bus for a row or two (the device's alternative is a copy, so the
      * decode's PCIe share does not apply) */
-    T.hy_n = 0;
+    T.hy_n = T.hy_nx = 0;
     int nhy = 0;
-    if (T.hybrid && T.hy_big > 0 && grow_hy(n, 0)) {
+    if (T.hybrid && T.hy_big > 0 && grow_hy(n, 0) && grow_hyx(S)) {
         for (int i = 0; i < n; i++) T.hy_of[i] = -1;
         for (int e = 0; e < E; e++) {
             if (cnt[e] < 1 || cnt[e] > T.hy_big || (cls[e] != BC_DEV && cls[e] != BC_STREAM) || !slot(layer, e)->host) continue;
@@ -1320,7 +1324,7 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
             if (!host_view_share(layer, e, &hv, 0) || !grow_hy(n, T.hy_n + cnt[e])) continue;
             for (int r = 0; r < cnt[e]; r++) {
                 const int i = T.blist[ofs[e] + r];
-                T.hy_v[T.hy_n] = hv; T.hy_x[T.hy_n] = x + (size_t)(i / K) * H; T.hy_w[T.hy_n] = w ? w[i] : 1.f;
+                T.hy_v[T.hy_n] = hv; T.hy_x[T.hy_n] = hy_keep_x(x + (size_t)(i / K) * H); T.hy_w[T.hy_n] = w ? w[i] : 1.f;
                 T.hy_of[i] = T.hy_n++;
             }
             if (T.bpool && T.bpool[e]) { T.bpool[e] = 0; npool--; }
@@ -1978,6 +1982,15 @@ int vkt_host_pairs_w(const VktHostExpert *const *hx, const float *const *xr, int
                      float limit, int nt, float *gu, float *hh, float *dn, const float *w) {
     return host_pairs(hx, xr, np, D, I, limit, nt, gu, hh, dn, w);
 }
+/* room for a step's S input rows of the CPU's pairs (hy_keep_x), before any is taken */
+static int grow_hyx(int S) {
+    if (S <= T.hy_xcap) return 1;
+    float *xb = realloc(T.hy_xb, (size_t)S * T.c.hidden * sizeof(float)); if (xb) T.hy_xb = xb;
+    const float **sr = realloc(T.hy_src, (size_t)S * sizeof(*sr)); if (sr) T.hy_src = sr;
+    if (!xb || !sr) return 0;
+    T.hy_xcap = S;
+    return 1;
+}
 /* room for n pairs of the step (hy_of) and for np of them on the CPU */
 static int grow_hy(int n, int np) {
     if (n > T.chy) {
@@ -2000,6 +2013,15 @@ static int grow_hy(int n, int np) {
     return 1;
 }
 
+/* a hybrid pair's input row, copied once a step (grow_hyx has made room for the step's rows) */
+static const float *hy_keep_x(const float *src) {
+    const int H = T.c.hidden;
+    for (int r = 0; r < T.hy_nx; r++) if (T.hy_src[r] == src) return T.hy_xb + (size_t)r * H;
+    float *dst = T.hy_xb + (size_t)T.hy_nx * H;
+    memcpy(dst, src, (size_t)H * sizeof(float));
+    T.hy_src[T.hy_nx++] = src;
+    return dst;
+}
 static int issue(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken) {
     if (S > 0 && K > 0) memset(taken, 0, (size_t)S * K);
     if (!T.on || T.inflight || layer < 0 || layer >= T.c.layers || S < 1 || K < 1) return 0;
@@ -2026,8 +2048,8 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     int E = T.c.experts, H = T.c.hidden, n = S * K;
     if (!grow_map(n)) return 0;
     /* a hybrid step: the host pool's experts the CPU can compute in place are its, at the join */
-    const int hyb = T.hybrid && S <= VKT_UP_ROWS && layer < T.main_layers && grow_hy(n, 0);
-    T.hy_n = 0;
+    const int hyb = T.hybrid && S <= VKT_UP_ROWS && layer < T.main_layers && grow_hy(n, 0) && grow_hyx(S);
+    T.hy_n = T.hy_nx = 0;
     /* heat for every routed expert, groups for the resident ones (first seen first) */
     int ng = 0, total = 0, rows1 = 0;
     for (int i = 0; i < n; i++) {
@@ -2042,7 +2064,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
         v->last = T.tick;
         if (v->state != VS_RESIDENT) continue;
         if (hyb && v->host && grow_hy(n, T.hy_n + 1) && host_view(layer, e, &T.hy_v[T.hy_n])) {
-            T.hy_x[T.hy_n] = x + (size_t)(i / K) * H; T.hy_w[T.hy_n] = w ? w[i] : 1.f;
+            T.hy_x[T.hy_n] = hy_keep_x(x + (size_t)(i / K) * H); T.hy_w[T.hy_n] = w ? w[i] : 1.f;
             T.hy_of[i] = T.hy_n++;
             continue;
         }
@@ -2986,7 +3008,7 @@ void vkt_shutdown(void) {
     free(T.st); free(T.sy); free(T.bcnt); free(T.bofs); free(T.bcls); free(T.blist); free(T.pred); free(T.pred_ok);
     for (int h = 0; h < 2; h++) { free(T.hf[h].slot); free(T.hf[h].yout); }
     free(T.d2_idx); free(T.d2_y); free(T.d2_bex); free(T.d2_brows); free(T.d2_bx); free(T.d2_bw);
-    free(T.hy_of); free(T.hy_v); free(T.hy_hx); free(T.hy_x); free(T.hy_gu); free(T.hy_hh); free(T.hy_out); free(T.hy_w); free(T.bpool);
+    free(T.hy_of); free(T.hy_v); free(T.hy_hx); free(T.hy_x); free(T.hy_gu); free(T.hy_hh); free(T.hy_out); free(T.hy_w); free(T.hy_xb); free(T.hy_src); free(T.bpool);
     memset(&T, 0, sizeof T);
 }
 #endif /* COLI_VULKAN */
