@@ -1872,7 +1872,7 @@ inkling$(EXE): inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build
 # flags for these targets and say so once, loudly.
 comma := ,
 NOCUDA_CFLAGS  = $(filter-out -DCOLI_CUDA -DCOLI_ANS,$(CFLAGS))
-NOCUDA_LDFLAGS = $(filter-out -lcudart -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
+NOCUDA_LDFLAGS = $(filter-out -lcudart -lcublasLt -lcublas -lstdc++ -lcuda -L$(CUDA_HOME)/lib64 \
                    -Wl$(comma)-rpath$(comma)$(CUDA_HOME)/lib64,$(LDFLAGS))
 
 # GLM-5.3-Flash: routed experts stream from the int4-gs64 container.
