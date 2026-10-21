@@ -766,8 +766,10 @@ jobs:
           gcc -fsyntax-only -DCOLI_CUDA -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-unused-function cu_tier.c
           gcc -fsyntax-only -D_GNU_SOURCE -DCOLI_CUDA -fopenmp -pthread -include pthread.h -Wall -Wextra \
             -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation deepseek_v4.c
-          gcc -fsyntax-only -DCOLI_CUDA -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
-            -Wno-misleading-indentation kimi_k3.c
+          for f in kimi_k3.c glm53.c deepseek_v41.c mimo.c; do
+            gcc -fsyntax-only -DCOLI_CUDA -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+              -Wno-misleading-indentation $f
+          done
           echo "CUDA tier syntax check passed"
       - name: Compile backend_cuda_ink.cu (syntax only, no GPU)
         run: |

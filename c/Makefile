@@ -1522,8 +1522,8 @@ ifneq ($(EXE),)
 .PHONY: deepseek_v41
 deepseek_v41: deepseek_v41$(EXE)
 endif
-deepseek_v41$(EXE): deepseek_v41.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) deepseek_v41.c $(VK_OBJ) -o deepseek_v41$(EXE) $(LDFLAGS)
+deepseek_v41$(EXE): deepseek_v41.c $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) deepseek_v41.c $(CUDA_OBJ) $(VK_OBJ) -o deepseek_v41$(EXE) $(LDFLAGS)
 
 # Xiaomi MiMo-V2.6 (Flash 309B, Pro 1.02T): one file plus its ViT header, reading the
 # release as it is -- MXFP4 experts streamed per layer, FP8/BF16 dense resident.
@@ -1531,8 +1531,8 @@ ifneq ($(EXE),)
 .PHONY: mimo
 mimo: mimo$(EXE)
 endif
-mimo$(EXE): mimo.c $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) mimo.c $(VK_OBJ) -o mimo$(EXE) $(LDFLAGS)
+mimo$(EXE): mimo.c $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) mimo.c $(CUDA_OBJ) $(VK_OBJ) -o mimo$(EXE) $(LDFLAGS)
 
 # Tiny MiMo fixture + vendor oracle, the Kimi K3 pattern: the generator is numpy (and
 # Pillow for the test picture) and deterministic; ref.json is committed and comes from
@@ -1881,8 +1881,8 @@ ifneq ($(EXE),)
 .PHONY: glm53
 glm53: glm53$(EXE)
 endif
-glm53$(EXE): glm53.c $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
-	$(CC) $(CFLAGS) glm53.c $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
+glm53$(EXE): glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) $(VK_SPV) .build-config
+	$(CC) $(CFLAGS) glm53.c $(CUDA_OBJ) $(METAL_OBJ) $(VK_OBJ) -o glm53$(EXE) $(LDFLAGS)
 
 ifneq ($(EXE),)
 .PHONY: kimi_k3
