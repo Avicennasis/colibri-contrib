@@ -2238,6 +2238,12 @@ every expert on the card:
 The int4-g64 row's teacher-forced loss after a 600-token prompt (125 tokens scored,
 `PPL=1`) is 3.2181 nats a token either way.
 
+Measured again on the same card once the matrix units ran at subgroups of 32 and the
+frame took the experts' grouped GEMMs, two series alternated, the same 467-token prompt and
+every expert on the card: colibri's int4-g64 container 1796-1902 tok/s of prefill and
+83.8-84.6 of decode, the GGUF Q4_K_M 1412-1556 and 73.7-81.9. Our container (22 GB) now leads
+the GGUF (21 GB) in both phases.
+
 The matrix units at subgroups of 32 then took the same prompt further, each step started
 on its own server twice, three runs a start (prefill / decode):
 
