@@ -24,8 +24,8 @@ dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engin
 Qwen3 -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
 Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
 glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine),
-deepseek41 (DeepSeek V4.1 Flash in antirez's format -> deepseek_v41 engine), olmoe (OLMoE ->
-olmoe engine).
+deepseek41 (DeepSeek V4.1 Flash, files with the config whole and the published K-quant and IQ ones ->
+deepseek_v41 engine), olmoe (OLMoE -> olmoe engine).
 
 Usage:
   python3 tools/gguf_import.py MODEL.gguf OUT_DIR [--mode link|copy]
@@ -510,12 +510,88 @@ def mimo2_config(meta, tensors, overrides=None):
     return cfg, layers
 
 
+def deepseek41_meta_config(meta, tensors):
+    """The published deepseek41 GGUFs (K-quant and IQ types) carry no config.json:
+    the checkpoint's text_config from its keys (conversion writes each from one of them).
+    No DSpark head and no vision tower in these files: their own GGUFs hold them (the
+    DSpark head's keys come from dspark_head, when main finds one)."""
+    p = "deepseek41."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    gating = int(meta.get(p + "expert_gating_func", 4))
+    if gating != 4:
+        sys.exit(f"{p}expert_gating_func {gating}: the engine routes with sqrt(softplus) (4) only")
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    clamp = meta.get(p + "swiglu_clamp_exp") or [10.0]
+    text = {
+        "model_type": "deepseek_v41_text",
+        "vocab_size": int(emb["dims"][1]),
+        "hidden_size": int(need("embedding_length")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "num_hidden_layers": int(need("block_count")),
+        "num_attention_heads": int(need("attention.head_count")),
+        "num_key_value_heads": int(meta.get(p + "attention.head_count_kv", 1)),
+        "head_dim": int(need("attention.key_length")),
+        "qk_rope_head_dim": int(need("rope.dimension_count")),
+        "q_lora_rank": int(need("attention.q_lora_rank")),
+        "o_lora_rank": int(need("attention.output_lora_rank")),
+        "o_groups": int(need("attention.output_group_count")),
+        "hidden_act": "silu",
+        "swiglu_limit": float(clamp[0]),
+        "rms_norm_eps": float(need("attention.layer_norm_rms_epsilon")),
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "max_position_embeddings": int(meta.get(p + "context_length", 1048576)),
+        "rope_theta": float(meta.get(p + "rope.freq_base", 10000.0)),
+        "rope_scaling": {
+            "rope_type": meta.get(p + "rope.scaling.type", "yarn"),
+            "factor": float(meta.get(p + "rope.scaling.factor", 1.0)),
+            "beta_fast": int(meta.get(p + "rope.scaling.yarn_beta_fast", 32)),
+            "beta_slow": int(meta.get(p + "rope.scaling.yarn_beta_slow", 1)),
+            "original_max_position_embeddings": int(meta.get(p + "rope.scaling.original_context_length",
+                                                             meta.get(p + "context_length", 65536))),
+        },
+        "n_routed_experts": int(need("expert_count")),
+        "n_shared_experts": int(meta.get(p + "expert_shared_count", 1)),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc",
+        "norm_topk_prob": bool(meta.get(p + "expert_weights_norm", True)),
+        "routed_scaling_factor": float(meta.get(p + "expert_weights_scale", 1.0)),
+        "sliding_window": int(need("attention.sliding_window")),
+        "compress_ratios": [int(r) for r in need("attention.compress_ratios")],
+        "compress_rope_theta": float(need("attention.compress_rope_freq_base")),
+        "kv_source_layer_ids": [int(x) for x in need("attention.kv_source_layers")],
+        "index_source_layer_ids": [int(x) for x in need("attention.indexer.source_layers")],
+        "index_n_heads": int(need("attention.indexer.head_count")),
+        "index_head_dim": int(need("attention.indexer.key_length")),
+        "index_topk": int(need("attention.indexer.top_k")),
+        "candidate_source_layer_id": int(need("attention.indexer.candidate_source_layer")),
+        "candidate_topk_blocks": int(need("attention.indexer.candidate_top_k_blocks")),
+        "candidate_block_size": int(need("attention.indexer.candidate_block_size")),
+        "hc_mult": int(need("hyper_connection.count")),
+        "hc_sinkhorn_iters": int(need("hyper_connection.sinkhorn_iterations")),
+        "hc_eps": float(meta.get(p + "hyper_connection.epsilon", 1e-6)),
+        "num_nextn_predict_layers": 0,
+    }
+    if p + "ple.layers" in meta:   # the engram: dsv41_engram.json carries its tables (deepseek41_engram)
+        text.update({"engram_layer_ids": [int(x) for x in need("ple.layers")],
+                     "engram_max_ngram_size": int(need("ple.ngram_size")),
+                     "engram_n_heads": int(need("ple.heads_per_ngram")),
+                     "engram_head_dim": int(need("embedding_length_per_layer_input")),
+                     "engram_pad_token_id": int(meta.get(p + "engram.pad_token_id", 2)),
+                     "engram_vocab_size": int(meta.get(p + "engram.vocab_size", 0)),
+                     "engram_compressed_vocab_size": int(meta.get(p + "engram.compressed_vocab_size", 0))})
+    return {"architectures": ["DeepseekV41ForConditionalGeneration"], "model_type": "deepseek_v41",
+            "bos_token_id": int(meta.get("tokenizer.ggml.bos_token_id", 0)),
+            "eos_token_id": int(meta.get("tokenizer.ggml.eos_token_id", 1)), "text_config": text}
+
+
 def deepseek41_config(meta, tensors, overrides=None):
-    """DeepSeek V4.1 (antirez's deepseek41): the file carries the checkpoint's config.json
-    whole (deepseek41.config), and the engine reads it as it is. The model's layers are
-    the blocks with attention (no MTP block in these files)."""
-    raw = meta.get("deepseek41.config") or sys.exit("GGUF metadata lacks deepseek41.config")
-    cfg = json.loads(raw)
+    """DeepSeek V4.1: a deepseek41 file may carry the checkpoint's config.json whole
+    (deepseek41.config), and the engine reads it as it is; the published K-quant and IQ files have its keys
+    (deepseek41_meta_config). The model's layers are the blocks with attention (no MTP
+    block in these files)."""
+    raw = meta.get("deepseek41.config")
+    cfg = json.loads(raw) if raw else deepseek41_meta_config(meta, tensors)
     text = cfg.get("text_config", cfg)
     layers = int(text["num_hidden_layers"])
     present = sum(1 for b in range(layers + 8) if f"blk.{b}.attn_q_a.weight" in tensors)
@@ -533,6 +609,8 @@ def deepseek41_engram(meta, cfg):
     ids = list(t.get("engram_layer_ids") or [])
     if not ids:
         return None
+    if "deepseek41.engram.primes" not in meta and "deepseek41.ple.layers" in meta:
+        return deepseek41_ple_engram(meta, t, ids)
     p = "deepseek41.engram."
     need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
     if list(need("layer_ids")) != ids:
@@ -559,6 +637,33 @@ def deepseek41_engram(meta, cfg):
             "pad_id": token_map[int(t.get("engram_pad_token_id", 2))], "layer_ids": ids,
             "num_embeddings": [int(x) for x in need("rows")], "primes": primes, "offsets": offsets,
             "multipliers": [[str(v) for v in mult_flat[i * n:(i + 1) * n]] for i in range(len(ids))],
+            "token_map": token_map}
+
+
+def deepseek41_ple_engram(meta, t, ids):
+    """The sidecar from the published deepseek41 GGUFs' keys: every table in one tensor
+    (per_layer_token_embd, the engine's engram.embed.weight) whose head_offsets run over all
+    of them, so a table's offsets are the file's and each layer reads the whole tensor."""
+    p = "deepseek41."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    n, heads = int(t["engram_max_ngram_size"]), int(t["engram_n_heads"])
+    per = (n - 1) * heads
+    sizes, offs = [int(x) for x in need("ple.head_vocab_sizes")], [int(x) for x in need("ple.head_offsets")]
+    mult = [int(x) for x in need("ple.layer_multipliers")]
+    if len(sizes) != len(ids) * per or len(offs) != len(sizes) or len(mult) != len(ids) * n:
+        sys.exit("deepseek41: the engram's head sizes, offsets and multipliers are not one set per table")
+    acc = 0
+    for k, (sz, off) in enumerate(zip(sizes, offs)):
+        if off != acc:
+            sys.exit(f"deepseek41: engram head {k} starts at row {off}, the heads before it end at {acc}")
+        acc += sz
+    token_map = [int(x) for x in need("engram.token_map")]
+    return {"max_ngram_size": n, "n_heads": heads, "head_dim": int(t["engram_head_dim"]),
+            "pad_id": token_map[int(t.get("engram_pad_token_id", 2))], "layer_ids": ids,
+            "num_embeddings": [sum(sizes[i * per:(i + 1) * per]) for i in range(len(ids))],
+            "primes": [[sizes[i * per + k * heads:i * per + (k + 1) * heads] for k in range(n - 1)] for i in range(len(ids))],
+            "offsets": [offs[i * per:(i + 1) * per] for i in range(len(ids))],
+            "multipliers": [[str(v) for v in mult[i * n:(i + 1) * n]] for i in range(len(ids))],
             "token_map": token_map}
 
 
@@ -712,6 +817,67 @@ def mtp_head_ok(path, meta, layers):
         if f"blk.{layers}.nextn.eh_proj.weight" not in names:
             return f"no blk.{layers}.nextn.eh_proj.weight"
         return ""
+    finally:
+        r.close()
+
+
+DSPARK_PREFERENCE = ("Q8_0", "BF16")
+
+
+def dspark_candidates(src):
+    """dspark-*.gguf next to the model, to name (main links one only with --mtp): its folder, the
+    parent, a dspark/ folder in either; Q8_0 first."""
+    seen, found = set(), []
+    for d in (src.parent, src.parent / "dspark", src.parent.parent, src.parent.parent / "dspark"):
+        for f in sorted(d.glob("dspark-*.gguf")) if d.is_dir() else ():
+            if f.resolve() not in seen:
+                seen.add(f.resolve()); found.append(f)
+    rank = lambda f: next((i for i, tag in enumerate(DSPARK_PREFERENCE) if f.name.endswith(f"-{tag}.gguf")), len(DSPARK_PREFERENCE))
+    return sorted(found, key=rank)
+
+
+def dspark_head(path, meta):
+    """(the text_config keys of DeepSeek V4.1's DSpark head, '') when path is one for this
+    deepseek41 model (arch dflash: its stages as blk.<s>, its own tensors beside them), else
+    (None, why not). The draft's noise token and Markov rank are the model's keys."""
+    try:
+        r = GGUFReader(str(path))
+    except (GGUFError, OSError) as e:
+        return None, str(e)
+    try:
+        hm, t = r.metadata, {x["name"]: x for x in r.tensors}
+        if hm.get("general.architecture") != "dflash":
+            return None, f"architecture {hm.get('general.architecture')!r}, not dflash"
+        p, q = "dflash.", "deepseek41."
+        for k in ("embedding_length", "attention.head_count", "attention.key_length", "attention.q_lora_rank",
+                  "attention.output_lora_rank", "attention.output_group_count", "attention.sliding_window",
+                  "expert_feed_forward_length", "hyper_connection.count"):
+            if int(hm.get(p + k, -1)) != int(meta.get(q + k, -2)):
+                return None, f"{k} {hm.get(p + k)} does not match the model's {meta.get(q + k)}"
+        for k, mk in (("expert_count", "dspark.expert_count"), ("expert_used_count", "dspark.expert_used_count"),
+                      ("block_size", "dspark.block_size")):
+            if mk and q + mk in meta and int(hm.get(p + k, -1)) != int(meta[q + mk]):
+                return None, f"{k} {hm.get(p + k)} does not match the model's dspark.{k.split('.')[-1]} {meta[q + mk]}"
+        targets = [int(x) for x in hm.get(p + "target_layers") or []]
+        if q + "dspark.target_layers" in meta and targets != [int(x) for x in meta[q + "dspark.target_layers"]]:
+            return None, "its target layers are not the model's"
+        stages = int(hm.get(p + "block_count", 0))
+        if stages < 1 or not targets or (q + "dspark.noise_token_id") not in meta:
+            return None, "no stages, no target layers, or the model has no dspark.noise_token_id"
+        need = ["fc.weight", "enc.output_norm.weight", "output_norm.weight", "conf_proj.weight",
+                "markov_w1.weight", "markov_w2.weight"] + [f"blk.{s}.ffn_gate_exps.weight" for s in range(stages)]
+        if any(n not in t for n in need):
+            return None, f"no {next(n for n in need if n not in t)}"
+        if int(t["fc.weight"]["dims"][0]) != len(targets) * int(meta[q + "embedding_length"]):
+            return None, "fc.weight does not read its target layers"
+        rank = int(t["markov_w1.weight"]["dims"][0])
+        if q + "dspark.markov_rank" in meta and rank != int(meta[q + "dspark.markov_rank"]):
+            return None, f"a Markov rank of {rank}, the model's {meta[q + 'dspark.markov_rank']}"
+        return {"n_mtp_layers": stages, "dspark_block_size": int(hm[p + "block_size"]),
+                "dspark_noise_token_id": int(meta[q + "dspark.noise_token_id"]),
+                "dspark_target_layer_ids": targets, "dspark_markov_rank": rank,
+                "dspark_n_routed_experts": int(hm[p + "expert_count"]),
+                "dspark_n_activated_experts": int(hm[p + "expert_used_count"])}, ""
     finally:
         r.close()
 
@@ -922,9 +1088,10 @@ def main():
     ap.add_argument("out", type=Path)
     ap.add_argument("--mode", choices=("link", "copy"), default="link")
     ap.add_argument("--mtp", type=Path, default=None,
-                    help="qwen4exp: the MTP head's GGUF (unsloth's mtp-*.gguf); unset, one next to the model "
-                         "is used (its folder, the parent, an MTP/ folder in either; shared-Q8_0 first)")
-    ap.add_argument("--no-mtp", action="store_true", help="qwen4exp: no MTP head, plain decoding")
+                    help="qwen4exp: the MTP head's GGUF (mtp-*.gguf), unset one next to the model (its folder, "
+                         "the parent, an MTP/ folder in either; shared-Q8_0 first); deepseek41: the DSpark head's "
+                         "(dspark-*.gguf, arch dflash), which drafts only when named")
+    ap.add_argument("--no-mtp", action="store_true", help="qwen4exp, deepseek41: no draft head, plain decoding")
     ap.add_argument("--indexer-compress-ratio", type=int, default=0,
                     help="qwen4exp: when the GGUF's attention.compress_ratios are all 0 (a converter "
                          "that read the layers as qwen_sparse_attention)")
@@ -955,6 +1122,21 @@ def main():
             cfg["mtp_num_hidden_layers"] = 1
             cfg["mtp"] = {"layer_types": ["full_attention"], "rope_theta": cfg["rope_parameters"]["rope_theta"]}
             cfg["mtp_use_dedicated_embeddings"] = False
+    # DeepSeek V4.1's DSpark head drafts only when --mtp names it: on UD-IQ1_S with the Q8_0
+    # head (an RTX PRO 4000, 62 GB of RAM) 22-33% of the drafts were accepted and decode
+    # went from 5.0-5.3 tok/s to 4.3-4.6 (docs/gguf.md). A head next to the model is named.
+    dspark_file = None
+    if arch == "deepseek41" and not args.no_mtp and not any(n.startswith("mtp.") for n in tensors):
+        text = cfg.get("text_config", cfg)
+        if args.mtp:
+            keys, why = dspark_head(args.mtp, meta)
+            if not keys:
+                sys.exit(f"--mtp {args.mtp}: {why}")
+            dspark_file = args.mtp.resolve(); mtp_where = str(dspark_file)
+            text.update(keys)
+        else:
+            mtp_where = next((f"none linked; {c} is this model's, --mtp links it (measured slower on "
+                              f"UD-IQ1_S, docs/gguf.md)" for c in dspark_candidates(src) if dspark_head(c, meta)[0]), None)
     tok, tcfg, gen = tokenizer_files(meta)
     args.out.mkdir(parents=True, exist_ok=True)
     cfg["colibri_gguf"] = {"arch": arch, "mode": args.mode, "source": str(src), **model_name(meta)}
@@ -974,12 +1156,15 @@ def main():
             "size": sum(p.stat().st_size for p in parts) if args.mode == "link" else target.stat().st_size}
     if mtp_file:
         link["mtp"] = str(mtp_file)
+    if dspark_file:
+        link["dspark"] = str(dspark_file)
     (args.out / "gguf.json").write_text(json.dumps(link, indent=1), encoding="utf-8")
     for r in readers:
         r.close()
     print(f"colibri model directory ready: {args.out}  ({arch}, {layers} layers, mode {args.mode})")
-    if arch == "qwen4exp":
-        print(f"  MTP head: {mtp_where or ('off (--no-mtp)' if args.no_mtp else 'none found: decoding without drafts (--mtp names one)')}")
+    if arch in ("qwen4exp", "deepseek41"):
+        head = "MTP head" if arch == "qwen4exp" else "DSpark head"
+        print(f"  {head}: {mtp_where or ('off (--no-mtp)' if args.no_mtp else 'none found: decoding without drafts (--mtp names one)')}")
 
 
 if __name__ == "__main__":

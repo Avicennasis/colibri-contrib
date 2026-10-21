@@ -651,7 +651,11 @@ and 262144 tokens (up to the family's maximum) whose conversation state, for eve
 KV slot, takes at most a quarter of the memory up to 65536 tokens and a tenth
 beyond (`RAM_GB` when set, the available memory otherwise), and the family's own
 default when even 16384 does not fit that. The larger share up to 64k is for
-coding agents, which do not run on less. The startup log says which
+coding agents, which do not run on less. DeepSeek V4.1 and MiMo, whose expert cache
+the plan sizes and which do not start without a slot a layer, count the prompt's
+workspace beside the state: V4.1 prefills a prompt in one forward (about 200 KB a
+token), so a 64 GB box gets 65536 tokens rather than the 262144 its 6.4 KB a token of
+state allowed, which left the cache nothing. The startup log says which
 (`[gateway] 65536 tokens of context ...`), and `GET /v1/models` reports it as
 `context_length` (and `max_model_len`), where agents read it.
 
