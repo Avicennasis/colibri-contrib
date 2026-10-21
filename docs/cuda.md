@@ -132,6 +132,15 @@ qwen36 has its own form of this, shaped like the Vulkan chain: `COLI_CUDA_CHAIN=
 runs every layer as one chain on the card (`c/cuda_chain.h`, `c/qwen36_cuda_chain.h`;
 docs/qwen36-cuda-tier.md, "The dense chain on the card").
 
+## The engines' routed-expert tier on CUDA (`cu_tier`)
+
+The routed-expert tier the Vulkan engines share (`c/vk_tier.c`, [vulkan.md](vulkan.md#the-routed-expert-tier-vk_tierc)) also runs on a CUDA device: `c/cu_tier.c` compiles the same file again over a CUDA backend (`c/cu_xb.cu`, through the table in `c/cu_tier_ops.h`), so the history, the warm start, the promotions, the host pool and the hybrid steps are the Vulkan tier's, and its lines read `[CUDA] tier <engine>`. It takes the same `COLI_VK_TIER*` settings.
+
+- **Formats:** colibri's (int8 a row or per group, int4 pairs, int3-g64, MXFP4, FP8, bf16, f32) and a GGUF's block types as the file has them, through the same block decoders as `cuda_bd.cuh`'s GEMVs, in the CPU's integer form (`GQ_EXACT=1`: the float form).
+- **The host pool:** the experts the card leaves sit in mapped page-locked RAM that the card reads over the bus; the CPU computes a small step's pairs from it in place (the hybrid, `COLI_VK_HYBRID=0` off).
+- **Not on CUDA yet:** the dense chain's expert table, a second device, streaming a prompt's cold experts, and the low-bit formats (fmt 200-203).
+- **DeepSeek V4** (`make deepseek-v4 CUDA=1`, `COLI_CUDA=1` with no Vulkan tier) uses it for a GGUF's experts, which the FP4 checkpoint's own CUDA tier cannot take; that tier keeps the dense part on the card. DeepSeek V4 Flash UD-IQ1_S (82.5 GB) on an RTX PRO 4000 (24 GB) with 62 GB of RAM, a 163-token prompt and 128 tokens: 14.0-14.3 tok/s of prompt and 4.08-4.17 of decode, against 7.8-8.4 and 2.67-2.68 with the experts on the CPU. The card holds 3280 experts and the host pool the other 7710, so nothing comes from the disk; Vulkan, whose dense chain also puts the trunk on the card, does 20-22 and 6.6-6.9.
+
 ## Notes and limitations
 
 - Text-mode timing reports prefill separately from decode.
