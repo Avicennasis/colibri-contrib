@@ -109,7 +109,9 @@
 #endif
 #include "cpu_check.h"   /* the processor runs what this build assumes, or it says so (#1979) */
 #include "cli_args.h"
+#define ST_GGUF   /* a gguf_import folder reads as the checkpoint (st_gguf.h) */
 #include "st.h"
+#include "ggml_view.h"
 #include "tok.h"
 #include "quant.h"
 #ifdef COLI_CUDA
@@ -156,7 +158,9 @@ typedef struct {
 } Cfg;
 
 /* ---------- RAM-resident or read-only mapped weight ---------- */
-typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;
+/* fmt 0 f32, 1 int8 rows, 4 int4 groups, 100 + t a GGUF's rows in ggml type t (gg, the
+ * file's blocks, multiplied with ggml_quants.h's kernels) */
+typedef struct { int fmt; float *f; int8_t *q8; uint8_t *q4; float *s; uint8_t *gg; int O, I, gs;
                  void *vk;    /* ColiVkTensor* once uploaded (K3_VK); NULL = CPU only */
                  void *metal; /* ColiMetalTensor* once registered (K3_METAL); NULL = CPU only */
                  st_mapped_raw data_map, scale_map;
@@ -485,7 +489,9 @@ static void k3_vk_aliases(void){
     }
 }
 /* the backend format of a resident W: int8 rows, int4 groups, f32 */
-static int k3_vk_fmt(const W *w){ return w->fmt==1?1 : w->fmt==4?4 : w->fmt==0?10 : -1; }
+static int k3_vk_fmt(const W *w){
+    if(w->fmt>=100){ const int be=coli_vk_block_elems(w->fmt); return be>0&&w->I%be==0?w->fmt:-1; }   /* a GGUF's blocks */
+    return w->fmt==1?1 : w->fmt==4?4 : w->fmt==0?10 : -1; }
 /* the format the device holds w in: an f32 W as bf16 or f16 where that holds it exactly */
 static int k3_vk_dev_fmt(const W *w){ return w->fmt==0&&w->f?coli_vk_f32_fmt(w->f,(size_t)w->I*w->O):k3_vk_fmt(w); }
 /* w's device copy into *t on device dev (0 or 1, the second) */
@@ -493,6 +499,7 @@ static int k3_vk_ensure(W *w, ColiVkTensor **t, int dev){
     int fmt=k3_vk_fmt(w);
     if(fmt<0||w->mapped) return 0;
     if(fmt==10) return coli_vk_tensor_ensure_f32(t,w->f,w->I,w->O,dev);
+    if(fmt>=100) return dev?coli_vk_tensor_ensure2(t,w->gg,NULL,fmt,w->I,w->O,0):coli_vk_tensor_ensure(t,w->gg,NULL,fmt,w->I,w->O,0);
     const void *src=fmt==1?(const void*)w->q8:(const void*)w->q4;
     return dev?coli_vk_tensor_ensure2(t,src,w->s,fmt,w->I,w->O,fmt==4?w->gs:0)
               :coli_vk_tensor_ensure(t,src,w->s,fmt,w->I,w->O,fmt==4?w->gs:0);
@@ -556,6 +563,11 @@ static void w_matmul(float *y, const float *x, const W *w, int S){
     if(w->vk_gone) k3_w_reload((W*)w);    /* the CPU needs a matrix the device held alone (a lost device) */
 #endif
     if(w->fmt==0)      matmul(y,x,w->f,S,w->I,w->O);
+    else if(w->fmt>=100){   /* a GGUF's blocks */
+        ColiTensorView v={0}; v.format=COLI_TENSOR_GGML; v.data=w->gg; v.rows=w->O; v.columns=w->I;
+        v.block_columns=(uint32_t)(w->fmt-100);
+        if(coli_ggml_matmul(y,&v,x,S)){ fprintf(stderr,"w_matmul: ggml type %d failed\n",w->fmt-100); exit(1); }
+    }
     else if(w->fmt==1) matmul_q(y,x,w->q8,w->s,S,w->I,w->O);
     else if(w->fmt==4) matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs);
     else { fprintf(stderr,"w_matmul: bad fmt %d\n",w->fmt); exit(1); }
@@ -650,7 +662,7 @@ static void w_map_prepared(Model *m, W *w, const char *name, const char *scale_n
 static void w_release_host(W *w){
     if(!w) return;
     if(w->mapped){ st_unmap_raw(&w->scale_map); st_unmap_raw(&w->data_map); }
-    else { free(w->f); free(w->q8); free(w->q4); free(w->s); }
+    else { free(w->f); free(w->q8); free(w->q4); free(w->s); free(w->gg); }
 #ifdef COLI_VULKAN
     free(w->vk_name);
 #endif
@@ -666,6 +678,18 @@ static void w_load(Model *m, W *w, const char *name, int O, int I, int bits){
     w->vk_name=strdup(name); w->vk_bits=bits;   /* to read it back as it is read now (k3_w_reload) */
     if(!w->vk_name){fprintf(stderr,"OOM weight name\n");exit(1);}
 #endif
+    if(st_is_ggml(t->dtype)){
+        /* a GGUF's (st_gguf.h): the file's blocks as they are, K3_BITS not applied (the file
+         * chose each matrix's type); the F32 / F16 / BF16 ones come as the checkpoint's */
+        const int gt=st_ggml_type(t->dtype);
+        const int64_t rb=gq_row_bytes(gt,I);
+        if(rb<0||t->nbytes!=rb*O){
+            fprintf(stderr,"%s: %lld bytes, not %d rows of %d in ggml type %s\n",nm,(long long)t->nbytes,O,I,gq_type_name(gt)); exit(1); }
+        w->fmt=100+gt; w->gg=malloc((size_t)t->nbytes);
+        if(!w->gg){fprintf(stderr,"OOM %s\n",nm);exit(1);}
+        st_read_raw(&m->S,nm,w->gg,1);
+        return;
+    }
     if(t->dtype==3){
         /* repacked container (tools/k3_repack.py): pre-quantized U8 + .qs f32
          * scales — no load-time quantization, K3_BITS is ignored for these
@@ -770,8 +794,35 @@ static float *f32_load(Model *m, const char *name, int64_t want){
     st_tensor *t=st_find(&m->S,nm);
     if(!t) st_die_missing(&m->S,nm);
     if(want>0 && t->numel!=want){ fprintf(stderr,"%s: numel %lld != %lld\n",nm,(long long)t->numel,(long long)want); exit(1); }
-    float *p=falloc(t->numel); st_read_f32(&m->S,nm,p,0); return p;
+    float *p=falloc(t->numel);
+    if(st_is_ggml(t->dtype)){   /* a GGUF's quantized one (the KDA's f_a and f_b): its rows dequantized */
+        const int gt=st_ggml_type(t->dtype); const int64_t cols=t->shape[t->rank-1], rows=t->numel/cols;
+        const int64_t rb=gq_row_bytes(gt,cols);
+        uint8_t *raw=malloc((size_t)t->nbytes);
+        if(rb<0||rb*rows!=t->nbytes||!raw){ fprintf(stderr,"%s: not rows of %lld in ggml type %s\n",nm,(long long)cols,gq_type_name(gt)); exit(1); }
+        st_read_raw(&m->S,nm,raw,1);
+        for(int64_t r=0;r<rows;r++) gq_dequant_row(gt,raw+r*rb,p+r*cols,(int)cols);
+        free(raw);
+        return p;
+    }
+    st_read_f32(&m->S,nm,p,0); return p;
 }
+
+/* A W from O rows of I floats it takes over: f32 at 32 bits, else int8 rows with a scale each
+ * (a GGUF's MLA kv_b, rebuilt from its per-head k_b and v_b). */
+static void w_set_f32(W *w, float *f, int O, int I, int bits){
+    memset(w,0,sizeof(*w)); w->O=O; w->I=I;
+    if(bits>=32){ w->fmt=0; w->f=f; return; }
+    w->fmt=1; w->q8=malloc((size_t)O*I); w->s=falloc(O);
+    if(!w->q8){fprintf(stderr,"OOM int8 rows\n");exit(1);}
+    for(int r=0;r<O;r++){ const float *src=f+(int64_t)r*I;
+        float am=0; for(int i=0;i<I;i++){ float a=fabsf(src[i]); if(a>am)am=a; }
+        float sc=am/127.f; if(sc<1e-20f)sc=1e-20f; w->s[r]=sc; float inv=1.f/sc;
+        int8_t *dst=w->q8+(int64_t)r*I;
+        for(int i=0;i<I;i++){ int v=(int)lrintf(src[i]*inv); if(v>127)v=127; if(v<-127)v=-127; dst[i]=(int8_t)v; } }
+    free(f);
+}
+static int k3_has(Model *m, const char *name){ char nm[1100]; snprintf(nm,sizeof(nm),"%s%s",m->pfx,name); return st_has(&m->S,nm); }
 
 #ifdef COLI_VULKAN
 /* ---- the dense matrices on the device only (COLI_VK_DENSE_HOST) -----------------
@@ -789,6 +840,7 @@ static size_t k3_w_host_bytes(const W *w){
     if(w->fmt==0) return w->f?(size_t)w->O*w->I*4:0;
     if(w->fmt==1) return w->q8?(size_t)w->O*w->I+(size_t)w->O*4:0;
     if(w->fmt==4) return w->q4?(size_t)w->O*((w->I+1)/2)+(size_t)w->O*((w->I+w->gs-1)/w->gs)*4:0;
+    if(w->fmt>=100) return w->gg?(size_t)gq_row_bytes(w->fmt-100,w->I)*(size_t)w->O:0;
     return 0;
 }
 static void k3_w_reload(W *w){
@@ -798,7 +850,7 @@ static void k3_w_reload(W *w){
         if(!m||!w->vk_name){fprintf(stderr,"[VK] kimi_k3: a dense matrix the device held alone cannot be read back\n");exit(1);}
         W t; w_load(m,&t,w->vk_name,w->O,w->I,w->vk_bits);
         if(t.fmt!=w->fmt||t.gs!=w->gs){fprintf(stderr,"[VK] kimi_k3: %s came back in another form\n",w->vk_name);exit(1);}
-        w->f=t.f; w->q8=t.q8; w->q4=t.q4; w->s=t.s;
+        w->f=t.f; w->q8=t.q8; w->q4=t.q4; w->s=t.s; w->gg=t.gg;
         free(t.vk_name);
         w->vk_gone=0;
         coli_vk_dense_host_reloaded(k3_w_host_bytes(w));
@@ -1111,7 +1163,12 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
         l->sparse=(i>=c->first_dense);
         l->in_ln  =f32_load(m,NM("model.layers.%d.input_layernorm.weight",i),c->hidden);
         l->post_ln=f32_load(m,NM("model.layers.%d.post_attention_layernorm.weight",i),c->hidden);
-        /* AttnRes score weight = res_norm.weight * res_proj.weight (elementwise) */
+        /* AttnRes score weight = res_norm.weight * res_proj.weight (elementwise); a GGUF has
+         * the product (res_score) */
+        if(k3_has(m,NM("model.layers.%d.self_attention_res_score.weight",i))){
+          l->attn_sw=f32_load(m,NM("model.layers.%d.self_attention_res_score.weight",i),c->hidden);
+          l->mlp_sw=f32_load(m,NM("model.layers.%d.mlp_res_score.weight",i),c->hidden);
+        } else
         { float *rn=f32_load(m,NM("model.layers.%d.self_attention_res_norm.weight",i),c->hidden);
           float *rp=f32_load(m,NM("model.layers.%d.self_attention_res_proj.weight",i),c->hidden);
           l->attn_sw=falloc(c->hidden); for(int d=0;d<c->hidden;d++) l->attn_sw[d]=rn[d]*rp[d];
@@ -1135,6 +1192,12 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
             a->bp=f32_load(m,NM("model.layers.%d.self_attn.b_proj.weight",i),(int64_t)c->kda_heads*c->hidden);
             a->dt=f32_load(m,NM("model.layers.%d.self_attn.dt_bias",i),P);
             a->onw=f32_load(m,NM("model.layers.%d.self_attn.o_norm.weight",i),c->kda_hd);
+            if(k3_has(m,NM("model.layers.%d.self_attn.ssm_a",i))){   /* a GGUF's: -exp(A_log) a head */
+              float *sa=f32_load(m,NM("model.layers.%d.self_attn.ssm_a",i),c->kda_heads);
+              a->A=falloc(c->kda_heads);
+              for(int h=0;h<c->kda_heads;h++) a->A[h]=-sa[h];
+              free(sa);
+            } else
             { /* A_log in the checkpoint is [kda_hd] = per-head zero-padded */
               char an[512]; snprintf(an,sizeof(an),"%smodel.layers.%d.self_attn.A_log",m->pfx,i);
               st_tensor *t=st_find(&m->S,an); if(!t) st_die_missing(&m->S,an);
@@ -1156,6 +1219,20 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
             w_load(m,&a->qa,NM("model.layers.%d.self_attn.q_a_proj.weight",i),c->q_lora,c->hidden,mbits);
             w_load(m,&a->qb,NM("model.layers.%d.self_attn.q_b_proj.weight",i),c->n_heads*c->qk_head,c->q_lora,mbits);
             w_load(m,&a->kva,NM("model.layers.%d.self_attn.kv_a_proj_with_mqa.weight",i),c->kv_lora+c->qk_rope,c->hidden,mbits);
+            if(k3_has(m,NM("model.layers.%d.self_attn.k_b.weight",i))){
+                /* a GGUF's: kv_b split per head, k_b transposed ([heads][kv_lora][qk_nope]) and
+                 * v_b ([heads][v_head][kv_lora]); back to kv_b's rows, a head's nope then v */
+                const int H=c->n_heads, Kl=c->kv_lora, Nn=c->qk_nope, Vh=c->v_head, R=Nn+Vh;
+                float *kb=f32_load(m,NM("model.layers.%d.self_attn.k_b.weight",i),(int64_t)H*Kl*Nn);
+                float *vb=f32_load(m,NM("model.layers.%d.self_attn.v_b.weight",i),(int64_t)H*Vh*Kl);
+                float *kv=falloc((int64_t)H*R*Kl);
+                for(int h=0;h<H;h++){
+                    for(int r=0;r<Nn;r++) for(int j=0;j<Kl;j++) kv[((int64_t)h*R+r)*Kl+j]=kb[((int64_t)h*Kl+j)*Nn+r];
+                    memcpy(kv+((int64_t)h*R+Nn)*Kl,vb+(int64_t)h*Vh*Kl,(size_t)Vh*Kl*sizeof(float));
+                }
+                free(kb); free(vb);
+                w_set_f32(&a->kvb,kv,H*R,Kl,mbits);
+            } else
             w_load(m,&a->kvb,NM("model.layers.%d.self_attn.kv_b_proj.weight",i),c->n_heads*(c->qk_nope+c->v_head),c->kv_lora,mbits);
             w_load(m,&a->o,NM("model.layers.%d.self_attn.o_proj.weight",i),c->hidden,c->n_heads*c->v_head,mbits);
             w_load(m,&a->g,NM("model.layers.%d.self_attn.g_proj.weight",i),c->n_heads*c->v_head,c->hidden,mbits);
@@ -1192,6 +1269,8 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
     m->has_head = load_boundaries&&st_has(&m->S,nm);
     if(m->has_head){
         m->final_norm=f32_load(m,"model.norm.weight",c->hidden);
+        if(k3_has(m,"model.output_attn_res_score.weight")) m->out_sw=f32_load(m,"model.output_attn_res_score.weight",c->hidden);   /* a GGUF's product */
+        else
         { float *rn=f32_load(m,"model.output_attn_res_norm.weight",c->hidden);
           float *rp=f32_load(m,"model.output_attn_res_proj.weight",c->hidden);
           m->out_sw=falloc(c->hidden); for(int d=0;d<c->hidden;d++) m->out_sw[d]=rn[d]*rp[d];
@@ -2776,6 +2855,14 @@ static void k3_embed(Model *m, const int *ids, int pos0, int C, float *hidden){
             memcpy(hidden+(int64_t)t*D,g_x0+(int64_t)(pos0+t)*D,D*sizeof(float));
         } else {
             char nm[512]; snprintf(nm,sizeof(nm),"%smodel.embed_tokens.weight",m->pfx);
+            const st_tensor *et=st_find(&m->S,nm);
+            if(et&&st_is_ggml(et->dtype)){   /* a GGUF's embedding: the id's row of blocks, dequantized */
+                const int gt=st_ggml_type(et->dtype); const int64_t rb=gq_row_bytes(gt,D);
+                uint8_t row[16384];
+                if(rb<0||rb>(int64_t)sizeof(row)){ fprintf(stderr,"%s: a row of %d in %s does not fit\n",nm,D,gq_type_name(gt)); exit(1); }
+                st_read_slice_raw_cap(&m->S,nm,(int64_t)ids[t]*rb,rb,row,rb,0);
+                gq_dequant_row(gt,row,hidden+(int64_t)t*D,D);
+            } else
             st_read_slice_f32(&m->S,nm,(int64_t)ids[t]*D,D,hidden+(int64_t)t*D,0);
         }
     }

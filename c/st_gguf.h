@@ -125,6 +125,48 @@ static const st_gg_name st_gg_dflash_glob[] = {
     {"markov_w1.weight", "mtp.@.markov_head.embed.weight"}, {"markov_w2.weight", "mtp.@.markov_head.head.weight"},
     {NULL, NULL}};
 
+/* Kimi K3 (kimi-k3): under the names of Moonshot's checkpoint (text side), which kimi_k3.c
+ * reads. Three come in another form than the checkpoint's, under names of their own the
+ * engine takes in place of the checkpoint's: res_score is res_norm * res_proj (the engine's
+ * attn_sw, mlp_sw, out_sw; verified on the released bytes), ssm_a is -exp(A_log), and MLA's
+ * kv_b_proj is split per head into k_b (transposed, [heads][kv_lora][qk_nope]) and v_b. */
+static const st_gg_name st_gg_k3_glob[] = {
+    {"token_embd.weight", "model.embed_tokens.weight"}, {"output_norm.weight", "model.norm.weight"},
+    {"output.weight", "lm_head.weight"}, {"output_res_score.weight", "model.output_attn_res_score.weight"},
+    {NULL, NULL}};
+static const st_gg_name st_gg_k3_layer[] = {
+    {"attn_norm.weight", "input_layernorm.weight"}, {"ffn_norm.weight", "post_attention_layernorm.weight"},
+    {"attn_res_score.weight", "self_attention_res_score.weight"}, {"ffn_res_score.weight", "mlp_res_score.weight"},
+    /* KDA */
+    {"attn_q.weight", "self_attn.q_proj.weight"}, {"attn_k.weight", "self_attn.k_proj.weight"},
+    {"attn_v.weight", "self_attn.v_proj.weight"}, {"ssm_g.weight", "self_attn.g_proj.weight"},
+    {"attn_output.weight", "self_attn.o_proj.weight"},
+    {"ssm_conv1d_q.weight", "self_attn.q_conv1d.weight"}, {"ssm_conv1d_k.weight", "self_attn.k_conv1d.weight"},
+    {"ssm_conv1d_v.weight", "self_attn.v_conv1d.weight"},
+    {"ssm_f_a.weight", "self_attn.f_a_proj.weight"}, {"ssm_f_b.weight", "self_attn.f_b_proj.weight"},
+    {"ssm_beta.weight", "self_attn.b_proj.weight"}, {"ssm_dt.bias", "self_attn.dt_bias"},
+    {"ssm_norm.weight", "self_attn.o_norm.weight"}, {"ssm_a", "self_attn.ssm_a"},
+    /* MLA (attn_output and attn_gate as the KDA's o_proj and g_proj) */
+    {"attn_q_a.weight", "self_attn.q_a_proj.weight"}, {"attn_q_a_norm.weight", "self_attn.q_a_layernorm.weight"},
+    {"attn_q_b.weight", "self_attn.q_b_proj.weight"}, {"attn_kv_a_mqa.weight", "self_attn.kv_a_proj_with_mqa.weight"},
+    {"attn_kv_a_norm.weight", "self_attn.kv_a_layernorm.weight"}, {"attn_gate.weight", "self_attn.g_proj.weight"},
+    {"attn_k_b.weight", "self_attn.k_b.weight"}, {"attn_v_b.weight", "self_attn.v_b.weight"},
+    /* the MoE: the router, the latent, the shared experts, the routed ones (w1 gate, w3 up, w2 down) */
+    {"ffn_gate_inp.weight", "block_sparse_moe.gate.weight"}, {"exp_probs_b.bias", "block_sparse_moe.gate.e_score_correction_bias"},
+    {"ffn_routed_norm.weight", "block_sparse_moe.routed_expert_norm.weight"},
+    {"ffn_routed_down.weight", "block_sparse_moe.routed_expert_down_proj.weight"},
+    {"ffn_routed_up.weight", "block_sparse_moe.routed_expert_up_proj.weight"},
+    {"ffn_gate_shexp.weight", "block_sparse_moe.shared_experts.gate_proj.weight"},
+    {"ffn_up_shexp.weight", "block_sparse_moe.shared_experts.up_proj.weight"},
+    {"ffn_down_shexp.weight", "block_sparse_moe.shared_experts.down_proj.weight"},
+    {"ffn_gate_exps.weight", "block_sparse_moe.experts.%d.w1.weight"},
+    {"ffn_up_exps.weight", "block_sparse_moe.experts.%d.w3.weight"},
+    {"ffn_down_exps.weight", "block_sparse_moe.experts.%d.w2.weight"},
+    /* the dense first layer */
+    {"ffn_gate.weight", "mlp.gate_proj.weight"}, {"ffn_up.weight", "mlp.up_proj.weight"},
+    {"ffn_down.weight", "mlp.down_proj.weight"},
+    {NULL, NULL}};
+
 /* Inkling (inkling): conversion/inkling.py of llama.cpp's PR (TML checkpoint names), here
  * under the names of transformers' port, which inkling.c reads. The port keeps gate and up
  * of a routed expert in one tensor (gate_up_proj, gate rows then up rows); the GGUF has them
@@ -260,6 +302,7 @@ static const st_gg_map st_gguf_maps[] = {
     {"deepseek4", "layers.%d.", st_gg_dsv4_glob, st_gg_dsv4_layer},
     {"deepseek41", "layers.%d.", st_gg_dsv41_glob, st_gg_dsv41_layer},
     {"dflash", "mtp.%d.", st_gg_dflash_glob, st_gg_dsv41_layer},
+    {"kimi-k3", "model.layers.%d.", st_gg_k3_glob, st_gg_k3_layer},
     {"inkling", "model.layers.%d.", st_gg_ink_glob, st_gg_ink_layer},
 };
 
