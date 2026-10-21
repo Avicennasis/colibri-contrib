@@ -149,16 +149,19 @@ static struct {
     ColiVkExpert **bex; int *brows; int *bfirst; int cb;
     const float **bx, **by; int *rowsrc; int cbx;
     float *bw;                           /* the rows' route weights (vkt_issue_w), beside bx */
-    /* hybrid steps (hybrid: COLI_VK_HYBRID, SwiGLU, a host pool): in a step of up to
+    /* hybrid steps (hybrid: COLI_VK_HYBRID, SwiGLU or DeepSeek V4's, a host pool): in a step of up to
      * VKT_UP_ROWS rows, the pairs of the host pool's experts of block types the CPU computes
      * in place at the join (vkt_host_pairs) while the device computes the ones it holds,
      * instead of the device reading them over PCIe; hy_of[i] pair i's place among them (-1
-     * none), hy_v their rows, hy_x their input rows, hy_out their outputs */
+     * none), hy_v their rows, hy_x their input rows, hy_w their route weights (VKT_ACT_SWIGLU_V4
+     * applies them as the device does), hy_out their outputs; hy_xb the input rows copied at
+     * the issue (hy_keep_x: an engine may free x once the issue returns, as DeepSeek V4 does),
+     * hy_src their sources, hy_nx how many */
     int hybrid, hy_n, chy, cho; int *hy_of;
     int hy_big;                          /* a prompt step's host pool experts of at most hy_big rows on the CPU too (0: none) */
     unsigned long long hyb_steps, hyb_pairs;
     VktHostExpert *hy_v; const VktHostExpert **hy_hx; const float **hy_x;
-    float *hy_gu, *hy_hh, *hy_out;
+    float *hy_gu, *hy_hh, *hy_out, *hy_w, *hy_xb; const float **hy_src; int hy_nx, hy_xcap;
     unsigned long long hy_steps, hy_pairs; double hy_ms;
     int max_dev_rows;
     double t_issued;
@@ -1265,6 +1268,8 @@ static int d2_issue_big(int layer, const float *x, int K, const float *w, const 
 }
 static int host_view_share(int layer, int e, VktHostExpert *hx, int share);   /* below, with the hybrid steps */
 static int grow_hy(int n, int np);
+static int grow_hyx(int S);
+static const float *hy_keep_x(const float *src);
 static int issue_big(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken) {
     const int E = T.c.experts, H = T.c.hidden, n = S * K;
     int *cnt = T.bcnt, *ofs = T.bofs, *cls = T.bcls;
@@ -1309,9 +1314,9 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
      * place at the join (vkt_host_pairs), while it waits for the device anyway, instead of its
      * bytes crossing the bus for a row or two (the device's alternative is a copy, so the
      * decode's PCIe share does not apply) */
-    T.hy_n = 0;
+    T.hy_n = T.hy_nx = 0;
     int nhy = 0;
-    if (T.hybrid && T.hy_big > 0 && grow_hy(n, 0)) {
+    if (T.hybrid && T.hy_big > 0 && grow_hy(n, 0) && grow_hyx(S)) {
         for (int i = 0; i < n; i++) T.hy_of[i] = -1;
         for (int e = 0; e < E; e++) {
             if (cnt[e] < 1 || cnt[e] > T.hy_big || (cls[e] != BC_DEV && cls[e] != BC_STREAM) || !slot(layer, e)->host) continue;
@@ -1319,7 +1324,8 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
             if (!host_view_share(layer, e, &hv, 0) || !grow_hy(n, T.hy_n + cnt[e])) continue;
             for (int r = 0; r < cnt[e]; r++) {
                 const int i = T.blist[ofs[e] + r];
-                T.hy_v[T.hy_n] = hv; T.hy_x[T.hy_n] = x + (size_t)(i / K) * H; T.hy_of[i] = T.hy_n++;
+                T.hy_v[T.hy_n] = hv; T.hy_x[T.hy_n] = hy_keep_x(x + (size_t)(i / K) * H); T.hy_w[T.hy_n] = w ? w[i] : 1.f;
+                T.hy_of[i] = T.hy_n++;
             }
             if (T.bpool && T.bpool[e]) { T.bpool[e] = 0; npool--; }
             cls[e] = BC_NONE; nhy++;   /* none of the device's */
@@ -1533,6 +1539,8 @@ static int issue_big(int layer, const float *x, int S, int K, const int *idx, co
     T.t_issued = vkt_now_ms();
     return total + T.hy_n;
 }
+static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
+                      float limit, int nt, float *gu, float *hh, float *dn, const float *pw);
 static int join_big(const float **rows) {
     double t0 = vkt_now_ms(), tc = t0 - T.t_issued;
     T.cpu_ms += tc;
@@ -1540,7 +1548,8 @@ static int join_big(const float **rows) {
     const int hn = T.hy_n;
     int hok = 1;
     if (hn) {
-        hok = vkt_host_pairs(T.hy_hx, T.hy_x, hn, T.c.hidden, T.c.inter, T.c.act_limit, 0, T.hy_gu, T.hy_hh, T.hy_out);
+        hok = host_pairs(T.hy_hx, T.hy_x, hn, T.c.hidden, T.c.inter, T.c.act_limit, 0, T.hy_gu, T.hy_hh, T.hy_out,
+                         T.c.act == VKT_ACT_SWIGLU_V4 ? T.hy_w : NULL);
         double th = vkt_now_ms() - t0;
         T.hy_ms += th; T.cpu_ms += th; T.hyb_steps++; T.hyb_pairs += (unsigned long long)hn;
         T.hy_n = 0;
@@ -1641,6 +1650,20 @@ static double hybrid_pcie_share(void) {
     if (f < 0) { const char *e = getenv("COLI_VK_HYBRID_PCIE"); f = e && *e ? atof(e) : 0.3; if (f < 0) f = 0; if (f > 1) f = 1; }
     return f;
 }
+/* The device formats the CPU computes from the host pool's rows: a GGUF's block types, and
+ * colibri's int8 (fmt 1 a row's scale, 13 a group's) and int4 pairs (fmt 2, 4), whose groups
+ * are whole blocks of 32 of the activations */
+static int host_fmt_ok(const ColiVkTensorInfo *ti) {
+    if (ti->fmt >= 100 && ti->fmt < 164) return 1;
+    if (ti->I % 32) return 0;
+    if (ti->fmt == 1 || ti->fmt == 2) return 1;
+    if (ti->fmt == 5) return ti->I % 64 == 0;
+    return (ti->fmt == 4 || ti->fmt == 13 || ti->fmt == 7 || ti->fmt == 12) && ti->gs >= 32 && ti->gs % 32 == 0;
+}
+static int host_type(const ColiVkTensorInfo *ti) { return ti->fmt >= 100 ? ti->fmt - 100 : -ti->fmt; }
+static int host_gs(const ColiVkTensorInfo *ti) {
+    return ti->fmt == 5 ? 64 : ti->fmt == 4 || ti->fmt == 13 || ti->fmt == 7 || ti->fmt == 12 ? ti->gs : 0;
+}
 /* A resident expert of the host pool the CPU computes in place in a hybrid step: outside the
  * device's share (by a hash of (layer, expert): the same split at every step and every read
  * of a table, the CPU's share spread over the experts), its three tensors block types the
@@ -1652,13 +1675,15 @@ static int host_view_share(int layer, int e, VktHostExpert *hx, int share) {
     hsh ^= hsh >> 15; hsh *= 2654435761u; hsh ^= hsh >> 13;
     if (share && (double)(hsh & 0xffff) / 65536.0 < hybrid_pcie_share()) return 0;
     ColiVkTensor *t[3]; ColiVkTensorInfo ti[3]; const void *r[3]; int ok = 1;
+    const void *sc[3] = {NULL, NULL, NULL};
     coli_vk_xb_expert_tensors(v->ex, &t[0], &t[1], &t[2]);
     for (int k = 0; k < 3 && ok; k++)
-        ok = t[k] && coli_vk_tensor_info(t[k], &ti[k]) && ti[k].fmt >= 100 && ti[k].fmt < 164 &&
-             (r[k] = coli_vk_tensor_host_rows(t[k], NULL)) != NULL;
-    if (!ok || ti[0].fmt != ti[1].fmt) return 0;
-    *hx = (VktHostExpert){r[0], r[1], r[2], ti[0].fmt - 100, ti[2].fmt - 100,
-                          (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4};
+        ok = t[k] && coli_vk_tensor_info(t[k], &ti[k]) && host_fmt_ok(&ti[k]) &&
+             (r[k] = coli_vk_tensor_host_rows(t[k], &sc[k])) != NULL && (ti[k].fmt >= 100 || sc[k]);
+    if (!ok || ti[0].fmt != ti[1].fmt || ti[0].gs != ti[1].gs) return 0;
+    *hx = (VktHostExpert){r[0], r[1], r[2], host_type(&ti[0]), host_type(&ti[2]),
+                          (size_t)ti[0].rowWords * 4, (size_t)ti[2].rowWords * 4,
+                          sc[0], sc[1], sc[2], host_gs(&ti[0]), host_gs(&ti[2])};
     return 1;
 }
 static int host_view(int layer, int e, VktHostExpert *hx) { return host_view_share(layer, e, hx, 1); }
@@ -1672,12 +1697,132 @@ static int hy_threads(void) {   /* the CPU's team: COLI_VK_HYBRID_THREADS, else 
     return 1;
 #endif
 }
-/* a row of type t (I inputs) against act a's rows (xf[s] their floats): the CPU's integer
- * form, or with GQ_EXACT=1 its float reference (gq_dequant_row), as its own matmuls would
- * take it. Each activation row its own dot, the same bits whatever rows share the call. */
-static inline void host_rows(float *y, int ys, const gq_act *a, const float *const *xf, const uint8_t *row, int t, int I, float *tmp) {
+/* colibri's int8 (fmt 1, 13), int4 (fmt 2, 4), int3-g64 (fmt 5), MXFP4 (fmt 7) and FP8 (fmt 12)
+ * rows. dev_codes: an int4 row's codes in element order (the pairs' low nibble first), 0..15
+ * (the value + 8), into u (I bytes). */
+static void dev_codes(uint8_t *u, const uint8_t *row, int I) {
+    int j = 0;
+#if defined(__AVX2__)
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    for (; j + 16 <= I / 2; j += 16) {
+        const __m128i b = _mm_loadu_si128((const __m128i *)(row + j));
+        const __m128i lo = _mm_and_si128(b, m4), hi = _mm_and_si128(_mm_srli_epi16(b, 4), m4);
+        _mm_storeu_si128((__m128i *)(u + 2 * j), _mm_unpacklo_epi8(lo, hi));
+        _mm_storeu_si128((__m128i *)(u + 2 * j + 16), _mm_unpackhi_epi8(lo, hi));
+    }
+#endif
+    for (; j < I / 2; j++) { u[2 * j] = row[j] & 15; u[2 * j + 1] = row[j] >> 4; }
+}
+/* an int3-g64 row's codes (16 bytes of 2-bit low planes, then 8 of high bits, a group of 64),
+ * 0..7 (the value + 4) */
+static void dev_codes3(uint8_t *u, const uint8_t *row, int I) {
+    for (int g = 0; g < I / 64; g++) {
+        const uint8_t *lo = row + (size_t)g * 24, *hi = lo + 16;
+        uint8_t *o = u + (size_t)g * 64;
+        for (int j = 0; j < 64; j++) o[j] = (uint8_t)(((lo[j >> 2] >> ((j & 3) * 2)) & 3u) | (((hi[j >> 3] >> (j & 7)) & 1u) << 2));
+    }
+}
+/* an MXFP4 row's values times 2, as int8 (e2m1: 0, 0.5, 1, 1.5, 2, 3, 4, 6 and the sign) */
+static void dev_codes_fp4(int8_t *w, const uint8_t *row, int I) {
+    static const int8_t v2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    for (int j = 0; j < I / 2; j++) { w[2 * j] = v2[row[j] & 15]; w[2 * j + 1] = v2[row[j] >> 4]; }
+}
+static float dev_fp8(uint8_t b) {   /* e4m3 as the backend decodes it */
+    const int e = (b >> 3) & 15, m = b & 7;
+    const float v = e == 0 ? m / 512.0f : ldexpf(1.0f + m / 8.0f, e - 7);
+    return (b & 0x80) ? -v : v;
+}
+/* Activation row q (int8 per 32, dx its scales, xs its sums per 16) against a row's codes:
+ * int8 w8, or int4 u4 (0..15, the value + 8: the bias comes back with the activation's
+ * sums). rs: the row's scale (gs 0) or its groups' of gs columns. Integer sums a block, then
+ * the block's scale: dx times the group's (the row's at the end). */
+static float dev_dot(const int8_t *w8, const uint8_t *u4, int zero, const float *rs, int gs, const int8_t *q, const float *dx,
+                     const int32_t *xs, int I) {
+    float bias = 0.f;
+#if defined(__AVX2__)
+    const __m256i one16 = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps();
+    for (int b = 0; b < I / 32; b++) {
+        const float sc = dx[b] * (gs ? rs[b * 32 / gs] : 1.f);
+        const __m256i x = _mm256_loadu_si256((const __m256i *)(q + b * 32));
+        __m256i p;
+        if (u4) {
+            p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i *)(u4 + b * 32)), x), one16);
+            bias += sc * (float)(xs[2 * b] + xs[2 * b + 1]);
+        } else {
+            const __m256i w = _mm256_loadu_si256((const __m256i *)(w8 + b * 32));
+            p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(x, w)), one16);
+        }
+        acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), _mm256_set1_ps(sc), acc);
+    }
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h)); h = _mm_add_ss(h, _mm_movehdup_ps(h));
+    float r = _mm_cvtss_f32(h);
+#else
+    float r = 0.f;
+    for (int b = 0; b < I / 32; b++) {
+        const float sc = dx[b] * (gs ? rs[b * 32 / gs] : 1.f);
+        int32_t p = 0;
+        for (int i = 0; i < 32; i++) p += (u4 ? (int32_t)u4[b * 32 + i] : (int32_t)w8[b * 32 + i]) * q[b * 32 + i];
+        if (u4) bias += sc * (float)(xs[2 * b] + xs[2 * b + 1]);
+        r += (float)p * sc;
+    }
+#endif
+    r -= (float)zero * bias;
+    return gs ? r : r * rs[0];
+}
+/* the float reference: the row dequantized (its codes times their scale) */
+static void dev_dequant(float *o, const uint8_t *row, int fmt, const float *rs, int gs, int I) {
+    static const float e2m1[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
+    for (int i = 0; i < I; i++) {
+        float w;
+        if (fmt == 1 || fmt == 13) w = (float)((const int8_t *)row)[i];
+        else if (fmt == 12) w = dev_fp8(row[i]);
+        else if (fmt == 5) {   /* 3/8 of a byte a weight: no nibble to read */
+            const uint8_t *lo = row + (size_t)(i >> 6) * 24, *hi = lo + 16; const int j = i & 63;
+            w = (float)((int)(((lo[j >> 2] >> ((j & 3) * 2)) & 3u) | (((hi[j >> 3] >> (j & 7)) & 1u) << 2)) - 4);
+        } else {
+            const int nib = (i & 1) ? row[i >> 1] >> 4 : row[i >> 1] & 15;
+            w = fmt == 7 ? ((nib & 8) ? -e2m1[nib & 7] : e2m1[nib & 7]) : (float)(nib - 8);
+        }
+        o[i] = w * (gs ? rs[i / gs] : rs[0]);
+    }
+}
+/* a row of type t (I inputs; rs its scales, gs their group for colibri's formats) against
+ * act a's rows (xf[s] their floats): the CPU's integer form, or with GQ_EXACT=1 its float
+ * reference, as its own matmuls would take it. Each activation row its own dot, the same
+ * bits whatever rows share the call. tmp: I floats, and for an int4 row I bytes after them. */
+static inline void host_rows(float *y, int ys, const gq_act *a, const float *const *xf, const uint8_t *row, int t, int I,
+                             float *tmp, const float *rs, int gs) {
+    if (t < 0 && (-t == 12 || (-t == 7 && I / gs > 2048)) && !gq_exact_mode()) {   /* FP8 has no integer form: its floats against x's */
+        dev_dequant(tmp, row, -t, rs, gs, I);
+        for (int s = 0; s < a->S; s++) {
+            const float *x = xf[s];
+            float acc = 0.f;
+            for (int i = 0; i < I; i++) acc += tmp[i] * x[i];
+            y[(size_t)s * ys] = acc;
+        }
+        return;
+    }
+    if (t < 0 && !gq_exact_mode()) {
+        const int fmt = -t;
+        uint8_t *u = NULL; const int8_t *w8 = (const int8_t *)row; int zero = 0;
+        float half[2048], *rsx = (float *)rs;
+        if (fmt == 2 || fmt == 4) { u = (uint8_t *)(tmp + I); dev_codes(u, row, I); zero = 8; }
+        else if (fmt == 5) { u = (uint8_t *)(tmp + I); dev_codes3(u, row, I); zero = 4; }
+        else if (fmt == 7) {   /* the values doubled: the group's scale halved */
+            int8_t *w = (int8_t *)(tmp + I); dev_codes_fp4(w, row, I); w8 = w;
+            for (int g = 0; g < I / gs; g++) half[g] = 0.5f * rs[g];   /* at most 2048: above */
+            rsx = half;
+        }
+        for (int s = 0; s < a->S; s++)
+            y[(size_t)s * ys] = dev_dot(w8, u, zero, rsx, gs, a->q + (size_t)s * I, a->d + (size_t)s * (I / 32),
+                                        a->s + (size_t)s * (I / 16), I);
+        return;
+    }
     if (!gq_exact_mode()) { gq_row_all(y, ys, a, row, t, I); return; }
-    gq_dequant_row(t, row, tmp, I);
+    if (t < 0) dev_dequant(tmp, row, -t, rs, gs, I);
+    else gq_dequant_row(t, row, tmp, I);
     for (int s = 0; s < a->S; s++) {
         double acc = 0; const float *x = xf[s];
         for (int i = 0; i < I; i++) acc += (double)tmp[i] * x[i];
@@ -1690,8 +1835,61 @@ static int hy_key_cmp(const void *a, const void *b) {
     if (x->g != y->g) return (uintptr_t)x->g < (uintptr_t)y->g ? -1 : 1;
     return x->p - y->p;
 }
-int vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
-                   float limit, int nt, float *gu, float *hh, float *dn) {
+/* DeepSeek V4's expert between gate/up and down, as shaders/expert_act.comp (act 2) and
+ * expert_act_v4.comp compute it and its CPU kernel does: gate and up to bf16 (nearest
+ * even), the clamped SwiGLU with the sigmoid's two forms, times the route weight and to
+ * bf16, then E4M3 and back per 128 inputs under a power-of-two scale (the smallest 2^e
+ * with max(amax, 1e-4) <= 448 * 2^e). Each step is exact in f32 or rounds once. */
+static float hy_bf16(float v) {
+    uint32_t b; memcpy(&b, &v, 4);
+    if ((b & 0x7f800000u) != 0x7f800000u) b += 0x7fffu + ((b >> 16) & 1u);
+    b &= 0xffff0000u; memcpy(&v, &b, 4);
+    return v;
+}
+static float hy_e4m3(float x) {   /* |x| <= 448: the nearest E4M3 value, ties to even */
+    float a = fabsf(x), r;
+    if (a == 0.f) return x;
+    if (a >= 448.f) r = 448.f;
+    else if (a < 0.015625f) {   /* subnormal codes, steps of 2^-9 */
+        float t = a * 512.f, f = floorf(t), fr = t - f;
+        if (fr > 0.5f || (fr == 0.5f && ((int)f & 1))) f += 1.f;
+        r = f * 0.001953125f;
+    } else {
+        uint32_t b; memcpy(&b, &a, 4);
+        const int E = (int)((b >> 23) & 0xffu) - 127;
+        uint32_t sig = 0x800000u | (b & 0x7fffffu), q = sig >> 20, rem = sig & 0xfffffu;
+        if (rem > 0x80000u || (rem == 0x80000u && (q & 1u))) q++;
+        r = ldexpf((float)q, E - 3);
+    }
+    return x < 0.f ? -r : r;
+}
+static void hy_act_v4(float *h, const float *g, const float *u, int I, float limit, float w) {
+    for (int o = 0; o < I; o++) {
+        float gv = hy_bf16(g[o]), uv = hy_bf16(u[o]);
+        if (limit > 0.f) { gv = gv < limit ? gv : limit; uv = uv < -limit ? -limit : uv > limit ? limit : uv; }
+        const float sg = gv >= 0.f ? 1.f / (1.f + expf(-gv)) : expf(gv) / (1.f + expf(gv));
+        h[o] = hy_bf16(gv * sg * uv * w);
+    }
+    for (int b0 = 0; b0 < I; b0 += 128) {
+        const int b1 = b0 + 128 < I ? b0 + 128 : I;
+        float amax = 0.f;
+        for (int o = b0; o < b1; o++) amax = fmaxf(amax, fabsf(h[o]));
+        const float m = fmaxf(amax, 1e-4f);
+        uint32_t mb; memcpy(&mb, &m, 4);
+        const int E = (int)((mb >> 23) & 0xffu) - 127;
+        int e = (mb & 0x7fffffu) <= 0x600000u ? E - 8 : E - 7;
+        e = e < -126 ? -126 : e > 126 ? 126 : e;
+        for (int o = b0; o < b1; o++) {
+            float v = ldexpf(h[o], -e);
+            v = v < -448.f ? -448.f : v > 448.f ? 448.f : v;
+            h[o] = ldexpf(hy_e4m3(v), e);
+        }
+    }
+}
+/* pw: the pairs' route weights for DeepSeek V4's expert (hy_act_v4, the weight in the row as
+ * the device's), NULL for SwiGLU */
+static int host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
+                      float limit, int nt, float *gu, float *hh, float *dn, const float *pw) {
     if (np < 1) return 1;
     /* The pairs of one expert side by side (q: their place in ord), a group reading the
      * expert's rows once for all of its pairs: a prompt step's experts of a few rows, or the
@@ -1730,16 +1928,25 @@ int vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int n
      * rows handed out in chunks (the cores of a hybrid CPU do not run at one speed) */
     #pragma omp parallel num_threads(nt > 0 ? nt : hy_threads())
     {
-        float *tmp = gq_exact_mode() ? malloc((size_t)(D > I ? D : I) * sizeof(float)) : NULL;
+        const int W = D > I ? D : I;   /* the float reference's row, an int4 row's codes after it */
+        float *tmp = malloc((size_t)W * sizeof(float) + (size_t)W);
+        if (!tmp) {
+            #pragma omp atomic write
+            err = 2;
+        }
         #pragma omp for schedule(dynamic, 32)
         for (int64_t r = 0; r < (int64_t)ng * 2 * I; r++) {
+            if (!tmp) continue;
             const int g = (int)(r / (2 * I)), o = (int)(r % (2 * I)), q0 = gs[g]; const VktHostExpert *h = hx[ord[q0]];
-            const uint8_t *row = o < I ? h->g + (size_t)o * h->rgu : h->u + (size_t)(o - I) * h->rgu;
-            host_rows(gu + (size_t)q0 * 2 * I + o, 2 * I, &ag[g], xo + q0, row, h->tg, D, tmp);
+            const int oo = o < I ? o : o - I;
+            const uint8_t *row = (o < I ? h->g : h->u) + (size_t)oo * h->rgu;
+            const float *rs = h->tg < 0 ? (o < I ? h->sg : h->su) + (size_t)oo * (h->gsgu ? (D + h->gsgu - 1) / h->gsgu : 1) : NULL;
+            host_rows(gu + (size_t)q0 * 2 * I + o, 2 * I, &ag[g], xo + q0, row, h->tg, D, tmp, rs, h->gsgu);
         }
         #pragma omp for schedule(static)
         for (int q = 0; q < np; q++) {
             const float *g = gu + (size_t)q * 2 * I, *u = g + I; float *h = hh + (size_t)q * I;
+            if (pw) { hy_act_v4(h, g, u, I, limit, pw[ord[q]]); continue; }
             for (int o = 0; o < I; o++) {
                 float gv = g[o], uv = u[o];
                 if (limit > 0.f) { gv = gv < limit ? gv : limit; uv = uv < -limit ? -limit : uv > limit ? limit : uv; }
@@ -1754,8 +1961,10 @@ int vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int n
             }
         #pragma omp for schedule(dynamic, 64)
         for (int64_t r = 0; r < (int64_t)ng * D; r++) {
+            if (!tmp) continue;
             const int g = (int)(r / D), o = (int)(r % D), q0 = gs[g]; const VktHostExpert *h = hx[ord[q0]];
-            host_rows(dy + (size_t)q0 * D + o, D, &ah[g], ho + q0, h->d + (size_t)o * h->rd, h->td, I, tmp);
+            const float *rs = h->td < 0 ? h->sd + (size_t)o * (h->gsd ? (I + h->gsd - 1) / h->gsd : 1) : NULL;
+            host_rows(dy + (size_t)q0 * D + o, D, &ah[g], ho + q0, h->d + (size_t)o * h->rd, h->td, I, tmp, rs, h->gsd);
         }
         free(tmp);
     }
@@ -1765,6 +1974,23 @@ out:
     for (int g = 0; ag && ah && g < np; g++) { gq_act_free(&ag[g]); gq_act_free(&ah[g]); }
     free(xa); free(ord); free(gs); free(gx); free(key); free(xo); free(ho); free(ag); free(ah); free(xb); free(dq);
     return !err;
+}
+int vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
+                   float limit, int nt, float *gu, float *hh, float *dn) {
+    return host_pairs(hx, xr, np, D, I, limit, nt, gu, hh, dn, NULL);
+}
+int vkt_host_pairs_w(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
+                     float limit, int nt, float *gu, float *hh, float *dn, const float *w) {
+    return host_pairs(hx, xr, np, D, I, limit, nt, gu, hh, dn, w);
+}
+/* room for a step's S input rows of the CPU's pairs (hy_keep_x), before any is taken */
+static int grow_hyx(int S) {
+    if (S <= T.hy_xcap) return 1;
+    float *xb = realloc(T.hy_xb, (size_t)S * T.c.hidden * sizeof(float)); if (xb) T.hy_xb = xb;
+    const float **sr = realloc(T.hy_src, (size_t)S * sizeof(*sr)); if (sr) T.hy_src = sr;
+    if (!xb || !sr) return 0;
+    T.hy_xcap = S;
+    return 1;
 }
 /* room for n pairs of the step (hy_of) and for np of them on the CPU */
 static int grow_hy(int n, int np) {
@@ -1781,12 +2007,22 @@ static int grow_hy(int n, int np) {
         float *g = realloc(T.hy_gu, (size_t)nc * 2 * I * sizeof(float)); if (g) T.hy_gu = g;
         float *u = realloc(T.hy_hh, (size_t)nc * I * sizeof(float)); if (u) T.hy_hh = u;
         float *o = realloc(T.hy_out, (size_t)nc * H * sizeof(float)); if (o) T.hy_out = o;
-        if (!v || !h || !x || !g || !u || !o) return 0;
+        float *w = realloc(T.hy_w, (size_t)nc * sizeof(float)); if (w) T.hy_w = w;
+        if (!v || !h || !x || !g || !u || !o || !w) return 0;
         T.cho = nc;
     }
     return 1;
 }
 
+/* a hybrid pair's input row, copied once a step (grow_hyx has made room for the step's rows) */
+static const float *hy_keep_x(const float *src) {
+    const int H = T.c.hidden;
+    for (int r = 0; r < T.hy_nx; r++) if (T.hy_src[r] == src) return T.hy_xb + (size_t)r * H;
+    float *dst = T.hy_xb + (size_t)T.hy_nx * H;
+    memcpy(dst, src, (size_t)H * sizeof(float));
+    T.hy_src[T.hy_nx++] = src;
+    return dst;
+}
 static int issue(int layer, const float *x, int S, int K, const int *idx, const float *w, uint8_t *taken) {
     if (S > 0 && K > 0) memset(taken, 0, (size_t)S * K);
     if (!T.on || T.inflight || layer < 0 || layer >= T.c.layers || S < 1 || K < 1) return 0;
@@ -1813,8 +2049,8 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
     int E = T.c.experts, H = T.c.hidden, n = S * K;
     if (!grow_map(n)) return 0;
     /* a hybrid step: the host pool's experts the CPU can compute in place are its, at the join */
-    const int hyb = T.hybrid && S <= VKT_UP_ROWS && layer < T.main_layers && grow_hy(n, 0);
-    T.hy_n = 0;
+    const int hyb = T.hybrid && S <= VKT_UP_ROWS && layer < T.main_layers && grow_hy(n, 0) && grow_hyx(S);
+    T.hy_n = T.hy_nx = 0;
     /* heat for every routed expert, groups for the resident ones (first seen first) */
     int ng = 0, total = 0, rows1 = 0;
     for (int i = 0; i < n; i++) {
@@ -1829,7 +2065,7 @@ static int issue(int layer, const float *x, int S, int K, const int *idx, const 
         v->last = T.tick;
         if (v->state != VS_RESIDENT) continue;
         if (hyb && v->host && grow_hy(n, T.hy_n + 1) && host_view(layer, e, &T.hy_v[T.hy_n])) {
-            T.hy_x[T.hy_n] = x + (size_t)(i / K) * H;
+            T.hy_x[T.hy_n] = hy_keep_x(x + (size_t)(i / K) * H); T.hy_w[T.hy_n] = w ? w[i] : 1.f;
             T.hy_of[i] = T.hy_n++;
             continue;
         }
@@ -1966,8 +2202,8 @@ int vkt_join(const float **rows) {
     const int hn = T.hy_n;
     int hok = 1;
     if (hn) {
-        hok = vkt_host_pairs(T.hy_hx, T.hy_x, hn, T.c.hidden, T.c.inter, T.c.act_limit, 0,
-                             T.hy_gu, T.hy_hh, T.hy_out);
+        hok = host_pairs(T.hy_hx, T.hy_x, hn, T.c.hidden, T.c.inter, T.c.act_limit, 0,
+                         T.hy_gu, T.hy_hh, T.hy_out, T.c.act == VKT_ACT_SWIGLU_V4 ? T.hy_w : NULL);
         double th = vkt_now_ms() - t0;
         T.hy_ms += th; T.hy_steps++; T.hy_pairs += (unsigned long long)hn;
         tc += th; t0 += th;
@@ -2518,9 +2754,10 @@ int vkt_init(const VktConfig *cfg, uint32_t *const *heat) {
     host_init(all);           /* and the rest in system RAM the device reads */
     /* hybrid steps: a decode step's or a verify's host pool experts of block types on the CPU,
      * in place, while the device computes the ones it holds (COLI_VK_HYBRID=0: the device
-     * reads them over PCIe). SwiGLU only: DeepSeek V4's expert rounds as its own kernel does. */
+     * reads them over PCIe). SwiGLU, and DeepSeek V4's expert with the device's roundings
+     * (hy_act_v4); Kimi K3's SiTU stays on the device. */
     const char *hy = getenv("COLI_VK_HYBRID");
-    T.hybrid = T.dmax[2] > 0 && T.c.act == VKT_ACT_SWIGLU && !(hy && *hy == '0');
+    T.hybrid = T.dmax[2] > 0 && (T.c.act == VKT_ACT_SWIGLU || T.c.act == VKT_ACT_SWIGLU_V4) && !(hy && *hy == '0');
     /* and a prompt step's host pool experts of at most COLI_VK_HYBRID_BIG_ROWS rows */
     const char *hbr = getenv("COLI_VK_HYBRID_BIG_ROWS");
     T.hy_big = hbr && *hbr ? atoi(hbr) : 2;
@@ -2772,7 +3009,7 @@ void vkt_shutdown(void) {
     free(T.st); free(T.sy); free(T.bcnt); free(T.bofs); free(T.bcls); free(T.blist); free(T.pred); free(T.pred_ok);
     for (int h = 0; h < 2; h++) { free(T.hf[h].slot); free(T.hf[h].yout); }
     free(T.d2_idx); free(T.d2_y); free(T.d2_bex); free(T.d2_brows); free(T.d2_bx); free(T.d2_bw);
-    free(T.hy_of); free(T.hy_v); free(T.hy_hx); free(T.hy_x); free(T.hy_gu); free(T.hy_hh); free(T.hy_out); free(T.bpool);
+    free(T.hy_of); free(T.hy_v); free(T.hy_hx); free(T.hy_x); free(T.hy_gu); free(T.hy_hh); free(T.hy_out); free(T.hy_w); free(T.hy_xb); free(T.hy_src); free(T.bpool);
     memset(&T, 0, sizeof T);
 }
 #endif /* COLI_VULKAN */

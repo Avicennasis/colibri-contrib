@@ -1092,6 +1092,11 @@ PY
   v4_tier "trunk on the device too" deepseek_v4_tiny_t long COLI_VK_DENSE=1
   v4_tier "the GEMM route from 2 rows" deepseek_v4_tiny_t long COLI_VK_TIER_GEMM_ROWS=2
   WARM=1 v4_tier "warm start from the CPU run's history" deepseek_v4_tiny_e8 long
+  # the host pool (a budget of three experts on the device, the rest in system RAM the
+  # device reads): the CPU computes its experts' pairs in place with the device's
+  # roundings (the hybrid), here in the float form (GQ_EXACT=1)
+  v4_tier "the host pool, its pairs on the CPU" deepseek_v4_tiny_t long COLI_VK_TIER_HOST=1 COLI_VK_TIER_GB=0.00009 GQ_EXACT=1
+  grep -q "host pool pairs computed by the CPU in place" v4-vk.err || { grep '\[VK\] tier' v4-vk.err; fail "deepseek_v4 tier the host pool: no pair on the CPU"; }
   # A served prompt with every routed expert on the device (warm start from the CPU
   # run's history): its per-position logprob echoes against the CPU's. Measured on
   # Lavapipe they are the same bytes; the gate allows 1e-3, for an exp() that rounds
@@ -1869,11 +1874,13 @@ family_qwen_chain() {
   dmoe_gate qwen36 "chain qwen36 the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 COLI_DENSE_I8=0 \
     SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   # the same budget with the host pool (COLI_VK_TIER_HOST=1: on a device that shares the
-  # host's RAM too): the experts the device leaves in system RAM it reads, every layer's
-  # routed experts in the frame again
-  dmoe_gate qwen36 "chain qwen36 the host pool" all COLI_VK_TIER_GB=0.00077 COLI_VK_TIER_HOST=1 COLI_DENSE_I8=0 \
+  # host's RAM too): the experts the device leaves in system RAM the CPU computes in place
+  # (the hybrid frame, its float form: GQ_EXACT=1, which the CPU run's int4 does not read),
+  # every layer's routed experts in the frame again
+  dmoe_gate qwen36 "chain qwen36 the host pool" all COLI_VK_TIER_GB=0.00077 COLI_VK_TIER_HOST=1 GQ_EXACT=1 COLI_DENSE_I8=0 \
     SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   grep -q "host pool on, [1-9]" vk.log || { cat vk.log; fail "chain qwen36 the host pool: no expert in the host pool"; }
+  grep -q "hybrid layer steps, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 the host pool: no int4 pair on the CPU"; }
   # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there; in a
   # step's frames on the host's routing, and in a step that is one frame
   lost_late qwen36 "chain qwen36 device lost" 20 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json

@@ -1955,7 +1955,12 @@ was off and the trunk ran on the CPU: on DeepSeek V4 Flash 0731 UD-IQ2_XXS (85 G
 PRO 4000 with 62 GB of RAM) decode 2.2-2.5 -> 5.6-6.2 tok/s and a 163-token prompt 6-10 ->
 16-19 tok/s, a 703-token one at 20-21.5; the logits within the model's own spread (its
 CPU's integer and float sums 6-9% apart, the chain 4-9% from the floats, the same greedy
-tokens). A whole chain (every layer and the head) gives the tier no dense bytes still to
+tokens). `make deepseek-v4 VK=1` on its own builds the block formats' shaders too now (the
+target depends on the parent's `VK_SPV`): its own list had no `qmatmul_bd.spv`, and such a
+build ran DeepSeek V4 Flash UD-IQ1_S (82.5 GB) with the chain and the tier off, 0 matmuls on
+the GPU. Built whole, on the same card: the CPU 7.9 tok/s of a 163-token prompt and 2.77-2.79
+of decode, the chain (43 layers, 6.0 GiB) and the tier (2382 experts) 20-22 and 6.62-6.94,
+the same greedy text. A whole chain (every layer and the head) gives the tier no dense bytes still to
 come: its matrices were counted twice before, and the tier's budget went from 10.3 to
 16.5 GiB. Every matrix takes the per-row GEMV, never the tiled GEMM: a row's bits then
 do not depend on how a forward is cut into chunks, nor on whether the row is a prompt
@@ -2295,8 +2300,12 @@ computes the ones it holds:
 A round trip of the two timelines measured 7 us on the card. The host pool is cached
 system RAM (it was write-combined, which made the CPU's reads 25 times slower; the
 device reads both at the same speed). A prompt chunk keeps the full table and reads the
-host pool over PCIe. Only a GGUF's block types take it (colibri's formats keep the
-device's reads); `COLI_VK_HYBRID=0` turns it off, `COLI_VK_HYBRID_THREADS` sizes the
+host pool over PCIe. A GGUF's block types take it, and colibri's int8 (a scale per row
+or per group), int4 pairs (per row or per group), int3-g64, MXFP4 and FP8 formats, with
+the CPU's kernels for them in `vk_tier.c` (int8 activations per 32 and integer dots, as
+`ggml_quants.h`'s; FP8, and MXFP4 past 2048 groups a row, against the float row; the
+float reference of every one with `GQ_EXACT=1`). The low-bit formats (fmt 200 to 203)
+keep the device's reads. `COLI_VK_HYBRID=0` turns it off, `COLI_VK_HYBRID_THREADS` sizes the
 worker's team (OpenMP's by default). The chain's line says how many steps and pairs it
 took and the CPU's time. A share of the host pool's experts (`COLI_VK_HYBRID_PCIE`, 0.3,
 by a hash of layer and expert) stays with the device over PCIe, so a step with several
@@ -2314,12 +2323,16 @@ Q2_0 down 28 us): the device's own experts take less, so a step waits for the CP
 (GLM-5.3, Inkling), a layer's routed experts run in the tier's batch, outside the chain's
 frame, and the device read the host pool's experts of that batch over the bus: 8 GB/s for GLM-5.3's (7.5 ms a layer of 8 against 0.25 ms from
 VRAM, `COLI_VK_CHAIN_BENCH=xb` with `COLI_VK_BENCH_HOST=1`). In a step of up to 8 rows the
-tier now leaves those of a GGUF's block types out of the device's batch and the CPU computes
+tier now leaves those of a GGUF's block types or of colibri's formats above out of the device's batch and the CPU computes
 them in place at the join (`vkt_host_pairs`, the same code as the chain's worker), while the
 device computes the ones it holds; the join hands their rows back as the device's, so no
 engine changes. The same share stays with the device over PCIe, a prompt step keeps them
-all on the device, and `COLI_VK_HYBRID=0` turns it off. SwiGLU only: DeepSeek V4's expert
-rounds as its own kernel does, and Kimi K3's is SiTU. The run's line adds `hybrid: N steps,
+all on the device, and `COLI_VK_HYBRID=0` turns it off. DeepSeek V4's expert takes it with
+the device's roundings (`hy_act_v4`, as `shaders/expert_act_v4.comp`: gate and up to bf16,
+the clamped SwiGLU, times the route weight and to bf16, E4M3 per 128, then down), the weight
+in the row as in the device's; the tier copies a CPU pair's input row at the issue, since
+that engine frees its rounded rows as the issue returns. Kimi K3's SiTU stays on the device.
+The run's line adds `hybrid: N steps,
 P host pool pairs computed by the CPU in place (T ms, U us a pair)`. Measured on the RTX PRO
 4000 with the i5-13500, each server on a copy of one history, 128 tokens, a warm-up and a run:
 
@@ -2328,8 +2341,10 @@ P host pool pairs computed by the CPU in place (T ms, U us a pair)`. Measured on
 | GLM-5.3 Flash UD-IQ2_XXS (95 GB) | 3.22, 3.31 tok/s | 3.53, 4.97 tok/s | 508 us |
 | the same, 199 tokens after a 59-token prompt, two runs | 3.22, 3.20 tok/s | 5.06, 5.24 tok/s | 494 us |
 | Inkling-Small UD-IQ2_XXS (77 GB) | 11.10, 10.54 tok/s | 15.06, 15.75 tok/s | 862 us |
+| GLM-5.3 int4-g64, colibri's (391 GB), a warm-up and three runs, twice in each order | 0.50 to 0.63 tok/s (0.56 on average) | 0.59 to 0.66 tok/s (0.62) | 852 to 882 us |
+| DeepSeek V4 Flash UD-IQ1_S (82.5 GB), a warm-up and four runs, twice in each order | 6.62 to 6.88 tok/s | 6.62 to 6.94 tok/s | 382 to 385 us |
 
-The prompts are unchanged; GLM-5.3's warm-up still overlaps the warm start's uploads. GLM-5.3
+The prompts are unchanged (GLM-5.3 int4-g64: 1.4 to 1.7 tok/s off, 1.6 to 1.8 on, the model three times the RAM, so the disk decides); GLM-5.3 Flash's warm-up still overlaps the warm start's uploads. With GLM-5.3 int4-g64 the device's time over the runs went from 277 to 108 s. DeepSeek V4 Flash's host pool is 4 GiB of its 76 GB of experts, its pairs one or two a step: the same either way. GLM-5.3
 gave the same greedy text (40 tokens) on and off, in 17.7 s against 26.7 s; with the device's
 share of the pool at 0, 0.3 and 0.5 its 199-token runs decoded at 5.01/4.96, 5.06/5.24 and
 3.92/4.02 tok/s. Alone (the bench

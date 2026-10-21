@@ -333,7 +333,9 @@ int  vkt_dev_changes(unsigned since, int *slots, int max);
  * compute in place (a GGUF block type: its rows as the file has them, in system RAM) gets
  * a zero entry, so the device skips it, and its rows in hx[e]; every other expert's entry
  * as vkt_dev_table gives it, its hx[e] zero. The count is vkt_dev_table's. */
-typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; } VktHostExpert;   /* rgu, rd: bytes a row */
+/* tg, td: a ggml type (>= 0) or -fmt, colibri's int8 and int4 device formats (fmt 1, 13, 2, 4)
+ * with their f32 scales sg/su/sd (a row's, or a group's of gsgu/gsd columns); rgu, rd: bytes a row */
+typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; const float *sg, *su, *sd; int gsgu, gsd; } VktHostExpert;
 int  vkt_dev_table_hybrid(int layer, uint32_t *entries, VktHostExpert *hx);
 int  vkt_dev_entry(int layer, int eid, uint32_t *ent, uint32_t *ent_hybrid, VktHostExpert *hx, uint8_t *host);
 /* The CPU's form of np pairs of the host pool's experts (the hybrid steps: vk_dmoe.h's, and
@@ -341,13 +343,21 @@ int  vkt_dev_entry(int layer, int eid, uint32_t *ent, uint32_t *ent_hybrid, VktH
  * out + p * D. SwiGLU, the gate clamped from above at limit and up to [-limit, limit] first
  * when limit > 0; every matmul as the CPU computes a GGUF's (ggml_quants.h: int8 activations
  * and integer dots, with GQ_EXACT=1 the float reference), each output its own dot, so how the
- * nt threads split them moves no bit (nt 0: COLI_VK_HYBRID_THREADS, else OpenMP's). The pairs
+ * nt threads split them moves no bit (nt 0: COLI_VK_HYBRID_THREADS, else OpenMP's). colibri's
+ * int8 and int4 formats likewise: int8 activations per 32 against the codes, each block's
+ * activation scale times the row's or group's (GQ_EXACT=1: the dequantized rows in doubles).
+ * The pairs
  * of one expert (the same hx[p]->g) go together, its rows read once for all of them, and a
  * pair's bits are the same as on its own (ggml_quants.h's kernels take each activation row
  * apart). gu (np * 2 * I floats) and hh (np * I) its scratch.
  * 0 = a row it could not quantize, or no memory. */
 int  vkt_host_pairs(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
                     float limit, int nt, float *gu, float *hh, float *out);
+/* vkt_host_pairs for DeepSeek V4's expert (VKT_ACT_SWIGLU_V4): w[p] pair p's route weight,
+ * applied between gate/up and down with the device's roundings (bf16, then E4M3 per 128),
+ * so out[p] carries it, as the device's rows do. */
+int  vkt_host_pairs_w(const VktHostExpert *const *hx, const float *const *xr, int np, int D, int I,
+                      float limit, int nt, float *gu, float *hh, float *out, const float *w);
 /* whether the tier keeps experts in its host pool (system RAM the device reads over PCIe) */
 int  vkt_host_pool_on(void);
 /* the device memory the budget left for a prompt chunk's staging (VktConfig.stage), 0 none */
@@ -363,7 +373,7 @@ static inline int vkt_host_pool_on(void){return 0;}
 static inline size_t vkt_stage_room(void){return 0;}
 static inline int vkt_dev_host(int l,uint8_t *h){(void)l;(void)h;return -1;}
 static inline int vkt_score(int l,uint64_t *s){(void)l;(void)s;return -1;}
-typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; } VktHostExpert;   /* rgu, rd: bytes a row */
+typedef struct { const uint8_t *g, *u, *d; int tg, td; size_t rgu, rd; const float *sg, *su, *sd; int gsgu, gsd; } VktHostExpert;
 static inline int vkt_dev_table_hybrid(int l,uint32_t *e,VktHostExpert *h){(void)l;(void)e;(void)h;return -1;}
 static inline int vkt_dev_entry(int l,int e,uint32_t *t,uint32_t *th,VktHostExpert *h,uint8_t *o){(void)l;(void)e;(void)t;(void)th;(void)h;(void)o;return -1;}
 static inline int vkt_host_pairs(const VktHostExpert *const *h,const float *const *x,int n,int D,int I,float l,int t,float *g,float *u,float *o){(void)h;(void)x;(void)n;(void)D;(void)I;(void)l;(void)t;(void)g;(void)u;(void)o;return 0;}
