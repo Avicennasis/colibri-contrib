@@ -1934,7 +1934,12 @@ was off and the trunk ran on the CPU: on DeepSeek V4 Flash 0731 UD-IQ2_XXS (85 G
 PRO 4000 with 62 GB of RAM) decode 2.2-2.5 -> 5.6-6.2 tok/s and a 163-token prompt 6-10 ->
 16-19 tok/s, a 703-token one at 20-21.5; the logits within the model's own spread (its
 CPU's integer and float sums 6-9% apart, the chain 4-9% from the floats, the same greedy
-tokens). A whole chain (every layer and the head) gives the tier no dense bytes still to
+tokens). `make deepseek-v4 VK=1` on its own builds the block formats' shaders too now (the
+target depends on the parent's `VK_SPV`): its own list had no `qmatmul_bd.spv`, and such a
+build ran DeepSeek V4 Flash UD-IQ1_S (82.5 GB) with the chain and the tier off, 0 matmuls on
+the GPU. Built whole, on the same card: the CPU 7.9 tok/s of a 163-token prompt and 2.77-2.79
+of decode, the chain (43 layers, 6.0 GiB) and the tier (2382 experts) 20-22 and 6.62-6.94,
+the same greedy text. A whole chain (every layer and the head) gives the tier no dense bytes still to
 come: its matrices were counted twice before, and the tier's budget went from 10.3 to
 16.5 GiB. Every matrix takes the per-row GEMV, never the tiled GEMM: a row's bits then
 do not depend on how a forward is cut into chunks, nor on whether the row is a prompt
