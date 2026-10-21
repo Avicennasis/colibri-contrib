@@ -78,7 +78,10 @@ for bits in 32 0; do
   env MIMO_DENSE_BITS=$bits COLI_TEMP=0 ./mimo mimo_tiny --ids "1 2 3 4 5 6 7 8" --ngen 6 > mimo-cpu.txt 2> mimo-cpu.err
   env MIMO_DENSE_BITS=$bits COLI_TEMP=0 $X ./mimo mimo_tiny --ids "1 2 3 4 5 6 7 8" --ngen 6 > mimo-cu.txt 2> mimo-cu.err
   d=$(dev_count mimo mimo-cu.err)
-  if [ -s mimo-cpu.txt ] && cmp -s mimo-cpu.txt mimo-cu.txt && [ "$d" -gt 0 ]; then ok "mimo dense bits $bits: tokens = CPU, device $d"
+  mats=$(grep -aoE "mimo: [0-9]+ dense matrices on the device" mimo-cu.err | sed -E 's/.*: ([0-9]+) dense.*/\1/' | head -1)
+  # the f32 trunk goes to the card (cu_dense.h); the release's bf16 and FP8 stay on the CPU
+  if [ -s mimo-cpu.txt ] && cmp -s mimo-cpu.txt mimo-cu.txt && [ "$d" -gt 0 ] && { [ $bits != 32 ] || [ "${mats:-0}" -gt 0 ]; }; then
+    ok "mimo dense bits $bits: tokens = CPU, device $d, ${mats:-0} dense matrices on the card"
   else bad "mimo dense bits $bits (device $d)"; diff mimo-cpu.txt mimo-cu.txt | head -4; tail -3 mimo-cu.err; fi
 done
 

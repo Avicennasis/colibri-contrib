@@ -73,7 +73,9 @@
 #include "xtier.h"         /* that tier on the CUDA device too (cu_tier.h): XT(f) */
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
+#include "cu_dense.h"      /* the dense matrices on the tier's CUDA device, a matrix at a time */
 static int g_mimo_cu;    /* COLI_CUDA=1 and the device opened for the tier */
+static size_t g_mimo_cud; /* the room the dense matrices take there (cud_open) */
 #endif
 #ifdef COLI_VULKAN
 /* VK=1 and COLI_VULKAN=1: the routed experts go to the shared expert tier
@@ -283,6 +285,8 @@ typedef struct {
      * holds it alone (COLI_VK_DENSE_HOST, the host copy dropped) */
     char *vk_name;
     int vk_kind, vk_bits, vk_li, vk_gone;
+    void *cu; int cu_no;   /* COLI_CUDA: the device's copy (cu_dense.h), NULL before its first use;
+                            * cu_no once the matrix stays the CPU's */
 } DW;
 
 /* 0 (default): the checkpoint's own FP8 and BF16 bytes, exact.
@@ -393,7 +397,18 @@ static int dw_matmul_vk(float *y, const float *x, int S, const DW *d) {
 static void dw_reload(DW *d);   /* below, beside the loaders it re-runs */
 #endif
 
+#ifdef COLI_CUDA
+/* the format a DW goes to the CUDA device in (cu_dense.h): f32, int8 rows with a scale, a GGUF's
+ * blocks; -1 for bf16 and FP8, which stay on the CPU */
+static int dw_cu_fmt(const DW *d) {
+    return d->fmt == DW_F32 ? 0 : d->fmt == DW_I8 ? 1 : d->fmt == DW_GQ ? 100 + d->gqt : -1;
+}
+#endif
 static void dw_matmul(float *y, const float *x, int S, const DW *d) {
+#ifdef COLI_CUDA
+    if (g_cud.on && dw_cu_fmt(d) >= 0 &&
+        cud_mm(&((DW *)d)->cu, &((DW *)d)->cu_no, y, x, S, dw_cu_fmt(d), d->w, d->s, d->O, d->I, 0)) return;
+#endif
 #ifdef COLI_VULKAN
     if (dw_matmul_vk(y, x, S, d)) return;
     if (d->vk_gone) dw_reload((DW *)d);   /* the CPU needs a matrix the device held alone (a lost device) */
@@ -2048,8 +2063,23 @@ static int mimo_tier_block_elems(int fmt) {
     (void)fmt; return 0;
 #endif
 }
-/* what the dense part still puts on the tier's device (the CUDA tier's engine keeps it on the CPU) */
+#ifdef COLI_CUDA
+/* the dense matrices as the CUDA device would hold them (cu_dense.h): the head and the layers' */
+static size_t mimo_cu_w(const DW *d) { return dw_cu_fmt(d) >= 0 ? cud_bytes(dw_cu_fmt(d), d->O, d->I, 0) : 0; }
+static size_t mimo_cu_dense_bytes(const Model *m) {
+    size_t b = mimo_cu_w(&m->head);
+    for (int i = 0; i < m->c.n_layers; i++) {
+        const Layer *l = &m->L[i];
+        b += mimo_cu_w(&l->qkv) + mimo_cu_w(&l->o) + mimo_cu_w(&l->gate) + mimo_cu_w(&l->up) + mimo_cu_w(&l->down);
+    }
+    return b;
+}
+#endif
+/* what the dense part still puts on the tier's device: on CUDA, cu_dense.h's budget */
 static size_t mimo_tier_dense_bytes(const Model *m) {
+#ifdef COLI_CUDA
+    if (xt_cuda()) return g_mimo_cud;
+#endif
 #ifdef COLI_VULKAN
     if (!xt_cuda())
         return (g_mc_fit.L && vkc_fit_partial(&g_mc_fit) ? mc_kv_bytes_n(m, g_mc_fit.n) :   /* a partial chain: placed already, its caches to come */
@@ -2805,7 +2835,7 @@ static void serve_loop(Model *m, Tok *tokenizer, const char *dir) {
  * asked for Vulkan and quietly stayed on the CPU says so. */
 static void vk_report(const Model *m) {
 #ifdef COLI_CUDA
-    if (xt_cuda()) { cut_report("run", m->hits, m->miss); return; }
+    if (xt_cuda()) { cut_report("run", m->hits, m->miss); cud_report("mimo"); return; }
 #endif
 #ifdef COLI_VULKAN
     if (!g_vk_ready) return;
@@ -2840,9 +2870,9 @@ static int is_dir(const char *path) {
 int main(int argc, char **argv) {
 #if defined(COLI_CUDA) && defined(COLI_VULKAN)
     {   /* A build with both backends runs on Vulkan, the same card, when CUDA was asked for
-         * (COLI_CUDA=1) and COLI_VULKAN was not set: the dense chain puts the trunk on the card, where the CUDA tier
-         * leaves it on the CPU. COLI_VULKAN=0 keeps the CUDA tier; without a Vulkan
-         * device the CUDA tier still starts. */
+         * (COLI_CUDA=1) and COLI_VULKAN was not set: the dense chain runs a layer's work on the card in one
+         * frame, where the CUDA path (cu_dense.h) takes a matrix at a time. COLI_VULKAN=0 keeps the CUDA
+         * tier; without a Vulkan device the CUDA tier still starts. */
         const char *cu = getenv("COLI_CUDA"), *vk = getenv("COLI_VULKAN");
         if (cu && atoi(cu) && !(vk && *vk)) {
             setenv("COLI_VULKAN", "1", 1);
@@ -2939,7 +2969,8 @@ int main(int argc, char **argv) {
 #endif
 #ifdef COLI_CUDA
     {   /* COLI_CUDA=1 with no Vulkan tier: the CUDA device opens for the routed experts, the same
-         * tier (cu_tier.h) holds them, the dense part stays on the CPU */
+         * tier (cu_tier.h) holds them, and the dense matrices go there too as far as their budget
+         * goes (cu_dense.h), which the tier leaves them */
         const char *cu = getenv("COLI_CUDA"), *mx = getenv("MIMO_VK_EXPERTS");
         int any_moe = 0, dev = 0;
         for (int i = 0; i < c->n_layers; i++) any_moe |= c->moe[i];
@@ -2948,8 +2979,9 @@ int main(int argc, char **argv) {
             else {
                 g_mimo_cu = 1;
                 xt_use_cuda(1);
+                g_mimo_cud = cud_open("mimo", coli_cuda_device_at(0), mimo_cu_dense_bytes(m));
                 vk_tier_start(m);
-                if (!cut_ready()) { xt_use_cuda(0); g_mimo_cu = 0; }
+                if (!cut_ready()) { xt_use_cuda(0); g_mimo_cu = 0; g_cud.on = 0; }
             }
         }
     }
