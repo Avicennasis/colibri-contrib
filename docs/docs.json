@@ -31,7 +31,7 @@
           },
           {
             "group": "Hardware backends",
-            "pages": ["cuda", "metal", "vulkan", "windows"]
+            "pages": ["cuda", "metal", "vulkan", "gpu-parity", "windows"]
           },
           {
             "group": "Contribute",

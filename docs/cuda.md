@@ -169,6 +169,8 @@ DeepSeek V4 Flash UD-IQ1_S (82.5 GB) on an RTX PRO 4000 (24 GB, PCIe 4.0 x8) wit
 - A pool that takes the cache's room instead (the cache down to its least, 22 slots a layer: 6215 experts in the pool, 509 disk reads against 4612) measured the same decode (7.60-7.69) and a slower prompt (15.1-15.4), so the cache keeps its room.
 - In the float forms (`GQ_EXACT=1 COLI_CUDA_BD_FLOAT=1 COLI_CUDA_BD_TILES=0`, and `COLI_VK_TIER_WARM=0`: the warm start places experts from many threads, so its pool can leave out a different few each run) the 40-token greedy text is the CPU's.
 
+The same models on the CPU, Vulkan and CUDA, one machine and one build: [gpu-parity.md](gpu-parity.md).
+
 ## Notes and limitations
 
 - Text-mode timing reports prefill separately from decode.
