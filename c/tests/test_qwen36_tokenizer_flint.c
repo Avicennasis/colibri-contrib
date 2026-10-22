@@ -26,7 +26,11 @@ int main(void) {
         for (size_t i = 0; i + 1 < hl; i += 2) { unsigned v; sscanf(line + i, "%2x", &v); text[i / 2] = (char)v; }
         text[hl / 2] = 0;
         int want[1024], nw = 0; char *p = tab + 1;
-        while (*p && *p != '\n' && nw < 1024) { want[nw++] = (int)strtol(p, &p, 10); while (*p == ' ') p++; }
+        while (*p && *p != '\n' && *p != '\r' && nw < 1024) {   /* a CRLF checkout (Windows) ends the ids at \r */
+            char *e; long v = strtol(p, &e, 10);
+            if (e == p) break;
+            want[nw++] = (int)v; p = e; while (*p == ' ') p++;
+        }
         int *ids = NULL, n = 0;
         encode_text(text, &ids, &n);
         int ok = n == nw;
