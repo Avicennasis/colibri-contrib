@@ -1033,8 +1033,10 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         ch->wait_ms += tm_now() - t0;
         if (!ok) goto lost;
         if (dm) q36cc_dm_books(ch, m, n, pb);
-        if (E == 0) for (int i = 0; i < L; i++) {           /* a dense model reads its K/V rows back here */
-            if (!c->is_attn[i]) continue;
+        /* a dense model reads its K/V rows back here, and so does a Flint dense layer (no
+         * expert step ends its frame; q36c_forward_seg says what went wrong without it) */
+        for (int i = 0; i < L; i++) {
+            if (!c->is_attn[i] || (E > 0 && !q36_dense_l(c, i))) continue;
             const float *kv = (const float *)cc_ptr(ch->kvd) + (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
             for (int s = 0; s < n; s++) for (int h = 0; h < c->kv_heads; h++) {
                 size_t dst = ((size_t)h * m->max_t + pb + s) * c->k_head_dim, src = (size_t)s * kvo + (size_t)h * c->k_head_dim;

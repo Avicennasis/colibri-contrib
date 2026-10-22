@@ -1824,6 +1824,24 @@ qwen36_gguf_chain_gates() {
   grep -q "host pool on, [1-9]" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no expert in the host pool"; }
   grep -q "hybrid layer steps, [1-9][0-9]* host pool pairs on the CPU" vk.log || { cat vk.log; fail "chain qwen36 GGUF hybrid: no pair on the CPU"; }
 }
+# Flint (two dense layers before the experts' ones, sliding-window layers, sinks) in serve
+# mode, the chain against the CPU frame for frame. A dense layer's K/V rows reach the
+# host's cache only from q36c_forward_seg's own read-back, and two things read them there:
+# the CPU's decode after the device's prompt (COLI_VK_CHAIN=2; before the read-back, a
+# different second turn on Lavapipe too), and a cache that grows on a turn that reuses
+# state, whose mirrors are made again from the host (CHAIN_SERVE_CONTINUE; on a discrete
+# card, where the prompt runs on the chain, an agent's continued turn answered "!!!!").
+# The GGUF read in place (gguf.json, as tools/gguf_import.py makes it); the tier off keeps
+# the experts in float (the tier holds a GGUF's F32 experts as int8).
+flint_chain_serve() {
+  rm -rf flint_tiny
+  $PY tools/make_flint_tiny.py --out flint_tiny --emit-ref flint_tiny/ref.json --gguf flint_tiny/model.gguf --gguf-experts F32
+  rm -f flint_tiny/model.safetensors
+  $PY -c "import sys; sys.path.insert(0, 'tests'); from prefix_serve_harness import ensure_byte_tokenizer as t; from pathlib import Path; t(Path('flint_tiny'))"
+  printf '{"format": "colibri-gguf-v1", "gguf": "%s/flint_tiny/model.gguf", "mode": "link", "arch": "flint", "parts": 1}\n' "$PWD" > flint_tiny/gguf.json
+  CHAIN_SERVE_CONTINUE=1 $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0
+  COLI_VK_CHAIN=2 CHAIN_SERVE_CONTINUE=1 $PY tests/vulkan_chain_serve.py ./qwen36 flint_tiny COLI_DENSE_I8=0 COLI_VK_TIER=0
+}
 family_qwen_chain() {
   make qwen36 qwen38 tests/test_vk_chain VK=1
   ./tests/test_vk_chain shaders/qmatmul.spv | tee vk_chain.log
@@ -1893,6 +1911,7 @@ family_qwen_chain() {
   CHAINMODE=2 chain_gate qwen36 "chain qwen36 prompts only" 1 COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   COLI_VK_CHAIN=2 $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
   qwen36_gguf_chain_gates
+  flint_chain_serve
 
   # qwen38: every resident format, prefill batching, every expert form, MTP
   $PY tools/make_qwen38_tiny.py --out qwen38_tiny

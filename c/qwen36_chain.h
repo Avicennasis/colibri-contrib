@@ -1069,7 +1069,11 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
         ok = ok && vkc_submit(1);
         ch->frames++; ch->wait_ms += tm_now() - t0;
         if (!ok) goto lost;
-        if (E == 0) for (int i = lo; i < hi; i++) q36c_kv_down(ch, m, i, n, pb);   /* a dense model reads its K/V rows back here */
+        /* A dense model reads its K/V rows back here, and so does a Flint dense layer (its MLP
+         * only, layers 0 and 1): no expert step ends its frame. Without it the host's rows of
+         * those layers stayed unwritten, and the first turn to grow the cache mirrored them
+         * back to the device: a continued agent turn answered "!!!!" (NaN). */
+        for (int i = lo; i < hi; i++) if (E == 0 || q36_dense_l(c, i)) q36c_kv_down(ch, m, i, n, pb);
         if (dmoe) q36c_dmoe_done(ch, m, from, hi, n, pb);
         if (want_x) memcpy(xh + (size_t)c0 * D, vkc_ptr(ch->xd), (size_t)n * D * sizeof(float));
         for (int i = lo; i < hi; i++) if (c->is_attn[i]) { ch->kv_valid[i] = pb + n; vkc_kv_done(&ch->ks, ch->attn_ord[i], pb + n); }
