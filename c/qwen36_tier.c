@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <pthread.h>
 #include <time.h>
 #ifdef __linux__
@@ -1839,7 +1840,8 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     return mask;
 }
 
-int qt_take(uint32_t mask,const float *val,int K,float *out){
+int qt_take(uint32_t mask,const float *val,int K,float *out){ return qt_take_scaled(mask,val,K,out,NULL,0.f); }
+int qt_take_scaled(uint32_t mask,const float *val,int K,float *out,const float *s,float eps){
     (void)K;
     if(!G.on) return mask==0;
     const float *result[QT_MAX_DEV]={0};
@@ -1858,6 +1860,12 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
         if(ok && result[di]) for(int j=0;j<G.is_cnt[di];j++){
             float w=val[G.is_k[di][j]];
             const float *row=result[di]+(size_t)j*G.D;
+            if(s){   /* Muse Spark: w * rmsnorm(row * s) */
+                double ms=0; for(int d=0;d<G.D;d++){ double v=(double)row[d]*s[d]; ms+=v*v; }
+                const float r=1.f/sqrtf((float)(ms/G.D)+eps);
+                for(int d=0;d<G.D;d++) out[d]+=w*(row[d]*s[d]*r);
+                continue;
+            }
             for(int d=0;d<G.D;d++) out[d]+=w*row[d];
         }
         G.is_cnt[di]=0;

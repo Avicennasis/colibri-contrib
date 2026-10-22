@@ -181,6 +181,9 @@ uint32_t qt_issue(int layer, const int *eids, int K, const float *x);
  * Returns 0 on collection failure, leaving out unchanged. The caller must
  * stop inference: experts selected by qt_issue were not computed on CPU. */
 int qt_take(uint32_t mask, const float *val, int K, float *out);
+/* qt_take with Muse Spark's norm on every expert's row first: out += w * row*s / rms(row*s),
+ * eps inside the root (the CPU path's products, in its order) */
+int qt_take_scaled(uint32_t mask, const float *val, int K, float *out, const float *s, float eps);
 
 /* Warmstart: plan the full fill set (heat order, budget reserved), then any
  * number of loader threads may call qt_note_planned per planned expert. */
@@ -318,6 +321,7 @@ static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}
+static inline int qt_take_scaled(uint32_t a,const float*b,int c,float*d,const float*s,float e){(void)b;(void)c;(void)d;(void)s;(void)e;return a==0;}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_layer_off(int a){(void)a;}
 static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}

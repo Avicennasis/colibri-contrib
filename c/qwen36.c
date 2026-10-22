@@ -5068,9 +5068,9 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
      * neither the CUDA tier nor the expert_ffn kernel is consulted.
      * Routing, shared expert, and the combine stay on the CPU below. */
     /* GGUF: the experts as the file stores them, ggml blocks no tier reads (moe_gq_run) */
-    int use_gq = g_gguf && !vkt_ready() && !(qt_ready() && qt_experts_on() && !c->muse);   /* the device tiers take a GGUF's experts */
+    int use_gq = g_gguf && !vkt_ready() && !(qt_ready() && qt_experts_on());   /* the device tiers take a GGUF's experts */
     int use_qq = !use_gq && qq_active();
-    int use_qt = !use_gq && !use_qq && qt_ready() && qt_experts_on() && !c->muse;   /* a trunk-only tier leaves the experts to the paths below */
+    int use_qt = !use_gq && !use_qq && qt_ready() && qt_experts_on();   /* a trunk-only tier leaves the experts to the paths below */
     /* the Vulkan tier takes the routed experts of every format it was given
      * (moe_vk_run): the routing is collected first, as for the shared kernel */
     int use_vk = !use_gq && !use_qq && !use_qt && vkt_ready();
@@ -5288,7 +5288,8 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                 tm_add(S, 3, tm_now()-_ts2);
             }
             double _q2 = tm_now();
-            if(!qt_take(qmask, val, K, out + (int64_t)s*D)){
+            if(!(l->post_en ? qt_take_scaled(qmask, val, K, out + (int64_t)s*D, l->post_en, c->post_eps)
+                            : qt_take(qmask, val, K, out + (int64_t)s*D))){
                 fprintf(stderr,"qwen36: CUDA expert collection failed at layer %d; stopping inference\n",layer);
                 exit(1);
             }
@@ -8618,9 +8619,6 @@ int main(int argc, char **argv) {
                                         : "[gpu] dense trunk -> CUDA (the routed experts stay on the CPU)\n");
         atexit(qt_shutdown);
         for (int i = 0; i < m.c.n_layers; i++) if (q36_dense_l(&m.c, i)) qt_layer_off(i);   /* Flint's dense layers */
-        /* the tier's sum takes its experts' outputs as they are, Muse Spark normalises each first:
-         * the trunk only (moe_ex keeps Muse's experts off the tier whatever CUDA_EXPERT_GB says) */
-        if (m.c.muse) qt_experts_withdraw("Muse Spark normalises every expert's output before the sum");
         /* The placer predicted; measure before uploading a byte of trunk. */
         if (!trunk_probe_gpu_wins(&m)) {
             qt_trunk_withdraw("measured slower than the CPU");
