@@ -9,7 +9,9 @@ import unittest
 SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "bench_ux.sh"
 
 
-@unittest.skipUnless(shutil.which("bash"), "bash is required")
+# bench_ux.sh and its fixture engine (a #!/bin/sh file it executes) are POSIX: on the Windows
+# runner the script cannot run the engine from its temporary directory (exit 1 there).
+@unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "a POSIX shell is required")
 class BenchUxFailureTest(unittest.TestCase):
     def test_engine_failure_stops_battery_and_preserves_diagnostic(self):
         with tempfile.TemporaryDirectory() as temporary:
