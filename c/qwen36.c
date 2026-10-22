@@ -874,6 +874,13 @@ typedef struct {
      * j % 3 == 1 and j < 3*sec[1], by the width one when j % 3 == 2 and
      * j < 3*sec[2], else by the temporal one. Text has all three equal. */
     int mrope_section[3];
+    /* Flint (RecursiveSI/flint, tools/make_flint_tiny.py): sigmoid routing (the top-k of
+     * sigmoid(logits), renormalised), a sink logit per attention head, sliding-window
+     * layers that see `window` rows (their own included), layers without RoPE, and dense
+     * layers (one SwiGLU MLP of dense_inter, no router) in a model with experts. All zero
+     * for the Qwen checkpoints. */
+    int router_sigmoid, attn_sinks, window, dense_inter;
+    uint8_t *win_layer, *nope_layer, *dense_layer;   /* [n_layers], NULL when none */
 } Cfg;
 
 /* ---- Dense int8: a dense matrix that is quantized to int8 during load
@@ -918,6 +925,8 @@ typedef struct {
     float *in_ln, *post_ln, *qn, *kn, *gate_bias;
     QW q, k, v, o, gate;
     QW sh_g, sh_u, sh_d; float *sh_gate;   /* shared expert (dense, int8-during-load) + shared_expert_gate */
+    int sh_I;                              /* its width: shared_inter, or dense_inter on a Flint dense layer */
+    float *sinks;                          /* Flint: a sink logit per attention head (self_attn.softmax_offset) */
     /* Gated DeltaNet (linear_attention) dense weights (f16->f32 via st_read_f32). */
     QW dn_qkv, dn_z; float *dn_b, *dn_a;   /* in_proj_qkv/z (int8-during-load), b/a (not dense-matmul'd) */
     float *dn_conv;                        /* conv1d.weight [conv_dim, convk] (groups=conv_dim) */
@@ -1979,6 +1988,14 @@ static void softmax_row(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] /= s;
 }
 
+/* The router's scores over E experts, in place: the softmax of the Qwen checkpoints, or
+ * Flint's sigmoid of each logit (scoring_func sigmoid). The top-k is taken from them and
+ * renormalised to sum to one either way. */
+static void router_probs(const Cfg *c, float *x, int n) {
+    if (!c->router_sigmoid) { softmax_row(x, n); return; }
+    for (int i = 0; i < n; i++) x[i] = 1.f / (1.f + expf(-x[i]));
+}
+
 /* softplus(z) = log(1+exp(z)), stable for large z (HF GatedDeltaNet g_rule). */
 static float softplus_f(float z) { return z > 20.f ? z : log1pf(expf(z)); }
 
@@ -2019,6 +2036,8 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->has_qk_norm = 1; c->has_bias = 0;
     c->attn_output_gate = 1; c->n_active = 0; c->zero_centered_norms = 1;
     c->vis_depth = 0; c->image_token = -1;
+    c->router_sigmoid = c->attn_sinks = c->window = c->dense_inter = 0;
+    c->win_layer = c->nope_layer = c->dense_layer = NULL;
     c->mrope_section[0] = 11; c->mrope_section[1] = 11; c->mrope_section[2] = 10;
     if (c->n_layers <= 0 || c->n_layers > 512) { fprintf(stderr, "load_cfg: n_layers=%d out of range 1..512\n", c->n_layers); exit(1); }
     c->is_attn = calloc((size_t)c->n_layers, sizeof(uint8_t));
@@ -2196,8 +2215,37 @@ static void load_meta(Cfg *c, const char *snap) {
             for (int i=0;i<lt->len && i<c->n_layers;i++){
                 const char *s = (lt->kids[i]->t==J_STR)? lt->kids[i]->str : "";
                 if (s && strcmp(s,"full_attention")==0) { c->is_attn[i]=1; c->n_active++; }
+                if (s && strcmp(s,"sliding_attention")==0) {   /* Flint: attention over a window */
+                    c->is_attn[i]=1; c->n_active++;
+                    if (!c->win_layer) c->win_layer = calloc((size_t)is_attn_len, 1);
+                    if (c->win_layer) c->win_layer[i] = 1;
+                }
             }
         }
+        if((v=json_get(r,"scoring_func"))&&v->t==J_STR) {
+            if (!strcmp(v->str,"sigmoid")) c->router_sigmoid = 1;
+            else CFG_NEED(!strcmp(v->str,"softmax"), "scoring_func %s: softmax or sigmoid", v->str);
+        }
+        if((v=json_get(r,"attn_sinks"))&&v->t==J_BOOL) c->attn_sinks=v->boolean;
+        if((v=json_get(r,"sliding_window"))&&v->t==J_NUM) c->window=(int)v->num;
+        if((v=json_get(r,"dense_inter"))&&v->t==J_NUM) c->dense_inter=(int)v->num;
+        {   /* Flint's per-layer lists: indices into the layers, each checked */
+            const char *keys[2] = {"no_rope_layers", "mlp_only_layers"};
+            uint8_t **into[2] = {&c->nope_layer, &c->dense_layer};
+            for (int k = 0; k < 2; k++) {
+                jval *a = json_get(r, keys[k]);
+                if (!a || a->t != J_ARR || a->len == 0) continue;
+                *into[k] = calloc((size_t)is_attn_len, 1);
+                if (!*into[k]) { fprintf(stderr, "OOM %s\n", keys[k]); exit(1); }
+                for (int j = 0; j < a->len; j++) {
+                    CFG_NEED(a->kids[j]->t == J_NUM && a->kids[j]->num >= 0 && a->kids[j]->num < is_attn_len,
+                             "%s: entry %d is not a layer index below %d", keys[k], j, is_attn_len);
+                    (*into[k])[(int)a->kids[j]->num] = 1;
+                }
+            }
+        }
+        CFG_NEED(!c->win_layer || c->window > 0, "sliding_attention layers need sliding_window > 0 (got %d)", c->window);
+        CFG_NEED(!c->dense_layer || c->dense_inter > 0, "mlp_only_layers need dense_inter > 0 (got %d)", c->dense_inter);
     }
     free(buf); free(arena);
     fprintf(stderr, "[meta] loaded: q_heads=%d kv_heads=%d head_dim=%d q_head_dim=%d k_head_dim=%d v_head_dim=%d "
@@ -2462,13 +2510,15 @@ static int qwen_dense_list(const Cfg *c, QwenDenseList *l) {
     int vd = c->dn_vheads * c->dn_vdim;
     #define QDL_ADD(I_, O_, ...) do { char *nm = l->name[l->count]; snprintf(nm, QDF_NAME, __VA_ARGS__); \
         l->spec[l->count++] = (QdfSpec){nm, (I_), (O_)}; } while (0)
-    const char *shp = c->n_experts ? "mlp.shared_expert." : "mlp.";
     for (int i = 0; i < c->n_layers; i++) {
-        if (c->n_experts) QDL_ADD(c->hidden, c->n_experts, "model.layers.%d.mlp.gate.weight", i);
-        if (c->shared_inter > 0) {
-            QDL_ADD(c->hidden, c->shared_inter, "model.layers.%d.%sgate_proj.weight", i, shp);
-            QDL_ADD(c->hidden, c->shared_inter, "model.layers.%d.%sup_proj.weight", i, shp);
-            QDL_ADD(c->shared_inter, c->hidden, "model.layers.%d.%sdown_proj.weight", i, shp);
+        const int dense_l = c->dense_layer && c->dense_layer[i];   /* Flint: one MLP, no router */
+        const char *shp = c->n_experts && !dense_l ? "mlp.shared_expert." : "mlp.";
+        const int SI = dense_l ? c->dense_inter : c->shared_inter;
+        if (c->n_experts && !dense_l) QDL_ADD(c->hidden, c->n_experts, "model.layers.%d.mlp.gate.weight", i);
+        if (SI > 0) {
+            QDL_ADD(c->hidden, SI, "model.layers.%d.%sgate_proj.weight", i, shp);
+            QDL_ADD(c->hidden, SI, "model.layers.%d.%sup_proj.weight", i, shp);
+            QDL_ADD(SI, c->hidden, "model.layers.%d.%sdown_proj.weight", i, shp);
         }
         if (c->is_attn[i]) {
             QDL_ADD(c->hidden, qr, "model.layers.%d.self_attn.q_proj.weight", i);
@@ -3155,7 +3205,8 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         LD(in_ln,  "input_layernorm.weight", c->hidden);
         LD(post_ln,"post_attention_layernorm.weight", c->hidden);
         #undef LD
-        if (c->n_experts) {
+        const int dense_l = c->dense_layer && c->dense_layer[i];   /* Flint: one MLP, no router */
+        if (c->n_experts && !dense_l) {
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.weight", ai);
             load_tq_noted(m, nm, c->hidden, c->n_experts, quantize_dense, "router", &l->gate);
             QCOUNT(l->gate);
@@ -3169,22 +3220,27 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         } else { l->qn = NULL; l->kn = NULL; }
         /* router correction bias (optional) */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias", ai);
-        if (c->n_experts && dense_has(m, nm)) { l->gate_bias = load_t_n(m, nm, c->n_experts); }
+        if (c->n_experts && !dense_l && dense_has(m, nm)) { l->gate_bias = load_t_n(m, nm, c->n_experts); }
         else l->gate_bias = NULL;
         /* shared expert (dense, int8-during-load). A dense model's MLP is the same
-         * SwiGLU under mlp.{gate,up,down}_proj, with no gate in front of it. */
-        const char *shp = c->n_experts ? "mlp.shared_expert." : "mlp.";
-        if (c->shared_inter > 0) {   /* Qwen3 MoE has none: its sh_* stay empty */
+         * SwiGLU under mlp.{gate,up,down}_proj, with no gate in front of it, and so is
+         * the MLP of a Flint dense layer (dense_inter wide). */
+        const char *shp = c->n_experts && !dense_l ? "mlp.shared_expert." : "mlp.";
+        l->sh_I = dense_l ? c->dense_inter : c->shared_inter;
+        if (l->sh_I > 0) {   /* Qwen3 MoE has none: its sh_* stay empty */
         snprintf(nm,sizeof(nm),"model.layers.%d.%sgate_proj.weight", ai, shp);
-        load_tq_noted(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_g); QCOUNT(l->sh_g);
+        load_tq_noted(m, nm, c->hidden, l->sh_I, quantize_dense, "shexp", &l->sh_g); QCOUNT(l->sh_g);
         snprintf(nm,sizeof(nm),"model.layers.%d.%sup_proj.weight", ai, shp);
-        load_tq_noted(m, nm, c->hidden, c->shared_inter, quantize_dense, "shexp", &l->sh_u); QCOUNT(l->sh_u);
+        load_tq_noted(m, nm, c->hidden, l->sh_I, quantize_dense, "shexp", &l->sh_u); QCOUNT(l->sh_u);
         snprintf(nm,sizeof(nm),"model.layers.%d.%sdown_proj.weight", ai, shp);
-        load_tq_noted(m, nm, c->shared_inter, c->hidden, quantize_dense, "shexp", &l->sh_d); QCOUNT(l->sh_d);
+        load_tq_noted(m, nm, l->sh_I, c->hidden, quantize_dense, "shexp", &l->sh_d); QCOUNT(l->sh_d);
         }
         /* shared_expert_gate: Linear(hidden -> 1), sigmoid-gated shared expert */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight", ai);
-        l->sh_gate = c->n_experts && c->shared_inter > 0 && dense_has(m, nm) ? load_t_n(m, nm, c->hidden) : NULL;
+        l->sh_gate = c->n_experts && !dense_l && c->shared_inter > 0 && dense_has(m, nm) ? load_t_n(m, nm, c->hidden) : NULL;
+        /* Flint's sinks: one logit per query head, in the softmax's denominator only */
+        snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.softmax_offset", ai);
+        l->sinks = c->attn_sinks && c->is_attn[i] ? load_t_n(m, nm, c->q_heads) : NULL;
         if (c->is_attn[i]) {
             /* Gated Attention (full_attention) layer, dense projections int8-during-load */
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_proj.weight", ai);
@@ -3923,6 +3979,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         }
     }
     const Q36Row *mr = m->mux_rows;   /* a multiplexed step: each row's own conversation and position */
+    const int nope = c->nope_layer && c->nope_layer[layer];   /* Flint: a layer without RoPE */
     for (int s = 0; s < S; s++) {
         int pos = mr ? mr[s].pos : pos_base + s;
         /* the rope of the row's conversation: an image turn's decode rows sit at
@@ -3933,12 +3990,14 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         for (int hh = 0; hh < H; hh++) {
             float *qh = query + ((int64_t)s*H + hh)*hd;
             if (l->qn) rmsnorm_row(qh, qh, l->qn, hd, c->eps);
+            if (nope) continue;
             if (mrope) rope_head_mrope(qh, p3, c->mrope_section, rotary, c->theta);
             else rope_head_partial(qh, pos, rotary, hd, c->theta);
         }
         for (int kvh = 0; kvh < KV; kvh++) {
             float *kh = k + (int64_t)s*KV*kvd + kvh*kvd;
             if (l->kn) rmsnorm_row(kh, kh, l->kn, kvd, c->eps);
+            if (nope) continue;
             if (mrope) rope_head_mrope(kh, p3, c->mrope_section, rotary, c->theta);
             else rope_head_partial(kh, pos, rotary, kvd, c->theta);
         }
@@ -3950,6 +4009,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         memcpy(Vl + ((int64_t)kvh*m->max_t + t)*kvd, vv + (int64_t)s*KV*kvd + kvh*kvd, kvd*sizeof(float));
     }
     float scale = 1.f / sqrtf((float)hd);
+    const int win = c->win_layer && c->win_layer[layer] ? c->window : 0;
     float *ctx = falloc((int64_t)S*H*hd);
     #pragma omp parallel for collapse(2) schedule(static)
     for (int hh = 0; hh < H; hh++) {
@@ -3963,15 +4023,24 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
             tid = omp_get_thread_num();
 #endif
             float *sc = m->attn_sc + (int64_t)tid * m->kv_cap;
-            for (int t = 0; t <= qpos; t++) {
+            /* a sliding-window layer (Flint) sees the window's rows, its own included */
+            int t0 = win > 0 && qpos - win + 1 > 0 ? qpos - win + 1 : 0;
+            for (int t = t0; t <= qpos; t++) {
                 const float *kv = Kl + ((int64_t)kvh*m->max_t + t)*kvd;
                 float acc = dot_f32_lanes(qv, kv, kvd);
                 sc[t] = acc * scale;
             }
-            softmax_row(sc, qpos+1);
+            if (l->sinks) {   /* Flint: the head's sink is one more logit in the denominator, with no value */
+                float mx = l->sinks[hh];
+                for (int t = t0; t <= qpos; t++) if (sc[t] > mx) mx = sc[t];
+                float sum = expf(l->sinks[hh] - mx);
+                for (int t = t0; t <= qpos; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
+                float inv = 1.f / sum;
+                for (int t = t0; t <= qpos; t++) sc[t] *= inv;
+            } else softmax_row(sc + t0, qpos + 1 - t0);
             float *cx = ctx + ((int64_t)s*H + hh)*hd;
             for (int dd = 0; dd < kvd; dd++) cx[dd] = 0;
-            for (int t = 0; t <= qpos; t++) {
+            for (int t = t0; t <= qpos; t++) {
                 const float *vrow = Vl + ((int64_t)kvh*m->max_t + t)*kvd;
                 float a = sc[t]; for (int dd = 0; dd < kvd; dd++) cx[dd] += a * vrow[dd];
             }
@@ -4011,7 +4080,7 @@ static int qwen_shared_batch_rows(int S, int D, int I) {
 
 static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
                                     float *out, float *g, float *u, float *hh) {
-    Cfg *c=&m->c; int D=c->hidden, I=c->shared_inter;
+    Cfg *c=&m->c; int D=c->hidden, I=l->sh_I;
     if (I <= 0) return;   /* no shared expert (qwen3_moe) */
     int B=qwen_shared_batch_rows(S,D,I);
     double _ts=tm_now();
@@ -4599,10 +4668,10 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
 static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                    const float *logits_in, int routed_only) {
     Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, K = c->topk, I = c->inter;
-    if (E == 0) {
+    if (E == 0 || (c->dense_layer && c->dense_layer[layer])) {   /* a dense model, or a Flint dense layer */
         memset(out, 0, (int64_t)S*D*sizeof(float));
         if (routed_only) return;
-        float *g = falloc(c->shared_inter), *u = falloc(c->shared_inter), *hh = falloc(D);
+        float *g = falloc(l->sh_I), *u = falloc(l->sh_I), *hh = falloc(D);
         qwen_shared_experts_cpu(m, l, x, S, out, g, u, hh);
         free(g); free(u); free(hh);
         (void)layer;
@@ -4657,7 +4726,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
         #pragma omp parallel for schedule(static)
         for (int s = 0; s < S; s++) {
             float *pr = logits + (int64_t)s*E;
-            softmax_row(pr, E);
+            router_probs(c, pr, E);
             uint8_t keep[1024]; int Ec = E;
             if (c->n_group > 1 && c->n_group <= Ec) {
                 int per = E / c->n_group;
@@ -4720,7 +4789,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
             if (is_zero) { for (int e = 0; e < E; e++) ema[e] = pr[e]; }
             else { for (int e = 0; e < E; e++) ema[e] = (1.f - m->pilot_smooth)*pr[e] + m->pilot_smooth*ema[e]; }
         }
-        softmax_row(pr, E);
+        router_probs(c, pr, E);
         /* group-limited top-k selection */
         uint8_t keep[1024]; int Ec = E < 1024 ? E : 1024;
         if (c->n_group > 1 && c->n_group <= Ec) {
@@ -7712,6 +7781,8 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
                     .layer_gate_up = lgu, .layer_down = ldn};
     rt_init("qwen36", c->n_layers, c->n_experts);
     rt_drop_row(c->n_layers);   /* no MTP row */
+    for (int i = 0; i < c->n_layers; i++)   /* Flint's dense layers: no experts, no history row */
+        if (c->dense_layer && c->dense_layer[i]) rt_drop_row(i);
     const char *up = getenv("COLI_USAGE");
     if (up && *up) snprintf(g_vk_usage, sizeof g_vk_usage, "%s", up);
     else snprintf(g_vk_usage, sizeof g_vk_usage, "%s/.coli_usage", snap);

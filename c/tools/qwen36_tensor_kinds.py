@@ -40,6 +40,8 @@ LAYER_KINDS = frozenset((
     "self_attn.o_proj.weight",
     "self_attn.q_norm.weight",
     "self_attn.k_norm.weight",
+    # Flint (RecursiveSI/flint): a learned sink logit per attention head
+    "self_attn.softmax_offset",
     # MoE block: router, shared expert, its gate
     "mlp.gate.weight",
     "mlp.shared_expert.gate_proj.weight",

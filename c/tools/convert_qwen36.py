@@ -549,6 +549,10 @@ def main():
     # each of those, so the defaults below branch on it. The dense Qwen3 (qwen3) is the
     # same layer with one MLP, loaded like the dense Qwen3.5's.
     plain_qwen3 = cfg_full.get("model_type") in ("qwen3_moe", "qwen3")
+    # Flint (RecursiveSI/flint): the Qwen3 MoE layer with a sink per attention head,
+    # sliding-window layers, layers without RoPE, dense layers in front (mlp_only_layers)
+    # and sigmoid routing beside an ungated shared expert (tools/make_flint_tiny.py).
+    flint = cfg_full.get("model_type") == "flint"
     layer_types = mcfg.get("layer_types")
     if layer_types is None:
         n = mcfg.get("num_hidden_layers", n_layers_weight)
@@ -740,7 +744,7 @@ def main():
                          if mcfg.get("num_experts") else int(mcfg["intermediate_size"])),
         "rms_eps": float(mcfg.get("rms_norm_eps", 1e-6)),
         "ebits": args.ebits,
-        "scoring_func": mcfg.get("scoring_func", "softmax"),
+        "scoring_func": mcfg.get("router_score_function" if flint else "scoring_func", "softmax"),
         "n_group": int(mcfg.get("n_group", 1)),
         "topk_group": int(mcfg.get("topk_group", 1)),
         "norm_topk_prob": bool(mcfg.get("norm_topk_prob", False)),
@@ -748,10 +752,19 @@ def main():
         "rope_theta": float((mcfg.get("rope_parameters") or {}).get(
             "rope_theta", mcfg.get("rope_theta", 10000000.0))),
         "mrope_section": (mcfg.get("rope_parameters") or {}).get("mrope_section", [16, 16, 16]),
-        "partial_rotary_factor": float(mcfg.get("partial_rotary_factor", 1.0 if plain_qwen3 else 0.25)),
+        "partial_rotary_factor": float(mcfg.get("partial_rotary_factor", 1.0 if plain_qwen3 or flint else 0.25)),
     }
-    if plain_qwen3:
+    if plain_qwen3 or flint:
         meta["zero_centered_norms"] = False
+    if flint:
+        # the layers config.layer_types calls sliding_attention see sliding_window rows,
+        # their own included; the layers listed in no_rope_layer_indices take no RoPE;
+        # mlp_only_layers carry one SwiGLU MLP of intermediate_size and no router
+        meta["sliding_window"] = int(mcfg.get("sliding_window") or 0)
+        meta["no_rope_layers"] = sorted(int(i) for i in mcfg.get("no_rope_layer_indices", []))
+        meta["mlp_only_layers"] = sorted(int(i) for i in mcfg.get("mlp_only_layers", []))
+        meta["dense_inter"] = int(mcfg.get("intermediate_size", 0))
+        meta["attn_sinks"] = True
     # derive head dims from first full-attention layer weights (authoritative).
     # Read from SOURCE (not local output) so this works even when layer 0 was
     # skipped during a resume and its local shard was already stream-deleted.
@@ -788,7 +801,7 @@ def main():
             meta["expert_down_gs"] = args.down_gs
         meta["head_dim"] = meta.get("k_head_dim", meta.get("q_head_dim", 256))
         meta["rope_dim"] = meta.get("qk_rope_head_dim", meta["head_dim"] // 4)
-        if plain_qwen3:
+        if plain_qwen3 or flint:
             # One position per token, so M-RoPE over sections that cover the whole
             # rotary half is ordinary 1D RoPE; the engine needs the sections to add up.
             half = int(meta["rope_dim"] * meta["partial_rotary_factor"]) // 2
