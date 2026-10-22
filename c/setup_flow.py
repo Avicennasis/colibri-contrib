@@ -1355,9 +1355,11 @@ def _pid_alive(pid):
         return False
 
 
-def _get_json(url, timeout=2.0):
+def _get_json(url, timeout=2.0, *, require_colibri=False):
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
+            if require_colibri and (response.headers.get("Server") or "").split()[:1] != ["colibri"]:
+                return response.status, None
             return response.status, json.loads(response.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as error:
         error.close()
@@ -1391,10 +1393,14 @@ def port_free(host, port):
 
 
 def pick_port(host, preferred, tries=20):
-    for port in range(preferred, preferred + tries):
+    if preferred > 65535:
+        raise SetupError("no higher port is available (maximum 65535); "
+                         "rerun `coli setup --port PORT` with a lower port")
+    last = min(preferred + tries - 1, 65535)
+    for port in range(preferred, last + 1):
         if port_free(host, port):
             return port
-    raise SetupError(f"ports {preferred}-{preferred + tries - 1} are all in use; pass --port")
+    raise SetupError(f"ports {preferred}-{last} are all in use; pass --port")
 
 
 def last_turn_speed(profile):
@@ -1417,7 +1423,7 @@ def server_status(cfg):
         pid = None
     alive = _pid_alive(pid)
     shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
-    code, health = _get_json(f"http://{shown}:{port}/health")
+    code, health = _get_json(f"http://{shown}:{port}/health", require_colibri=True)
     if code == 200 and isinstance(health, dict) and health.get("status") == "ok":
         state = "ready"
     elif alive:
@@ -2041,6 +2047,7 @@ def cmd_setup(a, ui=None):
                 ui.say(f" {mark} {entry.id:<24} {entry.disk_gb:>7.0f} GB  {row['status']:<10} {row['reason']}")
         return 0
 
+    write_state("starting")
     overriding = bool(a.backend or a.no_gpu or a.host is not None or a.port is not None)
     if cfg and not picking and not overriding and config_ready(cfg):
         cfg = remember_split_dirs(cfg, out=ui.say)
@@ -2071,6 +2078,8 @@ def cmd_setup(a, ui=None):
                 save_config(cfg)
                 ui.say(f"  context: {requested_ctx or 'automatic'} from now on")
             refresh_configured(cfg, out=ui.say)
+            write_state("ready", model=(cfg.get("model") or {}).get("id"),
+                        model_dir=cfg["model_dir"])
             return _finish(ui, cfg, a)
     # A setup that stopped half way (pending), or a finished one whose engine or
     # files went missing (ready, but not runnable): continue with the same choice.
@@ -2224,7 +2233,8 @@ def _finish(ui, cfg, a):
         if not a.no_start:
             result["status"] = start_server(cfg, background=True, open_browser=not a.no_browser,
                                             out=lambda *_: None)
-            write_state("started", urls=cfg["urls"])
+            result["config"] = load_config() or cfg
+            write_state("started", urls=result["status"]["urls"])
         print(json.dumps(result, indent=2))
         return 0
     if a.no_start:
@@ -2233,8 +2243,8 @@ def _finish(ui, cfg, a):
         return 0
     ui.say("\nStarting colibri")
     if a.background:
-        start_server(cfg, background=True, open_browser=not a.no_browser, out=ui.say)
-        write_state("started", urls=cfg["urls"])
+        status = start_server(cfg, background=True, open_browser=not a.no_browser, out=ui.say)
+        write_state("started", urls=status["urls"])
         ui.say("  stop: coli stop")
         return 0
     return start_server(cfg, background=False, open_browser=not a.no_browser, out=ui.say)

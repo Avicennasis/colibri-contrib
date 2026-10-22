@@ -120,6 +120,29 @@ class PngTest(unittest.TestCase):
             self.assertEqual(row, pixels[y * stride:(y + 1) * stride])
             previous = row
 
+    def test_png_decompression_stops_at_declared_image_size(self):
+        import tracemalloc
+        # Independently constructed 1x1 RGB image whose deflate stream has
+        # far more than its four declared scanline bytes.
+        png = (b"\x89PNG\r\n\x1a\n" +
+               _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) +
+               _chunk(b"IDAT", zlib.compress(bytes(1 << 20))) + _chunk(b"IEND", b""))
+        tracemalloc.start()
+        try:
+            with self.assertRaisesRegex(ValueError, "length"):
+                ie.decode_png(png)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 256 << 10, "decoder inflated the oversized payload before rejecting it")
+
+    def test_invalid_png_deflate_is_a_value_error(self):
+        png = (b"\x89PNG\r\n\x1a\n" +
+               _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) +
+               _chunk(b"IDAT", b"not a deflate stream") + _chunk(b"IEND", b""))
+        with self.assertRaises(ValueError):
+            ie.decode_png(png)
+
     def test_corruption_and_unsupported_formats_are_refused(self):
         png = bytearray(ie.encode_png(4, 4, bytes(64), 4))
         png[-20] ^= 0xff
@@ -137,6 +160,13 @@ class PngTest(unittest.TestCase):
 
 
 class RequestRulesTest(unittest.TestCase):
+    def test_unpaired_surrogates_are_prompt_errors(self):
+        for prompt in ("a\ud800cat", "a\udfffcat"):
+            with self.subTest(prompt=repr(prompt)), self.assertRaises(ie.ImageRequestError) as caught:
+                ie.image_request({"prompt": prompt}, INFO)
+            self.assertEqual(caught.exception.param, "prompt")
+        self.assertEqual(ie.image_request({"prompt": "a cat 🐈"}, INFO)["prompt"], "a cat 🐈")
+
     def test_defaults_come_from_ready(self):
         request = ie.image_request({"prompt": "a cat", "seed": 3}, INFO)
         self.assertEqual((request["width"], request["height"], request["steps"],
@@ -210,6 +240,13 @@ class ImageEngineTest(unittest.TestCase):
         self.assertEqual(size, meta["width"] * meta["height"] * 3)
         # stderr was drained from the first byte, into our callable
         self.assertTrue(any("stub" in line for line in self.logs))
+
+    def test_invalid_unicode_prompt_does_not_poison_the_engine(self):
+        engine = self.engine()
+        with self.assertRaises(ie.ImageRequestError):
+            engine.generate("bad\ud800prompt", 256, 256, 2, 1)
+        self.assertTrue(engine.alive)
+        self.assertEqual(engine.generate("a cat 🐈", 256, 256, 2, 1)["width"], 256)
 
     def test_engine_error_leaves_the_engine_usable(self):
         engine = self.engine()

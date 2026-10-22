@@ -544,7 +544,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract test_idot_ssse3 \
 	test_ggml_quants test_gguf_c test_gq_dot
-TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
+TEST_EXCLUDE += test_vk_chain test_vk_memtype test_glm53_vk_f32
 # needs a CUDA device and the CUDA objects: make tests/test_cu_tier CUDA=1
 TEST_EXCLUDE += test_cu_tier
 # takes a fixture and the CPU build's logits on its command line (ci.yml, the int4 gs64 A/B step)
@@ -2031,6 +2031,9 @@ tests/test_qwen38_idot$(EXE): tests/test_qwen38_idot.c qwen38.c $(VK_OBJ)
 tests/test_qwen38_int4_experts$(EXE): tests/test_qwen38_int4_experts.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_qwen38_igpu_defaults$(EXE): tests/test_qwen38_igpu_defaults.c qwen38.c $(VK_OBJ)
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
 
@@ -2052,6 +2055,15 @@ tests/test_qwenimage_vae$(EXE): tests/test_qwenimage_vae.c
 
 .PHONY: test_qwenimage_vae
 test_qwenimage_vae: tests/test_qwenimage_vae$(EXE)
+
+# Bare invocation is dependency-free and participates in make check. The
+# opt-in oracle uses the existing pinned torch/diffusers environment on CPU.
+tests/test_qwenimage_encoder$(EXE): tests/test_qwenimage_encoder.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+.PHONY: qwenimage-encoder-check
+qwenimage-encoder-check: tests/test_qwenimage_encoder$(EXE) tests/test_qwenimage_vae$(EXE)
+	$(PYTHON) tools/check_qwenimage_encoder.py
 
 # Il percorso completo: frame IMAGE, torre, sostituzione degli embedding,
 # generazione. Prova che due immagini diverse danno risposte diverse, che e'
@@ -2310,6 +2322,31 @@ tests/test_i4_grouped$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 tests/test_i4_grouped_sse41$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -O3 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
+tests/test_lora$(EXE): tests/test_lora.c
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_train_linear$(EXE): tests/test_train_linear.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_train_tiny$(EXE): tests/test_train_tiny.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+tests/test_train_resume$(EXE): tests/test_train_resume.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# QLoRA trainer (experimental). One translation unit, so -MMD writes a complete
+# coli_train.d. There is no coli_train.c for the engine discovery to find, so
+# the generated dependencies are hooked up here, the same way AUTODEP_BINS does
+# it: the binary depends on its own .d, and a missing .d forces the rebuild.
+coli_train$(EXE): train/train_main.c colibri.c $(METAL_OBJ) $(VK_OBJ) .build-config
+	$(CC) $(CFLAGS) train/train_main.c $(METAL_OBJ) $(VK_OBJ) -o $@ $(LDFLAGS)
+coli_train$(EXE): coli_train.d
+coli_train.d: ;
+-include $(wildcard coli_train.d)
+ifneq ($(EXE),)
+coli_train: coli_train$(EXE)
+endif
+
 tests/test_i4_grouped_sse41_o1$(EXE): tests/test_i4_grouped.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -O1 -DCOLI_HAVE_GROUPED_PAIR -DCOLI_I4_GROUPED_SCALAR_EXACT -msse4.1 -mno-avx2 -mno-fma $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
@@ -2344,6 +2381,13 @@ tests/test_kv_fp8$(EXE): tests/test_kv_fp8.c
 
 tests/test_kv_tq$(EXE): tests/test_kv_tq.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# #2096 gate: exercises coli_kv_share_adopt_rows (the COLI_KV_SHARE cross-slot
+# adoption routine) under KV8 and KV_TQ — donor "fully prefilled", receiver
+# adopts [from,from+n), rows dequantized and compared. Includes colibri.c
+# like test_kv_alloc (kv_alloc + the adopt routine live there).
+tests/test_kv_share_kv8$(EXE): tests/test_kv_share_kv8.c colibri.c $(VK_OBJ)
+	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_kv_disk$(EXE): tests/test_kv_disk.c colibri.c $(VK_OBJ)
 	$(CC) $(CFLAGS) $< $(VK_OBJ) -o $@ $(LDFLAGS)
@@ -2412,6 +2456,16 @@ tests/test_vk_chain$(EXE): tests/test_vk_chain.c $(VK_OBJ) $(VK_SPV)
 .PHONY: vk-chain-check
 vk-chain-check: tests/test_vk_chain$(EXE)
 	./tests/test_vk_chain$(EXE) shaders/qmatmul.spv
+
+# Checks the choice of memory type and the size, budget and room of the device memory
+# (vk_memtype.h) on memory-property tables written by the test. It needs the Vulkan headers
+# (VK=1) and no device, so `check` does not run it.
+tests/test_vk_memtype$(EXE): tests/test_vk_memtype.c
+	@[ "$(VK)" = 1 ] || { echo "tests/test_vk_memtype needs VK=1" >&2; exit 1; }
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+.PHONY: vk-memtype-check
+vk-memtype-check: tests/test_vk_memtype$(EXE)
+	./tests/test_vk_memtype$(EXE)
 
 # GLM-5.3's resident f32 dispatch and its dense memory reservation (#1863).
 # Run by vulkan_engines.sh shader; requires a real or software Vulkan device.

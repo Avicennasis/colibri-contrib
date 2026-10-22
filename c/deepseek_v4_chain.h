@@ -1104,7 +1104,7 @@ static void v4c_off(V4Chain *ch) { ch->failed = 1; if (!ch->d) g_v4c_mode = 0; }
 static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                            ColiDeepSeekV4WindowAttentionState **attention, const ColiDeepSeekV4Config *config,
                            ColiExpertStore *experts, const int *tokens, int start, int n, int pool,
-                           char *error, size_t error_size, int *lost) {
+                           int prompt, char *error, size_t error_size, int *lost) {
     *lost = 0;
     const ColiDeepSeekV4Config *c = config;
     int lo = ch->lo, L = ch->L, D = ch->D, HD = ch->HD, hd = ch->hd, rd = ch->rd, W = ch->W, E = start + n;
@@ -1188,8 +1188,20 @@ static int v4c_forward_seg(V4Chain *ch, ColiV4Engine *engine, float **state_ptr,
     }
     /* every matrix on the per-row GEMV: a row's bits do not depend on the chunk it sits
      * in (a prompt, a verify, a decode step, a prefix reused or computed cold), as on the
-     * CPU, whose batched and per-token kernels give the same bits */
-    vkc_gemm_rows(0);
+     * CPU, whose batched and per-token kernels give the same bits. COLI_VK_CHAIN_GEMM_ROWS=-1
+     * takes the backend's tiled-GEMM rule for prompt rows instead -- prompts only: a
+     * verify's rows and every decode step keep the GEMV's bits, as deepseek_v41's chain
+     * keeps a verify's rows on the decode step's. Measured on the RX 6900 XT, a
+     * 2,515-token prompt's first token 189.6 s -> 152.1 s; the GEMM is the resident-matrix
+     * path's row-canonical class, so a prompt row's bits can then depend on how the
+     * prompt is chunked. 0 (the default) keeps the position-independent bits; N uses the
+     * GEMM from N rows, and a negative N reads as -1. */
+    static int gemm_rows = -2;
+    if (gemm_rows == -2) {
+        const char *e = getenv("COLI_VK_CHAIN_GEMM_ROWS");
+        gemm_rows = e && *e ? atoi(e) : 0;
+    }
+    vkc_gemm_rows(prompt ? gemm_rows : 0);   /* a verify's rows get a decode step's bits */
     static int ident = -1;
     if (ident < 0) { const char *e = getenv("V4_IDX_IDENTITY"); ident = e && *e == '1'; }
     float *state = *state_ptr, *next = *next_ptr;
@@ -1426,7 +1438,7 @@ lost:   /* a frame failed: the device is gone (or would not take a command) */
 static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                        ColiDeepSeekV4WindowAttentionState **attention, const ColiDeepSeekV4Config *config,
                        ColiExpertStore *experts, const int *tokens, int start, int n, int pool,
-                       char *error, size_t error_size) {
+                       int prompt, char *error, size_t error_size) {
     V4Chain *ch = g_v4c, *ch2 = g_v4c2;
     if (!g_v4c_mode || !ch || !ch->ok || ch->failed || !engine || engine != ch->engine || !attention || n < 1) return 0;
     if (g_v4c_mode == COLI_VK_CHAIN_PREFILL && n <= 2) return 0;
@@ -1439,7 +1451,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
         return 0;
     }
     int r = v4c_forward_seg(ch, engine, state_ptr, next_ptr, attention, config, experts, tokens, start, n, pool,
-                            error, error_size, &lost);
+                            prompt, error, error_size, &lost);
     if (r <= 0) {
         if (lost) {
             for (int d = 0; d < 2; d++) if (v4c_of(d)) v4c_of(d)->failed = 1;
@@ -1453,7 +1465,7 @@ static int v4c_forward(ColiV4Engine *engine, float **state_ptr, float **next_ptr
     if (!ch2) return r;
     vkc_device(1);
     int r2 = v4c_forward_seg(ch2, engine, state_ptr, next_ptr, attention, config, experts, tokens, start, n, pool,
-                             error, error_size, &lost);
+                             prompt, error, error_size, &lost);
     vkc_device(0);
     if (r2 != 0) return r2;   /* the layer after its last, or the MoE's failure */
     /* not taken there: the CPU runs its layers from the streams the primary handed over

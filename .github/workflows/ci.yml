@@ -170,6 +170,10 @@ jobs:
           # choose staging on its own; then the formats, the tier and the chain's ops staged.
           bash tests/vulkan_engines.sh staged
           COLI_VK_STAGED=1 bash tests/vulkan_engines.sh shader
+      - name: Memory types and budgets against tables
+        run: |
+          cd c
+          make vk-memtype-check VK=1
 
   # Every engine with a Vulkan hook, run twice on its tiny fixture: on the CPU and on
   # Lavapipe, with the same snapshot and settings. The gate is the CPU's tokens (and
@@ -1614,6 +1618,10 @@ jobs:
           cd c
           python3 tools/make_qwenimage_vae_tiny.py qwenimage_vae_tiny
           tests/test_qwenimage_vae qwenimage_vae_tiny
+      - name: Single-frame VAE encoder against diffusers, normal and ASan/UBSan
+        run: |
+          make -C c qwenimage-encoder-check
+          python3 c/tools/check_qwenimage_encoder.py --sanitizers
       - name: The shipping defaults (int8 weights) end to end, and the serve protocol
         run: |
           cd c
