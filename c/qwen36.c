@@ -2221,6 +2221,37 @@ static double req_num(jval *r, const char *k){
     if(!v||v->t!=J_NUM){ fprintf(stderr,"config.json: missing or non-numeric \"%s\"\n",k); exit(1); }
     return v->num;
 }
+/* The tokens the model ends a turn with, as it declares them: config.json's and
+ * generation_config.json's eos_token_id (a number or a list), a GGUF's
+ * tokenizer.ggml.eog_token_ids, eos, eot and eom. serve_eos_ids adds them to the ones it
+ * knows by name: Flint ends a turn with <|observation|> before a tool's answer, and with
+ * <|user|>, and without them the engine wrote the tool's answer itself and went on. */
+#define Q36_MAX_EOS 16
+static int g_model_eos[Q36_MAX_EOS], g_n_model_eos;
+static void model_eos_add(long id) {
+    if (id < 0 || id > 0x7fffffff) return;
+    for (int k = 0; k < g_n_model_eos; k++) if (g_model_eos[k] == (int)id) return;
+    if (g_n_model_eos < Q36_MAX_EOS) g_model_eos[g_n_model_eos++] = (int)id;
+}
+static void model_eos_json(const jval *v) {
+    if (!v) return;
+    if (v->t == J_NUM) model_eos_add((long)v->num);
+    else if (v->t == J_ARR)
+        for (int k = 0; k < v->len; k++) if (v->kids[k] && v->kids[k]->t == J_NUM) model_eos_add((long)v->kids[k]->num);
+}
+/* generation_config.json beside config.json, when there is one */
+static void model_eos_file(const char *snap, const char *name) {
+    char path[2048]; snprintf(path, sizeof(path), "%s/%s", snap, name);
+    FILE *f = fopen(path, "rb"); if (!f) return;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n <= 0 || n > (16L << 20)) { fclose(f); return; }
+    char *buf = malloc((size_t)n + 1);
+    if (!buf || fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); fclose(f); return; }
+    buf[n] = 0; fclose(f);
+    char *arena = NULL; jval *r = json_parse(buf, &arena);
+    if (r) model_eos_json(json_get(r, "eos_token_id"));
+    free(buf); free(arena);
+}
 static void load_cfg(Cfg *c, const char *snap) {
     char path[2048]; snprintf(path, sizeof(path), "%s/config.json", snap);
     FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
@@ -2234,7 +2265,9 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->vocab     = (int)req_num(r,"vocab_size");
     c->eps       = (float)req_num(r,"rms_norm_eps");
     jval *th = json_get(r,"rope_theta"); c->theta = th ? (float)th->num : 10000.f;
+    model_eos_json(json_get(r,"eos_token_id"));
     free(buf); free(arena);
+    model_eos_file(snap, "generation_config.json");
     /* Phase-1 defaults; overridden by qwen36_meta.json in load_meta.
      * Clamped so a missing meta file can never produce a divide-by-zero. */
     c->q_heads = (c->hidden >= 16) ? (c->hidden / 16) : 1;
@@ -3148,8 +3181,30 @@ static float *load_norm_n(Model *m, const char *name, int64_t want) {
 
 /* Cfg from a qwen35moe GGUF: the same fields load_cfg + load_meta read from
  * config.json + qwen36_meta.json, and the tensor shapes checked against them. */
+/* A GGUF's integer array element, whatever width it was written in */
+static long q36_kv_arr_int(const gguf_kv *kv, uint64_t k) {
+    switch (kv->atype) {
+    case GGUF_T_U8:  return ((const uint8_t *)kv->arr)[k];
+    case GGUF_T_I8:  return ((const int8_t *)kv->arr)[k];
+    case GGUF_T_U16: return ((const uint16_t *)kv->arr)[k];
+    case GGUF_T_I16: return ((const int16_t *)kv->arr)[k];
+    case GGUF_T_U32: return (long)((const uint32_t *)kv->arr)[k];
+    case GGUF_T_I32: return ((const int32_t *)kv->arr)[k];
+    case GGUF_T_U64: return (long)((const uint64_t *)kv->arr)[k];
+    case GGUF_T_I64: return (long)((const int64_t *)kv->arr)[k];
+    default: return -1;
+    }
+}
+static void gguf_model_eos(const gguf_ctx *g) {
+    const gguf_kv *eog = gguf_get(g, "tokenizer.ggml.eog_token_ids");
+    if (eog && eog->type == GGUF_T_ARRAY && eog->arr)
+        for (uint64_t k = 0; k < eog->n; k++) model_eos_add(q36_kv_arr_int(eog, k));
+    const char *keys[3] = { "tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id" };
+    for (int k = 0; k < 3; k++) model_eos_add((long)gguf_get_int(g, keys[k], -1));
+}
 static void gguf_load_cfg(Cfg *c) {
     const gguf_ctx *g = &g_gg;
+    gguf_model_eos(g);
     const char *arch = gguf_get_str(g, "general.architecture");
     const char *gtype = gguf_get_str(g, "general.type");
     if (!arch && ((gtype && !strcmp(gtype, "imatrix")) || gguf_get(g, "imatrix.datasets") || gguf_get(g, "imatrix.chunk_count"))) {
@@ -7108,6 +7163,10 @@ static int serve_eos_ids(int *ids, int cap){
         if(!strcmp(g_sp_str[k],"<|im_end|>")||!strcmp(g_sp_str[k],"<|endoftext|>")||
            !strcmp(g_sp_str[k],"<|eot|>")||!strcmp(g_sp_str[k],"<|end_of_text|>"))   /* Muse Spark's two */
             ids[n++]=g_sp_id[k];
+    for(int k=0;k<g_n_model_eos && n<cap;k++){   /* the model's own (model_eos_add) */
+        int seen=0; for(int e=0;e<n;e++) if(ids[e]==g_model_eos[k]) seen=1;
+        if(!seen) ids[n++]=g_model_eos[k];
+    }
     if(!n) ids[n++]=151645;   /* tokenizer without added_tokens: old default */
     return n;
 }
@@ -7356,7 +7415,7 @@ static void serve_one(Model *m, ServeReq *q){
     if(!q36_serve_start(m,q,&ids,&np,&lo,&clk)) return;
     int gen=0, limited=1, forwards=1;   /* il prefill e' il primo forward */
     const double s_disk=clk.s_disk, s_attn=clk.s_attn, s_moe=clk.s_moe, s_head=clk.s_head;
-    int eos_ids[4]; int n_eos=serve_eos_ids(eos_ids,4);
+    int eos_ids[Q36_MAX_EOS + 4]; int n_eos=serve_eos_ids(eos_ids,Q36_MAX_EOS + 4);
     double t0=clk.t0;
     unsigned char sbuf[16]; int sbn=0;
     Q36Spec spec; q36_spec_begin(m, &spec, ids, np);   /* COLI_LOOKUP=1: drafts, every token still sampled from the exact logits */
@@ -7840,7 +7899,7 @@ static void serve_mux(Model *m){
     Q36Row *rows = malloc((size_t)n * sizeof *rows);
     int *tok = malloc((size_t)n * sizeof(int)), *who = malloc((size_t)n * sizeof(int));
     if (!rq || !rows || !tok || !who) { fprintf(stderr, "[serve] out of memory\n"); exit(1); }
-    int eos_ids[4]; int n_eos = serve_eos_ids(eos_ids, 4);
+    int eos_ids[Q36_MAX_EOS + 4]; int n_eos = serve_eos_ids(eos_ids, Q36_MAX_EOS + 4);
     unsigned long long steps = 0, nrows = 0;
     fprintf(stderr, "[qwen36] serving %d conversations at once (KV_SLOTS)\n", n);
     for (;;) {

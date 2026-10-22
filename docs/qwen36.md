@@ -559,7 +559,11 @@ splits digits by three and CJK runs before o200k's letter rules
 template is GLM's tool-call form with no thinking switch: the model writes
 `<think>` when it decides to reason, and the gateway files what follows as
 reasoning (`tests/test_flint_chat_template.py` holds the renderer to the
-release's template byte for byte). `tools/make_flint_tiny.py` writes a tiny
+release's template byte for byte). A turn ends on any of the four tokens the
+model declares (`<|end_of_text|>`, `<|user|>`, `<|observation|>`,
+`<|developer|>`: config.json's `eos_token_id`, a GGUF's `eog_token_ids`);
+after a tool call the model writes `<|observation|>`, and the tool answers
+there. `tools/make_flint_tiny.py` writes a tiny
 Flint with a float32 reference; CI runs it on the GGUF path (`Linux (generated
 qwen36 oracles)`).
 
