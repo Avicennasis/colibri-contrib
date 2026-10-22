@@ -77,6 +77,8 @@ static int qwen36_max_ctx(void) {
 #include "decode_batch.h" /* ColiSubmit + coli_submit_ext: le chiavi key=value di SUBMIT */
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
 #include "tok_unicode.h"        /* is_S/is_L/is_N: the exact pre-tokenizer classes (Clef) */
+#include "tok_unicode_o200k.h"  /* is_U/is_X: the case classes of o200k's letter rules (Flint) */
+#include "tok_unicode_flint.h"  /* is_PS: [\p{P}\p{S}] (Flint) */
 #include "qwen38_nfc.h"         /* NFC, the tokenizer.json normalizer (Clef) */
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "vk_tier.h"       /* optional Vulkan routed-expert tier (COLI_VULKAN=1; stubs without VK=1) */
@@ -347,6 +349,84 @@ static int pretok_end(const char *s,int i,int n){
     }
     return i+adv;
 }
+static void bpe_piece(const char *piece,int len,int **ids,int *n,int *cap);
+/* Flint's pre-tokenizer (its tokenizer.json): a Sequence of three Splits, each Isolated,
+ * every one on the pieces the one before left:
+ *   1. \p{N}{1,3}
+ *   2. [\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+
+ *   3. A: [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+ *      B: [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+ *      D: ' ?[\p{P}\p{S}]+[\r\n]*'   E: \s*[\r\n]+   F: \s+(?!\S)   G: \s+
+ * So a digit group and a CJK run are pieces of their own, the regex never reaches across
+ * them, and what it matches nowhere (a control character) is a piece up to its next match.
+ * The letter rules replay the regex's backtracking order as tok.h's o200k splitter does. */
+static int g_pretok_flint = 0;
+static int fl_cjk(uint32_t c){ return (c>=0x4E00&&c<=0x9FA5)||(c>=0x3040&&c<=0x309F)||(c>=0x30A0&&c<=0x30FF); }
+#define FL_S1(c) (is_U(c)||is_X(c))
+#define FL_S2(c) (is_X(c)||(is_L(c)&&!is_U(c)))
+static int fl_contraction(const uint32_t *cp,int n,int k){
+    if(k<n && cp[k]=='\'' && k+1<n){
+        uint32_t d=cp[k+1]>='A'&&cp[k+1]<='Z'?cp[k+1]+32:cp[k+1];
+        if(k+2<n){ uint32_t e=cp[k+2]>='A'&&cp[k+2]<='Z'?cp[k+2]+32:cp[k+2];
+            if((d=='r'&&e=='e')||(d=='v'&&e=='e')||(d=='l'&&e=='l')) return k+3; }
+        if(d=='s'||d=='t'||d=='m'||d=='d') return k+2;
+    }
+    return k;
+}
+static int fl_letters(const uint32_t *cp,int n,int i){
+    for(int branch=0;branch<2;branch++)
+        for(int pfx=1;pfx>=0;pfx--){
+            int j0=i;
+            if(pfx){ uint32_t c=cp[i]; if(c=='\r'||c=='\n'||is_L(c)||is_N(c)||i+1>=n) continue; j0=i+1; }
+            int m1=j0; while(m1<n && FL_S1(cp[m1])) m1++;
+            if(branch==0){   /* A: S1* given back until S2+ takes one */
+                for(int sp=m1;sp>=j0;sp--)
+                    if(sp<n && FL_S2(cp[sp])){ int k=sp+1; while(k<n && FL_S2(cp[k])) k++; return fl_contraction(cp,n,k); }
+            } else if(m1>j0){   /* B */
+                int k=m1; while(k<n && FL_S2(cp[k])) k++; return fl_contraction(cp,n,k);
+            }
+        }
+    return -1;
+}
+/* the end of the third Split's match at i in cp[0..n), or -1 */
+static int fl_match(const uint32_t *cp,int n,int i){
+    int e=fl_letters(cp,n,i); if(e>i) return e;
+    int j=i;
+    if(cp[i]==' ' && j+1<n && is_PS(cp[j+1])) j++;
+    if(j<n && is_PS(cp[j])){
+        while(j<n && is_PS(cp[j])) j++;
+        while(j<n && (cp[j]=='\r'||cp[j]=='\n')) j++;
+        return j;
+    }
+    int r=i; while(r<n && is_S(cp[r])) r++;
+    if(r>i){
+        int last=-1; for(int k=i;k<r;k++) if(cp[k]=='\r'||cp[k]=='\n') last=k;
+        if(last>=0) return last+1;
+        int end=r<n?r-1:r; return end>i?end:i+1;
+    }
+    return -1;
+}
+static void flint_encode_span(const char *s,int a,int b,int **ids,int *n,int *cap){
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((size_t)(nb+1)*sizeof(uint32_t)); int *off=malloc((size_t)(nb+2)*sizeof(int));
+    if(!cp||!off){ fprintf(stderr,"qwen36: OOM pre-tokenizing\n"); exit(1); }
+    int m=0;
+    for(int i=a;i<b;){ int adv; cp[m]=utf8_decode(s,i,b,&adv); if(adv<1) adv=1; off[m++]=i; i+=adv; }
+    off[m]=b;
+    for(int i=0;i<m;){
+        int j;
+        if(is_N(cp[i])){ j=i; while(j<m && j-i<3 && is_N(cp[j])) j++; }
+        else if(fl_cjk(cp[i])){ j=i; while(j<m && fl_cjk(cp[j])) j++; }
+        else {
+            int seg=i; while(seg<m && !is_N(cp[seg]) && !fl_cjk(cp[seg])) seg++;
+            j=fl_match(cp+0,seg,i);
+            if(j<=i){ j=i+1; while(j<seg && fl_match(cp,seg,j)<0) j++; }
+        }
+        bpe_piece(s+off[i],off[j]-off[i],ids,n,cap);
+        i=j;
+    }
+    free(cp); free(off);
+}
 static void bpe_piece(const char *piece,int len,int **ids,int *n,int *cap){
     if(len<=0) return;
     int sc=0,scap=16; char **syms=malloc(scap*sizeof(char*));
@@ -415,6 +495,7 @@ static void encode_text(const char *text,int **out_ids,int *out_n){
             }
             free(norm); i=end; continue;
         }
+        if(g_pretok_flint){ flint_encode_span(text,i,end,&ids,&n,&cap); i=end; continue; }
         while(i<end){
             int j=pretok_end(text,i,end); if(j<=i) j=i+utf8_adv(text,i,end);
             if(j>end) j=end;
@@ -441,6 +522,18 @@ static void load_tokenizer(const char *path){
     if (!vocab) vocab = json_get(model, "tokens");
     if (!vocab) { fprintf(stderr, "[tok] no model.vocab/tokens in %s\n", path); free(buf); return; }
     jval *adds = json_get(root, "added_tokens");
+    {   /* Flint's pre-tokenizer: a Split of \p{N}{1,3} first, and the punctuation class later */
+        jval *pt = json_get(root, "pre_tokenizer"), *seq = pt ? json_get(pt, "pretokenizers") : NULL;
+        int digits = 0, ps = 0;
+        for (int k = 0; seq && seq->t == J_ARR && k < seq->len; k++) {
+            jval *pat = json_get(seq->kids[k], "pattern"), *rx = pat ? json_get(pat, "Regex") : NULL;
+            if (!rx || rx->t != J_STR) continue;
+            if (k == 0 && !strcmp(rx->str, "\\p{N}{1,3}")) digits = 1;
+            if (strstr(rx->str, "[\\p{P}\\p{S}]") && strstr(rx->str, "\\p{Lu}")) ps = 1;
+        }
+        g_pretok_flint = digits && ps;
+        if (g_pretok_flint) fprintf(stderr, "[tok] Flint's pre-tokenizer (digits by three, CJK runs, o200k letters)\n");
+    }
 
     int mx = 0;
     if (vocab->t == J_OBJ){
@@ -548,6 +641,8 @@ static int load_tokenizer_gguf(const gguf_ctx *g){
     if (model && strcmp(model, "gpt2")) {
         fprintf(stderr, "[tok] GGUF tokenizer model is '%s', not byte-level BPE (gpt2): refusing\n", model); return -1;
     }
+    const char *pre = gguf_get_str(g, "tokenizer.ggml.pre");
+    g_pretok_flint = pre && !strcmp(pre, "flint");
     int n = (int)tk->n;
     const int32_t *types = (ty && ty->type == GGUF_T_ARRAY && (ty->atype == GGUF_T_I32 || ty->atype == GGUF_T_U32) && ty->n == tk->n)
                            ? (const int32_t *)ty->arr : NULL;
