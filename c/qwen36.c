@@ -5054,9 +5054,9 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
              * groups; the common block below is skipped. Not for a caller that
              * wants the routed experts only (the dense chain runs the shared
              * expert on the device, qwen36_cuda_chain.h). */
-            if (c->shared_inter > 0 && !routed_only) {
+            if (l->sh_I > 0 && !routed_only) {   /* the layer's own width, as the chains and the batch read it */
                 double _ts2 = tm_now();
-                int Ish = c->shared_inter;
+                int Ish = l->sh_I;
                 if (!qtd(l->qth_shg, sh, xs, D, Ish))  matmul_d(sh, xs, &l->sh_g, 1, D, Ish);
                 if (!qtd(l->qth_shu, shu, xs, D, Ish)) matmul_d(shu, xs, &l->sh_u, 1, D, Ish);
                 for (int i = 0; i < Ish; i++) { float sv = sh[i]; sh[i] = (sv / (1.f + expf(-sv))) * shu[i]; }
