@@ -66,7 +66,7 @@ static void make_weights(Weights *w) {
             l->dn_norm = fvec(VD, &s, 0.2f, 1.f);
         }
         mk_qw(&l->gate, D, E, &s);
-        mk_qw(&l->sh_g, D, SI, &s); mk_qw(&l->sh_u, D, SI, &s); mk_qw(&l->sh_d, SI, D, &s);
+        mk_qw(&l->sh_g, D, SI, &s); mk_qw(&l->sh_u, D, SI, &s); mk_qw(&l->sh_d, SI, D, &s); l->sh_I = SI;
         l->sh_gate = fvec(D, &s, 0.1f, 0.f);
         for (int e = 0; e < E; e++) {
             w->eg[i][e] = malloc((size_t)INTER * D); w->eu[i][e] = malloc((size_t)INTER * D); w->ed[i][e] = malloc((size_t)D * INTER);

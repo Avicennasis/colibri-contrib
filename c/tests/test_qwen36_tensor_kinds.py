@@ -155,6 +155,7 @@ QWEN38_27B = (
 )
 
 DENSE_MLP_KINDS = {"mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"}
+FLINT_KINDS = {"self_attn.softmax_offset"}   # Flint's sinks: no Qwen checkpoint has them
 
 
 def _concrete(names):
@@ -213,7 +214,7 @@ class TensorKindsTest(unittest.TestCase):
         self.assertTrue(any(p[0] == "mtp" for p in placed))
         self.assertEqual({p[1] for p in placed if p[0] == "global"}, set(GLOBAL_KINDS))
         self.assertEqual({p[2] for p in placed if p[0] == "layer"},
-                         set(LAYER_KINDS) - DENSE_MLP_KINDS)
+                         set(LAYER_KINDS) - DENSE_MLP_KINDS - FLINT_KINDS)
 
     def test_every_27b_tensor_is_placed(self):
         """The dense checkpoint: the MoE kinds are absent, the dense MLP is placed, the

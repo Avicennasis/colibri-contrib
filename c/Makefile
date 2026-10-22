@@ -1847,6 +1847,10 @@ tests/test_qwen36_dense_idot$(EXE): tests/test_qwen36_dense_idot.c qwen36.c $(QW
 tests/test_qwen36_tokenizer$(EXE): tests/test_qwen36_tokenizer.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
 	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
 
+# Flint's pre-tokenizer against HF's tokenizers (tests/fixtures/flint_tok_*).
+tests/test_qwen36_tokenizer_flint$(EXE): tests/test_qwen36_tokenizer_flint.c qwen36.c $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_OBJ) $(CUDA_OBJ) $(VK_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 # The serve sampler draws the same tokens as a sort of the whole vocabulary.
 tests/test_qwen36_sample$(EXE): tests/test_qwen36_sample.c
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

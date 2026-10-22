@@ -91,6 +91,7 @@ typedef struct {
     VkcKvSplit ks;                             /* the split past the device's budget (ks.on) */
     VkcBuf *prm;                               /* every norm / conv / DeltaNet parameter */
     size_t *o_in, *o_post, *o_qn, *o_kn, *o_conv, *o_dn, o_final;
+    size_t *o_snk;                             /* Flint: a layer's sink logits in prm */
     ColiVkTensor **t_ab, **t_sg;               /* DeltaNet b|a rows, shared gate row (f32) */
     VkcBuf **rec, **ring, **kc, **vc;          /* per layer state */
     VkcBuf **rec_snap[Q36_SPEC_SNAPS], **ring_snap[Q36_SPEC_SNAPS];   /* a verify's copies, slot r after row r */
@@ -192,8 +193,8 @@ static int q36c_layer_qws(Model *m, int i, QW **ws) {
     Cfg *c = &m->c; Layer *l = &m->L[i]; int n = 0;
     if (c->is_attn[i]) { ws[n++] = &l->q; ws[n++] = &l->k; ws[n++] = &l->v; ws[n++] = &l->o; }
     else { ws[n++] = &l->dn_qkv; ws[n++] = &l->dn_z; ws[n++] = &l->dn_out; }
-    if (c->n_experts > 0) ws[n++] = &l->gate;
-    if (c->shared_inter > 0) { ws[n++] = &l->sh_g; ws[n++] = &l->sh_u; ws[n++] = &l->sh_d; }
+    if (c->n_experts > 0 && !q36_dense_l(c, i)) ws[n++] = &l->gate;   /* a Flint dense layer has no router */
+    if (l->sh_I > 0) { ws[n++] = &l->sh_g; ws[n++] = &l->sh_u; ws[n++] = &l->sh_d; }
     return n;
 }
 
@@ -276,11 +277,12 @@ static Q36Chain *q36c_setup_dev(Model *m, int d) {
     ch->lo = lo;
     ch->o_in = calloc(L, sizeof(size_t)); ch->o_post = calloc(L, sizeof(size_t)); ch->o_qn = calloc(L, sizeof(size_t));
     ch->o_kn = calloc(L, sizeof(size_t)); ch->o_conv = calloc(L, sizeof(size_t)); ch->o_dn = calloc(L, sizeof(size_t));
+    ch->o_snk = calloc(L, sizeof(size_t));
     ch->t_ab = calloc(L, sizeof(void *)); ch->t_sg = calloc(L, sizeof(void *));
     ch->rec = calloc(L, sizeof(void *)); ch->ring = calloc(L, sizeof(void *));
     ch->kc = calloc(L, sizeof(void *)); ch->vc = calloc(L, sizeof(void *));
     ch->kv_valid = calloc(L, sizeof(int)); ch->attn_ord = calloc(L, sizeof(int));
-    if (!ch->o_in || !ch->o_post || !ch->o_qn || !ch->o_kn || !ch->o_conv || !ch->o_dn || !ch->t_ab || !ch->t_sg ||
+    if (!ch->o_in || !ch->o_post || !ch->o_qn || !ch->o_kn || !ch->o_conv || !ch->o_dn || !ch->o_snk || !ch->t_ab || !ch->t_sg ||
         !ch->rec || !ch->ring || !ch->kc || !ch->vc || !ch->kv_valid || !ch->attn_ord) return NULL;
     /* the parameter arena of the n layers: offsets, then one upload */
     size_t np = 0;
@@ -290,6 +292,7 @@ static Q36Chain *q36c_setup_dev(Model *m, int d) {
         if (c->is_attn[i]) {
             if (m->L[i].qn) { ch->o_qn[i] = np; np += c->head_dim; }
             if (m->L[i].kn) { ch->o_kn[i] = np; np += c->k_head_dim; }
+            if (m->L[i].sinks) { ch->o_snk[i] = np; np += c->q_heads; }
         } else {
             ch->o_conv[i] = np; np += (size_t)conv_dim * convk;
             ch->o_dn[i] = np; np += 2 * (size_t)vh + c->dn_vdim;
@@ -305,6 +308,7 @@ static Q36Chain *q36c_setup_dev(Model *m, int d) {
         if (c->is_attn[i]) {
             if (l->qn) memcpy(arena + ch->o_qn[i], l->qn, c->head_dim * sizeof(float));
             if (l->kn) memcpy(arena + ch->o_kn[i], l->kn, c->k_head_dim * sizeof(float));
+            if (l->sinks) memcpy(arena + ch->o_snk[i], l->sinks, c->q_heads * sizeof(float));
         } else {
             memcpy(arena + ch->o_conv[i], l->dn_conv, (size_t)conv_dim * convk * sizeof(float));
             memcpy(arena + ch->o_dn[i], l->dn_alog, vh * sizeof(float));
@@ -562,6 +566,7 @@ static int q36c_bufs(Q36Chain *ch, Model *m, int rows) {
     Cfg *c = &m->c; int D = c->hidden, H = c->q_heads, KV = c->kv_heads, hd = c->head_dim;
     int qo = H * c->q_head_dim, kvo = KV * c->k_head_dim, vd = c->dn_vheads * c->dn_vdim;
     int E = c->n_experts > 0 ? c->n_experts : 1, SI = c->shared_inter > 0 ? c->shared_inter : 1;
+    if (c->dense_layer && c->dense_inter > SI) SI = c->dense_inter;   /* Flint's dense layers: a wider MLP */
     size_t r = (size_t)rows;
     int ok = q36c_res(&ch->x, r * D, VKC_DEV) && q36c_res(&ch->nrm, r * D, VKC_DEV) && q36c_res(&ch->tmp, r * D, VKC_DEV) &&
              q36c_res(&ch->q, r * qo, VKC_DEV) && q36c_res(&ch->k, r * kvo, VKC_DEV) && q36c_res(&ch->v, r * kvo, VKC_DEV) &&
@@ -585,6 +590,11 @@ static int q36c_mirror(Q36Chain *ch, Model *m) {
         int plan = ch->n_attn ? vkc_kv_plan(&ch->ks, q36c_name(ch), ch->n_attn, row, m->kv_cap, 1, 0,
                                             (size_t)ch->n_attn * ch->dev_rows * row) : 1;
         if (!plan) { ch->cap = 0; return 0; }
+        if (ch->ks.on && (c->attn_sinks || c->win_layer)) {   /* the split's attention knows no window or sinks */
+            fprintf(stderr, "[VK] qwen36 chain: the KV cache does not fit the device, and its split has no "
+                            "sliding window or sinks (Flint); the chain stops\n");
+            vkc_kv_free(&ch->ks); ch->cap = 0; return 0;
+        }
         ch->dev_rows = ch->ks.on ? ch->ks.rows : m->kv_cap;
         for (int i = ch->lo; i < ch->lo + ch->n; i++) {
             if (!c->is_attn[i]) continue;
@@ -738,6 +748,8 @@ static int q36c_attention(Q36Chain *ch, Model *m, Layer *l, int i, int n, int pb
     Cfg *c = &m->c;
     int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, qdim = c->q_head_dim, kvd = c->k_head_dim;
     int qo = H * qdim, kvo = KV * kvd, half = c->rotary_dim / 2, gate_dim = qdim > hd ? qdim - hd : 0;
+    if (c->nope_layer && c->nope_layer[i]) half = 0;   /* Flint: a layer without RoPE */
+    const int win = c->win_layer && c->win_layer[i] ? c->window : 0;
     int ok = vkc_matmul(vk_qw_tensor(&l->q), ch->nrm, 0, ch->q, 0, n) &&
              vkc_matmul(vk_qw_tensor(&l->k), ch->nrm, 0, ch->k, 0, n) &&
              vkc_matmul(vk_qw_tensor(&l->v), ch->nrm, 0, ch->v, 0, n);
@@ -769,6 +781,11 @@ static int q36c_attention(Q36Chain *ch, Model *m, Layer *l, int i, int n, int pb
     free(rg);
     VkcAttn a = {n, H, KV, hd, pb, ch->dev_rows, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
                  1.f / sqrtf((float)hd), 0, 0};
+    if (win || l->sinks) {   /* Flint: a sliding window and a sink per head (vkc_attn_w, as MiMo's) */
+        VkcAttnW w = {a, win, 0, 0, 0, l->sinks != NULL, (int)ch->o_snk[i]};
+        return ok && vkc_attn_w(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, NULL, l->sinks ? ch->prm : NULL, &w) &&
+               vkc_matmul(vk_qw_tensor(&l->o), ch->ctx, 0, ch->tmp, 0, n);
+    }
     return ok && vkc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, NULL, &a) &&
            vkc_matmul(vk_qw_tensor(&l->o), ch->ctx, 0, ch->tmp, 0, n);
 }
@@ -798,7 +815,7 @@ static int q36c_deltanet(Q36Chain *ch, Model *m, Layer *l, int i, int n, int c0,
     return ok && vkc_matmul(vk_qw_tensor(&l->dn_out), ch->dny, 0, ch->tmp, 0, n);
 }
 static int q36c_shared(Q36Chain *ch, Model *m, Layer *l, int i, int n) {
-    Cfg *c = &m->c; int ok = 1, SI = c->shared_inter;
+    int ok = 1, SI = l->sh_I;   /* shared_inter, or a Flint dense layer's MLP width */
     if (SI > 0) {
         VkcEw p = {VKC_EW_SWIGLU, n * SI, SI, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
         ok = vkc_matmul(vk_qw_tensor(&l->sh_g), ch->h2, 0, ch->gs, 0, n) &&
@@ -813,7 +830,8 @@ static int q36c_shared(Q36Chain *ch, Model *m, Layer *l, int i, int n) {
  * routed: the host's sum (ch->routed) or the device's (ch->dm.y) */
 static int q36c_combine(Q36Chain *ch, Model *m, int i, int n, VkcBuf *routed) {
     Cfg *c = &m->c;
-    int flags = (c->n_experts > 0 ? 1 : 0) | (c->shared_inter > 0 ? 2 : 0) | (m->L[i].sh_gate && c->shared_inter > 0 ? 4 : 0);
+    const int routed_l = c->n_experts > 0 && !q36_dense_l(c, i), SI = m->L[i].sh_I;   /* a Flint dense layer routes nothing */
+    int flags = (routed_l ? 1 : 0) | (SI > 0 ? 2 : 0) | (m->L[i].sh_gate && SI > 0 ? 4 : 0);
     VkcEw p = {VKC_EW_COMBINE, n * c->hidden, c->hidden, 1, flags, 1, 0, 0, 0, 0, 0, 1.f};
     return vkc_ew(ch->x, ch->x, routed, ch->ds, ch->sgd, &p);
 }
@@ -936,9 +954,11 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
             ok = ok && vkc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
             if (ok && lf) ok = vkc_copy(ch->lfd, ((size_t)(i - lo) * 3 + 1) * D, ch->x, (size_t)(n - 1) * D, D);
             ok = ok && q36c_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps);
-            if (ok && E > 0 && dmoe && vkc_dmoe_on(&ch->dm, i)) {   /* everything here, and on to the next layer */
+            const int routed_l = E > 0 && !q36_dense_l(c, i);   /* a Flint dense layer: its MLP only */
+            if (ok && routed_l && dmoe && vkc_dmoe_on(&ch->dm, i)) {   /* everything here, and on to the next layer */
                 int ng = c->n_group > 1 && c->n_group <= E ? c->n_group : 1;
-                VkcRoute rp = {.kind = 0, .n_group = ng, .topk_group = ng > 1 ? c->topk_group : 1, .norm = 1, .temp = 1.f, .scale = 1.f};
+                VkcRoute rp = {.kind = c->router_sigmoid ? 1 : 0, .n_group = ng, .topk_group = ng > 1 ? c->topk_group : 1,
+                               .norm = 1, .temp = 1.f, .scale = 1.f};
                 VkcMoe mp = {.D = D, .I = c->inter, .act = 0, .blocks = g_gguf};
                 ok = vkc_matmul(vk_qw_tensor(&l->gate), ch->h2, 0, ch->lg, 0, n) && q36c_shared(ch, m, l, i, n) &&
                      vkc_dmoe_layer(&ch->dm, i, n, ch->lg, NULL, ch->h2, &rp, &mp);
@@ -946,7 +966,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
                 if (ok && i + 1 < hi) ok = vkc_layer_recorded(&sent);   /* the device starts on these layers */
                 continue;
             }
-            if (ok && E > 0) {
+            if (ok && routed_l) {
                 ok = vkc_matmul(vk_qw_tensor(&l->gate), ch->h2, 0, ch->lg, 0, n) &&
                      vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && vkc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
                 double t0 = tm_now();

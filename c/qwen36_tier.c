@@ -66,6 +66,7 @@ static struct {
     float *is_x; size_t is_x_floats;      /* QT_MAX_ROWS*D input replicas per device */
     /* M3 */
     int *fill_order; int fill_cur;        /* warmstart order (heat desc) */
+    uint8_t *off;                         /* layers without experts (qt_layer_off): never planned */
     int issue_open;                       /* guard: no tensor_free while a group is in flight */
     pthread_cond_t cv_take;               /* signals qt_take done + queue space */
     uint64_t tick, swaps, inplace, pf_hits, pf_notes;
@@ -1554,6 +1555,15 @@ int qt_fill_next(int *layer,int *eid){
 /* Plan the whole warmstart set in one pass -- same heat order and budget
  * reservation as qt_fill_next, but without loading. The experts are then
  * loaded by any number of threads and handed over via qt_note_planned. */
+/* Layer `layer` routes nothing (a Flint dense layer): no expert of it is ever planned. */
+void qt_layer_off(int layer){
+    if(!G.on || layer<0 || layer>=G.nl) return;
+    pthread_mutex_lock(&G.mx);
+    if(!G.off) G.off=calloc((size_t)G.nl,1);
+    if(G.off) G.off[layer]=1;
+    free(G.fill_order); G.fill_order=NULL;   /* planned again without it */
+    pthread_mutex_unlock(&G.mx);
+}
 int qt_plan_fill(int *layers,int *eids,int max){
     if(!G.on) return 0;
     size_t n=(size_t)G.nl*G.ne;
@@ -1570,6 +1580,7 @@ int qt_plan_fill(int *layers,int *eids,int max){
         if(full) break;
         int gi=G.fill_order[G.fill_cur++];
         int l=gi/G.ne, e=gi%G.ne, hd=home2(l,e);
+        if(G.off && G.off[l]) continue;   /* a layer with no experts (Flint's dense ones) */
         QSlot *s=qs(l,e);
         if(s->resident||s->queued||s->planned) continue;
         if(G.used[hd]+G.exp_bytes>G.budget[hd]) continue;
@@ -1946,6 +1957,7 @@ void qt_shutdown(void){
     free(G.slot); G.slot=NULL;
     free(G.is_x); G.is_x=NULL; G.is_x_floats=0;
     free(G.fill_order); G.fill_order=NULL;
+    free(G.off); G.off=NULL;
     free(G.heat0); G.heat0=NULL;
     pthread_cond_destroy(&G.cv_take);
     pthread_cond_destroy(&G.cv);
