@@ -60,6 +60,7 @@ typedef struct { int nseg, D, per_row, x_off, x_row, x_seg, y_off, y_row, y_seg,
 #define CC_NORM_ADD1 1
 #define CC_NORM_NOW  2
 #define CC_NORM_L2   4
+#define CC_NORM_PRESCALE 8   /* scale by w, then normalise (Muse Spark; cc_muse_ready) */
 /* chain_rope.comp */
 typedef struct { int nseg, per_row, x_off, x_row, x_seg, half_, cs_off, cs_row; } CcRope;
 /* chain_attn.comp (k_off/v_off: where the layer's cache starts in kc/vc; the cache
@@ -87,6 +88,8 @@ typedef struct { int S, VH, KH, VD, Ktot, cv_off, cv_row, b_off, b_row, a_off, a
 #define CC_EW_HC_APPLY 6
 #define CC_EW_SCALE    7
 #define CC_EW_GATE_ADD 8
+#define CC_EW_SIGMUL   9    /* y = a * sigmoid(b) (cc_muse_ready) */
+#define CC_EW_RESGATE  10   /* y = e[col] * a + c[col] * b (cc_muse_ready) */
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } CcEw;
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: S rows' selections) */
 typedef struct { int mode, ID, R, b0, half_, S, pos_base, budget, IQ, q_off, q_row, nbmax, sel_row; float eps;
@@ -244,6 +247,9 @@ typedef struct ColiCudaChainOps {
     int  (*host_up_done)(unsigned ticket);
     /* attn_w: cc_attn with a sliding window and sinks (CcAttnW) */
     int  (*attn_w)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p);
+    /* muse: 1 when the norm takes CC_NORM_PRESCALE and ew CC_EW_SIGMUL and CC_EW_RESGATE (an
+     * older backend's kernels would skip them without a word) */
+    int  (*muse)(void);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -309,6 +315,10 @@ static inline int cc_moe_stage(CcBuf *b, size_t slot_bytes, int slots) { return 
 static inline int cc_attn_w_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, attn_w) + sizeof t->attn_w; }
 static inline int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p) {
     return cc_attn_w_ready() ? cc_ops()->attn_w(q, kc, vc, o, gate, snk, p) : 0;
+}
+static inline int cc_muse_ready(void) {
+    const ColiCudaChainOps *t = cc_ops();
+    return t && t->size >= offsetof(ColiCudaChainOps, muse) + sizeof t->muse && t->muse && t->muse();
 }
 #endif
 

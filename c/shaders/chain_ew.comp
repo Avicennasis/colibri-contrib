@@ -17,6 +17,10 @@
 //   7 SCALE     y[i] = a[i] * fc                                     (MiMo's value scale)
 //   8 GATE_ADD  y[i] = a[i] + e[e_off + i % D] * b[i]                (Qwen-Image's gated residual,
 //                                                                     a gate per column)
+//   9 SIGMUL    y[i] = a[i] * sigmoid(b[i])                          (Muse Spark's attention gate)
+//  10 RESGATE   y[i] = e[e_off + i % D] * a[i] + c[c_off + i % D] * b[i]
+//                                                                    (Muse Spark's residual gate: alpha
+//                                                                     and beta a column, a the residual)
 // Offsets in floats: y_off, a_off, b_off, c_off, e_off.
 layout(local_size_x = 256) in;
 
@@ -71,5 +75,10 @@ void main() {
         y[p.y_off + i] = a[p.a_off + i] * p.fc;
     } else if (p.op == 8) {
         y[p.y_off + i] = a[p.a_off + i] + e[p.e_off + i % p.D] * b[p.b_off + i];
+    } else if (p.op == 9) {
+        y[p.y_off + i] = a[p.a_off + i] * sig(b[p.b_off + i]);
+    } else if (p.op == 10) {
+        int d = i % p.D;
+        y[p.y_off + i] = e[p.e_off + d] * a[p.a_off + i] + c[p.c_off + d] * b[p.b_off + i];
     }
 }

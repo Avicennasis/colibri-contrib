@@ -294,6 +294,12 @@ static void push_id(int **ids,int *n,int *cap,int v){
     (*ids)[(*n)++]=v;
 }
 
+/* The special tokens a reply is written in (Muse Spark's messages: <|start|>assistant
+ * to=...<|message|>...<|eom|>): they decode to their text so the gateway can read the
+ * messages apart (openai_server.py MuseChannels); every other special decodes to nothing. */
+static int q36_special_shown(const char *s){
+    return s && (!strcmp(s,"<|start|>") || !strcmp(s,"<|message|>") || !strcmp(s,"<|eom|>"));
+}
 static int try_special(const char *s,int i,int n,int *id_out){
     int best_len=0,best_id=-1;
     for(int k=0;k<g_nspecial;k++){
@@ -406,6 +412,48 @@ static int fl_match(const uint32_t *cp,int n,int i){
     }
     return -1;
 }
+/* o200k's pre-tokenizer (GPT-4o, Llama 4's tiktoken pattern; Muse Spark's l4_200k_base, a
+ * GGUF's tokenizer.ggml.pre "gpt-4o"), as tok.h's pretok_chunk_o200k splits:
+ *   A|B: Flint's letter rules (fl_letters)   C: \p{N}{1,3}
+ *   D: ' ?[^\s\p{L}\p{N}]+[\r\n/]*'   E: \s*[\r\n]+   F: \s+(?!\S)   G: \s+
+ * g_ignore_merges: a piece that is a token of its own is that token (tiktoken's rule, HF's
+ * ignore_merges), the merges only for the others. */
+static int g_pretok_o200k = 0, g_ignore_merges = 0;
+static void o200k_encode_span(const char *s,int a,int b,int **ids,int *n,int *cap){
+    int nb=b-a; if(nb<=0) return;
+    uint32_t *cp=malloc((size_t)(nb+1)*sizeof(uint32_t)); int *off=malloc((size_t)(nb+2)*sizeof(int));
+    if(!cp||!off){ fprintf(stderr,"qwen36: OOM pre-tokenizing\n"); exit(1); }
+    int m=0;
+    for(int i=a;i<b;){ int adv; cp[m]=utf8_decode(s,i,b,&adv); if(adv<1) adv=1; off[m++]=i; i+=adv; }
+    off[m]=b;
+    #define O2NL(c) ((c)=='\r'||(c)=='\n')
+    for(int i=0;i<m;){
+        int j=fl_letters(cp,m,i);
+        if(j<=i && is_N(cp[i])){ j=i; while(j<m && j-i<3 && is_N(cp[j])) j++; }
+        if(j<=i){   /* D */
+            int k=i;
+            if(cp[i]==' ' && k+1<m && !is_S(cp[k+1]) && !is_L(cp[k+1]) && !is_N(cp[k+1])) k++;
+            if(k<m && !is_S(cp[k]) && !is_L(cp[k]) && !is_N(cp[k])){
+                while(k<m && !is_S(cp[k]) && !is_L(cp[k]) && !is_N(cp[k])) k++;
+                while(k<m && (O2NL(cp[k]) || cp[k]=='/')) k++;
+                j=k;
+            }
+        }
+        if(j<=i){   /* E, F, G */
+            int r=i; while(r<m && is_S(cp[r])) r++;
+            if(r>i){
+                int last=-1; for(int k=i;k<r;k++) if(O2NL(cp[k])) last=k;
+                if(last>=0) j=last+1;
+                else { int end=r<m?r-1:r; j=end>i?end:i+1; }
+            }
+        }
+        if(j<=i) j=i+1;
+        bpe_piece(s+off[i],off[j]-off[i],ids,n,cap);
+        i=j;
+    }
+    #undef O2NL
+    free(cp); free(off);
+}
 static void flint_encode_span(const char *s,int a,int b,int **ids,int *n,int *cap){
     int nb=b-a; if(nb<=0) return;
     uint32_t *cp=malloc((size_t)(nb+1)*sizeof(uint32_t)); int *off=malloc((size_t)(nb+2)*sizeof(int));
@@ -429,6 +477,13 @@ static void flint_encode_span(const char *s,int a,int b,int **ids,int *n,int *ca
 }
 static void bpe_piece(const char *piece,int len,int **ids,int *n,int *cap){
     if(len<=0) return;
+    if(g_ignore_merges){   /* the piece whole, when the vocabulary has it */
+        size_t tl=0; for(int b=0;b<len;b++) tl+=strlen(byte_sym_utf8[(unsigned char)piece[b]]);
+        char *whole=malloc(tl+1); if(!whole){ fprintf(stderr,"qwen36: OOM in BPE\n"); exit(1); }
+        whole[0]=0; for(int b=0;b<len;b++) strcat(whole,byte_sym_utf8[(unsigned char)piece[b]]);
+        int id=smap_get(&g_rev,whole); free(whole);
+        if(id>=0){ push_id(ids,n,cap,id); return; }
+    }
     int sc=0,scap=16; char **syms=malloc(scap*sizeof(char*));
     for(int b=0;b<len;b++){
         const char *sym=byte_sym_utf8[(unsigned char)piece[b]];
@@ -496,6 +551,7 @@ static void encode_text(const char *text,int **out_ids,int *out_n){
             free(norm); i=end; continue;
         }
         if(g_pretok_flint){ flint_encode_span(text,i,end,&ids,&n,&cap); i=end; continue; }
+        if(g_pretok_o200k){ o200k_encode_span(text,i,end,&ids,&n,&cap); i=end; continue; }
         while(i<end){
             int j=pretok_end(text,i,end); if(j<=i) j=i+utf8_adv(text,i,end);
             if(j>end) j=end;
@@ -533,6 +589,14 @@ static void load_tokenizer(const char *path){
         }
         g_pretok_flint = digits && ps;
         if (g_pretok_flint) fprintf(stderr, "[tok] Flint's pre-tokenizer (digits by three, CJK runs, o200k letters)\n");
+        /* o200k's one regex (its letter rules and the "[\r\n/]*" tail of its punctuation rule) */
+        for (int k = 0; !g_pretok_flint && seq && seq->t == J_ARR && k < seq->len; k++) {
+            jval *pat = json_get(seq->kids[k], "pattern"), *rx = pat ? json_get(pat, "Regex") : NULL;
+            if (rx && rx->t == J_STR && strstr(rx->str, "\\p{Lu}") && strstr(rx->str, "[\\r\\n/]*")) g_pretok_o200k = 1;
+        }
+        jval *im = json_get(model, "ignore_merges");
+        g_ignore_merges = im && im->t == J_BOOL && im->boolean;
+        if (g_pretok_o200k) fprintf(stderr, "[tok] o200k's pre-tokenizer%s\n", g_ignore_merges ? ", whole pieces first" : "");
     }
 
     int mx = 0;
@@ -565,7 +629,7 @@ static void load_tokenizer(const char *path){
              * (<|im_start|>, <|endoftext|>, ...) keep decoding to nothing,
              * as reference decoding does with skip_special_tokens. */
             jval *sp = json_get(t,"special");
-            if (sp && sp->t==J_BOOL && sp->boolean) continue;
+            if (sp && sp->t==J_BOOL && sp->boolean && !q36_special_shown(c)) continue;
             if (c && id>=0 && id<=mx && !g_tok[id])
                 g_tok[id]=strdup(c);
         }
@@ -643,6 +707,7 @@ static int load_tokenizer_gguf(const gguf_ctx *g){
     }
     const char *pre = gguf_get_str(g, "tokenizer.ggml.pre");
     g_pretok_flint = pre && !strcmp(pre, "flint");
+    g_pretok_o200k = g_ignore_merges = pre && (!strcmp(pre, "gpt-4o") || !strcmp(pre, "llama4"));   /* tiktoken's split and rule */
     int n = (int)tk->n;
     const int32_t *types = (ty && ty->type == GGUF_T_ARRAY && (ty->atype == GGUF_T_I32 || ty->atype == GGUF_T_U32) && ty->n == tk->n)
                            ? (const int32_t *)ty->arr : NULL;
@@ -652,7 +717,7 @@ static int load_tokenizer_gguf(const gguf_ctx *g){
     for (int i = 0; i < n; i++) {
         int t = types ? types[i] : 1;
         if (t == 3 || t == 4) nsp++;
-        if (t == 3) continue;
+        if (t == 3 && !q36_special_shown(tk->strs[i])) continue;
         g_tok[i] = strdup(tk->strs[i] ? tk->strs[i] : "");
     }
     g_tok_n = n;
@@ -1052,6 +1117,7 @@ typedef struct {
      * three matrices. Offered per layer as "dnout", "attnproj", "shexp";
      * see trunk_offer_dense / trunk_place_dense. */
     int qth_dnout, qth_q, qth_k, qth_v, qth_o, qth_shg, qth_shu, qth_shd;
+    int qth_ag, qth_ld, qth_lu;   /* Muse Spark's attention gate (with "attnproj") and latent projections ("shexp") */
 } Layer;
 
 /* ---------- LRU expert cache (int8 weights + per-row float scales) ---------- */
@@ -4331,7 +4397,7 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
         for (int64_t r = 0; r < (int64_t)S*H; r++) rmsnorm_plain(ctx + r*hd, ctx + r*hd, hd, c->eps);
         if (l->ag.O) {
             gate = falloc((int64_t)S*H*hd); gate_dim = hd;
-            matmul_d(gate, x, &l->ag, S, D, H*hd);
+            if (!qtd_batch(l->qth_ag, gate, x, S, D, H*hd)) matmul_d(gate, x, &l->ag, S, D, H*hd);
         }
     }
     /* apply attn_output_gate: attn_out *= sigmoid(gate). Without a gate (Qwen3 MoE)
@@ -4994,9 +5060,9 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
      * neither the CUDA tier nor the expert_ffn kernel is consulted.
      * Routing, shared expert, and the combine stay on the CPU below. */
     /* GGUF: the experts as the file stores them, ggml blocks no tier reads (moe_gq_run) */
-    int use_gq = g_gguf && !vkt_ready() && !(qt_ready() && qt_experts_on());   /* the device tiers take a GGUF's experts */
+    int use_gq = g_gguf && !vkt_ready() && !(qt_ready() && qt_experts_on() && !c->muse);   /* the device tiers take a GGUF's experts */
     int use_qq = !use_gq && qq_active();
-    int use_qt = !use_gq && !use_qq && qt_ready() && qt_experts_on();   /* a trunk-only tier leaves the experts to the paths below */
+    int use_qt = !use_gq && !use_qq && qt_ready() && qt_experts_on() && !c->muse;   /* a trunk-only tier leaves the experts to the paths below */
     /* the Vulkan tier takes the routed experts of every format it was given
      * (moe_vk_run): the routing is collected first, as for the shared kernel */
     int use_vk = !use_gq && !use_qq && !use_qt && vkt_ready();
@@ -5258,10 +5324,10 @@ static void moe_muse(Model *m, Layer *l, int layer, float *x, int S, float *out)
     double _tr = tm_now();
     matmul_d(logits, x, &l->gate, S, D, E);
     tm_add(S, 4, tm_now()-_tr);
-    matmul_d(lat, x, &l->lat_d, S, D, L);
+    if (!qtd_batch(l->qth_ld, lat, x, S, D, L)) matmul_d(lat, x, &l->lat_d, S, D, L);
     for (int s = 0; s < S; s++) rmsnorm_row(lat + (int64_t)s*L, lat + (int64_t)s*L, l->pre_en, L, c->eps);
     moe_ex(m, l, layer, lat, S, lo, logits, 1);
-    matmul_d(out, lo, &l->lat_u, S, L, D);
+    if (!qtd_batch(l->qth_lu, out, lo, S, L, D)) matmul_d(out, lo, &l->lat_u, S, L, D);
     free(logits); free(lat); free(lo);
 }
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
@@ -5564,7 +5630,7 @@ static void trunk_offer_dense(Model *m){
         if (!c->is_attn[i]) continue;
         Layer *l = &m->L[i];
         size_t bq = qdw_bytes(&l->q), bk = qdw_bytes(&l->k), bv = qdw_bytes(&l->v), bo = qdw_bytes(&l->o);
-        if (bq && bk && bv && bo) qt_trunk_offer("attnproj", i, bq + bk + bv + bo);
+        if (bq && bk && bv && bo) qt_trunk_offer("attnproj", i, bq + bk + bv + bo + qdw_bytes(&l->ag));
     }
     /* The shared expert is offered only on request (Q36_OFFER_SHEXP=1). On the
      * card it is 120 synchronous small GEMVs per token that sit between
@@ -5580,6 +5646,12 @@ static void trunk_offer_dense(Model *m){
             size_t bg = qdw_bytes(&l->sh_g), bu = qdw_bytes(&l->sh_u), bd = qdw_bytes(&l->sh_d);
             if (bg && bu && bd) qt_trunk_offer("shexp", i, bg + bu + bd);
         } }
+    /* Muse Spark's projections to and from the experts' width, under "shexp": the dense
+     * work beside the routed experts (no shared expert there) */
+    for (int i = 0; c->muse && i < c->n_layers; i++) {
+        size_t bd = qdw_bytes(&m->L[i].lat_d), bu = qdw_bytes(&m->L[i].lat_u);
+        if (bd && bu) qt_trunk_offer("shexp", i, bd + bu);
+    }
 }
 /* After qt_init decided: upload what was placed, keep the handles in the
  * Layer. Every matrix falls back on its own, so a failed upload costs one
@@ -5601,12 +5673,15 @@ static int trunk_place_dense(Model *m, double *vram_bytes, int kinds[3]){
             if (l->qth_k) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->k); }
             if (l->qth_v) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->v); }
             if (l->qth_o) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->o); }
+            if (l->ag.O && (l->qth_ag = qdw_place(&l->ag, dev))) { placed++; kinds[1]++; vram += (double)qdw_bytes(&l->ag); }
         }
         int dev = qt_place_of("shexp", i);
         l->qth_shg = qdw_place(&l->sh_g, dev); l->qth_shu = qdw_place(&l->sh_u, dev); l->qth_shd = qdw_place(&l->sh_d, dev);
         if (l->qth_shg) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->sh_g); }
         if (l->qth_shu) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->sh_u); }
         if (l->qth_shd) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->sh_d); }
+        if (l->lat_d.O && (l->qth_ld = qdw_place(&l->lat_d, dev))) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->lat_d); }
+        if (l->lat_u.O && (l->qth_lu = qdw_place(&l->lat_u, dev))) { placed++; kinds[2]++; vram += (double)qdw_bytes(&l->lat_u); }
     }
     if (vram_bytes) *vram_bytes = vram;
     return placed;
@@ -6979,7 +7054,8 @@ static int serve_eos_ids(int *ids, int cap){
     int n=0;
     if(getenv("Q36_EOS")){ ids[n++]=atoi(getenv("Q36_EOS")); return n; }
     for(int k=0;k<g_nspecial && n<cap;k++)
-        if(!strcmp(g_sp_str[k],"<|im_end|>")||!strcmp(g_sp_str[k],"<|endoftext|>"))
+        if(!strcmp(g_sp_str[k],"<|im_end|>")||!strcmp(g_sp_str[k],"<|endoftext|>")||
+           !strcmp(g_sp_str[k],"<|eot|>")||!strcmp(g_sp_str[k],"<|end_of_text|>"))   /* Muse Spark's two */
             ids[n++]=g_sp_id[k];
     if(!n) ids[n++]=151645;   /* tokenizer without added_tokens: old default */
     return n;
@@ -8045,6 +8121,10 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
     Cfg *c = &m->c;
     if (!g_vk_ready || c->n_experts == 0 || qq_active()) return;
     if (qt_ready()) { fprintf(stderr, "[VK] tier qwen36: the CUDA expert tier is on and wins; the Vulkan tier stays off\n"); return; }
+    if (c->muse) {   /* the tier's batch sums its experts' outputs, Muse Spark normalises each one first */
+        fprintf(stderr, "[VK] tier qwen36: Muse Spark's experts stay on the CPU (each output normalised before the sum)\n");
+        return;
+    }
     const char *on = getenv("COLI_VK_TIER");
     if (on && *on == '0') return;
     int gs = c->expert_gs, dgs = down_gs_of(c);
@@ -8534,6 +8614,9 @@ int main(int argc, char **argv) {
                                         : "[gpu] dense trunk -> CUDA (the routed experts stay on the CPU)\n");
         atexit(qt_shutdown);
         for (int i = 0; i < m.c.n_layers; i++) if (q36_dense_l(&m.c, i)) qt_layer_off(i);   /* Flint's dense layers */
+        /* the tier's sum takes its experts' outputs as they are, Muse Spark normalises each first:
+         * the trunk only (moe_ex keeps Muse's experts off the tier whatever CUDA_EXPERT_GB says) */
+        if (m.c.muse) qt_experts_withdraw("Muse Spark normalises every expert's output before the sum");
         /* The placer predicted; measure before uploading a byte of trunk. */
         if (!trunk_probe_gpu_wins(&m)) {
             qt_trunk_withdraw("measured slower than the CPU");

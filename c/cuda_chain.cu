@@ -91,7 +91,8 @@ __global__ static void cc_norm_k(const float *__restrict__ x, const float *__res
     int wb = p.w_off + (p.w_mod > 0 ? (j % p.w_mod) * p.D : 0);
     int tid = threadIdx.x;
     float acc = 0.f;
-    for (int i = tid; i < p.D; i += 256) { float v = x[xb + i]; acc += v * v; }
+    const bool pre = (p.flags & 8) != 0;
+    for (int i = tid; i < p.D; i += 256) { float v = pre ? x[xb + i] * w[wb + i] : x[xb + i]; acc += v * v; }
     red[tid] = acc;
     __syncthreads();
     for (int off = 128; off > 0; off >>= 1) {
@@ -101,7 +102,7 @@ __global__ static void cc_norm_k(const float *__restrict__ x, const float *__res
     float r = (p.flags & 4) ? 1.f / sqrtf(red[0] + p.eps) : 1.f / sqrtf(red[0] / (float)p.D + p.eps);
     for (int i = tid; i < p.D; i += 256) {
         float wv = (p.flags & 2) ? 1.f : ((p.flags & 1) ? 1.f + w[wb + i] : w[wb + i]);
-        y[yb + i] = x[xb + i] * r * wv * p.post;
+        y[yb + i] = x[xb + i] * (pre ? w[wb + i] : wv) * r * p.post;
     }
 }
 __global__ static void cc_rope_k(float *__restrict__ x, const float *__restrict__ cs, CcRope p) {
@@ -724,6 +725,11 @@ __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ 
         y[p.y_off + i] = a[p.a_off + i] * p.fc;
     } else if (p.op == 8) {
         y[p.y_off + i] = a[p.a_off + i] + e[p.e_off + (int)(i % p.D)] * b[p.b_off + i];
+    } else if (p.op == 9) {
+        y[p.y_off + i] = a[p.a_off + i] * cc_sig(b[p.b_off + i]);
+    } else if (p.op == 10) {
+        int d = (int)(i % p.D);
+        y[p.y_off + i] = e[p.e_off + d] * a[p.a_off + i] + c[p.c_off + d] * b[p.b_off + i];
     }
 }
 
@@ -1504,6 +1510,7 @@ static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBu
     return launched(c, "attn (window, sinks)");
 }
 
+static int cc_muse(void) { return 1; }   /* the norm's PRESCALE, ew's SIGMUL and RESGATE */
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
     cc_init, cc_ready, cc_lost_, cc_shutdown, cc_device, cc_device_now,
@@ -1517,5 +1524,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_fetch, cc_fetch_wait, cc_fetch_done, cc_dev_addr,
     cc_moe_stage_op, cc_host_up, cc_host_up_done,
     cc_attn_w,
+    cc_muse,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

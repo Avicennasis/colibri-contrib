@@ -339,8 +339,8 @@ def _qwen36_geometry(config, context, _model_dir):
     30 of 40 layers never grow."""
     layers = _required_int(config, "num_hidden_layers", "qwen36")
     kinds = _qwen36_layer_types(config, layers, _model_dir)
-    # Flint's sliding_attention layers keep their rows like the full ones (the engine's KV is
-    # one array per attention layer, the window applied when it reads)
+    # Flint's and Muse Spark's sliding_attention layers keep their rows like the full ones (the
+    # engine's KV is one array per attention layer, the window applied when it reads)
     full = sum(kind in ("full_attention", "sliding_attention") for kind in kinds)
     kv = (full * context * _required_int(config, "num_key_value_heads", "qwen36") *
           _required_int(config, "head_dim", "qwen36") * 2 * 4)
@@ -1491,7 +1491,10 @@ FAMILIES = (
         # qwen3: the dense Qwen3 (0.6B to 32B), qwen3_moe's layers with one MLP each.
         # flint: Flint (RecursiveSI/flint), qwen3_moe's layers with a sink per head,
         # sliding-window layers, dense layers in front and sigmoid routing.
-        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text", "qwen3_moe", "qwen3", "flint"),
+        # muse_spark: Muse Spark Open (its GGUFs, tools/gguf_import.py), Flint's window and
+        # layers without RoPE, residual gates and the experts at their own width.
+        model_types=("qwen3_5_moe", "qwen3_5_moe_text", "qwen3_5", "qwen3_5_text", "qwen3_moe", "qwen3", "flint",
+                     "muse_spark"),
         display_name="Qwen3.6-35B-A3B",
         display_scale="35B",
         # Both checkpoints declare qwen3_5_moe_text. Keyed on the three
@@ -1517,6 +1520,9 @@ FAMILIES = (
             DisplayVariant((("num_hidden_layers", 49),
                             ("num_experts", 256), ("hidden_size", 2048)),
                            "Flint", "40B", model_id="flint-colibri"),
+            DisplayVariant((("num_hidden_layers", 62),
+                            ("num_experts", 256), ("hidden_size", 8192)),
+                           "Muse-Spark-Open-816B-A42B", "816B", model_id="muse-spark-open-colibri"),
         ),
         engine_artifact="qwen36",
         engine_aliases=(),
