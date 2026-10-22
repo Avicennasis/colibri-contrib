@@ -300,6 +300,9 @@ def main():
     ap.add_argument("--dense", default="F32", choices=("F32", "Q8_0"),
                     help="the GGUF's 2-D matrices (attention, projections, head): F32, or Q8_0")
     ap.add_argument("--experts", default="Q8_0", choices=("F32", "Q8_0"), help="the routed experts' GGUF type")
+    ap.add_argument("--act", default=None, choices=("q8", "f32"),
+                    help="the experts' inputs in the reference: q8 as the CPU's integer kernels quantize "
+                         "them (the default with Q8_0 experts), f32 as the device tiers read them")
     ap.add_argument("--min-gap", type=float, default=0.1,
                     help="draw seeds from --seed on until every greedy step's first logit beats the "
                          "second by this much, so a quantized matrix cannot flip a near tie")
@@ -311,7 +314,8 @@ def main():
         if not args.emit_ref:
             break
         with torch.no_grad():
-            full, gap = MuseRef(cfg, w, act_q8=args.experts == "Q8_0").generate(prompt, args.max_new)
+            act_q8 = (args.act or ("q8" if args.experts == "Q8_0" else "f32")) == "q8"
+            full, gap = MuseRef(cfg, w, act_q8=act_q8).generate(prompt, args.max_new)
         if gap >= args.min_gap:
             break
     else:

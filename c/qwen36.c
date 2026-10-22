@@ -4873,7 +4873,8 @@ static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, flo
         else    moe_vk_i8_cpu(m, layer, xb, rows, ib, want, ctb, g, u);
         if (shb) { memset(shb, 0, (size_t)rows * D * sizeof(float)); qwen_shared_experts_cpu(m, l, xb, rows, shb, g, u, hh); }
         const float *dsum = NULL;   /* a step wholly on the device: its routed rows summed there */
-        if (ndev && !vkt_join_sum(dev, vb, &dsum)) {   /* the batch failed (the tier stops): those pairs here */
+        /* Muse Spark normalises every expert's output before the sum: the rows come back apart */
+        if (ndev && !(l->post_en ? vkt_join(dev) : vkt_join_sum(dev, vb, &dsum))) {   /* the batch failed (the tier stops): those pairs here */
             if (g_gguf) moe_vk_gq_cpu(m, layer, xb, rows, ib, taken, ctb);
             else if (xf) moe_vk_xf_cpu(m, layer, xb, rows, ib, taken, ctb);
             else    moe_vk_i8_cpu(m, layer, xb, rows, ib, taken, ctb, g, u);
@@ -4894,6 +4895,13 @@ static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, flo
                 if (ib[i] < 0) continue;
                 const float *cp = taken[i] ? dev[i] : ctb + (int64_t)i * D;
                 float w = vb[i];
+                if (l->post_en) {   /* Muse Spark: w * rmsnorm_scaled(cp), the same products in the same order */
+                    const float *ps = l->post_en;
+                    double ms = 0; for (int d = 0; d < D; d++) { double v = (double)cp[d] * ps[d]; ms += v * v; }
+                    const float r = 1.f / sqrtf((float)(ms / D) + c->post_eps);
+                    for (int d = 0; d < D; d++) os[d] += w * (cp[d] * ps[d] * r);
+                    continue;
+                }
                 for (int d = 0; d < D; d++) os[d] += w * cp[d];
             }
             if (shb) { const float *sp = shb + (int64_t)s * D; for (int d = 0; d < D; d++) os[d] += sp[d]; }
@@ -8121,10 +8129,6 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
     Cfg *c = &m->c;
     if (!g_vk_ready || c->n_experts == 0 || qq_active()) return;
     if (qt_ready()) { fprintf(stderr, "[VK] tier qwen36: the CUDA expert tier is on and wins; the Vulkan tier stays off\n"); return; }
-    if (c->muse) {   /* the tier's batch sums its experts' outputs, Muse Spark normalises each one first */
-        fprintf(stderr, "[VK] tier qwen36: Muse Spark's experts stay on the CPU (each output normalised before the sum)\n");
-        return;
-    }
     const char *on = getenv("COLI_VK_TIER");
     if (on && *on == '0') return;
     int gs = c->expert_gs, dgs = down_gs_of(c);
