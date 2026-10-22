@@ -202,6 +202,17 @@ jobs:
               --gguf /tmp/flint_$experts/model.gguf --gguf-experts $experts
             COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/flint_$experts/model.gguf ./qwen36 16 8 /tmp/flint_$experts/ref.json
           done
+      # Muse Spark's layer (residual gates, the experts at their own width between two
+      # projections, a norm on every expert's output, capped logits) against
+      # tools/make_muse_tiny.py's reference, F32 experts and Q8_0 ones (the reference then
+      # quantizes the experts' inputs as the CPU's integer kernels do).
+      - name: Run the Muse Spark tiny oracles
+        run: |
+          cd c
+          for experts in F32 Q8_0; do
+            python tools/make_muse_tiny.py --out /tmp/muse_$experts --emit-ref /tmp/muse_$experts/ref.json --experts $experts
+            COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/muse_$experts/model.gguf ./qwen36 16 8 /tmp/muse_$experts/ref.json
+          done
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
