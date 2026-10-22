@@ -3019,8 +3019,8 @@ static void gguf_load_cfg(Cfg *c) {
         fprintf(stderr, "[gguf] qwen3 (dense): %d layers (all attention), hidden %d, MLP %d, vocab %d\n",
                 c->n_layers, c->hidden, c->shared_inter, c->vocab);
     else if (plain)
-        fprintf(stderr, "[gguf] qwen3moe: %d layers (all attention), hidden %d, %d experts top-%d, inter %d, vocab %d\n",
-                c->n_layers, c->hidden, c->n_experts, c->topk, c->inter, c->vocab);
+        fprintf(stderr, "[gguf] %s: %d layers (all attention), hidden %d, %d experts top-%d, inter %d, vocab %d\n",
+                flint ? "flint" : "qwen3moe", c->n_layers, c->hidden, c->n_experts, c->topk, c->inter, c->vocab);
     else if (dense)
         fprintf(stderr, "[gguf] qwen35 (dense): %d layers (%d attention), hidden %d, MLP %d, vocab %d, DeltaNet v/k heads %d/%d\n",
                 c->n_layers, c->n_active, c->hidden, c->shared_inter, c->vocab, c->dn_vheads, c->dn_kheads);
