@@ -3644,6 +3644,11 @@ static void unpack_int4_to_int8(int8_t *out, const uint8_t *raw, int64_t n)
 }
 
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
+    /* new bytes in the slot: the copy derived from the last ones (gq_slot_i8's int8,
+     * gq_slot_file_rows' file rows, keyed by t8_eid) is stale. The CUDA tier's copy-mode
+     * warm start reads every expert through one slot a thread whose eid never changes,
+     * and handed the device the first expert's rows for all of them. */
+    s->t8_eid = 0;
     if (g_gguf) {
         /* three reads, one per fused tensor: expert eid's gate, up, down rows */
         const GqExp *x = &m->gqx[layer]; const int ilv = gguf_expert_ilv(x);
