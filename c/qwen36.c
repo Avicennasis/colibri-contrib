@@ -7707,6 +7707,7 @@ static void tier_warmstart(Model *m, int expert_is_int4) {
     #pragma omp parallel for schedule(dynamic, 16)
     for (int gi = 0; gi < cap_total; gi++) {
         int l = gi / m->c.n_experts, eidw = gi % m->c.n_experts;
+        if (q36_dense_l(&m->c, l)) continue;   /* Flint's dense layers carry no experts */
         Slot *e; expert_get(m, l, eidw, &e);
         /* int4: i puntatori impacchettati (o planari); int8: i pesi stessi.
          * Prima qui si esigeva e->g4, che su un container int8 e' NULL: la
@@ -8357,6 +8358,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, qt_experts_on() ? "[gpu] MoE experts -> CUDA VRAM tier\n"
                                         : "[gpu] dense trunk -> CUDA (the routed experts stay on the CPU)\n");
         atexit(qt_shutdown);
+        for (int i = 0; i < m.c.n_layers; i++) if (q36_dense_l(&m.c, i)) qt_layer_off(i);   /* Flint's dense layers */
         /* The placer predicted; measure before uploading a byte of trunk. */
         if (!trunk_probe_gpu_wins(&m)) {
             qt_trunk_withdraw("measured slower than the CPU");
