@@ -110,7 +110,8 @@ class FlintGatewayTest(unittest.TestCase):
         openai_server.ARCH, openai_server.CHAT_FLAVOR = self.saved
 
     def test_template_fixture_is_the_release(self):
-        self.assertEqual(hashlib.sha256(TEMPLATE.read_bytes()).hexdigest(), TEMPLATE_SHA256)
+        # a CRLF checkout (the Windows runner's) holds the same template
+        self.assertEqual(hashlib.sha256(TEMPLATE.read_bytes().replace(b"\r\n", b"\n")).hexdigest(), TEMPLATE_SHA256)
 
     @unittest.skipUnless(jinja2, "jinja2 is not installed")
     def test_byte_identical(self):
