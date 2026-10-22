@@ -104,7 +104,10 @@ class Protocol(unittest.TestCase):
             input=deep + '\n' + ping + '\n', text=True, capture_output=True, timeout=10)
         self.assertEqual(process.returncode, 0, process.stderr)
         replies = [json.loads(line) for line in process.stdout.splitlines()]
-        self.assertEqual(replies[0]['error']['code'], mcp_server.PARSE_ERROR)
+        # Up to Python 3.13 the decoder stops at the recursion limit (a parse error). From
+        # 3.14 its guard follows the C stack, so this depth parses and the batch holds one
+        # array, an invalid request. Either way the session answers the next line.
+        self.assertIn(replies[0]['error']['code'], (mcp_server.PARSE_ERROR, mcp_server.INVALID_REQUEST))
         self.assertIsNone(replies[0]['id'])
         self.assertEqual(replies[1], {'jsonrpc': '2.0', 'id': 91, 'result': {}})
 
