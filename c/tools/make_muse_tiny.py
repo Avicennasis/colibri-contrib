@@ -28,7 +28,10 @@ modular_muse_glimmer.py):
 
 The GGUF folds what the published files fold: every (1 + w) norm is stored with the 1
 added, the residual gates as their alpha and beta vectors, q_norm as qk_scale_factor and
-k_norm as ones. The reference below is written on those stored values, in float32.
+k_norm as ones; and it holds q's and k's rows (and their norms) in the published files'
+rotary order, the two halves of every head interleaved (file row 2i + j = row j * hd/2 + i),
+which the engine puts back at load. The reference below is written on the stored values,
+in the checkpoint's order, in float32.
 
     python3 tools/make_muse_tiny.py --out muse_tiny --emit-ref muse_tiny/ref.json
 """
@@ -283,8 +286,18 @@ def write_gguf(path, cfg, w, expert_type="Q8_0", dense_type="F32"):
            ("tokenizer.ggml.merges", ARR, (STR, [])),
            ("tokenizer.ggml.bos_token_id", U32, cfg["bos_token_id"]),
            ("tokenizer.ggml.eos_token_id", U32, cfg["eos_token_id"])]
+    def rotary_order(name, t):
+        """the published files' q/k rows: each head's two halves interleaved"""
+        heads = {"attn_q.weight": cfg["num_attention_heads"], "attn_k.weight": cfg["num_key_value_heads"],
+                 "attn_q_norm.weight": 1, "attn_k_norm.weight": 1}.get(name.split(".", 2)[-1])
+        if not heads:
+            return t
+        hd = cfg["head_dim"]
+        return t.reshape(heads, 2, hd // 2, *t.shape[1:]).transpose(1, 2).reshape(t.shape)
+
     tensors = []
     for name, t in w.items():
+        t = rotary_order(name, t)
         a = t.float().contiguous().numpy().astype(np.float32)
         dims = list(reversed(a.shape))
         if _kind(name, t, expert_type, dense_type) == "Q8_0":

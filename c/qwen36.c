@@ -2863,6 +2863,34 @@ static int qwen_dense_read(Model *m, const char *name, int I, int O, QW *out) {
  * model_init_range/load_t_n, never main()'s dense-i8 block) -- passing it
  * through keeps their f32-only behavior exactly as it was; `tag` is unused
  * on that path. */
+/* A GGUF whose q and k rows are in llama.cpp's rotary order: within each head the rows of the
+ * two halves interleaved (file row 2i + j = checkpoint row j * hd/2 + i), so that a rotation of
+ * adjacent pairs is the checkpoint's of the two halves. Put back in the checkpoint's order at
+ * load (rows are whole blocks: a byte copy), every kernel then rotates the halves as for every
+ * other model. q36_gguf_rope_perm: 1 for such a file (muse-spark, Q36_GGUF_ROPE_PERM=0/1 sets it). */
+static int g_q36_rope_perm = 0;
+static int q36_rope_heads(const Model *m, const char *name) {
+    if (!g_q36_rope_perm || !name) return 0;
+    size_t L = strlen(name);
+    if (L > 23 && !strcmp(name + L - 23, "self_attn.q_proj.weight")) return m->c.q_heads;
+    if (L > 23 && !strcmp(name + L - 23, "self_attn.k_proj.weight")) return m->c.kv_heads;
+    if (L > 23 && !strcmp(name + L - 23, "self_attn.q_norm.weight")) return 1;
+    if (L > 23 && !strcmp(name + L - 23, "self_attn.k_norm.weight")) return 1;
+    return 0;
+}
+static void q36_rope_unpermute(void *rows, size_t row_bytes, int heads, int hd) {
+    if (heads <= 0 || hd < 2 || hd % 2) return;
+    const int half = hd / 2;
+    uint8_t *tmp = malloc(row_bytes * (size_t)hd), *base = (uint8_t *)rows;
+    if (!tmp) { fprintf(stderr, "OOM un-permuting rotary rows\n"); exit(1); }
+    for (int h = 0; h < heads; h++) {
+        uint8_t *hb = base + (size_t)h * hd * row_bytes;
+        memcpy(tmp, hb, row_bytes * (size_t)hd);
+        for (int i = 0; i < half; i++) for (int j = 0; j < 2; j++)
+            memcpy(hb + (size_t)(j * half + i) * row_bytes, tmp + (size_t)(2 * i + j) * row_bytes, row_bytes);
+    }
+    free(tmp);
+}
 static void load_tq(Model *m, const char *name, int I, int O, int quantize, const char *tag, QW *out) {
     if (g_gguf) {
         /* the matrix as the file stores it: rows along I, one ggml type */
@@ -2873,12 +2901,18 @@ static void load_tq(Model *m, const char *name, int I, int O, int quantize, cons
             fprintf(stderr, "GGUF %s: shape [%lld x %lld], config implies [%d x %d] -- refusing\n",
                     t->name, (long long)t->ne[0], (long long)(gg_numel(t) / t->ne[0]), I, O); exit(1);
         }
-        if (t->type == GQ_F32 || t->type == GQ_F16 || t->type == GQ_BF16) { out->w = load_t_n(m, name, (int64_t)I * O); return; }
+        const int rheads = q36_rope_heads(m, name) > 1 ? q36_rope_heads(m, name) : 0;
+        if (t->type == GQ_F32 || t->type == GQ_F16 || t->type == GQ_BF16) {
+            out->w = load_t_n(m, name, (int64_t)I * O);
+            if (rheads && out->w) q36_rope_unpermute((void *)out->w, (size_t)I * sizeof(float), rheads, O / rheads);
+            return;
+        }
         if (!gq_blk_decoder(t->type)) { fprintf(stderr, "GGUF %s: type %s is not supported\n", t->name, gq_type_name(t->type)); exit(1); }
         if (!gg_scale(t, 1, &out->gs)) out->gs = 1.f;
         if (g_gguf_dry) { out->gq_type = t->type; return; }
         out->gq = malloc((size_t)t->nbytes); out->gq_type = t->type;
         if (!out->gq || gguf_read(&g_gg, t, out->gq, 0, t->nbytes)) { fprintf(stderr, "GGUF %s: read failed\n", t->name); exit(1); }
+        if (rheads) q36_rope_unpermute(out->gq, (size_t)gq_row_bytes(t->type, I), rheads, O / rheads);
         const int ht = q36_gq_held(t->type, O, I);
         if (ht != t->type) {   /* interleaved by 16 for the CPU's kernels */
             const int64_t rb = gq_row_bytes(t->type, I), hb = gq_row_bytes(ht, I);
@@ -3104,6 +3138,7 @@ static int q36_vision_attach(Model *m, const float *patches, int grid_h, int gri
 static float *load_norm_n(Model *m, const char *name, int64_t want) {
     float *w = load_t_n(m, name, want);
     if (!w) return NULL;   /* GGUF_CHECK=1: shapes checked, nothing read */
+    if (g_gguf && q36_rope_heads(m, name) == 1) q36_rope_unpermute(w, sizeof(float), 1, (int)want);   /* a head's q/k norm, as its rows */
     if (!m->c.zero_centered_norms)
         for (int64_t i = 0; i < want; i++) w[i] -= 1.0f;
     return w;
@@ -3188,6 +3223,7 @@ static void gguf_load_cfg(Cfg *c) {
         CFG_NEED(gguf_get_float(g, GK("expert_weights_scale"), 1.0) == 1.0, "GGUF muse-spark.expert_weights_scale %g: only 1",
                  gguf_get_float(g, GK("expert_weights_scale"), 1.0));
         c->muse = 1; c->router_sigmoid = 1;
+        { const char *e = getenv("Q36_GGUF_ROPE_PERM"); g_q36_rope_perm = e && *e ? atoi(e) != 0 : 1; }
         c->window = (int)gguf_get_int(g, GK("attention.sliding_window"), 0);
         c->ehid = (int)gguf_get_int(g, GK("moe_latent_size"), 0);
         c->post_eps = (float)gguf_get_float(g, GK("post_norm_epsilon"), 1e-8);
