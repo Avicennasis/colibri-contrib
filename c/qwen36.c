@@ -8182,9 +8182,11 @@ int main(int argc, char **argv) {
     int expert_is_int4 = 1, expert_mixed = 0;
     {
         char probe[256];
-        snprintf(probe, sizeof(probe),
-                 "model.layers.%d.mlp.experts.0.merged_weight", m.active_of[0]);
-        st_tensor *pt = g_gguf ? NULL : st_find(&m.S, probe);
+        st_tensor *pt = NULL;
+        for (int l = 0; !g_gguf && !pt && l < m.c.n_layers; l++) {   /* the first layer with experts (Flint's start dense) */
+            snprintf(probe, sizeof(probe), "model.layers.%d.mlp.experts.0.merged_weight", m.active_of[l]);
+            pt = st_find(&m.S, probe);
+        }
         if (g_gguf) expert_is_int4 = 0;
         int64_t want = 2*(int64_t)m.c.inter*m.c.hidden + (int64_t)m.c.hidden*m.c.inter;
         if (pt && pt->nbytes == want) expert_is_int4 = 0;   /* int8: un byte per elemento */
@@ -8989,7 +8991,9 @@ static int qwen36_edge_engine_open(
     load_tq(&engine->model, "lm_head.weight", config->hidden, config->vocab, 0, "lmhead", &engine->model.lm_head);
     engine->model.final_norm = load_norm_n(
         &engine->model, "model.norm.weight", config->hidden);
-    engine->model.quant_bits = container_layer_is_int4(&engine->model, 0) ? 4 : 8;
+    int probe_layer = 0;   /* the first layer with experts: Flint's first layers are dense */
+    while (probe_layer + 1 < config->n_layers && q36_dense_l(config, probe_layer)) probe_layer++;
+    engine->model.quant_bits = container_layer_is_int4(&engine->model, probe_layer) ? 4 : 8;
     char tokenizer_path[4096];
     snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
              options->model_dir);
