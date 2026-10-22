@@ -35,7 +35,7 @@ except ImportError as exc:   # pragma: no cover
 
 
 def tiny_config(vocab=128, hidden=64, layers=7, heads=8, kv_heads=2, head_dim=16, experts=16,
-                topk=4, moe_inter=32, shared_inter=32, dense_inter=96, window=5):
+                topk=4, moe_inter=32, shared_inter=32, dense_inter=96, window=5, dense=2):
     # the real pattern at toy depth: two dense full-attention layers, then sliding
     # layers with a full one every fourth, the full ones without RoPE
     types = ["full_attention", "full_attention"]
@@ -47,7 +47,7 @@ def tiny_config(vocab=128, hidden=64, layers=7, heads=8, kv_heads=2, head_dim=16
         "attention_bias": False, "attention_dropout": 0.0, "bos_token_id": 1,
         "decoder_sparse_step": 1, "eos_token_id": [vocab - 1], "head_dim": head_dim,
         "hidden_act": "silu", "hidden_size": hidden, "intermediate_size": dense_inter,
-        "layer_types": types, "max_position_embeddings": 4096, "mlp_only_layers": [0, 1],
+        "layer_types": types, "max_position_embeddings": 4096, "mlp_only_layers": list(range(dense)),
         "moe_intermediate_size": moe_inter, "norm_topk_prob": True,
         "num_attention_heads": heads, "num_experts": experts, "num_experts_per_tok": topk,
         "num_hidden_layers": layers, "num_key_value_heads": kv_heads,
@@ -236,7 +236,7 @@ def _q8_0(a):
     return out.tobytes()
 
 
-def write_gguf(path, cfg, w, expert_type="Q8_0"):
+def write_gguf(path, cfg, w, expert_type="Q8_0", dense_type="F32"):
     """The same weights as llama.cpp's flint GGUF has them (the names, keys and per-layer
     patterns of unsloth/flint-GGUF): F32 everywhere, the routed experts in expert_type
     (F32 or Q8_0)."""
@@ -273,7 +273,9 @@ def write_gguf(path, cfg, w, expert_type="Q8_0"):
     def put(name, t, quant=False):
         a = t.float().contiguous().numpy().astype(np.float32)
         dims = list(reversed(a.shape))
-        if quant and expert_type == "Q8_0":
+        if not quant and dense_type == "Q8_0" and a.ndim == 2 and a.shape[-1] % 32 == 0:
+            quant = True   # the dense matrices in blocks too, as a published file has them
+        if quant and (expert_type == "Q8_0" or a.ndim == 2):
             tensors.append((name, 8, dims, _q8_0(a)))
         else:
             tensors.append((name, 0, dims, a.tobytes()))
@@ -314,7 +316,10 @@ def main():
     ap.add_argument("--vocab", type=int, default=128)
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--window", type=int, default=5)
+    ap.add_argument("--dense", type=int, default=2, help="dense layers in front (the release: 2)")
     ap.add_argument("--gguf", default=None, help="also write the model as a flint GGUF here")
+    ap.add_argument("--gguf-dense", default="F32", choices=("F32", "Q8_0"),
+                    help="the GGUF's 2-D dense matrices (attention, MLPs, router, head): F32, or Q8_0 as the published files")
     ap.add_argument("--gguf-experts", default="Q8_0", choices=("F32", "Q8_0"),
                     help="the routed experts' GGUF type")
     ap.add_argument("--min-gap", type=float, default=0.1,
@@ -322,7 +327,7 @@ def main():
                          "second by this much: the container's int8 experts move the logits by a few "
                          "thousandths, and a near tie would fail the gate for no fault")
     args = ap.parse_args()
-    cfg = tiny_config(vocab=args.vocab, hidden=args.hidden, window=args.window)
+    cfg = tiny_config(vocab=args.vocab, hidden=args.hidden, window=args.window, dense=args.dense)
     prompt = [int(t) for t in args.prompt_ids.split(",") if t.strip()]
     for seed in range(args.seed, args.seed + 200):
         w = random_weights(cfg, seed)
@@ -341,7 +346,7 @@ def main():
               metadata={"format": "pt"})
     print(f"tiny Flint -> {out} ({sum(v.numel() for v in w.values()) / 1e6:.2f}M parameters)")
     if args.gguf:
-        write_gguf(args.gguf, cfg, w, args.gguf_experts)
+        write_gguf(args.gguf, cfg, w, args.gguf_experts, args.gguf_dense)
         print(f"GGUF -> {args.gguf} (experts {args.gguf_experts})")
     if args.emit_ref:
         Path(args.emit_ref).parent.mkdir(parents=True, exist_ok=True)
