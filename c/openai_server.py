@@ -2085,10 +2085,12 @@ def _flint_tool_preamble(tools):
     for position, tool in enumerate(tools):
         if not isinstance(tool, dict):
             raise APIError(400, "Each tool must be an object.", f"tools.{position}")
-        lines.append("\n" + json.dumps(tool.get("function", tool), ensure_ascii=False))
+        lines.append(json.dumps(tool.get("function", tool), ensure_ascii=False))
+    # as transformers renders the template (trim_blocks): the declarations one after the
+    # other, with no line between them or around them
     return ("<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
             "You are provided with function signatures within <tools></tools> XML tags:\n<tools>" +
-            "".join(lines) + "\n</tools>\n\nFor each function call, output the function name and arguments "
+            "".join(lines) + "</tools>\n\nFor each function call, output the function name and arguments "
             "within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>"
             "<arg_value>{arg-value-1}</arg_value>...</tool_call>\n")
 
