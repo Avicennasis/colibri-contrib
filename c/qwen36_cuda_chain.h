@@ -185,6 +185,18 @@ static int q36cc_take(Q36CChain *ch, ColiCudaTensor **slot, ColiCudaTensor *t, i
     return 1;
 }
 
+/* The device bytes q36cc_setup's own tensors take (the router, b|a and gate rows), as it
+ * uploads them: qwen36's main keeps them out of the tier's allowance (qt_reserve). */
+static size_t q36cc_own_bytes(Model *m) {
+    Cfg *c = &m->c; size_t b = 0;
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        if (!c->is_attn[i]) b += (size_t)2 * c->dn_vheads * c->hidden * 4;
+        if (c->n_experts > 0 && !q36_dense_l(c, i)) b += (size_t)l->gate.I * l->gate.O * (l->gate.q ? 1 : 4);
+        if (l->sh_gate && l->sh_I > 0) b += (size_t)c->hidden * 4;
+    }
+    return b;
+}
 static void q36cc_free_own(Q36CChain *ch, Model *m) {
     int L = m->c.n_layers;
     if (ch->t_ab) for (int i = 0; i < L; i++) { if (ch->t_ab[i]) coli_cuda_tensor_free(ch->t_ab[i]); ch->t_ab[i] = NULL; }

@@ -84,6 +84,9 @@ void qt_trunk_withdraw(const char *why);
 /* The experts back to the CPU as well (the same probe; #2211), when the allowance is
  * automatic (CUDA_EXPERT_GB unset or auto). Before the warm start: nothing resident yet. */
 void qt_experts_withdraw(const char *why);
+/* Bytes the engine will put on the device after the tier sizes itself (the CUDA chain's own
+ * router, b|a and gate rows), kept out of the automatic allowance. Call before qt_init. */
+void qt_reserve(size_t bytes);
 
 /* DeltaNet input projections, qkv ++ z fused into one resident tensor per
  * layer: one GEMV instead of two, and the engine's qkv/z buffers are laid out
@@ -275,6 +278,7 @@ static inline void qt_trunk_offer(const char*a,int b,size_t c){(void)a;(void)b;(
 static inline int  qt_place_is_auto(void){return 0;}
 static inline void qt_trunk_withdraw(const char*a){(void)a;}
 static inline void qt_experts_withdraw(const char*a){(void)a;}
+static inline void qt_reserve(size_t b){(void)b;}
 static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dnproj_ready(int a){(void)a;return 0;}

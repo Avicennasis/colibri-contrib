@@ -8625,6 +8625,12 @@ int main(int argc, char **argv) {
      * tier holds the trunk only and the experts stay the CPU's. */
     int gguf_tier = 0;
 #ifdef COLI_CUDA
+    /* the CUDA chain uploads its own router, DeltaNet b|a and gate rows after the tier sized
+     * its budget: out of the tier's allowance, or the tier fills the card and the chain's
+     * prompt scratch and KV mirror find no room (Muse Spark's f32 router: 496 MiB) */
+    if (q36cc_env_on() && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') qt_reserve(q36cc_own_bytes(&m));
+#endif
+#ifdef COLI_CUDA
     if (g_gguf && !qq_active() && m.c.n_experts > 0 && getenv("COLI_CUDA") && getenv("COLI_CUDA")[0] == '1') {
         const int L = m.c.n_layers;
         int *tg = malloc((size_t)L * sizeof(int)), *td = malloc((size_t)L * sizeof(int));
