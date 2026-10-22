@@ -1729,6 +1729,8 @@ def run_via_gateway(a, family, engine, prompt):
                         if txt:
                             if think_open: think_open=False; sys.stdout.write(C.r+"\n")
                             sys.stdout.write(txt); sys.stdout.flush()
+                else:
+                    sys.exit("\nthe server closed the generation stream before completion")
         except KeyboardInterrupt:
             pass
         except urllib.error.HTTPError as e:
