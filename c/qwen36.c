@@ -5549,7 +5549,7 @@ static int q36_cuda_tier_drafts(Model *m) {
 #ifdef COLI_CUDA
     if (!qt_ready() || !g_cuda_chain || m->dn_dev) return 0;
     for (int i = 0; i < m->c.n_layers; i++)
-        for (int e = 0; e < m->c.n_experts; e++)
+        for (int e = 0; e < m->c.n_experts && !q36_dense_l(&m->c, i); e++)   /* Flint's dense layers hold none */
             if (!qt_is_resident(i, e)) return 0;
     return 1;
 #else

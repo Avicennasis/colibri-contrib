@@ -66,6 +66,10 @@ typedef struct { int nseg, per_row, x_off, x_row, x_seg, half_, cs_off, cs_row; 
  * head-major, K[(kvh*cap + t)*hd + d]; sel_row > 0: a selection list per row) */
 typedef struct { int S, H, KVH, hd, pos_base, cap, q_off, q_row, q_seg, g_off, g_row, g_seg, has_gate,
                  o_off, o_row, sel_off, sel_row; float scale; int k_off, v_off; } CcAttn;
+/* The same with Flint's two (vk_chain.h VkcAttnW's win and sink): a sliding window of win
+ * positions (row s sees max(0, pos - win + 1)..pos; 0 = all), and with sink a logit per head
+ * at snk[sink_off + h] that joins the softmax's denominator only. No selection list. */
+typedef struct { CcAttn a; int win, sink, sink_off; } CcAttnW;
 /* chain_dnconv.comp */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } CcDnConv;
 /* chain_dnrec.comp (KD a template parameter: 4, 8, 16, 32, 64, 128 or 256; VD <= 128). flags: 1 the gated
@@ -238,6 +242,8 @@ typedef struct ColiCudaChainOps {
      * 1 once the copies up to ticket landed (an engine's experts moved into its slots) */
     int  (*host_up)(void *dst, const void *src, size_t bytes, unsigned *ticket);
     int  (*host_up_done)(unsigned ticket);
+    /* attn_w: cc_attn with a sliding window and sinks (CcAttnW) */
+    int  (*attn_w)(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p);
 } ColiCudaChainOps;
 /* the table's size without the optional ops: a backend at least this big has the chain */
 #define CC_OPS_BASE_SIZE (offsetof(ColiCudaChainOps, route))
@@ -300,6 +306,10 @@ static inline int cc_host_up(void *dst, const void *src, size_t bytes, unsigned 
 static inline int cc_host_up_done(unsigned ticket) { return cc_host_up_ready() ? cc_ops()->host_up_done(ticket) : 0; }
 static inline int cc_moe_stage_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, moe_stage) + sizeof t->moe_stage; }
 static inline int cc_moe_stage(CcBuf *b, size_t slot_bytes, int slots) { return cc_moe_stage_ready() ? cc_ops()->moe_stage(b, slot_bytes, slots) : 0; }
+static inline int cc_attn_w_ready(void) { const ColiCudaChainOps *t = cc_ops(); return t && t->size >= offsetof(ColiCudaChainOps, attn_w) + sizeof t->attn_w; }
+static inline int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *p) {
+    return cc_attn_w_ready() ? cc_ops()->attn_w(q, kc, vc, o, gate, snk, p) : 0;
+}
 #endif
 
 #ifdef __cplusplus

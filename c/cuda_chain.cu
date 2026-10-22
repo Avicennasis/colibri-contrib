@@ -118,8 +118,11 @@ __global__ static void cc_rope_k(float *__restrict__ x, const float *__restrict_
 }
 /* one block of 128 per (head, row); K and V rows read once per tile of 128 positions;
  * hd <= 256: two dims per thread */
+/* win > 0: a sliding window, the row's last win positions; snk: a sink logit per head at
+ * snk[sink_off + h], in the denominator only (CcAttnW) */
 __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict__ q, const float *__restrict__ kc,
-        const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, const int *__restrict__ sel, CcAttn p) {
+        const float *__restrict__ vc, float *__restrict__ o, const float *__restrict__ gt, const int *__restrict__ sel, CcAttn p,
+        int win = 0, const float *__restrict__ snk = nullptr, int sink_off = 0) {
     __shared__ float qs[256];
     __shared__ float pe[128];
     __shared__ int   pt[128];
@@ -139,7 +142,8 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
     __syncthreads();
     float m = -3.0e38f, l = 0.f, acc0 = 0.f, acc1 = 0.f;
     int kbase = kvh * p.cap;
-    for (int t0 = 0; t0 < n; t0 += 128) {
+    int first = win > 0 && !list && n > win ? n - win : 0;
+    for (int t0 = first; t0 < n; t0 += 128) {
         int i = t0 + tid;
         float sv = -3.0e38f;
         if (i < n) {
@@ -179,6 +183,11 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
         }
         m = mn;
         __syncthreads();
+    }
+    if (snk) {   /* the sink: one more term of the denominator, with no value */
+        float sv = snk[sink_off + h], mn = fmaxf(m, sv), corr = expf(m - mn);
+        l = l * corr + expf(sv - mn);
+        acc0 *= corr; acc1 *= corr;
     }
     float inv = l > 0.f ? 1.f / l : 0.f;
     int ob = p.o_off + s * p.o_row + h * p.hd;
@@ -1418,6 +1427,19 @@ static int cc_host_up_done(unsigned ticket) {
     return cc_ok(c, e, "host up done");
 }
 static const void *cc_dev_addr(const CcBuf *b) { return b ? (const void *)b->d : nullptr; }   /* a mapped UP/DOWN buffer's: where the device reads it */
+/* cc_attn with a window and sinks (Flint): the plain kernel, a block per (head, row); the
+ * tensor-core and split-decode forms know neither */
+static int cc_attn_w(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *snk, const CcAttnW *w) {
+    CcCtx *c = live();
+    if (!w) return 0;
+    const CcAttn *p = &w->a;
+    if (!c || !q || !kc || !vc || !o || p->S < 1 || p->H < 1 || p->KVH < 1 || p->H % p->KVH || p->hd < 1 || p->hd > 256 ||
+        p->sel_row > 0 || w->win < 0 || (w->sink && !snk) || (p->has_gate && !gate)) return 0;
+    if (!w->win && !w->sink) return cc_attn(q, kc, vc, o, gate, nullptr, p);
+    cc_attn_k<<<dim3((unsigned)p->H, (unsigned)p->S), 128, 0, c->stream>>>(fp(q), fp(kc), fp(vc), fpw(o), fp(gate), nullptr, *p,
+                                                                         w->win, w->sink ? fp(snk) : nullptr, w->sink_off);
+    return launched(c, "attn (window, sinks)");
+}
 
 static const ColiCudaChainOps g_cc_ops = {
     sizeof(ColiCudaChainOps),
@@ -1431,5 +1453,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_route, cc_moe, cc_signal, cc_wait_host, coli_cuda_tensor_dev,
     cc_fetch, cc_fetch_wait, cc_fetch_done, cc_dev_addr,
     cc_moe_stage_op, cc_host_up, cc_host_up_done,
+    cc_attn_w,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }
