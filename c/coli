@@ -1835,6 +1835,26 @@ def server_probe(base, api_key=None, timeout=1.5):
     except Exception:
         return None
 
+def server_restarting(base, api_key=None, timeout=1.5):
+    """Is the coli serve at `base` starting its engine again? Its /health answers 503
+    "restarting" while it does (openai_server.keep_engine, #2290): server_probe sees no
+    server then, and a chat must wait for this one rather than start a second."""
+    import urllib.request, urllib.error
+    req=urllib.request.Request(base.rstrip("/")+"/health")
+    if api_key: req.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        urllib.request.urlopen(req, timeout=timeout).close()
+        return False
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code==503 and json.loads(e.read().decode("utf-8","replace")).get("status")=="restarting"
+        except Exception:
+            return False
+        finally:
+            e.close()
+    except Exception:
+        return False
+
 # ---- generation statistics for the chat footer (#1475) ----------------------
 # Measurement and rendering apart: gen_stats() counts (exact completion tokens
 # from the server's usage block when it sends one, the historical chars/4
@@ -2833,6 +2853,13 @@ def cmd_chat(a):
     if not getattr(a,"no_attach",False):
         base=getattr(a,"attach",None) or "http://127.0.0.1:8000"
         mid=server_probe(base, getattr(a,"api_key",None))
+        if not mid and server_restarting(base, getattr(a,"api_key",None)):
+            sp=Spinner(f"{base} is starting its engine again…"); sp.start()
+            try:
+                while not mid and server_restarting(base, getattr(a,"api_key",None)):
+                    time.sleep(1); mid=server_probe(base, getattr(a,"api_key",None))
+            finally:
+                sp.stop()
         if mid:
             entry=server_model_entry(base, getattr(a,"api_key",None))
             serves_images="image_generation" in (entry.get("capabilities") or [])

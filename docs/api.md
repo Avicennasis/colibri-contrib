@@ -322,6 +322,24 @@ request keeps priority across all slots. A full waiting queue does not reject
 a request that can immediately take an unreserved free slot; the queue limit
 bounds waiting requests, independently of active capacity.
 
+### When the engine stops
+
+`coli serve` starts the engine again when it dies (a crash, the out-of-memory
+killer, a kill). While the new engine loads, `GET /health` answers 503 with
+`{"status": "restarting"}` and `Retry-After: 5`, and nothing is admitted: a
+request waits in the queue for the new engine, within `--queue-timeout`, rather
+than failing on the old one. A request the dead engine was answering fails with
+`engine_error` and frees its slot. A start that fails is tried again after 2 s,
+then twice as long each time, up to 60 s. The authenticated `/health` counts the
+restarts in `engine_restarts`, and the log names the cause:
+
+```
+[gateway] the engine stopped (colibri engine exited unexpectedly (killed by signal 9, SIGKILL, most often the out-of-memory killer)); starting it again
+[gateway] the engine is running again (restart 1)
+```
+
+`coli chat` waits for a restarting server instead of starting a second one.
+
 ## Prometheus metrics
 
 `GET /metrics` returns Prometheus text exposition (version 0.0.4). When an
