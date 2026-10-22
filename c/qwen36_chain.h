@@ -588,7 +588,7 @@ static int q36c_bufs(Q36Chain *ch, Model *m, int rows) {
     if (c->dense_layer && c->dense_inter > SI) SI = c->dense_inter;   /* Flint's dense layers: a wider MLP */
     size_t r = (size_t)rows;
     /* the routed sum's rows: the experts' width (Muse Spark's latent), at least the hidden */
-    const size_t RW = (size_t)(q36_eh(c) > D ? q36_eh(c) : D), LT = c->muse ? (size_t)q36_eh(c) : 1, AG = c->muse ? (size_t)H * hd : 1;
+    const size_t RW = (size_t)(q36_eh(c) > D ? q36_eh(c) : D), LT = (size_t)q36_eh(c), AG = (size_t)H * hd;
     int ok = q36c_res(&ch->x, r * D, VKC_DEV) && q36c_res(&ch->nrm, r * D, VKC_DEV) && q36c_res(&ch->tmp, r * D, VKC_DEV) &&
              q36c_res(&ch->q, r * qo, VKC_DEV) && q36c_res(&ch->k, r * kvo, VKC_DEV) && q36c_res(&ch->v, r * kvo, VKC_DEV) &&
              q36c_res(&ch->ctx, r * H * hd, VKC_DEV) && q36c_res(&ch->qkv, r * c->dn_conv_dim, VKC_DEV) &&
@@ -600,8 +600,11 @@ static int q36c_bufs(Q36Chain *ch, Model *m, int rows) {
              q36c_res(&ch->h2d, r * D, VKC_DOWN) && q36c_res(&ch->lgd, r * E, VKC_DOWN) &&
              q36c_res(&ch->kvd, (size_t)(ch->n_attn ? ch->n_attn : 1) * 2 * r * kvo, VKC_DOWN) &&
              q36c_res(&ch->outd, c->vocab, VKC_DOWN) && q36c_res(&ch->routed, r * RW, VKC_UP) &&
-             q36c_res(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2), VKC_UP) &&
-             q36c_res(&ch->agb, r * AG, VKC_DEV) && q36c_res(&ch->lat, r * LT, VKC_DEV) && q36c_res(&ch->latd, r * LT, VKC_DOWN);
+             q36c_res(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2), VKC_UP);
+    /* Muse Spark's alone (the attention gate's rows, the experts' input rows): another
+     * model's scratch, and so coli plan's count of it, stays as it was */
+    if (ok && c->muse)
+        ok = q36c_res(&ch->agb, r * AG, VKC_DEV) && q36c_res(&ch->lat, r * LT, VKC_DEV) && q36c_res(&ch->latd, r * LT, VKC_DOWN);
     return ok;
 }
 /* Plan and allocate the KV mirror before sizing a prompt chunk. */
