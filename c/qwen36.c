@@ -4846,7 +4846,9 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
     }
     memset(out, 0, (int64_t)S*D*sizeof(float));
     float *g = falloc(I), *u = falloc(I), *hh = falloc(D);
-    float *sh = falloc(I), *shu = falloc(I), *shd = falloc(D);  /* shared expert scratch */
+    /* shared expert scratch: its own width, which is not the routed experts' (Flint: 1024 and 512) */
+    const int SIw = c->shared_inter > I ? c->shared_inter : I;
+    float *sh = falloc(SIw), *shu = falloc(SIw), *shd = falloc(D);
     /* When a qpack container owns the routed experts, they run through
      * the MLX-affine path (Metal on Apple, CPU reference elsewhere);
      * neither the CUDA tier nor the expert_ffn kernel is consulted.
