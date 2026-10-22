@@ -1996,6 +1996,9 @@ static void router_probs(const Cfg *c, float *x, int n) {
     for (int i = 0; i < n; i++) x[i] = 1.f / (1.f + expf(-x[i]));
 }
 
+/* A Flint dense layer: one MLP, no router, no routed experts. */
+static inline int q36_dense_l(const Cfg *c, int layer) { return c->dense_layer && c->dense_layer[layer]; }
+
 /* softplus(z) = log(1+exp(z)), stable for large z (HF GatedDeltaNet g_rule). */
 static float softplus_f(float z) { return z > 20.f ? z : log1pf(expf(z)); }
 
@@ -2387,6 +2390,7 @@ static const char *gg_name(const char *hf, char *out, size_t cap) {
         { "mlp.gate.e_score_correction_bias", "exp_probs_b.bias" },
         { "self_attn.q_norm.weight", "attn_q_norm.weight" },
         { "self_attn.k_norm.weight", "attn_k_norm.weight" },
+        { "self_attn.softmax_offset", "attn_sinks.weight" },   /* flint */
         { "mlp.shared_expert.gate_proj.weight", "ffn_gate_shexp.weight" },
         { "mlp.shared_expert.up_proj.weight", "ffn_up_shexp.weight" },
         { "mlp.shared_expert.down_proj.weight", "ffn_down_shexp.weight" },
@@ -2896,11 +2900,14 @@ static void gguf_load_cfg(Cfg *c) {
      * qwen3moe: Qwen3 MoE (Qwen3-30B-A3B, Qwen3-Coder), every layer attention, no output
      * gate, no shared expert, full rotary, plain RMSNorm (stored as is, so the 1 still comes off);
      * qwen3: the dense Qwen3 (0.6B to 32B), qwen3moe's layers with qwen35's dense MLP */
+    /* flint: Flint (RecursiveSI/flint), qwen3moe's layer with a sink per head, sliding-window
+     * layers, layers without RoPE, dense layers in front and sigmoid routing */
     const int dense = arch && (!strcmp(arch, "qwen35") || !strcmp(arch, "qwen3"));
-    const int plain = arch && (!strcmp(arch, "qwen3moe") || !strcmp(arch, "qwen3"));
+    const int flint = arch && !strcmp(arch, "flint");
+    const int plain = arch && (!strcmp(arch, "qwen3moe") || !strcmp(arch, "qwen3") || flint);
     if (!arch || (strcmp(arch, "qwen35moe") && !dense && !plain)) {
         fprintf(stderr, "GGUF architecture '%s' is not one of qwen35moe (Qwen3.5 / 3.6 MoE), qwen35 (their dense models), "
-                        "qwen3moe (Qwen3 MoE) or qwen3 (dense Qwen3): this engine cannot run it\n", arch ? arch : "?"); exit(1);
+                        "qwen3moe (Qwen3 MoE), qwen3 (dense Qwen3) or flint: this engine cannot run it\n", arch ? arch : "?"); exit(1);
     }
     g_gguf_plain = plain;
     char key[128];
@@ -2932,6 +2939,18 @@ static void gguf_load_cfg(Cfg *c) {
         c->n_experts = 0; c->topk = 0; c->inter = 0;
         c->shared_inter = (int)gguf_get_int(g, GK("feed_forward_length"), 0);
         CFG_NEED(c->shared_inter > 0, "GGUF %s.feed_forward_length %d", arch, c->shared_inter);
+    }
+    int flint_lead = 0;
+    if (flint) {
+        /* expert_gating_func 2: sigmoid; the first leading_dense_block_count layers carry one
+         * MLP of feed_forward_length; sliding_window_pattern and rope_pattern by layer */
+        CFG_NEED(gguf_get_int(g, GK("expert_gating_func"), 2) == 2, "GGUF flint.expert_gating_func %lld: only sigmoid (2)",
+                 (long long)gguf_get_int(g, GK("expert_gating_func"), 2));
+        c->router_sigmoid = 1;
+        c->window = (int)gguf_get_int(g, GK("attention.sliding_window"), 0);
+        flint_lead = (int)gguf_get_int(g, GK("leading_dense_block_count"), 0);
+        c->dense_inter = (int)gguf_get_int(g, GK("feed_forward_length"), 0);
+        CFG_NEED(!flint_lead || c->dense_inter > 0, "GGUF flint.feed_forward_length %d", c->dense_inter);
     }
     #undef GK
     CFG_NEED(c->n_layers > 0 && c->n_layers <= 512 && c->hidden > 0 && c->q_heads > 0 && c->head_dim > 0 && interval > 0,
@@ -2969,6 +2988,31 @@ static void gguf_load_cfg(Cfg *c) {
     }
     snprintf(nm, sizeof nm, "blk.%d.attn_q_norm.weight", c->n_layers - 1);
     c->has_qk_norm = gguf_find(g, nm) != NULL;
+    if (flint) {
+        c->attn_sinks = gguf_find(g, "blk.0.attn_sinks.weight") != NULL;
+        c->win_layer = calloc((size_t)c->n_layers, 1); c->nope_layer = calloc((size_t)c->n_layers, 1);
+        c->dense_layer = calloc((size_t)c->n_layers, 1);
+        if (!c->win_layer || !c->nope_layer || !c->dense_layer) { fprintf(stderr, "OOM flint layers\n"); exit(1); }
+        const char *keys[2] = {"flint.attention.sliding_window_pattern", "flint.attention.rope_pattern"};
+        for (int k = 0; k < 2; k++) {
+            const gguf_kv *a = gguf_get(g, keys[k]);
+            CFG_NEED(a && a->type == GGUF_T_ARRAY && a->atype == GGUF_T_BOOL && a->n == (uint64_t)c->n_layers,
+                     "GGUF %s: a bool per layer (%d)", keys[k], c->n_layers);
+            for (int i = 0; i < c->n_layers; i++) {
+                const int on = ((const uint8_t *)a->arr)[i] != 0;
+                if (k == 0) c->win_layer[i] = (uint8_t)on;
+                else c->nope_layer[i] = (uint8_t)!on;   /* rope_pattern: 1 = the layer takes RoPE */
+            }
+        }
+        CFG_NEED(c->window > 0, "GGUF flint.attention.sliding_window %d", c->window);
+        CFG_NEED(flint_lead >= 0 && flint_lead <= c->n_layers, "GGUF flint.leading_dense_block_count %d", flint_lead);
+        for (int i = 0; i < flint_lead; i++) c->dense_layer[i] = 1;
+        int nwin = 0, nnope = 0;
+        for (int i = 0; i < c->n_layers; i++) { nwin += c->win_layer[i]; nnope += c->nope_layer[i]; }
+        fprintf(stderr, "[gguf] flint: %d sliding-window layers of %d rows, %d without RoPE, %d dense in front (MLP %d), "
+                        "sigmoid routing, %s\n", nwin, c->window, nnope, flint_lead, c->dense_inter,
+                c->attn_sinks ? "a sink per head" : "no sinks");
+    }
     snprintf(nm, sizeof nm, "blk.0.exp_probs_b.bias");
     c->has_bias = gguf_find(g, nm) != NULL;
     if (plain && dense)
@@ -3026,6 +3070,7 @@ static void gguf_map_experts(Model *m) {
         }
         const uint32_t *tt = (const uint32_t *)ty->arr; const uint64_t *bb = (const uint64_t *)by->arr, *ss = (const uint64_t *)st->arr;
         for (int i = 0; i < c->n_layers; i++) {
+            if (q36_dense_l(c, i)) continue;   /* Flint's dense layers carry no experts */
             GqExp *x = &m->gqx[i];
             snprintf(nm, sizeof nm, "blk.%d.ffn_exps_colibri", i);
             x->packed = gguf_mark(&g_gg, nm);
@@ -3039,12 +3084,15 @@ static void gguf_map_experts(Model *m) {
             if (tot > m->gqe_max) m->gqe_max = tot;
             gguf_expert_held(m, x);
         }
-        for (int i = 0; i < c->n_layers; i++) gguf_expert_scales(m, i);
+        for (int i = 0; i < c->n_layers; i++) if (!q36_dense_l(c, i)) gguf_expert_scales(m, i);
         fprintf(stderr, "[gguf] colibri container: experts packed, one read each (layer 0 gate %s up %s down %s, %.2f MB)\n",
                 gq_type_name(m->gqx[0].tg), gq_type_name(m->gqx[0].tu), gq_type_name(m->gqx[0].td), m->gqe_max / 1048576.0);
         return;
     }
+    int first = -1;
     for (int i = 0; i < c->n_layers; i++) {
+        if (q36_dense_l(c, i)) continue;   /* Flint's dense layers carry no experts */
+        if (first < 0) first = i;
         GqExp *x = &m->gqx[i];
         const gguf_tensor **dst[3] = { &x->g, &x->u, &x->d };
         const char *kind[3] = { "gate", "up", "down" };
@@ -3067,9 +3115,17 @@ static void gguf_map_experts(Model *m) {
         if (tot > m->gqe_max) m->gqe_max = tot;
         gguf_expert_held(m, x);
     }
-    fprintf(stderr, "[gguf] experts: layer 0 gate %s up %s down %s, %.2f MB per expert at most%s\n",
-            gq_type_name(m->gqx[0].tg), gq_type_name(m->gqx[0].tu), gq_type_name(m->gqx[0].td), m->gqe_max / 1048576.0,
-            gguf_expert_ilv(&m->gqx[0]) ? "; held interleaved by 16 for the CPU (Q36_ILV16=0 keeps the rows)" : "");
+    if (first < 0) first = 0;
+    /* a dense layer takes the types of the first layer with experts and holds none: the
+     * loops over layers (the tiers' forms) see one shape, and nothing ever routes there */
+    for (int i = 0; i < c->n_layers; i++)
+        if (q36_dense_l(c, i)) {
+            GqExp *x = &m->gqx[i], *f = &m->gqx[first];
+            x->tg = f->tg; x->tu = f->tu; x->td = f->td; x->eb_g = f->eb_g; x->eb_u = f->eb_u; x->eb_d = f->eb_d;
+        }
+    fprintf(stderr, "[gguf] experts: layer %d gate %s up %s down %s, %.2f MB per expert at most%s\n", first,
+            gq_type_name(m->gqx[first].tg), gq_type_name(m->gqx[first].tu), gq_type_name(m->gqx[first].td), m->gqe_max / 1048576.0,
+            gguf_expert_ilv(&m->gqx[first]) ? "; held interleaved by 16 for the CPU (Q36_ILV16=0 keeps the rows)" : "");
 }
 
 /* After loading: every tensor of the file the engine did not consume. The

@@ -1128,6 +1128,9 @@ def detect_chat_flavor(family_id, model_dir):
         # Qwen3-Coder (qwen3_moe): its own XML tool block, no thinking
         if "interact with a computer to solve tasks" in text:
             return "qwen3_coder"
+        # Flint: GLM's tool-call form, role tokens without separators, no thinking switch
+        if "macro flint_text" in text:
+            return "flint"
     return None
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
@@ -2059,6 +2062,102 @@ def _qwen3_coder_tool_block(tools):
     out.append("\n</tools>")
     out.append(QWEN3_CODER_TOOL_RULES)
     return "".join(out)
+
+
+FLINT_ESCAPES = (("\x00", ""), ("<think>", ""), ("</think>", ""),
+                 ("<|begin_of_text|>", "&lt;|begin_of_text|&gt;"), ("<|end_of_text|>", "&lt;|end_of_text|&gt;"),
+                 ("<|system|>", "&lt;|system|&gt;"), ("<|developer|>", "&lt;|developer|&gt;"),
+                 ("<|user|>", "&lt;|user|&gt;"), ("<|assistant|>", "&lt;|assistant|&gt;"),
+                 ("<|observation|>", "&lt;|observation|&gt;"))
+
+
+def _flint_text(text):
+    """The template's flint_text macro: NULs and thinking tags dropped, role tokens escaped."""
+    for old, new in FLINT_ESCAPES:
+        text = text.replace(old, new)
+    return text
+
+
+def _flint_tool_preamble(tools):
+    if not tools:
+        return ""
+    lines = []
+    for position, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise APIError(400, "Each tool must be an object.", f"tools.{position}")
+        lines.append("\n" + json.dumps(tool.get("function", tool), ensure_ascii=False))
+    return ("<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>" +
+            "".join(lines) + "\n</tools>\n\nFor each function call, output the function name and arguments "
+            "within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>"
+            "<arg_value>{arg-value-1}</arg_value>...</tool_call>\n")
+
+
+def render_chat_flint(messages, tools=None, tool_choice=None, add_generation_prompt=True):
+    """Flint's chat_template.jinja (RecursiveSI/flint), byte for byte: role tokens with no
+    separators, the `# Tools` system block after the leading system turns, assistant
+    reasoning as <think>..</think> before the answer, calls as GLM's
+    <tool_call>name<arg_key>..</arg_key><arg_value>..</arg_value></tool_call>, tool results
+    as <|observation|><tool_response>..</tool_response>. The template has no thinking switch:
+    the model decides on each turn whether to write a <think> block. A trailing assistant turn
+    with add_generation_prompt=False stays open, as the template leaves it."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tool_choice == "none":
+        tools = None
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
+    preamble = _flint_tool_preamble(tools)
+    parts, pending = [], True
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        if pending and role != "system":
+            parts.append(preamble)
+            pending = False
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer", "user"):
+            parts.append(f"<|{role}|>" + _flint_text(text))
+        elif role == "tool":
+            parts.append("<|observation|><tool_response>" + _flint_text(text) + "</tool_response>")
+        else:
+            parts.append("<|assistant|>")
+            reasoning = message.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                parts.append(f"<think>{reasoning}</think>")
+            parts.append(text)
+            calls = message.get("tool_calls")
+            if calls is not None and not isinstance(calls, list):
+                raise APIError(400, "`tool_calls` must be an array.", f"messages.{index}.tool_calls")
+            for position, call in enumerate(calls or []):
+                where = f"messages.{index}.tool_calls.{position}"
+                fn = call.get("function", call) if isinstance(call, dict) else None
+                if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+                    raise APIError(400, "Each tool call needs a `function.name`.", where)
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args) if args.strip() else {}
+                    except ValueError:
+                        raise APIError(400, "`function.arguments` must be a JSON object.",
+                                       f"{where}.function.arguments")
+                if not isinstance(args, dict):
+                    raise APIError(400, "`function.arguments` must be a JSON object.",
+                                   f"{where}.function.arguments")
+                parts.append("<tool_call>" + fn["name"])
+                for key, value in args.items():
+                    shown = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+                    parts.append(f"<arg_key>{key}</arg_key><arg_value>{shown}</arg_value>")
+                parts.append("</tool_call>")
+    if pending:
+        parts.append(preamble)
+    if add_generation_prompt:
+        parts.append("<|assistant|>")
+    return "".join(parts)
 
 
 def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generation_prompt=True):
@@ -3634,6 +3733,8 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
                                   tool_choice, add_generation_prompt)
     if chat_flavor() == "qwen3_coder":
         return render_chat_qwen3_coder(messages, tools, tool_choice, add_generation_prompt)
+    if chat_flavor() == "flint":
+        return render_chat_flint(messages, tools, tool_choice, add_generation_prompt)
     if ARCH == "qwen36":
         return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
                                 tool_choice, add_generation_prompt, preserve_thinking)
@@ -3693,6 +3794,8 @@ def starts_in_reasoning(enable_thinking, add_generation_prompt=True):
     zero di risposta, col prompt corretto sul filo. Vale anche per glm53: la
     regola di famiglia sopra dice dove comincia un turno NUOVO, e il turno
     proseguito non ne apre nessuno."""
+    if chat_flavor() == "flint":   # no switch: a turn starts as text, and <think> opens reasoning
+        return False
     return (enable_thinking or ARCH == "glm53") and add_generation_prompt
 
 
@@ -3716,6 +3819,9 @@ class ThinkingStreamSplit:
         # with thinking off the prompt already closed it, so output is pure answer and
         # the splitter must start in text mode or it would file the whole answer as reasoning.
         self.thinking = initial_thinking
+        # Flint writes <think> itself when it decides to reason: the opening marker switches
+        # to reasoning there (every other family's prompt opened or closed the block already)
+        self.opens = chat_flavor() == "flint"
         self.buf = ""
         self.track_spans = track_spans
         self.thinking_spans = []
@@ -3750,6 +3856,8 @@ class ThinkingStreamSplit:
                     self.thinking = False
                     if self.on_thinking_end:
                         self.on_thinking_end()
+                elif marker == THINK_OPEN and self.opens and not self.thinking:
+                    self.thinking = True
                 continue
 
             hold = 0

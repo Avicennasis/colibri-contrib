@@ -21,7 +21,7 @@ serve`, `coli web` and the planner treat it like any other.
 
 Supported architectures: qwen35moe (Qwen3.5 / Qwen3.6 MoE -> qwen36 engine), qwen35 (their
 dense models -> qwen36 engine), qwen3moe (Qwen3 MoE, Qwen3-Coder -> qwen36 engine), qwen3 (the dense
-Qwen3 -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
+Qwen3 -> qwen36 engine), flint (Flint -> qwen36 engine), qwen4exp (Qwen3.8-Flash-Next -> qwen38 engine), deepseek4 (DeepSeek V4
 Flash -> deepseek_v4 engine), inkling (Inkling -> inkling engine), glm5-next (GLM-5.3-Flash ->
 glm53 engine), glm-dsa (GLM-5.2 / GLM-5.3 -> colibri engine), mimo2 (MiMo-V2.6 -> mimo engine),
 deepseek41 (DeepSeek V4.1 Flash, files with the config whole and the published K-quant and IQ ones ->
@@ -229,6 +229,52 @@ def qwen3_config(meta, tensors, overrides=None):
         cfg.pop(k, None)
     cfg.update({"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"],
                 "intermediate_size": int(need("feed_forward_length"))})
+    return cfg, layers
+
+
+def flint_config(meta, tensors, overrides=None):
+    """Flint (llama.cpp's flint: RecursiveSI/flint) as the qwen36 engine's config.json, in the
+    release's own form: qwen3moe's layers with a sink per head, sliding-window layers, layers
+    without RoPE, dense layers in front and sigmoid routing beside an ungated shared expert."""
+    p = "flint."
+    need = lambda k: meta[p + k] if (p + k) in meta else sys.exit(f"GGUF metadata lacks {p + k}")
+    layers = int(need("block_count"))
+    head_dim = int(meta.get(p + "attention.key_length", int(need("embedding_length")) // int(need("attention.head_count"))))
+    emb = tensors.get("token_embd.weight") or sys.exit("GGUF has no token_embd.weight")
+    if int(meta.get(p + "expert_gating_func", 2)) != 2:
+        sys.exit(f"GGUF {p}expert_gating_func {meta.get(p + 'expert_gating_func')}: Flint routes by sigmoid (2)")
+    sliding = list(need("attention.sliding_window_pattern"))
+    rope = list(need("attention.rope_pattern"))
+    if len(sliding) != layers or len(rope) != layers:
+        sys.exit(f"GGUF {p}attention patterns: {len(sliding)} and {len(rope)} entries for {layers} layers")
+    lead = int(meta.get(p + "leading_dense_block_count", 0))
+    cfg = {
+        "model_type": "flint",
+        "architectures": ["FlintForCausalLM"],
+        "hidden_size": int(need("embedding_length")),
+        "num_hidden_layers": layers,
+        "num_attention_heads": int(need("attention.head_count")),
+        "num_key_value_heads": int(need("attention.head_count_kv")),
+        "head_dim": head_dim,
+        "num_experts": int(need("expert_count")),
+        "num_experts_per_tok": int(need("expert_used_count")),
+        "moe_intermediate_size": int(need("expert_feed_forward_length")),
+        "shared_expert_intermediate_size": int(need("expert_shared_feed_forward_length")),
+        "intermediate_size": int(meta.get(p + "feed_forward_length", 0)),
+        "mlp_only_layers": list(range(lead)),
+        "norm_topk_prob": True,
+        "router_score_function": "sigmoid",
+        "vocab_size": int(emb["dims"][1]),
+        "rms_norm_eps": float(meta.get(p + "attention.layer_norm_rms_epsilon", 1e-6)),
+        "max_position_embeddings": int(meta.get(p + "context_length", 262144)),
+        "rope_theta": float(meta.get(p + "rope.freq_base", 10000.0)),
+        "sliding_window": int(need("attention.sliding_window")),
+        "layer_types": ["sliding_attention" if s_ else "full_attention" for s_ in sliding],
+        "no_rope_layer_indices": [i for i, r in enumerate(rope) if not r],
+        "softmax_type": "learnable",
+        "tie_word_embeddings": "output.weight" not in tensors,
+        "hidden_act": "silu",
+    }
     return cfg, layers
 
 
@@ -836,7 +882,7 @@ def qwen4exp_config(meta, tensors, overrides=None):
 
 
 COPY_UNREAD = {"qwen4exp"}   # their engine does not read the colibri container (copy mode)
-ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
+ARCHES = {"qwen35moe": qwen35moe_config, "qwen35": qwen35_config, "qwen3moe": qwen3moe_config, "qwen3": qwen3_config, "flint": flint_config, "deepseek4": deepseek4_config, "inkling": inkling_config, "glm5-next": glm5next_config, "glm-dsa": glmdsa_config, "mimo2": mimo2_config, "deepseek41": deepseek41_config, "kimi-k3": kimik3_config, "olmoe": olmoe_config, "qwen4exp": qwen4exp_config}
 
 # unsloth ships Qwen3.8-Flash-Next's MTP head apart, in an MTP/ folder of the repository:
 # shared-* borrow token_embd and output from the model (the engine always does), the
