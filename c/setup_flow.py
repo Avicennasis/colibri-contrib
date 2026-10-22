@@ -2043,6 +2043,7 @@ def cmd_setup(a, ui=None):
                 ui.say(f" {mark} {entry.id:<24} {entry.disk_gb:>7.0f} GB  {row['status']:<10} {row['reason']}")
         return 0
 
+    write_state("starting")
     overriding = bool(a.backend or a.no_gpu or a.host is not None or a.port is not None)
     if cfg and not picking and not overriding and config_ready(cfg):
         cfg = remember_split_dirs(cfg, out=ui.say)
@@ -2073,6 +2074,8 @@ def cmd_setup(a, ui=None):
                 save_config(cfg)
                 ui.say(f"  context: {requested_ctx or 'automatic'} from now on")
             refresh_configured(cfg, out=ui.say)
+            write_state("ready", model=(cfg.get("model") or {}).get("id"),
+                        model_dir=cfg["model_dir"])
             return _finish(ui, cfg, a)
     # A setup that stopped half way (pending), or a finished one whose engine or
     # files went missing (ready, but not runnable): continue with the same choice.
