@@ -239,7 +239,9 @@ typedef struct {
      * room for a layer's share of them comes out of the budget (vkt_stage_room). */
     int stage;
 } VktConfig;
-#define VKT_FORMS 8
+/* The forms a tier holds: form 1 the extra layers', so VKT_FORMS - 1 for the main layers.
+ * unsloth's flint UD-Q2_K_XL mixes 14 (gate, down) pairs of block types over its layers. */
+#define VKT_FORMS 16
 #define VKT_MAX_LAYERS 512
 
 
