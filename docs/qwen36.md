@@ -670,7 +670,12 @@ on the CPU, a prompt's in one batch per expert.
 `tools/make_muse_tiny.py` writes a tiny Muse Spark GGUF in the published
 files' layout, rotary order included, and its greedy continuation (CI: `Linux
 (generated qwen36 oracles)`): the CPU, the CUDA chain and tier, and the Vulkan
-chain and tier give its tokens.
+chain and tier give its tokens. With Q8_0 experts, `--act f32` writes Vulkan's
+reference (it reads the experts' inputs as floats, the CPU and CUDA as int8),
+and `--max-new 8 --min-gap 0.2` keeps the int8 one clear of the rounding that
+differs from one CPU to the next. The Vulkan tier holds F32 experts as int8 per
+32 (blocks it cannot read as the file has them), so Vulkan gives an F32
+oracle's tokens with `COLI_VK_TIER=0`.
 
 ### The converter's tensor contract
 

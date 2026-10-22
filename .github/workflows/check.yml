@@ -209,10 +209,13 @@ jobs:
       - name: Run the Muse Spark tiny oracles
         run: |
           cd c
-          for experts in F32 Q8_0; do
-            python tools/make_muse_tiny.py --out /tmp/muse_$experts --emit-ref /tmp/muse_$experts/ref.json --experts $experts
-            COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/muse_$experts/model.gguf ./qwen36 16 8 /tmp/muse_$experts/ref.json
-          done
+          python tools/make_muse_tiny.py --out /tmp/muse_F32 --emit-ref /tmp/muse_F32/ref.json --experts F32
+          COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/muse_F32/model.gguf ./qwen36 16 8 /tmp/muse_F32/ref.json
+          # Q8_0: the experts' inputs round to int8 from sums whose order differs from one CPU
+          # to the next (a code apart moved a 0.106 margin at the 16th token on AVX-VNNI), so
+          # this one is shorter and wider apart
+          python tools/make_muse_tiny.py --out /tmp/muse_Q8_0 --emit-ref /tmp/muse_Q8_0/ref.json --experts Q8_0 --max-new 8 --min-gap 0.2
+          COLI_CUDA=0 COLI_VULKAN=0 SNAP=/tmp/muse_Q8_0/model.gguf ./qwen36 16 8 /tmp/muse_Q8_0/ref.json
 
   macos:
     # clang; libomp for the threaded path (Makefile falls back to
