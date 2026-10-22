@@ -818,7 +818,11 @@ static void test_fanout_puts_every_request_on_the_wire_first(void)
             assert(out[r * 3 + d] == ws[r * 2] * 2.0f * x[r * 3 + d] + ws[r * 2 + 1] * 3.0f * x[r * 3 + d]);
     printf("fan-out: 2 workers holding %d ms each, the batch took %.0f ms (served in turn: %d ms)\n",
            hold_ms, elapsed, 2 * hold_ms);
-    assert(elapsed < 1.5 * hold_ms);             /* toward max(), not sum() */
+    /* toward max(), not sum(): in turn the holds add up, and a nanosleep never ends early,
+     * so served in turn takes two holds at least. The barrier above already proves the
+     * fan-out; this bound only has to tell the two apart, and macOS runners took 204 to
+     * 351 ms for one hold of 200. */
+    assert(elapsed < 2.0 * hold_ms);
     close(s0[0]); close(s0[1]); close(s1[0]); close(s1[1]);
 }
 /* One row routed to three experts of layer 7 -- 42, 43 and 45 -- across two
