@@ -4534,7 +4534,10 @@ static const uint8_t *gq_slot_file_rows(Model *m, int layer, Slot *e) {
     const GqExp *x = &m->gqx[layer];
     if (!gguf_expert_ilv(x)) return e->gqe;
     const int D = m->c.hidden, I = m->c.inter;
-    if (!e->t8 && !(e->t8 = malloc((size_t)(x->eb_g + x->eb_u + x->eb_d)))) { fprintf(stderr, "OOM GGUF expert for the device tier\n"); exit(1); }
+    /* the largest layer's: a slot can hold experts of several layers in turn (the CUDA
+     * tier's copy-mode warm start reads every expert through one slot a thread), and a
+     * published file's layers differ in their block types */
+    if (!e->t8 && !(e->t8 = malloc((size_t)m->gqe_max))) { fprintf(stderr, "OOM GGUF expert for the device tier\n"); exit(1); }
     uint8_t *b = (uint8_t *)e->t8;
     if (e->t8_eid != e->eid + 1) {
         const int ft[3] = { x->tg, x->tu, x->td }, ht[3] = { x->hg, x->hu, x->hd }, rows[3] = { I, I, D }, cols[3] = { D, D, I };
