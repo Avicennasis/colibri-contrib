@@ -1393,10 +1393,14 @@ def port_free(host, port):
 
 
 def pick_port(host, preferred, tries=20):
-    for port in range(preferred, preferred + tries):
+    if preferred > 65535:
+        raise SetupError("no higher port is available (maximum 65535); "
+                         "rerun `coli setup --port PORT` with a lower port")
+    last = min(preferred + tries - 1, 65535)
+    for port in range(preferred, last + 1):
         if port_free(host, port):
             return port
-    raise SetupError(f"ports {preferred}-{preferred + tries - 1} are all in use; pass --port")
+    raise SetupError(f"ports {preferred}-{last} are all in use; pass --port")
 
 
 def last_turn_speed(profile):
