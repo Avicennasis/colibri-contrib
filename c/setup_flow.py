@@ -1355,9 +1355,11 @@ def _pid_alive(pid):
         return False
 
 
-def _get_json(url, timeout=2.0):
+def _get_json(url, timeout=2.0, *, require_colibri=False):
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
+            if require_colibri and (response.headers.get("Server") or "").split()[:1] != ["colibri"]:
+                return response.status, None
             return response.status, json.loads(response.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as error:
         error.close()
@@ -1417,7 +1419,7 @@ def server_status(cfg):
         pid = None
     alive = _pid_alive(pid)
     shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
-    code, health = _get_json(f"http://{shown}:{port}/health")
+    code, health = _get_json(f"http://{shown}:{port}/health", require_colibri=True)
     if code == 200 and isinstance(health, dict) and health.get("status") == "ok":
         state = "ready"
     elif alive:
@@ -2224,7 +2226,8 @@ def _finish(ui, cfg, a):
         if not a.no_start:
             result["status"] = start_server(cfg, background=True, open_browser=not a.no_browser,
                                             out=lambda *_: None)
-            write_state("started", urls=cfg["urls"])
+            result["config"] = load_config() or cfg
+            write_state("started", urls=result["status"]["urls"])
         print(json.dumps(result, indent=2))
         return 0
     if a.no_start:
@@ -2233,8 +2236,8 @@ def _finish(ui, cfg, a):
         return 0
     ui.say("\nStarting colibri")
     if a.background:
-        start_server(cfg, background=True, open_browser=not a.no_browser, out=ui.say)
-        write_state("started", urls=cfg["urls"])
+        status = start_server(cfg, background=True, open_browser=not a.no_browser, out=ui.say)
+        write_state("started", urls=status["urls"])
         ui.say("  stop: coli stop")
         return 0
     return start_server(cfg, background=False, open_browser=not a.no_browser, out=ui.say)
