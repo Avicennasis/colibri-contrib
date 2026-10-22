@@ -1054,6 +1054,8 @@ typedef struct {
     int muse, ehid;
     float post_eps, logit_scale, softcap;
 } Cfg;
+/* the experts' width: ehid, or hidden for a Cfg built without it (the tests' hand-made ones) */
+static inline int q36_eh(const Cfg *c) { return c->ehid > 0 ? c->ehid : c->hidden; }
 
 /* ---- Dense int8: a dense matrix that is quantized to int8 during load
  * (load_tq, below matmul_d) instead of loaded as f32 and quantized in a
@@ -1557,7 +1559,7 @@ static int xf_mode(Model *m) {
     const char *e = getenv("QWEN_EXPERT_KERNEL");
     int on = !(e && *e == '0');
     Cfg *c = &m->c;
-    if (c->expert_gs != XF_BLOCK || !xf_layout_ok(c->ehid) || !xf_layout_ok(c->inter)) on = 0;
+    if (c->expert_gs != XF_BLOCK || !xf_layout_ok(q36_eh(c)) || !xf_layout_ok(c->inter)) on = 0;
     if (on) {
         int probe = -1;
         for (int l = 0; l < c->n_layers && probe < 0; l++) {
@@ -1580,7 +1582,7 @@ static int xf_a32(Model *m) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("Q36_ILV16");
-        v = !(e && !strcmp(e, "0")) && xf_mode(m) && xf_act_mode() == 1 && m->c.ehid % 16 == 0 && m->c.inter % 16 == 0;
+        v = !(e && !strcmp(e, "0")) && xf_mode(m) && xf_act_mode() == 1 && q36_eh(&m->c) % 16 == 0 && m->c.inter % 16 == 0;
     }
     return v;
 #else
@@ -3231,9 +3233,9 @@ static void gguf_load_cfg(Cfg *c) {
         c->softcap = (float)gguf_get_float(g, GK("final_logit_softcapping"), 0.0);
         const double swa = gguf_get_float(g, GK("rope.freq_base_swa"), gguf_get_float(g, GK("rope.freq_base"), 10000.0));
         CFG_NEED(swa == gguf_get_float(g, GK("rope.freq_base"), 10000.0), "GGUF muse-spark.rope.freq_base_swa %g: one theta for every layer", swa);
-        CFG_NEED(c->ehid > 0 && c->window > 0 && c->post_eps > 0.f && c->logit_scale > 0.f && c->softcap >= 0.f,
+        CFG_NEED(q36_eh(c) > 0 && c->window > 0 && c->post_eps > 0.f && c->logit_scale > 0.f && c->softcap >= 0.f,
                  "GGUF muse-spark: moe_latent_size %d, sliding_window %d, post_norm_epsilon %g, logit_scale %g, softcapping %g",
-                 c->ehid, c->window, c->post_eps, c->logit_scale, c->softcap);
+                 q36_eh(c), c->window, c->post_eps, c->logit_scale, c->softcap);
     }
     #undef GK
     CFG_NEED(c->n_layers > 0 && c->n_layers <= 512 && c->hidden > 0 && c->q_heads > 0 && c->head_dim > 0 && interval > 0,
@@ -3313,7 +3315,7 @@ static void gguf_load_cfg(Cfg *c) {
         CFG_NEED(c->has_qk_norm && c->shared_inter == 0, "GGUF muse-spark: q/k norms and no shared expert");
         fprintf(stderr, "[gguf] muse-spark: %d sliding-window layers of %d rows, %d full without RoPE, experts at %d "
                         "between two projections, logits x %g capped at %g\n",
-                nwin, c->window, c->n_layers - nwin, c->ehid, c->logit_scale, c->softcap);
+                nwin, c->window, c->n_layers - nwin, q36_eh(c), c->logit_scale, c->softcap);
     }
     snprintf(nm, sizeof nm, "blk.0.exp_probs_b.bias");
     c->has_bias = gguf_find(g, nm) != NULL;
@@ -3346,7 +3348,7 @@ static void gguf_expert_scales(Model *m, int L) {
 
 /* Layer x's experts as a slot holds them (q36_gq_held) and the slot size that needs. */
 static void gguf_expert_held(Model *m, GqExp *x) {
-    const int D = m->c.ehid, I = m->c.inter;
+    const int D = q36_eh(&m->c), I = m->c.inter;
     x->hg = q36_gq_held(x->tg, I, D); x->hu = q36_gq_held(x->tu, I, D); x->hd = q36_gq_held(x->td, D, I);
     x->hb_g = x->hg == x->tg ? x->eb_g : gq_row_bytes(x->hg, D) * I;
     x->hb_u = x->hu == x->tu ? x->eb_u : gq_row_bytes(x->hu, D) * I;
@@ -3379,8 +3381,8 @@ static void gguf_map_experts(Model *m) {
             x->tg = (int)tt[3 * i]; x->tu = (int)tt[3 * i + 1]; x->td = (int)tt[3 * i + 2];
             x->eb_g = (int64_t)bb[3 * i]; x->eb_u = (int64_t)bb[3 * i + 1]; x->eb_d = (int64_t)bb[3 * i + 2]; x->stride = (int64_t)ss[i];
             int ok = x->packed && x->packed->ne[0] == x->stride && x->packed->ne[1] == c->n_experts &&
-                     x->eb_g == gq_row_bytes(x->tg, c->ehid) * c->inter && x->eb_u == gq_row_bytes(x->tu, c->ehid) * c->inter &&
-                     x->eb_d == gq_row_bytes(x->td, c->inter) * c->ehid && x->eb_g + x->eb_u + x->eb_d <= x->stride;
+                     x->eb_g == gq_row_bytes(x->tg, q36_eh(c)) * c->inter && x->eb_u == gq_row_bytes(x->tu, q36_eh(c)) * c->inter &&
+                     x->eb_d == gq_row_bytes(x->td, c->inter) * q36_eh(c) && x->eb_g + x->eb_u + x->eb_d <= x->stride;
             if (!ok) { fprintf(stderr, "colibri container: layer %d expert tensor disagrees with its declared layout\n", i); exit(1); }
             int64_t tot = x->eb_g + x->eb_u + x->eb_d;
             if (tot > m->gqe_max) m->gqe_max = tot;
@@ -3401,7 +3403,7 @@ static void gguf_map_experts(Model *m) {
         for (int k = 0; k < 3; k++) {
             snprintf(nm, sizeof nm, "blk.%d.ffn_%s_exps.weight", i, kind[k]);
             const gguf_tensor *t = gguf_mark(&g_gg, nm);
-            int64_t in = k == 2 ? c->inter : c->ehid, outd = k == 2 ? c->ehid : c->inter;
+            int64_t in = k == 2 ? c->inter : q36_eh(c), outd = k == 2 ? q36_eh(c) : c->inter;
             if (!t || t->n_dims != 3 || t->ne[0] != in || t->ne[1] != outd || t->ne[2] != c->n_experts) {
                 fprintf(stderr, "GGUF %s: missing or not [%lld x %lld x %d]\n", nm, (long long)in, (long long)outd, c->n_experts); exit(1);
             }
@@ -3603,19 +3605,19 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.gate_proj.weight", ai);
             load_tq_noted(m, nm, c->hidden, c->q_heads * c->head_dim, quantize_dense, "attn", &l->ag); QCOUNT(l->ag);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.pre_expert_proj.weight", ai);
-            load_tq_noted(m, nm, c->hidden, c->ehid, quantize_dense, "shexp", &l->lat_d); QCOUNT(l->lat_d);
+            load_tq_noted(m, nm, c->hidden, q36_eh(c), quantize_dense, "shexp", &l->lat_d); QCOUNT(l->lat_d);
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.post_expert_proj.weight", ai);
-            load_tq_noted(m, nm, c->ehid, c->hidden, quantize_dense, "shexp", &l->lat_u); QCOUNT(l->lat_u);
+            load_tq_noted(m, nm, q36_eh(c), c->hidden, quantize_dense, "shexp", &l->lat_u); QCOUNT(l->lat_u);
             #define LDM(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,ai); l->field = load_t_n(m,nm,(want))
             LDM(ra_a, "post_attention_residual_gate.alpha", c->hidden);
             LDM(ra_b, "post_attention_residual_gate.beta", c->hidden);
             LDM(rf_a, "post_feedforward_residual_gate.alpha", c->hidden);
             LDM(rf_b, "post_feedforward_residual_gate.beta", c->hidden);
-            LDM(post_en, "mlp.experts.post_expert_norm.weight", c->ehid);
+            LDM(post_en, "mlp.experts.post_expert_norm.weight", q36_eh(c));
             LDM(post_fn, "post_feedforward_layernorm.weight", c->hidden);
             #undef LDM
             snprintf(nm,sizeof(nm),"model.layers.%d.mlp.pre_expert_norm.weight", ai);
-            l->pre_en = load_norm_n(m, nm, c->ehid);
+            l->pre_en = load_norm_n(m, nm, q36_eh(c));
         }
         if (c->is_attn[i]) {
             /* Gated Attention (full_attention) layer, dense projections int8-during-load */
@@ -3687,7 +3689,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         int n_active = layer_end - layer_begin;
         double slot_gb = 0.0, budget_gb = 0.0;
         cap = qwen36_cap_for_ram(resident, avail, ram_override,
-                                  c->ehid, c->inter, c->n_experts, n_active,
+                                  q36_eh(c), c->inter, c->n_experts, n_active,
                                   xf_mode(m), &slot_gb, &budget_gb);
         fprintf(stderr, "[qwen36] cache auto-sized: %d slots/layer of %d experts "
                         "(%.1f GB budget via %s, %.1f GB dense resident, %.0f MB/slot)\n",
@@ -3739,9 +3741,9 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
 }
 
 /* scale counts per expert matrix: per-row (gs=0) or grouped along input dim */
-static int64_t scale_count_gu(const Cfg *c){ return c->expert_gs ? (int64_t)c->inter * ((c->ehid + c->expert_gs - 1) / c->expert_gs) : c->inter; }
+static int64_t scale_count_gu(const Cfg *c){ return c->expert_gs ? (int64_t)c->inter * ((q36_eh(c) + c->expert_gs - 1) / c->expert_gs) : c->inter; }
 static int down_gs_of(const Cfg *c){ return c->expert_down_bits ? c->expert_down_gs : c->expert_gs; }
-static int64_t scale_count_d (const Cfg *c){ int gs = down_gs_of(c); return gs ? (int64_t)c->ehid * ((c->inter + gs - 1) / gs) : c->ehid; }
+static int64_t scale_count_d (const Cfg *c){ int gs = down_gs_of(c); return gs ? (int64_t)q36_eh(c) * ((c->inter + gs - 1) / gs) : q36_eh(c); }
 
 /* Pure: no Model pointer, no globals, no I/O, same testability contract as
  * coli_resolve_cap / k3_cap_for_ram. cap<=0 sentinel ("auto") resolves to
@@ -3777,8 +3779,8 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
         s->pinned = 0; s->is_int4 = 0; s->g = s->u = s->d = NULL; s->g4 = s->u4 = s->d4 = NULL; s->pw = NULL;
         return;
     }
-    int64_t ng = (int64_t)c->inter * c->ehid;
-    int64_t nd = (int64_t)c->ehid * c->inter;
+    int64_t ng = (int64_t)c->inter * q36_eh(c);
+    int64_t nd = (int64_t)q36_eh(c) * c->inter;
     if (xf_mode(m)) {
         /* half the bytes of the int8 block: the int4 stays packed */
         g_pw_gp = ng / 2;
@@ -3897,7 +3899,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
             fprintf(stderr, "GGUF: reading layer %d expert %d failed\n", layer, eid); exit(1);
         }
         if (ilv) {   /* the three matrices' groups of 16 rows on the threads, unless the caller already runs on them */
-            const int D = m->c.ehid, I = m->c.inter;
+            const int D = q36_eh(&m->c), I = m->c.inter;
             const int ft[3] = { x->tg, x->tu, x->td }, ht[3] = { x->hg, x->hu, x->hd }, rows[3] = { I, I, D }, cols[3] = { D, D, I };
             const int64_t fo[3] = { 0, x->eb_g, x->eb_g + x->eb_u }, ho[3] = { 0, x->hb_g, x->hb_g + x->hb_u }, fb[3] = { x->eb_g, x->eb_u, x->eb_d };
             int ng[3];
@@ -3921,7 +3923,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
     snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.merged_weight", la, eid);
     snprintf(qsnm, sizeof(qsnm), "model.layers.%d.mlp.experts.%d.qs", la, eid);
     Cfg *cc = &m->c;
-    int64_t ng = (int64_t)cc->inter * cc->ehid, nd = (int64_t)cc->ehid * cc->inter;
+    int64_t ng = (int64_t)cc->inter * q36_eh(cc), nd = (int64_t)q36_eh(cc) * cc->inter;
     int64_t want_w = ng + ng + nd;
     int64_t want_s = 2*scale_count_gu(cc) + scale_count_d(cc);
     st_tensor *tw = st_find(&m->S, nm), *ts = st_find(&m->S, qsnm);
@@ -3972,7 +3974,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         if (s->pw && xf_r16(m)) {
             /* shared kernel, rows interleaved by 16: pairs -> planar beside, then the slot's
              * groups with the scales, on the threads unless the caller already runs on them */
-            const int H = cc->ehid, I = cc->inter, ngI = I / 16, ngH = H / 16;
+            const int H = q36_eh(cc), I = cc->inter, ngI = I / 16, ngH = H / 16;
             const int64_t gp = ng / 2, scu = scale_count_gu(cc), nsc = 2 * scu + scale_count_d(cc);
             const size_t gbH = xf16_group_bytes(H), gbI = xf16_group_bytes(I);
             static _Thread_local uint8_t *pl; static _Thread_local float *scb; static _Thread_local int64_t pcap;
@@ -4002,9 +4004,9 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
         if (s->pw) {
             /* shared kernel: pairs -> planar, never int8 */
             int64_t gp = ng / 2;
-            xf_repack_pairs_signed(s->pw,          raw,          cc->inter,  cc->ehid);
-            xf_repack_pairs_signed(s->pw + gp,     raw + gp,     cc->inter,  cc->ehid);
-            xf_repack_pairs_signed(s->pw + 2 * gp, raw + 2 * gp, cc->ehid, cc->inter);
+            xf_repack_pairs_signed(s->pw,          raw,          cc->inter,  q36_eh(cc));
+            xf_repack_pairs_signed(s->pw + gp,     raw + gp,     cc->inter,  q36_eh(cc));
+            xf_repack_pairs_signed(s->pw + 2 * gp, raw + 2 * gp, q36_eh(cc), cc->inter);
             s->is_int4 = 1;
             st_read_f32(&m->S, qsnm, s->gs, 0);
             return;
@@ -4044,7 +4046,7 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
  * pipeline at init time. */
 static int container_layer_is_int4(Model *m, int layer) {
     Cfg *cc = &m->c;
-    int64_t ng = (int64_t)cc->inter * cc->ehid, nd = (int64_t)cc->ehid * cc->inter;
+    int64_t ng = (int64_t)cc->inter * q36_eh(cc), nd = (int64_t)q36_eh(cc) * cc->inter;
     int64_t want_w = ng + ng + nd;
     char nm[256];
     snprintf(nm, sizeof(nm),
@@ -4060,7 +4062,7 @@ static int container_layer_is_int4(Model *m, int layer) {
 static void slot_ensure_int8(Model *m, Slot *s) {
     if (s->g || !s->g4) return;
     Cfg *c = &m->c;
-    int64_t ng = (int64_t)c->inter * c->ehid, nd = (int64_t)c->ehid * c->inter;
+    int64_t ng = (int64_t)c->inter * q36_eh(c), nd = (int64_t)q36_eh(c) * c->inter;
     int8_t *w = malloc((size_t)(ng + ng + nd));
     if (!w) { fprintf(stderr, "OOM slot_ensure_int8\n"); exit(1); }
     /* #1271's unpack_int4_to_int8 (branchless, AVX2/NEON/scalar -- see its
@@ -4514,7 +4516,7 @@ static void qwen_shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
 /* A slot's expert as the shared kernel takes it: planar rows and scale arrays, or the
  * xf16 groups (xf_r16) */
 static XfExpert xf_slot_expert(Model *m, const Slot *e) {
-    const int H = m->c.ehid, I = m->c.inter;
+    const int H = q36_eh(&m->c), I = m->c.inter;
     if (xf_r16(m)) { const size_t gu = (size_t)(I / 16) * xf16_group_bytes(H); return (XfExpert){e->pw, e->pw + gu, e->pw + 2 * gu, NULL, NULL, NULL}; }
     const int64_t gp = (int64_t)I * H / 2;
     return (XfExpert){e->pw, e->pw + gp, e->pw + 2 * gp, e->gs, e->us, e->ds};
@@ -4540,7 +4542,7 @@ static XfExpert xf_slot_expert(Model *m, const Slot *e) {
  * given up for a run. */
 #define QWEN_XF_ROWS 256   /* rows per run at most: about 31 MB of scratch on the 35B */
 static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
-    Cfg *c = &m->c; int D = c->ehid, K = c->topk, F = c->inter;
+    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, F = c->inter;
     int cap = m->cache[layer].cap;
     int kper = cap >= K ? K : 1;              /* experts per run */
     int room = cap;                           /* slots a run may fill */
@@ -4591,7 +4593,7 @@ static void moe_xf_run(Model *m, int layer, const float *x, int S, float *out, c
 static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val);
 static void qt_cpu_misses(Model *m, int layer, const float *xs, const int *idx, const float *val,
                           uint32_t mask, float *os, float *g, float *u, float *hh) {
-    Cfg *c = &m->c; int D = c->ehid, K = c->topk, I = c->inter;
+    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, I = c->inter;
     if (g_gguf) {   /* a GGUF's misses through its own CPU path, each offered to the tier first */
         int mi[64]; float mv[64];
         for (int kk = 0; kk < K && kk < 64; kk++) {
@@ -4750,7 +4752,7 @@ static void route_footer(FILE *f, const Model *m) {
 static void gq_slot_i8(Model *m, int layer, Slot *e) {
     if (e->t8_eid == e->eid + 1) return;
     const Cfg *c = &m->c; const GqExp *x = &m->gqx[layer];
-    const int D = c->ehid, I = c->inter; const int64_t n = (int64_t)I * D;
+    const int D = q36_eh(c), I = c->inter; const int64_t n = (int64_t)I * D;
     if (!e->t8) {
         e->t8 = malloc((size_t)(3 * n)); e->t8s = malloc((size_t)(3 * (n / 32)) * sizeof(float));
         if (!e->t8 || !e->t8s) { fprintf(stderr, "OOM gq_slot_i8\n"); exit(1); }
@@ -4767,7 +4769,7 @@ static int g_vk_gguf_raw;   /* the tier holds the GGUF experts' blocks as the fi
 static const uint8_t *gq_slot_file_rows(Model *m, int layer, Slot *e) {
     const GqExp *x = &m->gqx[layer];
     if (!gguf_expert_ilv(x)) return e->gqe;
-    const int D = m->c.ehid, I = m->c.inter;
+    const int D = q36_eh(&m->c), I = m->c.inter;
     /* the largest layer's: a slot can hold experts of several layers in turn (the CUDA
      * tier's copy-mode warm start reads every expert through one slot a thread), and a
      * published file's layers differ in their block types */
@@ -4791,14 +4793,14 @@ static VktExpertSrc vk_slot_src(Model *m, int layer, Slot *e) {
         return (VktExpertSrc){b, b + x->eb_g, b + x->eb_g + x->eb_u, NULL, NULL, NULL};
     }
     if (g_gguf) {
-        int64_t n = (int64_t)m->c.inter * m->c.ehid;
+        int64_t n = (int64_t)m->c.inter * q36_eh(&m->c);
         gq_slot_i8(m, layer, e);
         return (VktExpertSrc){e->t8, e->t8 + n, e->t8 + 2 * n, e->t8s, e->t8s + n / 32, e->t8s + 2 * (n / 32)};
     }
     if (e->pw) {
-        int64_t gp = (int64_t)m->c.inter * m->c.ehid / 2;
+        int64_t gp = (int64_t)m->c.inter * q36_eh(&m->c) / 2;
         if (xf_r16(m)) {   /* the device reads planar rows and scale arrays: back from the groups, once per expert */
-            const int H = m->c.ehid, I = m->c.inter; const int64_t scu = scale_count_gu(&m->c), nsc = 2 * scu + scale_count_d(&m->c);
+            const int H = q36_eh(&m->c), I = m->c.inter; const int64_t scu = scale_count_gu(&m->c), nsc = 2 * scu + scale_count_d(&m->c);
             const size_t gu = (size_t)(I / 16) * xf16_group_bytes(H);
             if (!e->t8 && !(e->t8 = malloc((size_t)(3 * gp)))) { fprintf(stderr, "OOM int4 expert for the Vulkan tier\n"); exit(1); }
             if (!e->t8s && !(e->t8s = malloc((size_t)nsc * sizeof(float)))) { fprintf(stderr, "OOM int4 expert for the Vulkan tier\n"); exit(1); }
@@ -4819,7 +4821,7 @@ static VktExpertSrc vk_slot_src(Model *m, int layer, Slot *e) {
  * held slots released after each. */
 static void moe_vk_xf_cpu(Model *m, int layer, const float *x, int S, const int *idx,
                           const uint8_t *want, float *ctb) {
-    Cfg *c = &m->c; int D = c->ehid, K = c->topk, F = c->inter;
+    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, F = c->inter;
     int cap = m->cache[layer].cap;
     int per = cap >= S * K ? S : 1, kper = cap >= K ? K : 1, n = per * kper;
     XfExpert *ex = malloc(sizeof(XfExpert) * (size_t)n);
@@ -4853,7 +4855,7 @@ static void moe_vk_xf_cpu(Model *m, int layer, const float *x, int S, const int 
 /* The int8 slots' CPU pairs (want[i] set), into ctb[i], one at a time. */
 static void moe_vk_i8_cpu(Model *m, int layer, const float *x, int S, const int *idx,
                           const uint8_t *want, float *ctb, float *g, float *u) {
-    Cfg *c = &m->c; int D = c->ehid, K = c->topk, I = c->inter;
+    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, I = c->inter;
     for (int i = 0; i < S * K; i++) {
         if (idx[i] < 0 || !want[i]) continue;
         const float *xs = x + (int64_t)(i / K) * D;
@@ -4871,7 +4873,7 @@ static void moe_vk_i8_cpu(Model *m, int layer, const float *x, int S, const int 
  * them; an expert the tier would take now is converted for it (vkt_wants) and noted. */
 static void moe_vk_gq_cpu(Model *m, int layer, const float *x, int S, const int *idx,
                           const uint8_t *want, float *ctb) {
-    Cfg *c = &m->c; int D = c->ehid, K = c->topk, I = c->inter;
+    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, I = c->inter;
     const GqExp *gx = &m->gqx[layer];
     float *G = falloc(I), *U = falloc(I);
     for (int i = 0; i < S * K; i++) {
@@ -4891,7 +4893,7 @@ static void moe_vk_gq_cpu(Model *m, int layer, const float *x, int S, const int 
 }
 static void moe_vk_run(Model *m, Layer *l, int layer, const float *x, int S, float *out,
                        const int *idx, const float *val, int routed_only) {
-    Cfg *c = &m->c; int D = c->ehid, K = c->topk, I = c->inter, SI = routed_only ? 0 : c->shared_inter;
+    Cfg *c = &m->c; int D = q36_eh(c), K = c->topk, I = c->inter, SI = routed_only ? 0 : c->shared_inter;
     int xf = xf_mode(m), B = vkt_step_rows(S, QWEN_VK_ROWS);   /* a whole prompt chunk when the tier streams */
     float *ctb = falloc((int64_t)B * K * D), *shb = SI > 0 ? falloc((int64_t)B * D) : NULL;
     float *g = falloc(I > SI ? I : SI), *u = falloc(I > SI ? I : SI), *hh = falloc(D);
@@ -4963,7 +4965,7 @@ static inline void gq_rows_u(float *y, int u, const gq_act *a, const uint8_t *W,
     for (int j = 0; j < u; j++) gq_row_all(y + j, 1, a, W + (int64_t)j * rb, t, I);
 }
 static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const int *idx, const float *val) {
-    Cfg *c = &m->c; const int D = c->ehid, K = c->topk, I = c->inter;
+    Cfg *c = &m->c; const int D = q36_eh(c), K = c->topk, I = c->inter;
     const GqExp *gx = &m->gqx[layer];
     if (m->cache[layer].cap < K || K > 64 || !gq_int_ok(gx->hg, D) || !gq_int_ok(gx->hu, D) || !gq_int_ok(gx->hd, I)) return -1;
     /* rows interleaved by 16 (q36_gq_held) go a group at a time, and then every matrix's rows by 16 */
@@ -5024,7 +5026,7 @@ static int moe_gq_decode(Model *m, int layer, const float *x, float *out, const 
 }
 
 static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, const int *idx, const float *val) {
-    Cfg *c = &m->c; const int D = c->ehid, K = c->topk, I = c->inter, E = c->n_experts;
+    Cfg *c = &m->c; const int D = q36_eh(c), K = c->topk, I = c->inter, E = c->n_experts;
     const GqExp *gx = &m->gqx[layer];
     static int nodec = -1; if (nodec < 0) { const char *e = getenv("GQ_NODECODE"); nodec = e && *e == '1'; }
     if (S == 1 && !nodec && !moe_gq_decode(m, layer, x, out, idx, val)) return;
@@ -5072,7 +5074,7 @@ static void moe_gq_run(Model *m, int layer, const float *x, int S, float *out, c
 static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
                    const float *logits_in, int routed_only) {
     /* D: the experts' width, the rows of x and out (Muse Spark's latent, hidden otherwise) */
-    Cfg *c = &m->c; int D = c->ehid, E = c->n_experts, K = c->topk, I = c->inter;
+    Cfg *c = &m->c; int D = q36_eh(c), E = c->n_experts, K = c->topk, I = c->inter;
     if (E == 0 || (c->dense_layer && c->dense_layer[layer])) {   /* a dense model, or a Flint dense layer */
         memset(out, 0, (int64_t)S*D*sizeof(float));
         if (routed_only) return;
@@ -5368,7 +5370,7 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
  * (ehid) between the two projections, normalised in front (pre_en); moe_ex runs the
  * routed experts on the latent rows and normalises every expert's output. */
 static void moe_muse(Model *m, Layer *l, int layer, float *x, int S, float *out) {
-    Cfg *c = &m->c; const int D = c->hidden, L = c->ehid, E = c->n_experts;
+    Cfg *c = &m->c; const int D = c->hidden, L = q36_eh(c), E = c->n_experts;
     float *logits = falloc((int64_t)S*E), *lat = falloc((int64_t)S*L), *lo = falloc((int64_t)S*L);
     double _tr = tm_now();
     matmul_d(logits, x, &l->gate, S, D, E);
@@ -8185,7 +8187,7 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
         for (int l = 0; raw && l < L; l++) {
             const GqExp *x = &m->gqx[l];
             int bg = coli_vk_block_elems(100 + x->tg), bd = coli_vk_block_elems(100 + x->td);
-            if (x->tu != x->tg || x->sg || x->su || x->sd || !bg || !bd || c->ehid % bg || c->inter % bd) raw = 0;
+            if (x->tu != x->tg || x->sg || x->su || x->sd || !bg || !bd || q36_eh(c) % bg || c->inter % bd) raw = 0;
             if (x->tg != m->gqx[0].tg || x->td != m->gqx[0].td) mixed = 1;
         }
         for (int l = 0; raw && l < L; l++) {   /* the commonest pair is the tier's main form */
@@ -8217,12 +8219,12 @@ static void vk_tier_start(Model *m, const char *snap, int cap, int expert_is_int
     } else {
         gu = (VktFmt){gs ? VKT_SRC_I8_GS : VKT_SRC_I8_ROW, gs}; dn = gu;
     }
-    int64_t ng = (int64_t)c->inter * c->ehid;
+    int64_t ng = (int64_t)c->inter * q36_eh(c);
     size_t slot = g_vk_slot_bytes = g_gguf ? (size_t)m->gqe_max
                 : (size_t)(xf_mode(m) ? (2 * ng + ng) / 2 : 3 * ng) +
                   (size_t)(2 * scale_count_gu(c) + scale_count_d(c)) * sizeof(float);
     VktConfig vc = {.engine = "qwen36", .layers = c->n_layers, .experts = c->n_experts,
-                    .hidden = c->ehid, .inter = c->inter, .topk = c->topk,
+                    .hidden = q36_eh(c), .inter = c->inter, .topk = c->topk,
                     .gate_up = gu, .down = dn, .act = VKT_ACT_SWIGLU,
                     .max_rows = QWEN_VK_ROWS * c->topk,
                     .ram_reserve = slot * (size_t)cap * (size_t)c->n_layers,
@@ -8584,7 +8586,7 @@ int main(int argc, char **argv) {
             pt = st_find(&m.S, probe);
         }
         if (g_gguf) expert_is_int4 = 0;
-        int64_t want = 2*(int64_t)m.c.inter*m.c.ehid + (int64_t)m.c.ehid*m.c.inter;
+        int64_t want = 2*(int64_t)m.c.inter*q36_eh(&m.c) + (int64_t)q36_eh(&m.c)*m.c.inter;
         if (pt && pt->nbytes == want) expert_is_int4 = 0;   /* int8: un byte per elemento */
         /* mixed (convert_qwen36.py --down-bits): int4 gate/up + int8 down = 2/3 of int8 */
         if (pt && pt->nbytes == want * 2 / 3) { expert_is_int4 = 0; expert_mixed = 1; }
@@ -8644,10 +8646,10 @@ int main(int argc, char **argv) {
             const GqExp *x = &m.gqx[l];
             ok = x->tg == x->tu && !x->sg && !x->su && !x->sd && cc_moe_block_type(x->tg) && cc_moe_block_type(x->td) &&
                  coli_cuda_block_elems(100 + x->tg) > 0 && coli_cuda_block_elems(100 + x->td) > 0 &&
-                 m.c.ehid % coli_cuda_block_elems(100 + x->tg) == 0 && m.c.inter % coli_cuda_block_elems(100 + x->td) == 0;
+                 q36_eh(&m.c) % coli_cuda_block_elems(100 + x->tg) == 0 && m.c.inter % coli_cuda_block_elems(100 + x->td) == 0;
             if (ok) { tg[l] = x->tg; td[l] = x->td; bg[l] = (size_t)x->eb_g; bdn[l] = (size_t)x->eb_d; }
         }
-        if (ok && qt_init_gguf(L, m.c.n_experts, m.c.ehid, m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) gguf_tier = 1;   /* the slots' rows stay */
+        if (ok && qt_init_gguf(L, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk, tg, td, bg, bdn, 0)) gguf_tier = 1;   /* the slots' rows stay */
         else fprintf(stderr, "[qwen36] COLI_CUDA=1: %s; the routed experts stay on the CPU\n",
                      ok ? "the CUDA expert tier did not start" : "the GGUF's expert types are not all ones the CUDA chain's experts take");
         free(tg); free(td); free(bg); free(bdn);
@@ -8659,7 +8661,7 @@ int main(int argc, char **argv) {
      * dense trunk goes to the devices all the same (-1). Not a GGUF. */
     if (m.c.n_experts > 0 && !g_gguf) qt_source_planar(xf_mode(&m));
     if (gguf_tier || (!qq_active() && !g_gguf && m.c.n_experts > 0 &&
-        qt_init(m.c.n_layers, m.c.n_experts, m.c.ehid, m.c.inter, cap, m.c.topk,
+        qt_init(m.c.n_layers, m.c.n_experts, q36_eh(&m.c), m.c.inter, cap, m.c.topk,
                 m.c.expert_gs, expert_mixed ? -1 : expert_is_int4))) {
         fprintf(stderr, qt_experts_on() ? "[gpu] MoE experts -> CUDA VRAM tier\n"
                                         : "[gpu] dense trunk -> CUDA (the routed experts stay on the CPU)\n");

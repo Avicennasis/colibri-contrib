@@ -302,7 +302,7 @@ static Q36Chain *q36c_setup_dev(Model *m, int d) {
             if (m->L[i].sinks) { ch->o_snk[i] = np; np += c->q_heads; }
             if (c->muse) {
                 ch->o_ra[i] = np; np += 2 * (size_t)D; ch->o_rf[i] = np; np += 2 * (size_t)D;
-                ch->o_pre[i] = np; np += c->ehid; ch->o_pf[i] = np; np += D;
+                ch->o_pre[i] = np; np += q36_eh(c); ch->o_pf[i] = np; np += D;
             }
         } else {
             ch->o_conv[i] = np; np += (size_t)conv_dim * convk;
@@ -323,7 +323,7 @@ static Q36Chain *q36c_setup_dev(Model *m, int d) {
             if (c->muse) {
                 memcpy(arena + ch->o_ra[i], l->ra_a, D * sizeof(float)); memcpy(arena + ch->o_ra[i] + D, l->ra_b, D * sizeof(float));
                 memcpy(arena + ch->o_rf[i], l->rf_a, D * sizeof(float)); memcpy(arena + ch->o_rf[i] + D, l->rf_b, D * sizeof(float));
-                memcpy(arena + ch->o_pre[i], l->pre_en, c->ehid * sizeof(float));
+                memcpy(arena + ch->o_pre[i], l->pre_en, q36_eh(c) * sizeof(float));
                 memcpy(arena + ch->o_pf[i], l->post_fn, D * sizeof(float));
             }
         } else {
@@ -445,7 +445,7 @@ static void q36c_fit_layer(Model *m, int i, int kv_rows, size_t *dev, size_t *ma
         if (l->qn) prm += c->head_dim;
         if (l->kn) prm += c->k_head_dim;
         if (l->sinks) prm += c->q_heads;
-        if (c->muse) prm += 5 * (size_t)D + c->ehid;
+        if (c->muse) prm += 5 * (size_t)D + q36_eh(c);
         *dev += 2 * vkc_fit_buf((size_t)c->kv_heads * kv_rows * c->k_head_dim * sizeof(float));
     } else {
         prm += (size_t)c->dn_conv_dim * c->dn_convk + 2 * (size_t)vh + c->dn_vdim;
@@ -588,7 +588,7 @@ static int q36c_bufs(Q36Chain *ch, Model *m, int rows) {
     if (c->dense_layer && c->dense_inter > SI) SI = c->dense_inter;   /* Flint's dense layers: a wider MLP */
     size_t r = (size_t)rows;
     /* the routed sum's rows: the experts' width (Muse Spark's latent), at least the hidden */
-    const size_t RW = (size_t)(c->ehid > D ? c->ehid : D), LT = c->muse ? (size_t)c->ehid : 1, AG = c->muse ? (size_t)H * hd : 1;
+    const size_t RW = (size_t)(q36_eh(c) > D ? q36_eh(c) : D), LT = c->muse ? (size_t)q36_eh(c) : 1, AG = c->muse ? (size_t)H * hd : 1;
     int ok = q36c_res(&ch->x, r * D, VKC_DEV) && q36c_res(&ch->nrm, r * D, VKC_DEV) && q36c_res(&ch->tmp, r * D, VKC_DEV) &&
              q36c_res(&ch->q, r * qo, VKC_DEV) && q36c_res(&ch->k, r * kvo, VKC_DEV) && q36c_res(&ch->v, r * kvo, VKC_DEV) &&
              q36c_res(&ch->ctx, r * H * hd, VKC_DEV) && q36c_res(&ch->qkv, r * c->dn_conv_dim, VKC_DEV) &&
@@ -633,7 +633,7 @@ static int q36c_mirror(Q36Chain *ch, Model *m) {
 
 /* scratch for `rows` rows, and the KV mirrors at the host's capacity */
 static int q36c_scratch(Q36Chain *ch, Model *m, int rows) {
-    Cfg *c = &m->c; int D = c->ehid > c->hidden ? c->ehid : c->hidden;   /* the routed sum's width */
+    Cfg *c = &m->c; int D = q36_eh(c) > c->hidden ? q36_eh(c) : c->hidden;   /* the routed sum's width */
     size_t r = (size_t)rows;
     if (!q36c_bufs(ch, m, rows)) return 0;
     if (ch->rows < rows) {
@@ -1014,9 +1014,9 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
             if (ok && routed_l) {
                 ok = vkc_matmul(vk_qw_tensor(&l->gate), ch->h2, 0, ch->lg, 0, n) && vkc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E);
                 if (c->muse) {   /* Muse Spark: the experts read the rows at their width, normalised */
-                    VkcNorm pn = {n, c->ehid, 1, 0, c->ehid, c->ehid, 0, c->ehid, c->ehid, (int)ch->o_pre[i], 0, VKC_NORM_ADD1, c->eps, 1.f};
+                    VkcNorm pn = {n, q36_eh(c), 1, 0, q36_eh(c), q36_eh(c), 0, q36_eh(c), q36_eh(c), (int)ch->o_pre[i], 0, VKC_NORM_ADD1, c->eps, 1.f};
                     ok = ok && vkc_matmul(vk_qw_tensor(&l->lat_d), ch->h2, 0, ch->lat, 0, n) && vkc_norm(ch->lat, ch->prm, ch->lat, &pn) &&
-                         vkc_copy(ch->latd, 0, ch->lat, 0, (size_t)n * c->ehid);
+                         vkc_copy(ch->latd, 0, ch->lat, 0, (size_t)n * q36_eh(c));
                 } else
                 ok = ok && vkc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
                 double t0 = tm_now();
@@ -1035,7 +1035,7 @@ static int q36c_forward_seg(Model *m, Q36Chain *ch, float *xh, int S, int pos_ba
                 ch->frames++;
                 double t1 = tm_now();
                 moe_ex(m, l, i, (float *)vkc_ptr(c->muse ? ch->latd : ch->h2d), n, ch->host_routed, (const float *)vkc_ptr(ch->lgd), 1);
-                memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)n * c->ehid * sizeof(float));
+                memcpy(vkc_ptr(ch->routed), ch->host_routed, (size_t)n * q36_eh(c) * sizeof(float));
                 double t2 = tm_now();
                 tm_add(n, 2, t2 - t1); ch->host_ms += t2 - t1;
                 ok = ok && vkc_begin();

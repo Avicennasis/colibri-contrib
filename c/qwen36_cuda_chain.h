@@ -297,7 +297,7 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
             if (m->L[i].sinks) { ch->o_snk[i] = np; np += c->q_heads; }
             if (c->muse) {
                 ch->o_ra[i] = np; np += 2 * (size_t)D; ch->o_rf[i] = np; np += 2 * (size_t)D;
-                ch->o_pre[i] = np; np += c->ehid; ch->o_pf[i] = np; np += D;
+                ch->o_pre[i] = np; np += q36_eh(c); ch->o_pf[i] = np; np += D;
             }
         } else {
             ch->o_conv[i] = np; np += (size_t)conv_dim * convk;
@@ -318,7 +318,7 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
             if (c->muse) {
                 memcpy(arena + ch->o_ra[i], l->ra_a, D * sizeof(float)); memcpy(arena + ch->o_ra[i] + D, l->ra_b, D * sizeof(float));
                 memcpy(arena + ch->o_rf[i], l->rf_a, D * sizeof(float)); memcpy(arena + ch->o_rf[i] + D, l->rf_b, D * sizeof(float));
-                memcpy(arena + ch->o_pre[i], l->pre_en, c->ehid * sizeof(float));
+                memcpy(arena + ch->o_pre[i], l->pre_en, q36_eh(c) * sizeof(float));
                 memcpy(arena + ch->o_pf[i], l->post_fn, D * sizeof(float));
             }
         } else {
@@ -379,7 +379,7 @@ static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
     if (c->dense_layer && c->dense_inter > SI) SI = c->dense_inter;   /* Flint's dense layers: a wider MLP */
     size_t r = (size_t)rows, F = sizeof(float);
     /* the routed sum's rows: the experts' width (Muse Spark's latent), at least the hidden */
-    const size_t RW = (size_t)(c->ehid > D ? c->ehid : D), LT = c->muse ? (size_t)c->ehid : 1, AG = c->muse ? (size_t)H * hd : 1;
+    const size_t RW = (size_t)(q36_eh(c) > D ? q36_eh(c) : D), LT = c->muse ? (size_t)q36_eh(c) : 1, AG = c->muse ? (size_t)H * hd : 1;
     int ok = cc_reserve(&ch->x, r * D * F, CC_DEV) && cc_reserve(&ch->nrm, r * D * F, CC_DEV) && cc_reserve(&ch->tmp, r * D * F, CC_DEV) &&
              cc_reserve(&ch->q, r * qo * F, CC_DEV) && cc_reserve(&ch->k, r * kvo * F, CC_DEV) && cc_reserve(&ch->v, r * kvo * F, CC_DEV) &&
              cc_reserve(&ch->ctx, r * H * hd * F, CC_DEV) && cc_reserve(&ch->qkvz, r * (c->dn_conv_dim + vd) * F, CC_DEV) &&
@@ -412,7 +412,7 @@ static int q36cc_mirror(Q36CChain *ch, Model *m) {
     return 1;
 }
 static int q36cc_scratch(Q36CChain *ch, Model *m, int rows) {
-    Cfg *c = &m->c; int D = c->ehid > c->hidden ? c->ehid : c->hidden;   /* the routed sum's width */
+    Cfg *c = &m->c; int D = q36_eh(c) > c->hidden ? q36_eh(c) : c->hidden;   /* the routed sum's width */
     if (!q36cc_bufs(ch, m, rows)) return 0;
     if (ch->rows < rows) {
         float *hr = realloc(ch->host_routed, (size_t)rows * D * sizeof(float));
@@ -981,9 +981,9 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
             if (ok && routed_l) {
                 ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) && cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E);
                 if (c->muse) {   /* Muse Spark: the experts read the rows at their width, normalised */
-                    CcNorm pn = {n, c->ehid, 1, 0, c->ehid, c->ehid, 0, c->ehid, c->ehid, (int)ch->o_pre[i], 0, CC_NORM_ADD1, c->eps, 1.f};
+                    CcNorm pn = {n, q36_eh(c), 1, 0, q36_eh(c), q36_eh(c), 0, q36_eh(c), q36_eh(c), (int)ch->o_pre[i], 0, CC_NORM_ADD1, c->eps, 1.f};
                     ok = ok && cc_matmul(ch->t_ld[i], ch->h2, 0, ch->lat, 0, n) && cc_norm(ch->lat, ch->prm, ch->lat, &pn) &&
-                         cc_copy(ch->latd, 0, ch->lat, 0, (size_t)n * c->ehid);
+                         cc_copy(ch->latd, 0, ch->lat, 0, (size_t)n * q36_eh(c));
                 } else
                 ok = ok && cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
                 if (ok && pend_v) { ok = q36cc_dm_serve(ch, m, pend_i, n, pend_v); pend_v = 0; }   /* before a wait for the frame */
@@ -1003,7 +1003,7 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
                 ok = q36cc_frame_begin(ch) && q36cc_shared(ch, m, l, i, n) && cc_submit(0);
                 double t1 = tm_now();
                 moe_ex(m, l, i, (float *)cc_ptr(c->muse ? ch->latd : ch->h2d), n, ch->host_routed, (const float *)cc_ptr(ch->lgd), 1);
-                memcpy(cc_ptr(ch->routed), ch->host_routed, (size_t)n * c->ehid * sizeof(float));
+                memcpy(cc_ptr(ch->routed), ch->host_routed, (size_t)n * q36_eh(c) * sizeof(float));
                 double t2 = tm_now();
                 tm_add(n, 2, t2 - t1); ch->host_ms += t2 - t1;
                 ok = ok && q36cc_frame_begin(ch);
