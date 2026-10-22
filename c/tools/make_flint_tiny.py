@@ -178,10 +178,14 @@ class FlintRef:
         return self.rms(x, w["model.norm.weight"]) @ w["lm_head.weight"].T
 
     def generate(self, prompt, n):
-        ids = list(prompt)
+        """The greedy continuation and the smallest margin between the first and the
+        second logit over its steps."""
+        ids, gap = list(prompt), float("inf")
         for _ in range(n):
-            ids.append(int(self.logits(ids)[-1].argmax()))
-        return ids
+            top = self.logits(ids)[-1].topk(2)
+            gap = min(gap, float(top.values[0] - top.values[1]))
+            ids.append(int(top.indices[0]))
+        return ids, gap
 
 
 def main():
@@ -194,10 +198,23 @@ def main():
     ap.add_argument("--vocab", type=int, default=128)
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--window", type=int, default=5)
+    ap.add_argument("--min-gap", type=float, default=0.1,
+                    help="draw seeds from --seed on until every greedy step's first logit beats the "
+                         "second by this much: the container's int8 experts move the logits by a few "
+                         "thousandths, and a near tie would fail the gate for no fault")
     args = ap.parse_args()
-    torch.manual_seed(args.seed)
     cfg = tiny_config(vocab=args.vocab, hidden=args.hidden, window=args.window)
-    w = random_weights(cfg, args.seed)
+    prompt = [int(t) for t in args.prompt_ids.split(",") if t.strip()]
+    for seed in range(args.seed, args.seed + 200):
+        w = random_weights(cfg, seed)
+        if not args.emit_ref:
+            break
+        with torch.no_grad():
+            full, gap = FlintRef(cfg, w).generate(prompt, args.max_new)
+        if gap >= args.min_gap:
+            break
+    else:
+        sys.exit(f"no seed in {args.seed}..{args.seed + 199} gives a margin of {args.min_gap}")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(cfg, indent=2))
@@ -205,13 +222,11 @@ def main():
               metadata={"format": "pt"})
     print(f"tiny Flint -> {out} ({sum(v.numel() for v in w.values()) / 1e6:.2f}M parameters)")
     if args.emit_ref:
-        prompt = [int(t) for t in args.prompt_ids.split(",") if t.strip()]
-        with torch.no_grad():
-            full = FlintRef(cfg, w).generate(prompt, args.max_new)
         Path(args.emit_ref).parent.mkdir(parents=True, exist_ok=True)
         Path(args.emit_ref).write_text(json.dumps(
             {"prompt_ids": prompt, "full_ids": full, "mode": "full", "model": "flint_tiny"}, indent=2))
-        print(f"ref.json -> {args.emit_ref}\n  prompt_ids={prompt}\n  full_ids ={full}")
+        print(f"ref.json -> {args.emit_ref} (seed {seed}, smallest margin {gap:.3f})\n"
+              f"  prompt_ids={prompt}\n  full_ids ={full}")
 
 
 if __name__ == "__main__":
