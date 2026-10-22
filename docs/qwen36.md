@@ -627,7 +627,7 @@ without it. What the engine adds for it (`model_type: muse_spark`, the GGUF's
 - the logits times 0.177, capped at 20 tanh(x / 20).
 
 The published GGUFs hold q's and k's rows with each head's two halves
-interleaved (llama.cpp's rotary order); the engine puts them back at load, a
+interleaved (rotary pairs adjacent); the engine puts them back at load, a
 byte copy of whole rows, so every kernel rotates the halves as for the other
 models (`Q36_GGUF_ROPE_PERM=0` keeps the file's order). The tokenizer is o200k's
 split with tiktoken's rule that a piece in the vocabulary is that token

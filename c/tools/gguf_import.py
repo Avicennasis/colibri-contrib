@@ -280,7 +280,7 @@ def flint_config(meta, tensors, overrides=None):
 
 
 def muse_config(meta, tensors, overrides=None):
-    """Muse Spark (llama.cpp's muse-spark: meta-models/Muse-Spark-Open) as the qwen36 engine's
+    """Muse Spark (the GGUF arch muse-spark: meta-models/Muse-Spark-Open) as the qwen36 engine's
     config.json: the text model's keys, flat. The engine reads everything from the GGUF; this
     is what coli's planner, doctor and gateway read (the window, the experts, the KV)."""
     p = "muse-spark."

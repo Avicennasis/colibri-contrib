@@ -2865,7 +2865,7 @@ static int qwen_dense_read(Model *m, const char *name, int I, int O, QW *out) {
  * model_init_range/load_t_n, never main()'s dense-i8 block) -- passing it
  * through keeps their f32-only behavior exactly as it was; `tag` is unused
  * on that path. */
-/* A GGUF whose q and k rows are in llama.cpp's rotary order: within each head the rows of the
+/* A GGUF whose q and k rows are in the interleaved rotary order: within each head the rows of the
  * two halves interleaved (file row 2i + j = checkpoint row j * hd/2 + i), so that a rotation of
  * adjacent pairs is the checkpoint's of the two halves. Put back in the checkpoint's order at
  * load (rows are whole blocks: a byte copy), every kernel then rotates the halves as for every
