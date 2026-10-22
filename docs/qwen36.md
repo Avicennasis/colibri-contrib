@@ -541,6 +541,66 @@ cache.
 
 ![Qwen3-Coder-30B-A3B in coli web](media/qwen3-coder-web.png)
 
+### Flint
+
+[RecursiveSI/flint](https://huggingface.co/RecursiveSI/flint) (Apache-2.0) is
+a 40B MoE with 2.5B active (`model_type: flint`): 49 attention layers, the
+first two dense (one MLP of 6144), the other 47 with 256 experts top-6 (512
+wide) beside an ungated shared expert (1024 wide), routed by sigmoid and
+renormalised. Every attention head has a learned sink
+(`self_attn.softmax_offset`: one more logit in the softmax's denominator, with
+no value); 35 layers see a sliding window of 513 positions (their own
+included) with RoPE, the other 14 every position without it; 32 query heads,
+4 KV heads, head dim 128.
+
+The CPU, the Vulkan chain and the CUDA chain run all of it. The tokenizer
+splits digits by three and CJK runs before o200k's letter rules
+(`tests/test_qwen36_tokenizer_flint.c` against HF's tokenizers). The chat
+template is GLM's tool-call form with no thinking switch: the model writes
+`<think>` when it decides to reason, and the gateway files what follows as
+reasoning (`tests/test_flint_chat_template.py` holds the renderer to the
+release's template byte for byte). `tools/make_flint_tiny.py` writes a tiny
+Flint with a float32 reference; CI runs it on the GGUF path (`Linux (generated
+qwen36 oracles)`).
+
+```bash
+hf download RecursiveSI/flint --local-dir flint                    # 75 GB, bf16
+python3 tools/convert_qwen36.py --model flint --out flint-i4 --ebits 4 --gs 64
+coli import flint-UD-Q3_K_XL.gguf                                   # or any unsloth/flint-GGUF file
+```
+
+Every file unsloth published and the int4 gs64 container, on an RTX PRO 4000
+(24 GB) with 62 GB of RAM: a 161-token prompt and 127 tokens, prompt / decode
+in tok/s, the median of three runs after a warm-up. NLL is the teacher-forced
+loss in nats per token over the first 2048 tokens of the GPL-3 text, on the
+Vulkan chain: a text the model knows nearly by heart, so every bit lost
+shows. (On a text it does not know, 2048 tokens of colibri's own docs and
+code, every file from BF16 to UD-IQ1_M lands between 2.30 and 2.42 and the
+order is lost in the noise.)
+
+| file | size | NLL | CPU | Vulkan chain | CUDA chain |
+|---|---|---|---|---|---|
+| BF16 | 79.6 GB | 0.534 | 9 / 2.4 | 66 / 28.1 | 9 / 2.4 |
+| Q8_0 | 42.3 GB | 0.537 | 89 / 13.9 | 81 / 54.5 | 57 / 29.8 |
+| UD-Q6_K_XL | 36.3 GB | 0.541 | 86 / 15.4 | 116 / 65.7 | 104 / 51.4 |
+| UD-Q5_K_XL | 29.9 GB | 0.547 | 89 / 15.4 | 208 / 79.6 | 153 / 62.5 |
+| UD-Q4_K_XL | 25.1 GB | 0.560 | 95 / 15.8 | 210 / 77.7 | 248 / 77.4 |
+| int4 gs64 (`convert_qwen36.py`) | 25.2 GB | 0.599 | 124 / 17.1 | 903 / 94.6 | 949 / 99.0 |
+| UD-Q3_K_XL | 18.5 GB | 0.661 | 73 / 15.8 | 748 / 95.9 | 745 / 113.8 |
+| UD-IQ3_XXS | 14.5 GB | 0.859 | 59 / 15.0 | 755 / 90.3 | 696 / 120.0 |
+| UD-Q2_K_XL | 13.6 GB | 0.864 | 64 / 16.6 | 802 / 97.7 | 734 / 128.1 |
+| UD-IQ2_XXS | 11.9 GB | 1.045 | 67 / 17.7 | 811 / 95.8 | 738 / 133.0 |
+| UD-IQ1_M | 11.4 GB | 1.139 | 65 / 17.3 | 816 / 95.8 | 743 / 131.3 |
+
+Up to UD-Q3_K_XL every expert sits on the card. From UD-Q4_K_XL on the GGUFs'
+do not, and the prompt falls to what the host pool and the CPU give; the
+Vulkan chain's host pool keeps more decode than the CUDA tier there. The BF16
+file's experts are not a type the CUDA chain computes: with `COLI_VULKAN`
+unset a CUDA build hands such a file to the Vulkan chain on the same card
+([gguf.md](gguf.md)); the CUDA column is its run with `COLI_VULKAN=0`, all on
+the CPU. UD-IQ3_XXS costs as much quality as UD-Q2_K_XL for one more GB:
+UD-Q3_K_XL is the smallest file that keeps most of it.
+
 ### The converter's tensor contract
 
 Both checkpoints ship experts **fused** per layer (`mlp.experts.gate_up_proj`,
