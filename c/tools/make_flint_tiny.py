@@ -188,14 +188,63 @@ class FlintRef:
         return ids, gap
 
 
+def _gguf_bytes(kv, tensors, alignment=32):
+    """A GGUF v3 file: kv is [(key, type, value)], tensors [(name, ggml_type, dims, payload)];
+    dims in ggml order (the row length first). Written here so the fixture needs no package."""
+    import struct
+
+    def string(text):
+        data = text.encode("utf-8")
+        return struct.pack("<Q", len(data)) + data
+
+    def value(vt, v):
+        if vt == 8:
+            return string(v)
+        if vt == 7:
+            return b"\x01" if v else b"\x00"
+        if vt == 9:
+            et, items = v
+            return struct.pack("<IQ", et, len(items)) + b"".join(value(et, item) for item in items)
+        return struct.pack({4: "<I", 5: "<i", 6: "<f"}[vt], v)
+
+    out = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kv))
+    for key, vt, v in kv:
+        out += string(key) + struct.pack("<I", vt) + value(vt, v)
+    align = lambda n: (n + alignment - 1) // alignment * alignment
+    info, offset = b"", 0
+    for name, gtype, dims, payload in tensors:
+        info += string(name) + struct.pack("<I", len(dims)) + b"".join(struct.pack("<Q", d) for d in dims)
+        info += struct.pack("<IQ", gtype, offset)
+        offset = align(offset + len(payload))
+    out += info
+    out += b"\x00" * (align(len(out)) - len(out))
+    for _name, _gtype, _dims, payload in tensors:
+        out += payload + b"\x00" * (align(len(payload)) - len(payload))
+    return out
+
+
+def _q8_0(a):
+    """ggml's Q8_0: blocks of 32, an f16 scale max|x|/127 and 32 int8 (round half away)."""
+    import numpy as np
+    blocks = a.reshape(-1, 32).astype(np.float32)
+    d = np.abs(blocks).max(axis=1) / 127.0
+    inv = np.where(d > 0, 1.0 / np.where(d > 0, d, 1.0), 0.0)
+    q = np.clip(np.trunc(blocks * inv[:, None] + np.copysign(0.5, blocks)), -127, 127).astype(np.int8)
+    out = np.empty((blocks.shape[0], 34), dtype=np.uint8)
+    out[:, :2] = d.astype(np.float16).view(np.uint8).reshape(-1, 2)
+    out[:, 2:] = q.view(np.uint8)
+    return out.tobytes()
+
+
 def write_gguf(path, cfg, w, expert_type="Q8_0"):
     """The same weights as llama.cpp's flint GGUF has them (the names, keys and per-layer
-    patterns of unsloth/flint-GGUF): F32 everywhere, the routed experts in expert_type."""
-    import gguf
+    patterns of unsloth/flint-GGUF): F32 everywhere, the routed experts in expert_type
+    (F32 or Q8_0)."""
     import numpy as np
-    L, D, E = cfg["num_hidden_layers"], cfg["hidden_size"], cfg["num_experts"]
-    g = gguf.GGUFWriter(str(path), "flint")
+    U32, F32, BOOL, STR, ARR = 4, 6, 7, 8, 9
+    L, D, E, V = cfg["num_hidden_layers"], cfg["hidden_size"], cfg["num_experts"], cfg["vocab_size"]
     p = "flint."
+    kv = [("general.architecture", STR, "flint"), ("general.name", STR, "flint tiny")]
     for k, v in (("block_count", L), ("context_length", cfg["max_position_embeddings"]),
                  ("embedding_length", D), ("feed_forward_length", cfg["intermediate_size"]),
                  ("attention.head_count", cfg["num_attention_heads"]),
@@ -206,28 +255,28 @@ def write_gguf(path, cfg, w, expert_type="Q8_0"):
                  ("expert_shared_feed_forward_length", cfg["shared_expert_intermediate_size"]),
                  ("leading_dense_block_count", len(cfg["mlp_only_layers"])), ("expert_shared_count", 1),
                  ("attention.sliding_window", cfg["sliding_window"])):
-        g.add_uint32(p + k, v)
-    g.add_float32(p + "rope.freq_base", cfg["rope_theta"])
-    g.add_float32(p + "attention.layer_norm_rms_epsilon", cfg["rms_norm_eps"])
-    g.add_bool(p + "expert_weights_norm", True)
-    g.add_float32(p + "expert_weights_scale", 1.0)
-    g.add_array(p + "attention.sliding_window_pattern", [t == "sliding_attention" for t in cfg["layer_types"]])
-    g.add_array(p + "attention.rope_pattern", [i not in cfg["no_rope_layer_indices"] for i in range(L)])
-    V = cfg["vocab_size"]
-    g.add_tokenizer_model("gpt2")
-    g.add_token_list([f"<0x{b:02X}>" for b in range(V)])
-    g.add_token_types([1] * V)
-    g.add_token_merges([])
-    g.add_bos_token_id(cfg["bos_token_id"])
-    g.add_eos_token_id(cfg["eos_token_id"][0])
-    qt = getattr(gguf.GGMLQuantizationType, expert_type)
+        kv.append((p + k, U32, int(v)))
+    kv += [(p + "rope.freq_base", F32, float(cfg["rope_theta"])),
+           (p + "attention.layer_norm_rms_epsilon", F32, float(cfg["rms_norm_eps"])),
+           (p + "expert_weights_norm", BOOL, True), (p + "expert_weights_scale", F32, 1.0),
+           (p + "attention.sliding_window_pattern", ARR,
+            (BOOL, [t == "sliding_attention" for t in cfg["layer_types"]])),
+           (p + "attention.rope_pattern", ARR, (BOOL, [i not in cfg["no_rope_layer_indices"] for i in range(L)])),
+           ("tokenizer.ggml.model", STR, "gpt2"),
+           ("tokenizer.ggml.tokens", ARR, (STR, [f"<0x{b:02X}>" for b in range(V)])),
+           ("tokenizer.ggml.token_type", ARR, (5, [1] * V)),
+           ("tokenizer.ggml.merges", ARR, (STR, [])),
+           ("tokenizer.ggml.bos_token_id", U32, cfg["bos_token_id"]),
+           ("tokenizer.ggml.eos_token_id", U32, cfg["eos_token_id"][0])]
+    tensors = []
 
     def put(name, t, quant=False):
-        a = t.float().numpy().astype(np.float32)
-        if quant and qt != gguf.GGMLQuantizationType.F32:
-            g.add_tensor(name, gguf.quants.quantize(a, qt), raw_dtype=qt)
+        a = t.float().contiguous().numpy().astype(np.float32)
+        dims = list(reversed(a.shape))
+        if quant and expert_type == "Q8_0":
+            tensors.append((name, 8, dims, _q8_0(a)))
         else:
-            g.add_tensor(name, a)
+            tensors.append((name, 0, dims, a.tobytes()))
 
     put("token_embd.weight", w["model.embed_tokens.weight"])
     put("output.weight", w["lm_head.weight"])
@@ -252,10 +301,7 @@ def write_gguf(path, cfg, w, expert_type="Q8_0"):
         for proj, gg in (("gate_proj", "ffn_gate_exps"), ("up_proj", "ffn_up_exps"), ("down_proj", "ffn_down_exps")):
             stack = torch.stack([w[f"model.layers.{i}.mlp.experts.{e}.{proj}.weight"] for e in range(E)])
             put(f"blk.{i}.{gg}.weight", stack, quant=True)
-    g.write_header_to_file()
-    g.write_kv_data_to_file()
-    g.write_tensors_to_file()
-    g.close()
+    Path(path).write_bytes(_gguf_bytes(kv, tensors))
 
 
 def main():
@@ -269,7 +315,8 @@ def main():
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--window", type=int, default=5)
     ap.add_argument("--gguf", default=None, help="also write the model as a flint GGUF here")
-    ap.add_argument("--gguf-experts", default="Q8_0", help="the routed experts' GGUF type (F32, Q8_0, ...)")
+    ap.add_argument("--gguf-experts", default="Q8_0", choices=("F32", "Q8_0"),
+                    help="the routed experts' GGUF type")
     ap.add_argument("--min-gap", type=float, default=0.1,
                     help="draw seeds from --seed on until every greedy step's first logit beats the "
                          "second by this much: the container's int8 experts move the logits by a few "
