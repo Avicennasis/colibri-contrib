@@ -70,6 +70,7 @@ typedef struct {
     int dn_where, host_zero;
     CcBuf *x, *nrm, *tmp, *q, *k, *v, *ctx, *qkvz, *ab, *cv, *dny, *h2, *lg, *gs, *us, *hs, *ds, *sgd, *fin;
     CcBuf *h2d, *lgd, *kvd, *outd, *xd, *lfd, *routed, *cs;
+    CcBuf *csd;   /* cs on the device: every RoPE of a step reads it there, not over the bus */
     float *host_routed;
     /* the routed experts in the frame (q36cc_dm_*): the tier's residents on this device by
      * address ([L][E] entries, the host's copy of who is in it, the layers with some expert
@@ -349,7 +350,8 @@ static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
              cc_reserve(&ch->h2d, r * D * F, CC_DOWN) && cc_reserve(&ch->lgd, r * E * F, CC_DOWN) &&
              cc_reserve(&ch->kvd, (size_t)(ch->n_attn ? ch->n_attn : 1) * 2 * r * kvo * F, CC_DOWN) &&
              cc_reserve(&ch->outd, (size_t)c->vocab * F, CC_DOWN) && cc_reserve(&ch->routed, r * D * F, CC_UP) &&
-             cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP);
+             cc_reserve(&ch->cs, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_UP) &&
+             cc_reserve(&ch->csd, r * (c->rotary_dim > 0 ? c->rotary_dim : 2) * F, CC_DEV);
     return ok;
 }
 /* the KV mirrors at the host's capacity (a cache that grew is mirrored again) */
@@ -484,10 +486,10 @@ static int q36cc_attention(Q36CChain *ch, Model *m, Layer *l, int i, int n, int 
              cc_matmul(ch->t_v[i], ch->nrm, 0, ch->v, 0, n);
     if (ok && l->qn) { CcNorm p = {n * H, hd, H, 0, qo, qdim, 0, qo, qdim, (int)ch->o_qn[i], 0, CC_NORM_ADD1, c->eps, 1.f};
                        ok = cc_norm(ch->q, ch->prm, ch->q, &p); }
-    if (ok && half) { CcRope p = {n * H, H, 0, qo, qdim, half, 0, 2 * half}; ok = cc_rope(ch->q, ch->cs, &p); }
+    if (ok && half) { CcRope p = {n * H, H, 0, qo, qdim, half, 0, 2 * half}; ok = cc_rope(ch->q, ch->csd, &p); }
     if (ok && l->kn) { CcNorm p = {n * KV, kvd, KV, 0, kvo, kvd, 0, kvo, kvd, (int)ch->o_kn[i], 0, CC_NORM_ADD1, c->eps, 1.f};
                        ok = cc_norm(ch->k, ch->prm, ch->k, &p); }
-    if (ok && half) { CcRope p = {n * KV, KV, 0, kvo, kvd, half, 0, 2 * half}; ok = cc_rope(ch->k, ch->cs, &p); }
+    if (ok && half) { CcRope p = {n * KV, KV, 0, kvo, kvd, half, 0, 2 * half}; ok = cc_rope(ch->k, ch->csd, &p); }
     if (!ok) return 0;
     /* the new rows into the device cache, and to the host's */
     size_t ko = (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
@@ -880,6 +882,9 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         if (dm) memset(ch->dm_ran, 0, (size_t)L);
         if (!q36cc_frame_begin(ch) || !cc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
             !q36cc_push_state(ch, m, pb)) goto lost;
+        /* the angles to the device once a step: a RoPE that read them where the host wrote them
+         * paid the bus on every element, 11-16 us a call (Flint: 70 calls a token) */
+        if (half && !cc_copy(ch->csd, 0, ch->cs, 0, (size_t)n * 2 * half)) goto lost;
         if (dm && q36cc_dm_tab(ch, 0, n, &(int){0}) == ch->dm_tabb && !q36cc_stage_from(ch, m, 0)) goto lost;   /* the first staged layer's copy */
         int ok = 1, pending = 0, pend_i = -1;   /* pend_i: the hybrid layer the host serves after recording the next */
         unsigned pend_v = 0;
