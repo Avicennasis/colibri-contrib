@@ -765,7 +765,7 @@ def _q36_chain_layout(info, env, vulkan):
         types = ["full_attention" if i % interval == interval - 1 else "linear_attention" for i in range(L)]
     if L < 1 or len(types) < L:
         return None
-    attn = [t == "full_attention" for t in types[:L]]
+    attn = [t in ("full_attention", "sliding_attention") for t in types[:L]]   # Flint's windowed layers attend too
     rot = int(meta.get("rotary_dim") or 0)
     if rot <= 0:
         factor = float(meta.get("partial_rotary_factor") or c.get("partial_rotary_factor") or 0)
@@ -780,6 +780,9 @@ def _q36_chain_layout(info, env, vulkan):
         if layer is not None and layer < L and part in ("self_attn.q_norm", "self_attn.k_norm"):
             norms[layer] += hd
             continue
+        if layer is not None and layer < L and name.endswith(".self_attn.softmax_offset") and isinstance(shape, list) and shape:
+            norms[layer] += int(shape[0])                              # Flint: a sink per head, with the norms
+            continue
         if not isinstance(shape, list) or len(shape) != 2:
             continue
         if name == "lm_head.weight" or (layer is not None and layer < L and (part in _Q36_CHAIN_TAGS or part in (
@@ -789,7 +792,7 @@ def _q36_chain_layout(info, env, vulkan):
     def rows(part, default=0):
         return rows_of[part][0] if part in rows_of else default
     E = rows("mlp.gate")
-    SI = rows("mlp.shared_expert.gate_proj") or rows("mlp.gate_proj")
+    SI = max(rows("mlp.shared_expert.gate_proj"), rows("mlp.gate_proj"))   # Flint's dense layers: a wider MLP
     vh = rows("linear_attn.in_proj_b")
     conv, vd = rows("linear_attn.in_proj_qkv"), rows("linear_attn.in_proj_z")
     qo, kvo = rows("self_attn.q_proj"), rows("self_attn.k_proj")
