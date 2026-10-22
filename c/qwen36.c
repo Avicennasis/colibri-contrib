@@ -5104,9 +5104,13 @@ static void moe_ex(Model *m, Layer *l, int layer, float *x, int S, float *out,
      * neither the CUDA tier nor the expert_ffn kernel is consulted.
      * Routing, shared expert, and the combine stay on the CPU below. */
     /* GGUF: the experts as the file stores them, ggml blocks no tier reads (moe_gq_run) */
-    int use_gq = g_gguf && !vkt_ready() && !(qt_ready() && qt_experts_on());   /* the device tiers take a GGUF's experts */
+    /* Muse Spark's prompt rows go to the CPU's batched path (each expert read once for every row
+     * routed to it): the CUDA chain's frame does not run its experts, and the tier's host step
+     * takes a token at a time */
+    const int qt_rows = qt_ready() && qt_experts_on() && !(c->muse && S >= 16);
+    int use_gq = g_gguf && !vkt_ready() && !qt_rows;   /* the device tiers take a GGUF's experts */
     int use_qq = !use_gq && qq_active();
-    int use_qt = !use_gq && !use_qq && qt_ready() && qt_experts_on();   /* a trunk-only tier leaves the experts to the paths below */
+    int use_qt = !use_gq && !use_qq && qt_rows;   /* a trunk-only tier leaves the experts to the paths below */
     /* the Vulkan tier takes the routed experts of every format it was given
      * (moe_vk_run): the routing is collected first, as for the shared kernel */
     int use_vk = !use_gq && !use_qq && !use_qt && vkt_ready();
