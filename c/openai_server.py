@@ -1065,6 +1065,8 @@ def _parse_arch_tool_calls(reply, tools, tool_reply, track_spans):
         return parse_k3_tool_calls(reply, tools) + (None, None)  # pre-#1147 engines
     if chat_flavor() in ("qwen36", "qwen38", "qwen3_coder"):
         return parse_qwen_tool_calls(reply, tools) + (None, None)
+    if chat_flavor() == "muse":
+        return parse_muse_tool_calls(reply, tools) + (None, None)
     if ARCH == "mimo":
         return _parse_mimo_tool_calls(reply, tools, track_spans)
     return _parse_tool_calls(reply, tools, track_spans)
@@ -1080,6 +1082,8 @@ def _tool_stream_markers():
         return (v41_dsml.TOOL_CALLS_PREFIX, v41_dsml.TOOL_CALL_PREFIX)
     if ARCH == "kimi":
         return (K3_TOOLS_OPEN,)
+    if chat_flavor() == "muse":
+        return (MUSE_ATEM_OPEN,)
     return (BOX_START,)
 
 
@@ -1131,6 +1135,9 @@ def detect_chat_flavor(family_id, model_dir):
         # Flint: GLM's tool-call form, role tokens without separators, no thinking switch
         if "macro flint_text" in text:
             return "flint"
+        # Muse Spark: messages to recipients, calls as <atem:function_calls>
+        if "render_valid_recipients" in text:
+            return "muse"
     return None
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
@@ -2160,6 +2167,415 @@ def render_chat_flint(messages, tools=None, tool_choice=None, add_generation_pro
     if add_generation_prompt:
         parts.append("<|assistant|>")
     return "".join(parts)
+
+
+# ---- Muse Spark (meta-models/Muse-Spark-Open) ---------------------------------------------
+# Every turn is a message <|start|>ROLE<|message|>BODY<|eot|> (or <|eom|> when the same role
+# goes on); the assistant addresses each message to a recipient: "self" for its reasoning,
+# "commentary" for updates between tool calls, "user" for the answer, a function's name for
+# a call written as an <atem:function_calls> block. The prompt ends on <|start|>assistant and
+# the model writes the rest of the header itself (" to=self<|message|>..."). MuseChannels turns
+# that stream into the form the gateway's later stages read: the reasoning between <think>
+# and </think>, the commentary and the answer as text, a call's block as it is, and <|eot|>
+# (a stop sequence) where the turn ends.
+
+MUSE_EFFORT = {"low": 8, "medium": 32, "high": 256, "xhigh": 512}
+MUSE_CUTOFF = "2026-01-04"
+MUSE_ATEM_OPEN, MUSE_ATEM_CLOSE = "<atem:function_calls>", "</atem:function_calls>"
+MUSE_STOP_SEQUENCES = ("<|eot|>", "<|end_of_text|>")
+
+
+def _muse_esc(value):
+    """The template's esc: no special token and no bare media placeholder out of caller text."""
+    if isinstance(value, bool):
+        value = "True" if value else "False"
+    return (str(value).replace("<|", "< |").replace("<image>", "< image>")
+            .replace("<video>", "< video>").replace("<audio>", "< audio>"))
+
+
+def _muse_esc_header(value):
+    return _muse_esc(value).replace("\r", " ").replace("\n", " ")
+
+
+def _muse_esc_attr(value):
+    return (_muse_esc_header(value).replace("&", "&amp;").replace('"', "&quot;")
+            .replace("'", "&#39;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _muse_json(value):
+    """The template's tojson, as transformers defines it: json.dumps with its default separators."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _muse_content(content, where):
+    """render_content: a string, or the text parts of a list, each escaped (the engine takes no
+    image, video or audio for this model)."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return _muse_esc(content)
+    if not isinstance(content, list):
+        raise APIError(400, "Message content must be a string or an array of text parts.", where)
+    out = []
+    for index, part in enumerate(content):
+        if not isinstance(part, dict) or part.get("type") not in ("text", "input_text", "output_text"):
+            raise APIError(400, "Colibri currently supports text message content only.",
+                           f"{where}.{index}", "unsupported_content_type")
+        if not isinstance(part.get("text"), str):
+            raise APIError(400, "Text content parts require a string `text` field.", f"{where}.{index}.text")
+        out.append(_muse_esc(part["text"]))
+    return "".join(out)
+
+
+def _muse_fn_line(fn, where):
+    name = fn.get("name")
+    if not isinstance(name, str) or not name:
+        raise APIError(400, "Each tool needs a `function.name`.", where)
+    desc = fn.get("description") or ""
+    params = fn.get("parameters") or {}
+    if fn.get("defer_loading"):
+        desc = desc + " [deferred: use tool_search to load full schema]"
+        return ('\n{"name": ' + _muse_esc(_muse_json(name)) + ', "description": ' +
+                _muse_esc(_muse_json(desc)) + ', "defer_loading": true}')
+    if isinstance(params, dict) and not params:
+        text = '{"type": "object", "properties": {}, "additionalProperties": false}'
+    elif isinstance(params, dict) and "additionalProperties" not in params:
+        text = _muse_json(params)[:-1] + ', "additionalProperties": false}'
+    else:
+        text = _muse_json(params)
+    return ('\n{"name": ' + _muse_esc(_muse_json(name)) + ', "description": ' +
+            _muse_esc(_muse_json(desc)) + ', "parameters": ' + _muse_esc(text) + '}')
+
+
+def _muse_tool_defs(tools):
+    meta, fns = "", ""
+    for position, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise APIError(400, "Each tool must be an object.", f"tools.{position}")
+        if tool.get("type") == "namespace":
+            raise APIError(400, "Namespace tools are not supported with this model; send functions.",
+                           f"tools.{position}", "unsupported_parameter")
+        fn = tool.get("function", tool)
+        if not isinstance(fn, dict):
+            raise APIError(400, "Each tool needs a `function` object.", f"tools.{position}")
+        if not meta:
+            meta = '\n{"name": "", "description": ""}'
+        fns += _muse_fn_line(fn, f"tools.{position}.function")
+    return ("In this environment you have access to a set of tools you can use to answer the user's question.\n\n"
+            'You can invoke a function by writing a "<atem:function_calls>" block like the following as part of your reply to the user:\n'
+            '<atem:function_calls>\n<atem:invoke name="$FUNCTION_NAME">\n<atem:parameter name="$PARAMETER_NAME">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\n'
+            "String and scalar parameters should be specified as is, while lists and objects should use JSON format. "
+            "Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\n"
+            "Here are the functions available in JSONSchema format:\n"
+            "// Tool metadata" + meta + "\n// Function schemas" + fns + "\n\n"
+            "Here are examples of how to call functions in the tool set. To make parallel tool calls, emit each call as its "
+            "own message (one tool call per message) in consecutive messages, as shown below:\n"
+            "(If the tool namespace is not specified, invoke the function directly as `example_function_name_1` rather than "
+            "`example_tool_name_1.example_function_name_1`)\n\n"
+            "to=example_tool_name_1.example_function_name_1\n\n"
+            '<atem:function_calls>\n<atem:invoke name="example_tool_name_1.example_function_name_1">\n'
+            '<atem:parameter name="example_parameter_1">value_1</atem:parameter>\n'
+            "</atem:invoke>\n</atem:function_calls>\n\n"
+            "to=example_tool_name_2.example_function_name_2\n\n"
+            '<atem:function_calls>\n<atem:invoke name="example_tool_name_2.example_function_name_2">\n'
+            '<atem:parameter name="example_parameter_2">This is the value for the second parameter\nthat can span\n"multiple" lines\n</atem:parameter>\n'
+            '<atem:parameter name="example_parameter_3">value_3</atem:parameter>\n'
+            "</atem:invoke>\n</atem:function_calls>").strip()
+
+
+def _muse_recipients(tools):
+    recipients = ['"self"', '"commentary"']
+    text = ('Use the appropriate recipient for each message:\n\n'
+            '- "self": private reasoning and tool planning.\n'
+            '- "commentary": user-visible intermediate updates while the assistant will continue working, '
+            'including messages sent to the user before or between tool calls.\n')
+    if tools:
+        first = next((t.get("function", t).get("name") for t in tools
+                      if isinstance(t, dict) and t.get("type") != "namespace"), None)
+        if first is not None:
+            recipients.append('"[func_name] (e.g., ' + _muse_esc_header(first) + ')"')
+        text += '- "tool" or "[tool name]": the name of the tool to call.\n'
+    recipients.append('"user"')
+    text += ('- "user": messages that end the assistant turn, such as a completed response or clarification '
+             "question that waits for the user's reply; do not use for pre-tool updates or partial responses.\n")
+    return (text + "\n# Valid recipients: " + ", ".join(recipients) + ".").strip()
+
+
+def _muse_args(call, where):
+    fn = call.get("function", call) if isinstance(call, dict) else None
+    if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+        raise APIError(400, "Each tool call needs a `function.name`.", where)
+    args = fn.get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except ValueError:
+            raise APIError(400, "`function.arguments` must be a JSON object.", f"{where}.function.arguments")
+    if not isinstance(args, dict):
+        raise APIError(400, "`function.arguments` must be a JSON object.", f"{where}.function.arguments")
+    return fn["name"], args
+
+
+def _muse_atem(name, args):
+    out = ['<atem:function_calls>\n<atem:invoke name="' + _muse_esc_attr(name) + '">\n']
+    for key, value in args.items():
+        out.append('<atem:parameter name="' + _muse_esc_attr(key) + '">')
+        if isinstance(value, bool):
+            out.append("true" if value else "false")
+        elif value is None:
+            out.append("null")
+        elif isinstance(value, (dict, list, tuple)):
+            out.append(_muse_esc(_muse_json(value)))
+        else:
+            out.append(_muse_esc(value))
+        out.append("</atem:parameter>\n")
+    out.append("</atem:invoke>\n</atem:function_calls>")
+    return "".join(out)
+
+
+def render_chat_muse(messages, enable_thinking=True, reasoning_effort=None, tools=None, tool_choice=None,
+                     add_generation_prompt=True, current_date=None):
+    """Muse Spark's chat_template.jinja (the GGUF's tokenizer.chat_template), byte for byte for
+    text and function tools: the system message the template builds (identity, knowledge cutoff,
+    today's date, the caller's instructions, the tools, the reasoning strength, the recipients),
+    then every turn as a message, the assistant's reasoning to "self", its calls one message
+    each. reasoning_effort low / medium / high / xhigh (the template's default) sets the
+    reasoning strength; the template has no switch to turn reasoning off, so thinking off is
+    the lowest strength. current_date: the date the template's strftime_now gives (today)."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tool_choice == "none":
+        tools = None
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
+    effort = reasoning_effort or "xhigh"
+    if effort in ("minimal", "none") or not enable_thinking:
+        effort = "low"
+    if effort not in MUSE_EFFORT:
+        raise APIError(400, "Muse Spark's reasoning_effort is low, medium, high or xhigh.", "reasoning_effort")
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        if message.get("role") not in ("system", "developer", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {message.get('role')!r}.", f"messages.{index}.role")
+    rest, instructions, first = messages, None, 0
+    if messages[0]["role"] in ("system", "developer"):
+        instructions = (_muse_content(messages[0].get("content"), "messages.0.content")
+                        .replace("Reasoning effort", "Reasoning strength").replace("Reasoning Effort", "Reasoning Strength")
+                        .replace("reasoning effort", "reasoning strength").replace("REASONING EFFORT", "REASONING STRENGTH"))
+        rest, first = messages[1:], 1
+    if current_date is None:
+        current_date = time.strftime("%Y-%m-%d")
+    parts = ["You are a helpful AI assistant.", f"Knowledge cutoff: {MUSE_CUTOFF}."]
+    if current_date:
+        parts.append(f"Current date: {current_date}.")
+    if instructions:
+        parts.append(instructions)
+    if tools:
+        parts.append(_muse_tool_defs(tools))
+    if "reasoning strength:" not in (instructions or "").lower():
+        parts.append(f"Reasoning strength: {MUSE_EFFORT[effort]}.")
+    parts.append(_muse_recipients(tools))
+    out = ["<|begin_of_text|>", "<|start|>system<|message|>" + "\n\n".join(parts) + "<|eot|>"]
+    for offset, message in enumerate(rest):
+        index, role = first + offset, message["role"]
+        last = offset == len(rest) - 1
+        end_token = "<|eom|>" if not last and rest[offset + 1]["role"] == role else "<|eot|>"
+        where = f"messages.{index}.content"
+        if role in ("system", "developer"):
+            out.append(f"<|start|>{role}<|message|>" + _muse_content(message.get("content"), where) + "<|eot|>")
+        elif role == "user":
+            stamp = ""
+            if message.get("render_timestamp") and isinstance(message.get("timestamp"), str):
+                stamp = "[" + _muse_esc_header(message["timestamp"]) + "] "
+            out.append("<|start|>user<|message|>" + stamp + _muse_content(message.get("content"), where) + "<|eot|>")
+        elif role == "tool":
+            name = message.get("name")
+            if not name:
+                call_id = message.get("tool_call_id")
+                name = call_id or ""
+                for other in messages:
+                    for call in (other.get("tool_calls") or []) if isinstance(other, dict) else []:
+                        if call_id is not None and isinstance(call, dict) and call.get("id") == call_id:
+                            name = (call.get("function") or {}).get("name", name)
+            if not name:
+                raise APIError(400, "A tool message needs a `name` or a `tool_call_id` that names a call.",
+                               f"messages.{index}")
+            out.append("<|start|>tool " + _muse_esc_header(name) + '<|message|><tool_output name="' +
+                       _muse_esc_attr(name) + '">\n' + _muse_content(message.get("content"), where) +
+                       "\n</tool_output><|eot|>")
+        else:
+            reasoning = message.get("reasoning_content") or message.get("reasoning")
+            if reasoning:
+                out.append("<|start|>assistant to=self<|message|>" + _muse_esc(reasoning) + "<|eom|>")
+            body = _muse_content(message.get("content"), where)
+            calls = message.get("tool_calls")
+            if calls is not None and not isinstance(calls, list):
+                raise APIError(400, "`tool_calls` must be an array.", f"messages.{index}.tool_calls")
+            if calls:
+                if body:
+                    out.append("<|start|>assistant to=commentary<|message|>" + body + "<|eom|>")
+                for position, call in enumerate(calls):
+                    name, args = _muse_args(call, f"messages.{index}.tool_calls.{position}")
+                    out.append("<|start|>assistant to=" + _muse_esc_header(name) + "<|message|>" +
+                               _muse_atem(name, args) + (end_token if position == len(calls) - 1 else "<|eom|>"))
+            elif body or not reasoning:
+                recipient = message.get("recipient") or "user"
+                if recipient == "user":
+                    end_turn = True
+                elif recipient in ("self", "commentary"):
+                    end_turn = False
+                else:
+                    end_turn = bool(message.get("end_turn")) if message.get("end_turn") is not None else False
+                out.append("<|start|>assistant to=" + _muse_esc_header(recipient) + "<|message|>" + body +
+                           ("<|eot|>" if end_turn else "<|eom|>"))
+    if add_generation_prompt:
+        out.append("<|start|>assistant")
+    return "".join(out)
+
+
+class MuseChannels:
+    """Muse Spark's messages, streamed, as the gateway's later stages read a reply: a message to
+    "self" between <think> and </think>, any other message's body as it is (an answer,
+    commentary, a call's <atem:function_calls> block), two visible messages a blank line apart,
+    and <|eot|> passed on where the turn ends (MUSE_STOP_SEQUENCES stop there). A header the
+    model writes is " to=RECIPIENT<|message|>" after the prompt's <|start|>assistant, and
+    "<|start|>assistant to=RECIPIENT<|message|>" for every message after the first."""
+    START, MESSAGE, EOM, EOT, END = "<|start|>", "<|message|>", "<|eom|>", "<|eot|>", "<|end_of_text|>"
+
+    def __init__(self, sink):
+        self.sink = sink
+        self.buf = ""
+        self.state = "header"       # header: up to <|message|>; body: up to <|eom|> / <|eot|>
+        self.recipient = None
+        self.visible = False        # a visible message was emitted already
+        self.pending_gap = False    # the next visible text starts a new message
+        self.done = False
+
+    def _hold(self, markers):
+        for size in range(min(len(self.buf), max(map(len, markers)) - 1), 0, -1):
+            if any(m.startswith(self.buf[-size:]) for m in markers):
+                return size
+        return 0
+
+    def feed(self, chunk):
+        if self.done:
+            return
+        self.buf += chunk
+        while self.buf and not self.done:
+            if self.state == "header":
+                end = self.buf.find(self.MESSAGE)
+                stop = min((p for p in (self.buf.find(self.EOT), self.buf.find(self.END)) if p >= 0), default=-1)
+                if stop >= 0 and (end < 0 or stop < end):
+                    self.sink(self.EOT)
+                    self.done = True
+                    return
+                if end < 0:
+                    return
+                header = self.buf[:end].replace(self.START, "").strip()
+                self.buf = self.buf[end + len(self.MESSAGE):]
+                self.recipient = header.split("to=", 1)[1].strip() if "to=" in header else "user"
+                self.state = "body"
+                if self.recipient == "self":
+                    self.sink(THINK_OPEN)
+                elif self.visible:
+                    self.pending_gap = True
+                continue
+            hits = [(p, m) for m in (self.EOM, self.EOT, self.END, self.START) if (p := self.buf.find(m)) >= 0]
+            if not hits:
+                hold = self._hold((self.EOM, self.EOT, self.END, self.START))
+                self._body(self.buf[:len(self.buf) - hold])
+                self.buf = self.buf[len(self.buf) - hold:]
+                return
+            pos, marker = min(hits)
+            self._body(self.buf[:pos])
+            self.buf = self.buf[pos + (len(marker) if marker != self.START else 0):]
+            if self.recipient == "self":
+                self.sink(THINK_CLOSE)
+            self.state = "header"
+            if marker in (self.EOT, self.END):
+                self.sink(self.EOT)
+                self.done = True
+
+    def _body(self, text):
+        if not text:
+            return
+        if self.recipient != "self":
+            if self.pending_gap:
+                self.sink("\n\n")
+                self.pending_gap = False
+            self.visible = True
+        self.sink(text)
+
+    def finish(self):
+        if self.done:
+            return
+        if self.state == "body":
+            self._body(self.buf)
+            if self.recipient == "self":
+                self.sink(THINK_CLOSE)
+        self.buf = ""
+        self.done = True
+
+
+def chat_channels(sink):
+    """The first stage of a chat reply: Muse Spark's channels (MuseChannels), else none."""
+    return MuseChannels(sink) if chat_flavor() == "muse" else None
+
+
+_MUSE_INVOKE = re.compile(r'<atem:invoke name="([^"]*)">(.*?)</atem:invoke>', re.S)
+_MUSE_PARAM = re.compile(r'<atem:parameter name="([^"]*)">(.*?)</atem:parameter>', re.S)
+
+
+def _muse_unattr(text):
+    return (text.replace("&lt;", "<").replace("&gt;", ">").replace("&#39;", "'")
+            .replace("&quot;", '"').replace("&amp;", "&"))
+
+
+def _muse_value(raw, schema):
+    """A parameter's text as its schema types it: strings as written, JSON for the rest."""
+    kind = schema.get("type") if isinstance(schema, dict) else None
+    if kind == "string" or (isinstance(kind, list) and "string" in kind and len(kind) == 1):
+        return raw
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+def parse_muse_tool_calls(reply, tools):
+    """Muse Spark's calls: each <atem:function_calls> block's invokes, the parameters typed by the
+    tool's schema. Returns (content, tool_calls); the content is the text outside the blocks,
+    an unfinished block cut off."""
+    schemas = {}
+    for tool in tools or []:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+            schemas[fn["name"]] = ((fn.get("parameters") or {}).get("properties") or {})
+    calls, content, rest = [], [], reply
+    while True:
+        start = rest.find(MUSE_ATEM_OPEN)
+        if start < 0:
+            content.append(rest)
+            break
+        content.append(rest[:start])
+        end = rest.find(MUSE_ATEM_CLOSE, start)
+        if end < 0:
+            break                                   # unfinished: dropped from the content
+        block = rest[start:end]
+        for name, body in _MUSE_INVOKE.findall(block):
+            name = _muse_unattr(name)
+            props = schemas.get(name, {})
+            args = {}
+            for key, raw in _MUSE_PARAM.findall(body):
+                key = _muse_unattr(key)
+                args[key] = _muse_value(raw, props.get(key))
+            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+        rest = rest[end + len(MUSE_ATEM_CLOSE):]
+    text = re.sub(re.escape(THINK_OPEN) + ".*?(?:" + re.escape(THINK_CLOSE) + "|$)", "", "".join(content), flags=re.S)
+    text = text.replace(THINK_CLOSE, "").replace("<|eot|>", "")
+    return text.strip(), calls
 
 
 def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generation_prompt=True):
@@ -3737,6 +4153,9 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
         return render_chat_qwen3_coder(messages, tools, tool_choice, add_generation_prompt)
     if chat_flavor() == "flint":
         return render_chat_flint(messages, tools, tool_choice, add_generation_prompt)
+    if chat_flavor() == "muse":
+        return render_chat_muse(messages, enable_thinking, reasoning_effort, tools, tool_choice,
+                                add_generation_prompt)
     if ARCH == "qwen36":
         return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
                                 tool_choice, add_generation_prompt, preserve_thinking)
@@ -3796,7 +4215,7 @@ def starts_in_reasoning(enable_thinking, add_generation_prompt=True):
     zero di risposta, col prompt corretto sul filo. Vale anche per glm53: la
     regola di famiglia sopra dice dove comincia un turno NUOVO, e il turno
     proseguito non ne apre nessuno."""
-    if chat_flavor() == "flint":   # no switch: a turn starts as text, and <think> opens reasoning
+    if chat_flavor() in ("flint", "muse"):   # a turn starts as text, and <think> opens reasoning
         return False
     return (enable_thinking or ARCH == "glm53") and add_generation_prompt
 
@@ -3823,7 +4242,7 @@ class ThinkingStreamSplit:
         self.thinking = initial_thinking
         # Flint writes <think> itself when it decides to reason: the opening marker switches
         # to reasoning there (every other family's prompt opened or closed the block already)
-        self.opens = chat_flavor() == "flint"
+        self.opens = chat_flavor() in ("flint", "muse")   # Muse Spark's through MuseChannels
         self.buf = ""
         self.track_spans = track_spans
         self.thinking_spans = []
@@ -4378,6 +4797,9 @@ def stop_policy(body, chat):
         # occasional leading GLM marker patiently; client-provided stops remain
         # strict unless the extension is explicitly requested.
         return DEFAULT_CHAT_STOP_SEQUENCES, True
+    if chat and chat_flavor() == "muse" and not sequences:
+        # the end of the turn, which MuseChannels passes on as <|eot|>
+        return MUSE_STOP_SEQUENCES, ignore_leading
     if chat and ARCH == "qwen36" and not sequences:
         # KAT normally ends with the special im_end token, which the native
         # engine handles by token id. Quantized checkpoints can instead spell
@@ -8070,14 +8492,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 def generation_stopped():
                     return stop_filter.stopped() or sideband.stopped()
 
+                channels = chat_channels(stop_filter.feed) if chat else None   # Muse Spark's messages first
                 stats = self.server.generate(
-                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    prompt, maximum, temperature, top_p, (channels.feed if channels else stop_filter.feed), cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     **({"audio": audio} if audio else {}),
                     **({"image": image} if image is not None else {}),
                     **({"on_echo": prompt_echoes.append} if engine_k and echo else {}),
                     **_engine_extension_args(engine_k))
+                if channels:
+                    channels.finish()
                 stop_filter.finish()
                 sideband.finish()
                 text = "".join(output)
@@ -8314,13 +8739,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 def generation_stopped():
                     return stop_filter.stopped() or sideband.stopped()
 
+                channels = chat_channels(stop_filter.feed) if chat else None   # Muse Spark's messages first
                 stats = self.server.generate(
-                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    prompt, maximum, temperature, top_p, (channels.feed if channels else stop_filter.feed), cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     on_accept=start_stream, **({"audio": audio} if audio else {}),
                     **({"image": image} if image is not None else {}),
                     **_engine_extension_args(engine_k))
+                if channels:
+                    channels.finish()
                 stop_filter.finish()
                 sideband.finish()
                 if think:
@@ -8353,12 +8781,15 @@ class APIHandler(BaseHTTPRequestHandler):
                         sys.stderr.write(chunk); sys.stderr.flush()
                     (content_split.feed if content_split else emit)(chunk)
                 stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
+                channels = chat_channels(stop_filter.feed) if chat else None   # Muse Spark's messages first
                 stats = self.server.generate(
-                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    prompt, maximum, temperature, top_p, (channels.feed if channels else stop_filter.feed), cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
                     on_accept=start_stream, **({"audio": audio} if audio else {}),
                     **({"image": image} if image is not None else {}),
                     **_engine_extension_args(engine_k))
+                if channels:
+                    channels.finish()
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
@@ -8424,7 +8855,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if reasoning_effort is None and "enable_thinking" not in body:
             # Qwen3.8's official template defaults to enabled xhigh thinking;
             # preserve the older opt-in default for the other families.
-            if chat_flavor() == "qwen38":
+            if chat_flavor() in ("qwen38", "muse"):   # Muse Spark's template: xhigh unless told
                 reasoning_effort = "xhigh"
             elif ARCH == "mimo" or os.environ.get("COLI_THINK", "0") == "1":
                 # MiMo-V2.6's template thinks unless told not to (enable_thinking false)
@@ -8622,8 +9053,12 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
                 _wait, slot = admission
+                channels = chat_channels(output.append)
                 self.server.generate(prompt, budget, 0.3, 0.9,
-                                     output.append, slot, self.client_disconnected)
+                                     channels.feed if channels else output.append, slot,
+                                     self.client_disconnected)
+                if channels:
+                    channels.finish()
         except APIError as error:
             if error.code == "context_length_exceeded":
                 return None
@@ -8798,11 +9233,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 def generation_stopped():
                     return stop_filter.stopped() or sideband.stopped()
 
+                channels = chat_channels(stop_filter.feed)   # Muse Spark's messages first
                 stats = self.server.generate(
-                    prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                    prompt, maximum, temperature, top_p, (channels.feed if channels else stop_filter.feed), cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
                     **({"image": image} if image is not None else {}))
+                if channels:
+                    channels.finish()
                 stop_filter.finish()
                 sideband.finish()
                 content, stop_reason = blocks_and_stop("".join(output), stats,
@@ -8951,11 +9389,14 @@ class APIHandler(BaseHTTPRequestHandler):
             def generation_stopped():
                 return stop_filter.stopped() or sideband.stopped()
 
+            channels = chat_channels(stop_filter.feed)   # Muse Spark's messages first
             stats = self.server.generate(
-                prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
+                prompt, maximum, temperature, top_p, (channels.feed if channels else stop_filter.feed), cache_slot,
                 lambda: not connected[0], grammar=grammar, stopped=generation_stopped,
                 **({"on_tool": sideband.feed} if sideband.enabled else {}),
                 **({"image": image} if image is not None else {}))
+            if channels:
+                channels.finish()
             stop_filter.finish()
             sideband.finish()
             if split:

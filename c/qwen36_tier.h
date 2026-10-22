@@ -84,6 +84,9 @@ void qt_trunk_withdraw(const char *why);
 /* The experts back to the CPU as well (the same probe; #2211), when the allowance is
  * automatic (CUDA_EXPERT_GB unset or auto). Before the warm start: nothing resident yet. */
 void qt_experts_withdraw(const char *why);
+/* Bytes the engine will put on the device after the tier sizes itself (the CUDA chain's own
+ * router, b|a and gate rows), kept out of the automatic allowance. Call before qt_init. */
+void qt_reserve(size_t bytes);
 
 /* DeltaNet input projections, qkv ++ z fused into one resident tensor per
  * layer: one GEMV instead of two, and the engine's qkv/z buffers are laid out
@@ -181,6 +184,9 @@ uint32_t qt_issue(int layer, const int *eids, int K, const float *x);
  * Returns 0 on collection failure, leaving out unchanged. The caller must
  * stop inference: experts selected by qt_issue were not computed on CPU. */
 int qt_take(uint32_t mask, const float *val, int K, float *out);
+/* qt_take with Muse Spark's norm on every expert's row first: out += w * row*s / rms(row*s),
+ * eps inside the root (the CPU path's products, in its order) */
+int qt_take_scaled(uint32_t mask, const float *val, int K, float *out, const float *s, float eps);
 
 /* Warmstart: plan the full fill set (heat order, budget reserved), then any
  * number of loader threads may call qt_note_planned per planned expert. */
@@ -272,6 +278,7 @@ static inline void qt_trunk_offer(const char*a,int b,size_t c){(void)a;(void)b;(
 static inline int  qt_place_is_auto(void){return 0;}
 static inline void qt_trunk_withdraw(const char*a){(void)a;}
 static inline void qt_experts_withdraw(const char*a){(void)a;}
+static inline void qt_reserve(size_t b){(void)b;}
 static inline int  qt_dnproj_init(int a,const int8_t*b,const float*c,int d,int e,int f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return 0;}
 static inline int  qt_dnproj_matmul(int a,float*b,const float*c,int d,int e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 static inline int  qt_dnproj_ready(int a){(void)a;return 0;}
@@ -318,6 +325,7 @@ static inline void qt_shutdown(void){}
 static inline void qt_note(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}
 static inline uint32_t qt_issue(int a,const int*b,int c,const float*d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static inline int qt_take(uint32_t a,const float*b,int c,float*d){(void)b;(void)c;(void)d;return a==0;}
+static inline int qt_take_scaled(uint32_t a,const float*b,int c,float*d,const float*s,float e){(void)b;(void)c;(void)d;(void)s;(void)e;return a==0;}
 static inline int  qt_plan_fill(int*a,int*b,int c){(void)a;(void)b;(void)c;return 0;}
 static inline void qt_layer_off(int a){(void)a;}
 static inline void qt_note_planned(int a,int b,const uint8_t*c,const uint8_t*d,const uint8_t*e,const float*f,const float*g,const float*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;}

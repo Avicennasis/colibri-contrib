@@ -601,6 +601,82 @@ unset a CUDA build hands such a file to the Vulkan chain on the same card
 the CPU. UD-IQ3_XXS costs as much quality as UD-Q2_K_XL for one more GB:
 UD-Q3_K_XL is the smallest file that keeps most of it.
 
+### Muse Spark Open
+
+[meta-models/Muse-Spark-Open-816B-A42B](https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B)
+runs from its GGUFs ([unsloth/Muse-Spark-Open-816B-A42B-GGUF](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF),
+UD-IQ1_S at 176 GB to UD-Q4_K_XL at 505 GB), text only. Its license lets you use,
+change and redistribute it; a product that uses it shows "Built with Muse Spark
+Open", and a model-as-a-service business past 20 million dollars a year needs an
+agreement with Meta (LICENSE.md in the repository).
+
+62 attention layers, hidden 8192, 128 query heads of 64 over 16 KV heads: 46
+layers see a window of 2048 positions with RoPE, the other 16 every position
+without it. What the engine adds for it (`model_type: muse_spark`, the GGUF's
+`muse-spark`):
+
+- an RMSNorm without a weight on the embedding, on every attention head's
+  output and on the attention branch; the attention's gate is its own
+  projection of the attention's input;
+- a residual gate after attention and after the feed-forward:
+  x = alpha * x + beta * branch;
+- the router on the hidden width, its logits times 0.177, the top-8 of 256
+  chosen on sigmoid + bias and weighted by the sigmoid; the experts at a width
+  of 4096 between a projection down and one back up, normalised in front, and
+  every expert's output scaled, then normalised, before the sum;
+- the logits times 0.177, capped at 20 tanh(x / 20).
+
+The published GGUFs hold q's and k's rows with each head's two halves
+interleaved (rotary pairs adjacent); the engine puts them back at load, a
+byte copy of whole rows, so every kernel rotates the halves as for the other
+models (`Q36_GGUF_ROPE_PERM=0` keeps the file's order). The tokenizer is o200k's
+split with tiktoken's rule that a piece in the vocabulary is that token
+(`tests/test_qwen36_tokenizer_o200k.c`: HF's ids on 102 texts, on a fixture and
+on the release's 202048 pieces).
+
+The chat format is messages to recipients: the model writes `to=self` for its
+reasoning, `to=commentary` for updates between tool calls, `to=user` for the
+answer, and a function's name for a call, written as an `<atem:function_calls>`
+block. The gateway renders the release's `chat_template.jinja` byte for byte
+(`tests/test_muse_chat.py`; the template is not in the repository, its license
+travels with every copy: `COLI_MUSE_TEMPLATE=path/to/chat_template.jinja` runs
+the check), files the reasoning as `reasoning_content`, parses the calls with
+the tools' schemas, and stops at `<|eot|>`. `reasoning_effort` sets the reasoning
+strength (low 8, medium 32, high 256, xhigh 512, the template's default); the
+template has no switch to turn reasoning off, so thinking off is low.
+
+```bash
+coli import Muse-Spark-Open-816B-A42B-UD-IQ1_S-00001-of-00005.gguf    # every part next to it
+coli serve --model Muse-Spark-Open-816B-A42B-UD-IQ1_S.colibri
+```
+
+UD-IQ1_S (175.6 GB) on an RTX PRO 4000 (24 GB) with 62 GB of RAM and two NVMe
+drives in an md array, through `coli serve`: a 303-token prompt (the template's
+system message and a 120-word question) and 63 tokens, three runs each, tok/s:
+
+| path | prompt | decode |
+|---|---|---|
+| Vulkan chain, tier and host pool | 5.0-5.3 | 1.55-1.58 |
+| CUDA chain and tier | 3.5 | 1.34-1.40 |
+| the CPU | 3.0 | 0.83-0.89 |
+
+The dense part (17.3 GB of the file's blocks) sits on the card. The Vulkan tier
+holds 193 experts there and about 3600 more in a 34.5 GB host pool the card
+reads over PCIe; the RAM cache keeps 8 a layer, and the rest of the 15872 come
+from the disk. A prompt touches nearly every expert of every layer, so it runs
+at what the disk gives. On CUDA the experts the card does not hold are computed
+on the CPU, a prompt's in one batch per expert.
+
+`tools/make_muse_tiny.py` writes a tiny Muse Spark GGUF in the published
+files' layout, rotary order included, and its greedy continuation (CI: `Linux
+(generated qwen36 oracles)`): the CPU, the CUDA chain and tier, and the Vulkan
+chain and tier give its tokens. With Q8_0 experts, `--act f32` writes Vulkan's
+reference (it reads the experts' inputs as floats, the CPU and CUDA as int8),
+and `--max-new 8 --min-gap 0.2` keeps the int8 one clear of the rounding that
+differs from one CPU to the next. The Vulkan tier holds F32 experts as int8 per
+32 (blocks it cannot read as the file has them), so Vulkan gives an F32
+oracle's tokens with `COLI_VK_TIER=0`.
+
 ### The converter's tensor contract
 
 Both checkpoints ship experts **fused** per layer (`mlp.experts.gate_up_proj`,

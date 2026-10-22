@@ -125,6 +125,7 @@ typedef struct { int nseg, D, per_row, x_off, x_row, x_seg, y_off, y_row, y_seg,
 #define VKC_NORM_ADD1 1
 #define VKC_NORM_NOW  2
 #define VKC_NORM_L2   4
+#define VKC_NORM_PRESCALE 8   /* scale by w, then normalise (Muse Spark) */
 int  vkc_norm(VkcBuf *x, VkcBuf *w, VkcBuf *y, const VkcNorm *p);
 /* chain_rope.comp */
 typedef struct { int nseg, per_row, x_off, x_row, x_seg, half_, cs_off, cs_row; } VkcRope;
@@ -190,6 +191,8 @@ int  vkc_dnrec(int KD, VkcBuf *cv, VkcBuf *ab, VkcBuf *z, VkcBuf *st, VkcBuf *pr
 #define VKC_EW_HC_APPLY 6
 #define VKC_EW_SCALE    7
 #define VKC_EW_GATE_ADD 8
+#define VKC_EW_SIGMUL   9    /* y = a * sigmoid(b) */
+#define VKC_EW_RESGATE  10   /* y = e[col] * a + c[col] * b (alpha, beta a column) */
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } VkcEw;
 int  vkc_ew(VkcBuf *y, VkcBuf *a, VkcBuf *b, VkcBuf *c, VkcBuf *e, const VkcEw *p);
 /* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: the selection of S rows, run as two dispatches that write the

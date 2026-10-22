@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <pthread.h>
 #include <time.h>
 #ifdef __linux__
@@ -586,6 +587,9 @@ void qt_trunk_withdraw(const char *why){
  * is withdrawn: CUDA_EXPERT_GB as a number is the user's word. The engine calls this
  * before its warm start, so nothing is resident yet; the tier stays up for nothing else
  * and every expert call answers "not here". */
+/* qt_reserve: device bytes the engine places after the tier sized itself (qwen36_tier.h) */
+static size_t G_reserve;
+void qt_reserve(size_t bytes){ G_reserve = bytes; }
 void qt_experts_withdraw(const char *why){
     const char *bg = getenv("CUDA_EXPERT_GB");
     if(!G.on || G_trunk_only || (bg && strcmp(bg,"auto") && atof(bg) > 0)) return;
@@ -852,7 +856,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
     }
 
     /* Per-device allowance for tier + trunk: CUDA_EXPERT_GB when numeric,
-     * else free minus 1 GB headroom. The heat table is loaded here too (it
+     * else free minus 1 GB headroom and what the engine reserved (qt_reserve). The heat table is loaded here too (it
      * used to be loaded after the budgets) because the placer prices
      * experts by heat. */
     size_t capacity[QT_MAX_DEV]; int capdev[QT_MAX_DEV]; int ncap = G.ndev;
@@ -862,7 +866,7 @@ int qt_init(int nl, int ne, int D, int Ih, int cap, int topk, int expert_gs,
         capdev[i] = G.dev[i];
         capacity[i] = (bg && strcmp(bg,"auto") && atof(bg)>0)
                    ? (size_t)(atof(bg)*1024.0*1024.0*1024.0)
-                   : (freeb>(1ull<<30) ? freeb-(1ull<<30) : 0);
+                   : (freeb>(1ull<<30)+G_reserve ? freeb-(1ull<<30)-G_reserve : 0);
         fprintf(stderr,"[qtier] dev %d: %.1f GB free, allowance %.1f GB\n",
                 G.dev[i], freeb/1073741824.0, capacity[i]/1073741824.0);
     }
@@ -1839,7 +1843,8 @@ uint32_t qt_issue(int layer,const int *eids,int K,const float *x){
     return mask;
 }
 
-int qt_take(uint32_t mask,const float *val,int K,float *out){
+int qt_take(uint32_t mask,const float *val,int K,float *out){ return qt_take_scaled(mask,val,K,out,NULL,0.f); }
+int qt_take_scaled(uint32_t mask,const float *val,int K,float *out,const float *s,float eps){
     (void)K;
     if(!G.on) return mask==0;
     const float *result[QT_MAX_DEV]={0};
@@ -1858,6 +1863,12 @@ int qt_take(uint32_t mask,const float *val,int K,float *out){
         if(ok && result[di]) for(int j=0;j<G.is_cnt[di];j++){
             float w=val[G.is_k[di][j]];
             const float *row=result[di]+(size_t)j*G.D;
+            if(s){   /* Muse Spark: w * rmsnorm(row * s) */
+                double ms=0; for(int d=0;d<G.D;d++){ double v=(double)row[d]*s[d]; ms+=v*v; }
+                const float r=1.f/sqrtf((float)(ms/G.D)+eps);
+                for(int d=0;d<G.D;d++) out[d]+=w*(row[d]*s[d]*r);
+                continue;
+            }
             for(int d=0;d<G.D;d++) out[d]+=w*row[d];
         }
         G.is_cnt[di]=0;
