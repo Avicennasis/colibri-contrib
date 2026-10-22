@@ -126,10 +126,15 @@ def _act_q8(x):
 class MuseRef:
     """Muse Spark's text forward over a whole sequence, float32, no cache. act_q8: the
     experts read their inputs as the engine's int8 kernels do, for a GGUF whose experts
-    are in blocks (the weights are the blocks' own values, as_stored)."""
+    are in blocks (the weights are the blocks' own values, as_stored); dense_q8: the 2-D
+    matrices too (every one but the router)."""
 
-    def __init__(self, cfg, w, act_q8=False):
-        self.c, self.w, self.act_q8 = cfg, w, act_q8
+    def __init__(self, cfg, w, act_q8=False, dense_q8=False):
+        self.c, self.w, self.act_q8, self.dense_q8 = cfg, w, act_q8, dense_q8
+
+    def mm(self, x, name):
+        """x @ W^T for a dense matrix, its rows quantized first when the engine does"""
+        return (_act_q8(x) if self.dense_q8 else x) @ self.w[name].T
 
     @staticmethod
     def rms(x, eps, weight=None):
@@ -149,9 +154,9 @@ class MuseRef:
         c, w, p = self.c, self.w, f"blk.{i}."
         T = h.shape[0]
         H, KV, hd, eps = c["num_attention_heads"], c["num_key_value_heads"], c["head_dim"], c["rms_norm_eps"]
-        q = (h @ w[p + "attn_q.weight"].T).view(T, H, hd)
-        k = (h @ w[p + "attn_k.weight"].T).view(T, KV, hd)
-        v = (h @ w[p + "attn_v.weight"].T).view(T, KV, hd)
+        q = self.mm(h, p + "attn_q.weight").view(T, H, hd)
+        k = self.mm(h, p + "attn_k.weight").view(T, KV, hd)
+        v = self.mm(h, p + "attn_v.weight").view(T, KV, hd)
         q = self.rms(q, eps, w[p + "attn_q_norm.weight"])
         k = self.rms(k, eps, w[p + "attn_k_norm.weight"])
         theta = c["layer_rope_theta"][i]
@@ -169,8 +174,8 @@ class MuseRef:
             s = s.masked_fill(~allowed, float("-inf"))
             out[:, hh, :] = torch.softmax(s, -1) @ v[:, hh // rep, :]
         out = self.rms(out, eps).reshape(T, H * hd)
-        out = out * torch.sigmoid(h @ w[p + "attn_gate.weight"].T)
-        return out @ w[p + "attn_output.weight"].T
+        out = out * torch.sigmoid(self.mm(h, p + "attn_gate.weight"))
+        return self.mm(out, p + "attn_output.weight")
 
     def moe(self, i, h):
         c, w, p = self.c, self.w, f"blk.{i}."
@@ -180,7 +185,7 @@ class MuseRef:
         top = torch.topk(scores + w[p + "exp_probs_b.bias"], K, dim=-1).indices
         wts = scores.gather(1, top)
         wts = wts / (wts.sum(-1, keepdim=True) + 1e-15) * c["routed_scaling_factor"]
-        lat = self.rms(h @ w[p + "ffn_latent_down.weight"].T, c["rms_norm_eps"], w[p + "ffn_pre_exp_norm.weight"])
+        lat = self.rms(self.mm(h, p + "ffn_latent_down.weight"), c["rms_norm_eps"], w[p + "ffn_pre_exp_norm.weight"])
         out = torch.zeros_like(lat)
         for r in range(h.shape[0]):
             for j in range(K):
@@ -192,7 +197,7 @@ class MuseRef:
                 y = (_act_q8(a) if self.act_q8 else a) @ w[p + "ffn_down_exps.weight"][e].T
                 y = self.rms(y * w[p + "ffn_post_exp_norm.weight"], c["post_norm_eps"])
                 out[r] += wts[r, j] * y
-        return out @ w[p + "ffn_latent_up.weight"].T
+        return self.mm(out, p + "ffn_latent_up.weight")
 
     def logits(self, ids):
         w, c = self.w, self.c
@@ -205,7 +210,7 @@ class MuseRef:
             f = self.moe(i, self.rms(x, c["rms_norm_eps"], w[p + "ffn_norm.weight"]))
             f = self.rms(f * w[p + "post_ffw_norm.weight"], c["post_norm_eps"])
             x = w[p + "ffn_resid_alpha.weight"] * x + w[p + "ffn_resid_beta.weight"] * f
-        lo = self.rms(x, c["rms_norm_eps"], w["output_norm.weight"]) @ w["output.weight"].T
+        lo = self.mm(self.rms(x, c["rms_norm_eps"], w["output_norm.weight"]), "output.weight")
         cap = c["final_logit_softcapping"]
         return cap * torch.tanh(lo * c["output_multiplier"] / cap)
 
@@ -301,8 +306,8 @@ def main():
                     help="the GGUF's 2-D matrices (attention, projections, head): F32, or Q8_0")
     ap.add_argument("--experts", default="Q8_0", choices=("F32", "Q8_0"), help="the routed experts' GGUF type")
     ap.add_argument("--act", default=None, choices=("q8", "f32"),
-                    help="the experts' inputs in the reference: q8 as the CPU's integer kernels quantize "
-                         "them (the default with Q8_0 experts), f32 as the device tiers read them")
+                    help="the inputs of the matrices in blocks, in the reference: q8 as the integer kernels "
+                         "quantize them (the CPU's, CUDA's; the default with Q8_0), f32 as Vulkan reads them")
     ap.add_argument("--min-gap", type=float, default=0.1,
                     help="draw seeds from --seed on until every greedy step's first logit beats the "
                          "second by this much, so a quantized matrix cannot flip a near tie")
@@ -314,8 +319,9 @@ def main():
         if not args.emit_ref:
             break
         with torch.no_grad():
-            act_q8 = (args.act or ("q8" if args.experts == "Q8_0" else "f32")) == "q8"
-            full, gap = MuseRef(cfg, w, act_q8=act_q8).generate(prompt, args.max_new)
+            q8 = (args.act or ("q8" if "Q8_0" in (args.experts, args.dense) else "f32")) == "q8"
+            full, gap = MuseRef(cfg, w, act_q8=q8 and args.experts == "Q8_0",
+                                dense_q8=q8 and args.dense == "Q8_0").generate(prompt, args.max_new)
         if gap >= args.min_gap:
             break
     else:
