@@ -2917,6 +2917,174 @@ class CapSentinelShimTest(unittest.TestCase):
             self.assertNotIn(key, env)
 
 
+class _DeadableEngine(FakeEngine):
+    """A served engine that can die: what Engine.alive and ImageEngine.alive report."""
+    def __init__(self, name="engine"):
+        super().__init__()
+        self.name = name
+        self.alive = True
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+
+
+class EngineRestartTest(unittest.TestCase):
+    """#2290: a dead engine under a live server is seen by /health and started again."""
+
+    def test_a_paused_scheduler_admits_nothing_until_it_resumes(self):
+        scheduler = GenerationScheduler(max_queue=1, queue_timeout=5)
+        scheduler.pause()
+        admitted = threading.Event()
+
+        def waiter():
+            with scheduler.admit():
+                admitted.set()
+        thread = threading.Thread(target=waiter, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 2
+        while scheduler.snapshot()["queued"] != 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(scheduler.snapshot()["queued"], 1)
+        self.assertFalse(admitted.wait(0.3))
+        # the queue is full while paused, though the slot itself is free
+        with self.assertRaises(APIError) as caught:
+            with scheduler.admit():
+                pass
+        self.assertEqual(caught.exception.status, 429)
+        scheduler.resume()
+        self.assertTrue(admitted.wait(2))
+        thread.join(timeout=2)
+        self.assertEqual(scheduler.snapshot()["completed"], 1)
+
+    def test_health_answers_503_while_the_engine_is_down(self):
+        engine = _DeadableEngine()
+        server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 2)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_port}/health"
+
+        def status():
+            try:
+                with urlopen(base, timeout=2) as response:
+                    return response.status, json.load(response)["status"], None
+            except HTTPError as error:
+                with error:
+                    return error.code, json.load(error)["status"], error.headers["Retry-After"]
+        self.assertEqual(status(), (200, "ok", None))
+        engine.alive = False
+        self.assertEqual(status(), (503, "engine_down", "5"))
+        server.keeps_engine = True       # serve() runs keep_engine: it is being started again
+        self.assertEqual(status(), (503, "restarting", "5"))
+        engine.alive = True
+        server.scheduler.pause()         # the new engine is loading
+        self.assertEqual(status(), (503, "restarting", "5"))
+        server.scheduler.resume()
+        self.assertEqual(status(), (200, "ok", None))
+
+    def _server(self, engine):
+        server = APIServer(("127.0.0.1", 0), engine, "test-model", "secret", 16)
+        self.addCleanup(server.server_close)
+        return server
+
+    def test_keep_engine_starts_a_dead_engine_again(self):
+        dead, fresh = _DeadableEngine("dead"), _DeadableEngine("fresh")
+        server = self._server(dead)
+        server.pinned_prefixes[0] = ("prefix", 3)
+        stopping = threading.Event()
+        paused_while_starting = []
+
+        def start():
+            paused_while_starting.append(server.scheduler.paused)
+            return fresh
+        thread = threading.Thread(target=openai_server.keep_engine,
+                                  args=(server, start, stopping, 0.01, (0.01, 0.02), 0.01), daemon=True)
+        thread.start()
+        dead.alive = False
+        deadline = time.monotonic() + 2
+        while server.engine is not fresh and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stopping.set()
+        thread.join(timeout=2)
+        self.assertIs(server.engine, fresh)
+        self.assertEqual(paused_while_starting, [True])
+        self.assertFalse(server.scheduler.paused)
+        self.assertEqual(server.engine_restarts, 1)
+        self.assertEqual(dead.closed, 1)
+        self.assertEqual(fresh.closed, 0)
+        self.assertEqual(server.pinned_prefixes, {})   # the photos lived in the dead KV
+
+    def test_keep_engine_tries_a_failed_start_again(self):
+        dead, fresh = _DeadableEngine("dead"), _DeadableEngine("fresh")
+        dead.alive = False
+        server = self._server(dead)
+        stopping = threading.Event()
+        attempts = []
+
+        def start():
+            attempts.append(time.monotonic())
+            if len(attempts) < 3:
+                raise RuntimeError("colibri engine exited unexpectedly")
+            return fresh
+        thread = threading.Thread(target=openai_server.keep_engine,
+                                  args=(server, start, stopping, 0.01, (0.05, 0.08), 0.01), daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 3
+        while server.engine is not fresh and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stopping.set()
+        thread.join(timeout=2)
+        self.assertIs(server.engine, fresh)
+        self.assertEqual(len(attempts), 3)
+        # 0.05 s after the first failure, then twice that capped at 0.08
+        self.assertGreaterEqual(attempts[1] - attempts[0], 0.045)
+        self.assertGreaterEqual(attempts[2] - attempts[1], 0.075)
+        self.assertFalse(server.scheduler.paused)
+
+    def test_an_engine_that_loads_after_the_server_stopped_is_closed(self):
+        dead, fresh = _DeadableEngine("dead"), _DeadableEngine("fresh")
+        dead.alive = False
+        server = self._server(dead)
+        stopping = threading.Event()
+
+        def start():
+            with server.engine_swap:     # serve()'s teardown, while the engine loads
+                stopping.set()
+            return fresh
+        openai_server.keep_engine(server, start, stopping, 0.01, (0.01, 0.02), 0.01)
+        self.assertIs(server.engine, dead)
+        self.assertEqual(fresh.closed, 1)
+        self.assertEqual(server.engine_restarts, 0)
+
+    def test_a_server_that_stops_with_its_engine_loads_nothing(self):
+        """Ctrl-C reaches the engine too: serve() sets `stopping` within the grace."""
+        dead = _DeadableEngine("dead")
+        dead.alive = False
+        server = self._server(dead)
+        stopping = threading.Event()
+        starts = []
+        threading.Timer(0.05, stopping.set).start()
+        openai_server.keep_engine(server, lambda: starts.append(1), stopping, 0.01,
+                                  (0.01, 0.02), 0.5)
+        self.assertEqual(starts, [])
+        self.assertIs(server.engine, dead)
+        self.assertEqual(dead.closed, 0)       # serve()'s teardown closes it
+
+    def test_engine_alive_follows_the_process_and_its_reader(self):
+        process = FakeProcess(lambda process, frame: None)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("olmoe", "model")
+        self.assertTrue(engine.alive)
+        process.returncode = -9          # killed: the pipe closes under the reader
+        process.stdout.close()
+        engine.dispatcher.join(timeout=2)
+        self.assertFalse(engine.alive)
+        engine.close()
+
+
 class HTTPTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
