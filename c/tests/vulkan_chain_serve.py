@@ -21,7 +21,10 @@ straight after top_p (what the qwen engines have always been sent); "numeric", i
 2, ... (glm53); "colibri", numeric ids and the grammar-bytes field (0) before the
 options (colibri's multiplexed serve). CHAIN_SERVE_SLOTS=n sends request i to KV slot
 i % n (the engine needs KV_SLOTS=n): the turns move between sessions, and with them
-whatever state the chain keeps on the device.
+whatever state the chain keeps on the device. CHAIN_SERVE_CONTINUE=1 adds a last turn
+that continues the one before it exactly (its prompt, what it wrote, two bytes more) and
+asks for enough tokens to grow the cache: the state is reused while the KV mirrors are
+made again from the host's rows, which then have to hold what the device wrote.
 """
 import os
 import re
@@ -55,8 +58,15 @@ def session(engine, snap, extra, chain):
     turns = [(base, 6, "pin=1 logprobs=3"), (base + b"xyz", 6, "logprobs=2"), (base + b"QRS", 6, ""),
              (base + b"QRS" + b"tuvw", 6, ""), (b"zzz" + base, 5, "logprobs=2"), (base + b"QRS", 4, "pin=1"),
              (base + b"QRSk", 4, "")]
+    if os.environ.get("CHAIN_SERVE_CONTINUE") == "1":
+        turns.append(None)
     out = []
-    for i, (prompt, max_tok, ext) in enumerate(turns):
+    for i, turn in enumerate(turns):
+        if turn is None:   # the turn before, what it wrote and two bytes more; a cache that grows
+            prompt, max_tok, ext = turns[i - 1][0] + written + b"mn", 12, ""
+            turns[i] = (prompt, max_tok, ext)
+        prompt, max_tok, ext = turns[i]
+        written = b""
         dialect = os.environ.get("CHAIN_SERVE_DIALECT", "")
         rid = f"{i + 1}" if dialect in ("numeric", "colibri") else f"r{i}"
         slot = i % int(os.environ.get("CHAIN_SERVE_SLOTS", "1"))
@@ -73,6 +83,8 @@ def session(engine, snap, extra, chain):
                 body = p.stdout.read(int(line.split()[2]))
                 p.stdout.readline()
                 out.append(line.rstrip() + b" " + body)
+                if kind == b"DATA":
+                    written += body
             elif kind == b"DONE":
                 out.append(b"DONE " + line.split()[1])
                 break
