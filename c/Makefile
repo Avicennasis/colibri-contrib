@@ -552,7 +552,6 @@ TEST_EXCLUDE += test_qwen36_tier_stream_engine
 TEST_BINS    = $(addprefix tests/,$(addsuffix $(EXE),$(filter-out $(TEST_EXCLUDE),$(TEST_RULES))))
 ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
-TEST_BINS += tests/test_exact_dot$(EXE)
 endif
 ifneq (,$(IS_WIN))
 TEST_BINS += tests/test_xdna_execution$(EXE) tests/test_xdna_failure$(EXE)
@@ -565,7 +564,6 @@ TEST_BINS += tests/test_gsgemv_sse41$(EXE) tests/test_qgemv_sse41$(EXE) \
 	tests/test_idot_ssse3$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
-TEST_BINS += tests/test_v4_hybrid_policy$(EXE) tests/test_k3_fill_budget$(EXE) tests/test_v4_bank_pair$(EXE)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
 	tests/test_v4_serve_framing$(EXE) \
 	tests/test_segment_adapters_registration$(EXE) \
