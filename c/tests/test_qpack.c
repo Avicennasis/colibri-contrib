@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "../compat.h"
@@ -634,6 +635,88 @@ static void test_section_name_cap(void) {
                          "section 0 name is longer than 255 bytes", "mmmm");
 }
 
+static void write_manifest(const char *root, const char *text, size_t size) {
+    char path[1024];
+    make_path(path, sizeof(path), root, "manifest.json");
+    must_write(path, text, size);
+}
+
+/* A key of the files table repeated with other keys between the two copies
+ * is a duplicate: the scan must find repeats that are not neighbours in the
+ * order the manifest lists them. */
+static void test_files_table_repeated_key_apart_is_refused(void) {
+    char root[] = "test_qpack_dup_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    write_fixture(root, valid_layout_bf16, "QPACK", 32768, 4, 8,
+                  COLI_AFFINE_SCALAR_BF16);
+    char manifest[1024];
+    int count = snprintf(
+        manifest, sizeof(manifest),
+        "{\"magic\":\"QPACK\",\"version\":1,\"modelName\":\"fixture\","
+        "\"sourceCheckpoint\":\"fixture\",\"quantBits\":4,"
+        "\"quantGroupSize\":8,\"files\":{"
+        "\"packed_experts/layout.json\":%zu,"
+        "\"packed_experts/layer_00.bin\":32768,"
+        "\"packed_experts/layer_01.bin\":32768,"
+        "\"packed_experts/layout.json\":%zu}}",
+        strlen(valid_layout_bf16), strlen(valid_layout_bf16));
+    CHECK(count > 0 && (size_t)count < sizeof(manifest));
+    write_manifest(root, manifest, (size_t)count);
+
+    ColiQpackReader reader;
+    char error[512] = {0};
+    CHECK(coli_qpack_open(&reader, root, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "manifest files table is invalid") != NULL);
+    CHECK(reader.layer_fds == NULL && reader.layout.sections == NULL);
+    cleanup(root);
+}
+
+/* Nothing bounds a root object's key count before its duplicate-key scan
+ * but the 16 MiB JSON cap, about 1.4 million short keys.  A manifest root of
+ * 100,000 keys whose first key is repeated as its last: the pairwise scan
+ * compared every pair before refusing (18 s of CPU on dev 36b713e1 here;
+ * 1.4 million keys would be an hour), the sorted scan refuses in well under
+ * a second.  The bound is CPU time (clock), not wall time, so a loaded host
+ * does not fail it. */
+static void test_manifest_root_repeated_key_is_refused_in_bounded_cpu_time(void) {
+    enum { keys = 100000 };
+    char root[] = "test_qpack_root_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    write_fixture(root, valid_layout_bf16, "QPACK", 32768, 4, 8,
+                  COLI_AFFINE_SCALAR_BF16);
+    size_t capacity = (size_t)keys * 16 + 512;
+    char *manifest = (char *)malloc(capacity);
+    CHECK(manifest != NULL);
+    size_t used = (size_t)snprintf(manifest, capacity, "{");
+    for (int i = 0; i < keys; i++)
+        used += (size_t)snprintf(manifest + used, capacity - used,
+                                 "\"r%06d\":0,", i);
+    used += (size_t)snprintf(
+        manifest + used, capacity - used,
+        "\"magic\":\"QPACK\",\"version\":1,\"modelName\":\"fixture\","
+        "\"sourceCheckpoint\":\"fixture\",\"quantBits\":4,"
+        "\"quantGroupSize\":8,\"files\":{"
+        "\"packed_experts/layout.json\":%zu,"
+        "\"packed_experts/layer_00.bin\":32768,"
+        "\"packed_experts/layer_01.bin\":32768},\"r000000\":0}",
+        strlen(valid_layout_bf16));
+    CHECK(used < capacity);
+    write_manifest(root, manifest, used);
+    free(manifest);
+
+    ColiQpackReader reader;
+    char error[512] = {0};
+    clock_t start = clock();
+    CHECK(coli_qpack_open(&reader, root, error, sizeof(error)) != 0);
+    double cpu_seconds = (double)(clock() - start) / CLOCKS_PER_SEC;
+    CHECK(strstr(error, "not a supported QPACK v1") != NULL);
+    CHECK(reader.layer_fds == NULL && reader.layout.sections == NULL);
+    fprintf(stderr, "test_qpack: 100,000-key manifest root refused in %.3f s CPU\n",
+            cpu_seconds);
+    CHECK(cpu_seconds < 4.0);
+    cleanup(root);
+}
+
 int main(void) {
     static const struct {
         const char *layout;
@@ -667,6 +750,8 @@ int main(void) {
     test_section_token_rules();
     test_section_name_cap();
     test_post_open_truncation();
+    test_files_table_repeated_key_apart_is_refused();
+    test_manifest_root_repeated_key_is_refused_in_bounded_cpu_time();
     puts("test_qpack: strict v1 metadata, printable bounded names, packed "
          "widths, fixed-stride read, affine views: ok");
     return 0;

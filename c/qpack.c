@@ -125,12 +125,34 @@ static int qpack_json_u64(jval *value, uint64_t *output) {
     return 0;
 }
 
+static int qpack_key_order(const void *left, const void *right) {
+    return strcmp(*(const char *const *)left, *(const char *const *)right);
+}
+
+/* A repeated key in a JSON object.  The keys are sorted once and compared
+ * neighbour to neighbour: n log n comparisons where the pairwise scan this
+ * replaced took n^2 / 2 of them, and nothing bounds a root object's key count
+ * before this runs but the 16 MiB JSON cap, about 1.4 million short keys (a
+ * manifest root of 100,000 took 16 s of CPU pairwise; 1.4 million would be an
+ * hour, before the refusal).  If the pointer copy cannot be allocated the
+ * pairwise scan answers instead: memory changes the time, never the verdict. */
 static int qpack_object_has_duplicate_keys(jval *object) {
-    if (!object || object->t != J_OBJ) return 0;
-    for (int i = 0; i < object->len; i++)
-        for (int j = 0; j < i; j++)
-            if (strcmp(object->keys[i], object->keys[j]) == 0) return 1;
-    return 0;
+    if (!object || object->t != J_OBJ || object->len < 2) return 0;
+    const char **sorted =
+        (const char **)malloc((size_t)object->len * sizeof(*sorted));
+    if (!sorted) {
+        for (int i = 1; i < object->len; i++)
+            for (int j = 0; j < i; j++)
+                if (strcmp(object->keys[i], object->keys[j]) == 0) return 1;
+        return 0;
+    }
+    for (int i = 0; i < object->len; i++) sorted[i] = object->keys[i];
+    qsort(sorted, (size_t)object->len, sizeof(*sorted), qpack_key_order);
+    int duplicate = 0;
+    for (int i = 1; i < object->len && !duplicate; i++)
+        duplicate = strcmp(sorted[i - 1], sorted[i]) == 0;
+    free(sorted);
+    return duplicate;
 }
 
 static int qpack_dtype_size(const char *dtype, size_t *size) {
