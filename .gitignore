@@ -153,6 +153,9 @@ c/clef_tiny/*
 c/clef_tiny_c/
 c/qwen38_2p4t_tiny/
 c/qwen38_2p4t_tiny_c/
+# tools/make_olmoe_tiny.py + convert_olmoe_merged.py (the CI olmoe job's recipe)
+c/olmoe_tiny/
+c/olmoe_tiny_c/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/
