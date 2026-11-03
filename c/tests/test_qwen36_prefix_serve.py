@@ -106,7 +106,7 @@ class Qwen36PrefixServeTest(PrefixReuseContract, unittest.TestCase):
                     self.assertEqual(text, "ERROR cancel-prefill CANCELLED")
                 else:
                     self.assertTrue(text.startswith("DONE cancel-prefill STAT 0 "), text)
-                    self.assertEqual(text.split()[-1], "0", "STOP is not length-limited")
+                    self.assertEqual(text.split()[8], "0", "STOP is not length-limited")   # the limited flag; later fields are timings
                 break
 
         # Cancellation must not poison the persistent process or its next turn.

@@ -81,7 +81,7 @@ class QwenStopProtocolTest(unittest.TestCase):
                                 self.assertTrue(sent)
                                 if command == "STOP":
                                     self.assertTrue(text.startswith("DONE control STAT "), text)
-                                    self.assertEqual(text.split()[-1], "0", "STOP is not length-limited")
+                                    self.assertEqual(text.split()[8], "0", "STOP is not length-limited")   # the limited flag; later fields are timings
                                 else:
                                     self.assertEqual(text, "ERROR control CANCELLED")
                                 break
