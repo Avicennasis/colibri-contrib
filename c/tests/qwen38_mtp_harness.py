@@ -275,8 +275,8 @@ def serve_session(engine, model, extra, turns=SERVE_TURNS):
                     fields, line = frame()
                     if not fields or fields[0] in (b"STAT", b"PROF", b"EMAP", b"HITS", b"CAPS"):
                         continue    # timings, and the expert residency the draft rows change
-                    if fields[0] == b"DONE":    # tokens/s and RSS vary: keep the count and the reason
-                        line = b" ".join(fields[:4] + fields[-2:])
+                    if fields[0] == b"DONE":    # seconds, tokens/s, RSS and the trailing prefill seconds vary:
+                        line = b" ".join(fields[:4] + fields[7:9])    # keep the count, the prompt tokens, the reason
                     frames.append(line)
                     if fields[0] in (b"DONE", b"ERROR"):
                         break
